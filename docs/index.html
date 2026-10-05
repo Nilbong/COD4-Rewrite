@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CoD4 Rewrite</title>
+<meta name="description" content="A Call of Duty 4 multiplayer reimplementation on the Bevy engine. Bring your own game files.">
+<style>
+:root {
+  --bg: #0e1110;
+  --panel: #161b19;
+  --line: #27302c;
+  --text: #e4e9e6;
+  --muted: #98a39d;
+  --accent: #c8f26b;
+  --accent-ink: #11160a;
+  --code: #0a0d0c;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7f4; --panel: #ffffff; --line: #dde2dc; --text: #1a201c;
+    --muted: #5c675f; --accent: #3c6b00; --accent-ink: #ffffff; --code: #eef1ec;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--accent); }
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+nav { border-bottom: 1px solid var(--line); }
+nav .wrap { display: flex; align-items: center; gap: 24px; height: 56px; }
+nav strong { letter-spacing: .04em; margin-right: auto; }
+nav a { color: var(--muted); text-decoration: none; font-size: 14px; }
+nav a:hover { color: var(--text); }
+.hero { padding: 88px 0 64px; }
+.hero h1 { font-size: clamp(2.4rem, 7vw, 4.2rem); line-height: 1.05; margin: 0 0 18px; letter-spacing: -.02em; }
+.hero p { max-width: 640px; color: var(--muted); font-size: 1.15rem; margin: 0 0 28px; }
+.btns { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn {
+  display: inline-block; padding: 11px 20px; border-radius: 8px; text-decoration: none;
+  font-weight: 600; border: 1px solid var(--line); color: var(--text);
+}
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+section { padding: 52px 0; border-top: 1px solid var(--line); }
+h2 { font-size: 1.7rem; margin: 0 0 8px; letter-spacing: -.01em; }
+.lead { color: var(--muted); margin: 0 0 28px; max-width: 680px; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+.card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+.card p { margin: 0; color: var(--muted); font-size: .95rem; }
+pre {
+  background: var(--code); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px; overflow-x: auto; font-size: .9rem; margin: 12px 0;
+}
+code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+p code, li code, td code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: .88em; }
+table { border-collapse: collapse; width: 100%; font-size: .93rem; }
+td, th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.shots { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.shots img { width: 100%; border-radius: 10px; border: 1px solid var(--line); display: block; }
+.notice { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 16px 18px; }
+footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--muted); font-size: .9rem; }
+ol.steps { padding-left: 20px; }
+ol.steps li { margin-bottom: 6px; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <strong>CoD4 Rewrite</strong>
+    <a href="#features">Features</a>
+    <a href="#modes">Modes</a>
+    <a href="#screenshots" id="nav-shots" hidden>Screenshots</a>
+    <a href="#run">Run it</a>
+    <a href="#legal">Legal</a>
+    <a href="https://github.com/Nilbong/COD4-Rewrite">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>Call of Duty 4 multiplayer,<br>rebuilt in Rust.</h1>
+    <p>A from-scratch reimplementation on the <a href="https://bevyengine.org">Bevy</a> engine. It reads maps, models and textures from your own CoD4 install at runtime, the way OpenMW does for Morrowind. The repository ships no game data.</p>
+    <div class="btns">
+      <a class="btn primary" href="#run">Get started</a>
+      <a class="btn" href="https://github.com/Nilbong/COD4-Rewrite">View on GitHub</a>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="lead">The game's own fastfiles, menus and rules, running on a modern engine.</p>
+    <div class="grid">
+      <div class="card"><h3>Loads the real game files</h3><p>Decompresses <code>.ff</code> zones and parses the IW3 asset stream: materials, images, models, world geometry, collision and map entities. Every multiplayer map's zone parses.</p></div>
+      <div class="card"><h3>The original menus</h3><p>An interpreter for the IW3 menu system runs CoD4's own menus from <code>ui_mp.ff</code>: main menu, Private Match and Create a Class, with fonts, sounds and music.</p></div>
+      <div class="card"><h3>Create a Class and progression</h3><p>CoD4's XP, the 55 ranks, per-weapon challenges, attachments and camos, saved locally. Classes can stack a sight, silencer and grip, and weapons are rotatable 3D previews.</p></div>
+      <div class="card"><h3>Bots that play like you</h3><p>Record your own matches, fit a profile with a Python tool, and bots adopt your reaction time, aim speed, strafing and fighting range.</p></div>
+      <div class="card"><h3>Splitscreen co-op</h3><p>Two to four local players, each with their own camera, HUD and controller, including DualSense, DualShock 4, Xbox and Switch Pro.</p></div>
+      <div class="card"><h3>Weapons from three games</h3><p>CoD4 guns plus Black Ops and World at War weapons converted at load time from your installs of those games.</p></div>
+      <div class="card"><h3>Controller support</h3><p>Gamepads map onto the keyboard bindings, with aim assist, controller glyphs and rumble.</p></div>
+      <div class="card"><h3>Built-in debugging aids</h3><p>F10 takes a screenshot, pauses, and saves a bug report with the map, positions and every bot's state. A free-camera spectator mode follows bots by name or role.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="modes">
+  <div class="wrap">
+    <h2>Game modes</h2>
+    <p class="lead">Playable with bots on the multiplayer maps.</p>
+    <div class="grid">
+      <div class="card"><h3>Free-for-all</h3><p>Everyone against everyone.</p></div>
+      <div class="card"><h3>Domination</h3><p>Hold flags to earn points, with bot flag play learned from recorded demos.</p></div>
+      <div class="card"><h3>Search &amp; Destroy</h3><p>Plant or defuse the bomb, one life per round.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="screenshots" hidden>
+  <div class="wrap">
+    <h2>Screenshots</h2>
+    <p class="lead">Captured from the game running on a local install.</p>
+    <div class="shots" id="shots"></div>
+  </div>
+</section>
+
+<section id="run">
+  <div class="wrap">
+    <h2>Run it</h2>
+    <p class="lead">You need a Rust toolchain and an installed copy of CoD4 (Steam or retail, patch 1.7).</p>
+    <ol class="steps">
+      <li>Clone the repository.</li>
+      <li>Run the game. The install is found automatically in common Steam library locations. If it isn't, set <code>COD4_PATH</code> to the folder containing <code>iw3mp.exe</code>.</li>
+    </ol>
+<pre><code>git clone https://github.com/Nilbong/COD4-Rewrite.git
+cd COD4-Rewrite
+cargo run --release -p game</code></pre>
+    <p>Skip the menus and drop straight into a match:</p>
+<pre><code>cargo run --release -p game -- --map mp_killhouse --bots 6</code></pre>
+    <h3>Common options</h3>
+    <table>
+      <tr><th>Flag</th><th>Default</th><th>What it does</th></tr>
+      <tr><td><code>--map</code></td><td><code>mp_killhouse</code></td><td>Start this map directly</td></tr>
+      <tr><td><code>--bots</code></td><td><code>6</code></td><td>Players per team</td></tr>
+      <tr><td><code>--skill</code></td><td><code>0.6</code></td><td>Bot skill, 0 to 1</td></tr>
+      <tr><td><code>--hardcore</code></td><td>off</td><td>Hardcore rules</td></tr>
+      <tr><td><code>--spectate</code></td><td></td><td>Watch the bots with a free camera</td></tr>
+      <tr><td><code>--splitscreen</code></td><td></td><td>Local co-op devices, e.g. <code>kbm,pad,pad</code></td></tr>
+    </table>
+    <p>The full option list, controls and format notes are in the <a href="https://github.com/Nilbong/COD4-Rewrite#readme">README</a>.</p>
+  </div>
+</section>
+
+<section id="legal">
+  <div class="wrap">
+    <h2>Legal</h2>
+    <div class="notice">
+      <p style="margin:0 0 10px">CoD4 Rewrite is an independent fan project. It is not affiliated with, endorsed by, or sponsored by Activision, Infinity Ward or Microsoft. <em>Call of Duty</em> is a trademark of its owners.</p>
+      <p style="margin:0">This repository contains <strong>no game data</strong>: no maps, models, textures, sounds or fonts. You must own a legitimate copy of the game, and everything is read from your own installation at runtime. The format layouts were derived from community reverse-engineering work, especially <a href="https://github.com/Laupetin/OpenAssetTools">OpenAssetTools</a>, used as documentation only.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">CoD4 Rewrite &middot; <a href="https://github.com/Nilbong/COD4-Rewrite">Source on GitHub</a></div>
+</footer>
+
+<script>
+// Screenshots appear only for files that exist in docs/img (shot-1.jpg ... shot-8.jpg).
+(function () {
+  var box = document.getElementById('shots');
+  var section = document.getElementById('screenshots');
+  var nav = document.getElementById('nav-shots');
+  var found = 0;
+  for (var i = 1; i <= 8; i++) {
+    (function (n) {
+      var img = new Image();
+      img.alt = 'CoD4 Rewrite gameplay screenshot ' + n;
+      img.loading = 'lazy';
+      img.onload = function () {
+        box.appendChild(img);
+        found++;
+        section.hidden = false;
+        nav.hidden = false;
+      };
+      img.src = 'img/shot-' + n + '.jpg';
+    })(i);
+  }
+})();
+</script>
+</body>
+</html>
