@@ -5,6 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CoD4 Rewrite</title>
 <meta name="description" content="A Call of Duty 4 multiplayer reimplementation on the Bevy engine. Bring your own game files.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="CoD4 Rewrite">
+<meta property="og:description" content="A Call of Duty 4 multiplayer reimplementation on the Bevy engine. Bring your own game files.">
+<meta property="og:image" content="https://nilbong.github.io/COD4-Rewrite/img/social.jpg">
+<meta property="og:url" content="https://nilbong.github.io/COD4-Rewrite/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://nilbong.github.io/COD4-Rewrite/img/social.jpg">
 <meta name="theme-color" content="#0b0e0c">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e0c'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%23c8f26b' stroke-width='2'/%3E%3Cpath d='M16 3v8M16 21v8M3 16h8M21 16h8' stroke='%23c8f26b' stroke-width='2'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -28,13 +35,7 @@
   --head: "Oswald", "Bahnschrift", "Arial Narrow", Impact, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
 }
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f3f5ef; --bg2: #eaede4; --panel: #ffffff; --line: #d6dccf; --text: #171c18;
-    --muted: #59655d; --accent: #3f6f00; --accent-dim: #5a8f10; --amber: #a86400; --red: #c0392b;
-    --ink: #ffffff; --code: #ecefe6; --grid: rgba(40,80,0,.07);
-  }
-}
+:root { color-scheme: dark; }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body {
@@ -60,14 +61,19 @@ nav a.l:hover { color: var(--text); }
 /* hero */
 .hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line);
   background:
-    radial-gradient(900px 520px at 78% 40%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%),
-    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 44px 44px,
-    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 44px 44px,
+    linear-gradient(90deg, var(--bg) 0%, color-mix(in srgb, var(--bg) 82%, transparent) 38%, color-mix(in srgb, var(--bg) 30%, transparent) 100%),
+    linear-gradient(0deg, var(--bg) 0%, transparent 22%),
+    url("img/hero-bg.jpg") center right / cover no-repeat,
     var(--bg); }
 .hero::after { content: ""; position: absolute; inset: 0; pointer-events: none;
-  background: repeating-linear-gradient(0deg, rgba(0,0,0,.10) 0 1px, transparent 1px 3px); opacity: .5; }
-.hero .wrap { position: relative; z-index: 1; display: grid; grid-template-columns: 1.1fr .9fr; gap: 24px; align-items: center; min-height: 600px; padding-top: 40px; padding-bottom: 40px; }
-@media (max-width: 880px) { .hero .wrap { grid-template-columns: 1fr; min-height: 0; } .reticle { order: -1; max-width: 300px; margin: 0 auto; } }
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,.12) 0 1px, transparent 1px 3px); opacity: .45; }
+.hero .wrap { position: relative; z-index: 1; display: grid; grid-template-columns: 1.05fr .95fr; gap: 24px; align-items: center; min-height: 680px; padding-top: 40px; padding-bottom: 40px; }
+.hero-art { position: relative; justify-self: center; width: 100%; max-width: 440px; align-self: end; }
+.hero-art img { position: relative; z-index: 1; display: block; width: 100%; height: auto;
+  -webkit-mask-image: radial-gradient(ellipse 62% 66% at 50% 48%, #000 55%, transparent 100%);
+          mask-image: radial-gradient(ellipse 62% 66% at 50% 48%, #000 55%, transparent 100%); }
+.hero-art .reticle { position: absolute; z-index: 2; inset: 6% -18% auto auto; width: 62%; opacity: .85; pointer-events: none; }
+@media (max-width: 880px) { .hero .wrap { grid-template-columns: 1fr; min-height: 0; } .hero-art { order: -1; max-width: 300px; } .hero-art .reticle { inset: 0 -10% auto auto; width: 55%; } }
 .tag { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; letter-spacing: .12em;
   text-transform: uppercase; color: var(--accent); border: 1px solid var(--line); background: var(--panel);
   padding: 5px 12px; border-radius: 999px; margin-bottom: 22px; }
@@ -86,7 +92,7 @@ nav a.l:hover { color: var(--text); }
 .btn svg { width: 16px; height: 16px; }
 
 /* reticle */
-.reticle { width: 100%; max-width: 460px; justify-self: center; filter: drop-shadow(0 0 40px color-mix(in srgb, var(--accent) 22%, transparent)); }
+.reticle { filter: drop-shadow(0 0 24px color-mix(in srgb, var(--accent) 35%, transparent)); }
 .reticle svg { width: 100%; height: auto; display: block; overflow: visible; }
 .spin { transform-origin: 250px 250px; animation: spin 40s linear infinite; }
 .spin2 { transform-origin: 250px 250px; animation: spin 26s linear infinite reverse; }
@@ -106,7 +112,7 @@ nav a.l:hover { color: var(--text); }
 
 /* sections */
 section { padding: 84px 0; border-bottom: 1px solid var(--line); }
-section:nth-of-type(even) { background: var(--bg2); }
+section:nth-of-type(even) { background: linear-gradient(color-mix(in srgb, var(--bg2) 55%, transparent), color-mix(in srgb, var(--bg2) 55%, transparent)), url("img/texture.jpg") 0 0 / 512px 512px, var(--bg2); }
 .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
 .eyebrow::before { content: ""; width: 28px; height: 2px; background: var(--accent); }
 h2 { font-size: clamp(2rem, 4.5vw, 3rem); margin: 0 0 12px; line-height: 1.05; }
@@ -137,8 +143,11 @@ h2 { font-size: clamp(2rem, 4.5vw, 3rem); margin: 0 0 12px; line-height: 1.05; }
 /* modes */
 .modes { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 .mode { background: var(--panel); border: 1px solid var(--line); overflow: hidden; }
-.mode svg { width: 100%; height: auto; display: block; background: var(--code); border-bottom: 1px solid var(--line); }
-.mode div { padding: 18px 22px 22px; }
+.mode .art { position: relative; border-bottom: 1px solid var(--line); overflow: hidden; padding: 0; }
+.mode .art img { width: 100%; height: auto; display: block; transition: transform .5s; }
+.mode:hover .art img { transform: scale(1.04); }
+.mode .art::after { content: ""; position: absolute; inset: 0; background: linear-gradient(0deg, var(--panel) 0%, transparent 45%); }
+.mode > div:not(.art) { padding: 18px 22px 22px; }
 .mode h3 { margin: 0 0 6px; font-size: 1.3rem; }
 .mode p { margin: 0; color: var(--muted); font-size: .95rem; }
 
@@ -198,6 +207,8 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: 
       </div>
     </div>
 
+    <div class="hero-art">
+    <img src="img/operator.jpg" width="900" height="1200" alt="Original artwork of an armoured operator holding a suppressed rifle, lit in lime green">
     <div class="reticle" aria-hidden="true">
       <svg viewBox="0 0 500 500" fill="none" stroke="var(--accent)">
         <circle cx="250" cy="250" r="230" stroke-opacity=".25" stroke-width="1"/>
@@ -226,6 +237,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: 
         <circle cx="250" cy="250" r="3" fill="var(--accent)" stroke="none"/>
         <text x="258" y="22" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent)" stroke="none" opacity=".7">N</text>
       </svg>
+    </div>
     </div>
   </div>
 </header>
@@ -315,35 +327,15 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: 
     <p class="lead">All three are playable against bots on the multiplayer maps.</p>
     <div class="modes">
       <div class="mode">
-        <svg viewBox="0 0 320 160" aria-hidden="true">
-          <g stroke="var(--line)" stroke-width="1"><path d="M0 40h320M0 80h320M0 120h320M80 0v160M160 0v160M240 0v160"/></g>
-          <g fill="var(--amber)"><circle cx="50" cy="40" r="6"/><circle cx="130" cy="110" r="6"/><circle cx="210" cy="50" r="6"/><circle cx="270" cy="120" r="6"/><circle cx="180" cy="130" r="6"/><circle cx="90" cy="70" r="6"/></g>
-          <circle cx="160" cy="80" r="7" fill="var(--accent)"/>
-          <g stroke="var(--accent)" stroke-opacity=".5" stroke-dasharray="3 4"><path d="M160 80L90 70M160 80L210 50M160 80L180 130"/></g>
-        </svg>
+        <div class="art"><img src="img/mode-ffa.jpg" width="1000" height="500" loading="lazy" alt="Top-down night map with dotted lines of sight between scattered amber player markers"></div>
         <div><h3>Free-for-all</h3><p>Everyone against everyone. First to the score limit wins.</p></div>
       </div>
       <div class="mode">
-        <svg viewBox="0 0 320 160" aria-hidden="true">
-          <g stroke="var(--line)" stroke-width="1"><path d="M0 40h320M0 80h320M0 120h320M80 0v160M160 0v160M240 0v160"/></g>
-          <g font-family="Oswald, sans-serif" font-size="16" text-anchor="middle">
-            <circle cx="60" cy="80" r="22" fill="none" stroke="var(--accent)" stroke-width="2"/><text x="60" y="86" fill="var(--accent)">A</text>
-            <circle cx="160" cy="80" r="22" fill="var(--accent)" fill-opacity=".18" stroke="var(--accent)" stroke-width="2"/><text x="160" y="86" fill="var(--accent)">B</text>
-            <circle cx="260" cy="80" r="22" fill="none" stroke="var(--red)" stroke-width="2"/><text x="260" y="86" fill="var(--red)">C</text>
-          </g>
-          <path d="M82 80h56M182 80h56" stroke="var(--line)" stroke-width="2" stroke-dasharray="4 4"/>
-        </svg>
+        <div class="art"><img src="img/mode-dom.jpg" width="1000" height="500" loading="lazy" alt="Top-down night map with three glowing capture zones in a row, one lime, one red"></div>
         <div><h3>Domination</h3><p>Hold flags to earn points. Bots learned their flag play from recorded human demos.</p></div>
       </div>
       <div class="mode">
-        <svg viewBox="0 0 320 160" aria-hidden="true">
-          <g stroke="var(--line)" stroke-width="1"><path d="M0 40h320M0 80h320M0 120h320M80 0v160M160 0v160M240 0v160"/></g>
-          <rect x="196" y="48" width="64" height="64" fill="var(--red)" fill-opacity=".12" stroke="var(--red)" stroke-dasharray="5 4"/>
-          <rect x="216" y="70" width="24" height="20" fill="var(--red)"/>
-          <path d="M222 70v-8h12v8" stroke="var(--red)" stroke-width="2" fill="none"/>
-          <g fill="var(--accent)"><circle cx="40" cy="60" r="6"/><circle cx="60" cy="100" r="6"/><circle cx="90" cy="76" r="6"/></g>
-          <path d="M96 76L190 82" stroke="var(--accent)" stroke-opacity=".5" stroke-dasharray="3 4"/>
-        </svg>
+        <div class="art"><img src="img/mode-snd.jpg" width="1000" height="500" loading="lazy" alt="Top-down night map of a walled compound with a red bomb site"></div>
         <div><h3>Search &amp; Destroy</h3><p>Plant or defuse the bomb. One life per round.</p></div>
       </div>
     </div>
