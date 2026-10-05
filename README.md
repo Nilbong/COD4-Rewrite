@@ -9,6 +9,11 @@ CoD4 installation, the way OpenMW works for Morrowind.
 
 You need a Rust toolchain and an installed copy of CoD4 (Steam or retail, patch 1.7).
 
+Installs of *Call of Duty: Black Ops* (`BLACKOPS_PATH`, the folder with `BlackOps.exe`) and *Call of Duty: World at
+War* (`WAW_PATH`, the folder with `CoDWaWmp.exe`) are optional. When found, their weapons and characters are added to
+the game; without them it runs with CoD4's content alone. Like CoD4, they are found automatically in common Steam
+library locations.
+
 ```bash
 cargo run --release -p game
 ```
@@ -127,6 +132,19 @@ back to that). Looking for newly plugged-in pads runs on a thread of its own: li
   of the screen holding the class's primary weapon, attachments and camo included. Unlike CoD4, a gun can
   carry several attachments: one sight (red dot or ACOG), a silencer and a grip; the grenade launcher stays on its
   own.
+* **Combat Record** (`crates/game/src/ui/combat_record`): replaces Rank & Challenges in the menus. It uses the
+  original `menu_challenges` artwork, fonts, title/footer, button highlights and rank-panel materials from the
+  installed CoD4 assets. Calling cards reuse its original camo artwork. The overview shows K/D, W/L, match
+  playtime, headshots, assists, best streak, favourite weapons, rank and XP to the next rank.
+  The weapon pages keep separate kills, headshots, shots and time held for CoD4, Black Ops and World at War guns;
+  these new counters start from this update, without guessing historical weapon totals. Challenge pages show
+  every stage from CoD4's challenge tables, with progress, rewards and filters for attachments, camos, career
+  and individual weapons. Existing gameplay limits on which challenges count still apply, as listed below.
+  Identity includes a saved 16-character name, four-character clan tag, 16x16 pixel emblem editor (palette,
+  eraser, undo, clear, reset, save/cancel) and six calling cards unlocked through career milestones. Names and
+  clan tags appear in matches; emblems/cards appear in the record's player card. These are local Player 1
+  stats, saved in the existing `stats.txt`, and are not yet verified or shared online. Playtime is recorded as
+  you play, including matches left early. Debug runs still never write the profile.
 * **Progression** (`crates/game/src/ui/progression.rs`): CoD4's XP (10 a kill, 5 in free-for-all, doubled for a
   headshot; 2 an assist; 30 an objective; the match bonus at the end) climbs the 55 ranks of `mp/rankTable.csv`
   with "You've been promoted!", the rank's icon and what it brings ("New Weapon: M4 Carbine"). Each CoD4 gun's
@@ -290,6 +308,12 @@ back to that). Looking for newly plugged-in pads runs on a thread of its own: li
     over the map's times;
   - Black Ops' light grid brightness for models (`r_lightGridIntensity` 1.3, the usual value in its maps' art
     scripts; its `r_lightGridContrast` is left off, as it blackened models' shaded sides on CoD4's grids);
+  - optional ray-traced lighting (Options > Game > Lighting: Baked, Ray Traced Low or High, `r_lighting`, or
+    `COD4RW_LIGHTING=baked|rt_low|rt_high`; from the next match), with Bevy's Solari on GPUs with ray queries: the
+    sun, a sky-tinted dome only the rays see and lit-up fixtures (opaque unlit materials) traced through the map with
+    bounce light, in place of the lightmaps, light grid and shadow maps (`crate::rtgi`). Outdoors it works well;
+    interiors lit only by CoD4's baked lights come out dark, and without DLSS there's grain in shade. Splitscreen
+    always uses Baked. `COD4RW_RES=1920x1080` sizes the window for timing;
   - alpha test/blend/decal state from the original material state bits, including the screen-add blend of lamps'
     fake light beams and flares (which fade as they turn edge-on, on the world and on props) and the 2x multiply of
     doorways' HDR portals (`hdrportal_lighten`/`_darken`: what's seen through a doorway brightens or darkens with
@@ -548,7 +572,7 @@ crates/net     server query protocol (Quake 3/CoD4 connectionless packets) and t
 ### Black Ops content (`crates/t5`)
 
 Black Ops' multiplayer weapons, attachments and characters are loaded from a local Black Ops install (found
-automatically or via `BLACKOPS_PATH`), ready for the game but not used by it yet:
+automatically or via `BLACKOPS_PATH`); the game offers them when an install is present:
 
 * Every Black Ops multiplayer zone parses completely (`common_mp`, `code_post_gfx_mp` and all 26 maps), through a
   schema-driven loader generated from OpenAssetTools' T5 definitions (`python tools/gen_schema.py <dir>
@@ -571,7 +595,7 @@ detail textures some guns blend over their colour map.
 ### World at War content (`crates/t4`)
 
 World at War's multiplayer guns, attachments, equipment and characters are loaded from a local World at War install
-(found automatically or via `WAW_PATH`), ready for the game but not used by it yet. Same design as `crates/t5`:
+(found automatically or via `WAW_PATH`); the game offers them when an install is present. Same design as `crates/t5`:
 
 * Every World at War multiplayer, campaign and zombies zone parses completely (`common_mp`, all 23 maps, their
   `localized_mp_*` team zones, the 15 campaign levels and the four zombies maps), through the schema-driven loader
@@ -641,6 +665,8 @@ Any `COD4RW_*` variable (other than `COD4RW_UNLOCKS`) makes a debug run, which n
 * `COD4RW_LOADOUT=<gun spec>[@camo]`: start with that primary (`ak47@6` is the gold AK-47, `t5_ak47:reflex@115` a
   gold Black Ops AK-47 with a reflex sight).
 * `COD4RW_NOSHINE=1`: guns without their specular reflections, for comparison.
+* `COD4RW_GUNLOOK=cod4`: guns as CoD4 drew them, for comparison. By default they're normal-mapped (as characters
+  are), their camos have more contrast and colour, and their specular reflection is stronger.
 * `COD4RW_VMTEST=<dir>`: screenshot the viewmodel idle, firing, in ADS, reloading, sprinting (in, loop, out),
   walking and inspected (each side), then exit.
 * `COD4RW_VMANIM=<xanim>`: hold one viewmodel animation at 0.3x speed.

@@ -5,126 +5,355 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CoD4 Rewrite</title>
 <meta name="description" content="A Call of Duty 4 multiplayer reimplementation on the Bevy engine. Bring your own game files.">
+<meta name="theme-color" content="#0b0e0c">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e0c'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%23c8f26b' stroke-width='2'/%3E%3Cpath d='M16 3v8M16 21v8M3 16h8M21 16h8' stroke='%23c8f26b' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg: #0e1110;
-  --panel: #161b19;
-  --line: #27302c;
-  --text: #e4e9e6;
-  --muted: #98a39d;
+  --bg: #0b0e0c;
+  --bg2: #101512;
+  --panel: #141a16;
+  --line: #243029;
+  --text: #e6ece8;
+  --muted: #94a199;
   --accent: #c8f26b;
-  --accent-ink: #11160a;
-  --code: #0a0d0c;
+  --accent-dim: #8fb83f;
+  --amber: #ffb547;
+  --red: #ff6b5a;
+  --ink: #0e1308;
+  --code: #090c0a;
+  --grid: rgba(200,242,107,.055);
+  --head: "Oswald", "Bahnschrift", "Arial Narrow", Impact, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 @media (prefers-color-scheme: light) {
   :root {
-    --bg: #f6f7f4; --panel: #ffffff; --line: #dde2dc; --text: #1a201c;
-    --muted: #5c675f; --accent: #3c6b00; --accent-ink: #ffffff; --code: #eef1ec;
+    --bg: #f3f5ef; --bg2: #eaede4; --panel: #ffffff; --line: #d6dccf; --text: #171c18;
+    --muted: #59655d; --accent: #3f6f00; --accent-dim: #5a8f10; --amber: #a86400; --red: #c0392b;
+    --ink: #ffffff; --code: #ecefe6; --grid: rgba(40,80,0,.07);
   }
 }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 body {
   margin: 0; background: var(--bg); color: var(--text);
-  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 a { color: var(--accent); }
-.wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
-nav { border-bottom: 1px solid var(--line); }
-nav .wrap { display: flex; align-items: center; gap: 24px; height: 56px; }
-nav strong { letter-spacing: .04em; margin-right: auto; }
-nav a { color: var(--muted); text-decoration: none; font-size: 14px; }
-nav a:hover { color: var(--text); }
-.hero { padding: 88px 0 64px; }
-.hero h1 { font-size: clamp(2.4rem, 7vw, 4.2rem); line-height: 1.05; margin: 0 0 18px; letter-spacing: -.02em; }
-.hero p { max-width: 640px; color: var(--muted); font-size: 1.15rem; margin: 0 0 28px; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+h1, h2, h3 { font-family: var(--head); text-transform: uppercase; letter-spacing: .03em; font-weight: 600; }
+
+/* nav */
+nav { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
+nav .wrap { display: flex; align-items: center; gap: 22px; height: 58px; }
+nav .brand { font-family: var(--head); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin-right: auto;
+  display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; }
+nav .brand svg { width: 22px; height: 22px; }
+nav a.l { color: var(--muted); text-decoration: none; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; }
+nav a.l:hover { color: var(--text); }
+@media (max-width: 760px) { nav a.l:not(.keep) { display: none; } }
+
+/* hero */
+.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line);
+  background:
+    radial-gradient(900px 520px at 78% 40%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 70%),
+    linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 44px 44px,
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 44px 44px,
+    var(--bg); }
+.hero::after { content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,.10) 0 1px, transparent 1px 3px); opacity: .5; }
+.hero .wrap { position: relative; z-index: 1; display: grid; grid-template-columns: 1.1fr .9fr; gap: 24px; align-items: center; min-height: 600px; padding-top: 40px; padding-bottom: 40px; }
+@media (max-width: 880px) { .hero .wrap { grid-template-columns: 1fr; min-height: 0; } .reticle { order: -1; max-width: 300px; margin: 0 auto; } }
+.tag { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--accent); border: 1px solid var(--line); background: var(--panel);
+  padding: 5px 12px; border-radius: 999px; margin-bottom: 22px; }
+.tag i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: pulse 2s infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.hero h1 { font-size: clamp(2.8rem, 7.4vw, 5.4rem); line-height: .98; margin: 0 0 22px; font-weight: 700; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.hero p { max-width: 560px; color: var(--muted); font-size: 1.12rem; margin: 0 0 30px; }
 .btns { display: flex; flex-wrap: wrap; gap: 12px; }
-.btn {
-  display: inline-block; padding: 11px 20px; border-radius: 8px; text-decoration: none;
-  font-weight: 600; border: 1px solid var(--line); color: var(--text);
-}
-.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-section { padding: 52px 0; border-top: 1px solid var(--line); }
-h2 { font-size: 1.7rem; margin: 0 0 8px; letter-spacing: -.01em; }
-.lead { color: var(--muted); margin: 0 0 28px; max-width: 680px; }
-.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
-.card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 13px 24px; border-radius: 6px; text-decoration: none;
+  font-family: var(--head); text-transform: uppercase; letter-spacing: .08em; font-size: 15px; font-weight: 600;
+  border: 1px solid var(--line); color: var(--text); background: var(--panel);
+  clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px)); border-radius: 0; transition: transform .15s, background .15s; }
+.btn:hover { transform: translateY(-2px); }
+.btn.primary { background: var(--accent); color: var(--ink); border-color: var(--accent); }
+.btn svg { width: 16px; height: 16px; }
+
+/* reticle */
+.reticle { width: 100%; max-width: 460px; justify-self: center; filter: drop-shadow(0 0 40px color-mix(in srgb, var(--accent) 22%, transparent)); }
+.reticle svg { width: 100%; height: auto; display: block; overflow: visible; }
+.spin { transform-origin: 250px 250px; animation: spin 40s linear infinite; }
+.spin2 { transform-origin: 250px 250px; animation: spin 26s linear infinite reverse; }
+.sweep { transform-origin: 250px 250px; animation: spin 6s linear infinite; }
+.blip { animation: blip 3s infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes blip { 0%,100% { opacity: .15; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .spin, .spin2, .sweep, .blip, .tag i { animation: none; } html { scroll-behavior: auto; } }
+
+/* stat strip */
+.stats { border-bottom: 1px solid var(--line); background: var(--bg2); }
+.stats .wrap { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+.stat { padding: 26px 20px; border-left: 1px solid var(--line); }
+.stat:first-child { border-left: 0; }
+.stat b { display: block; font-family: var(--head); font-size: 2.4rem; line-height: 1; color: var(--accent); font-weight: 700; }
+.stat span { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+
+/* sections */
+section { padding: 84px 0; border-bottom: 1px solid var(--line); }
+section:nth-of-type(even) { background: var(--bg2); }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+.eyebrow::before { content: ""; width: 28px; height: 2px; background: var(--accent); }
+h2 { font-size: clamp(2rem, 4.5vw, 3rem); margin: 0 0 12px; line-height: 1.05; }
+.lead { color: var(--muted); margin: 0 0 40px; max-width: 700px; font-size: 1.05rem; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); }
+.card { position: relative; background: var(--panel); border: 1px solid var(--line); padding: 24px 22px 22px; transition: border-color .2s, transform .2s;
+  clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 0 100%); }
+.card:hover { border-color: var(--accent-dim); transform: translateY(-3px); }
+.card .ic { width: 42px; height: 42px; color: var(--accent); margin-bottom: 14px; }
+.card h3 { margin: 0 0 8px; font-size: 1.2rem; }
 .card p { margin: 0; color: var(--muted); font-size: .95rem; }
-pre {
-  background: var(--code); border: 1px solid var(--line); border-radius: 10px;
-  padding: 14px 16px; overflow-x: auto; font-size: .9rem; margin: 12px 0;
-}
-code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
-p code, li code, td code { background: var(--code); padding: 1px 6px; border-radius: 5px; font-size: .88em; }
-table { border-collapse: collapse; width: 100%; font-size: .93rem; }
-td, th { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 600; }
-.shots { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
-.shots img { width: 100%; border-radius: 10px; border: 1px solid var(--line); display: block; }
-.notice { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 16px 18px; }
-footer { border-top: 1px solid var(--line); padding: 28px 0 48px; color: var(--muted); font-size: .9rem; }
-ol.steps { padding-left: 20px; }
-ol.steps li { margin-bottom: 6px; }
+
+/* requirements */
+.req { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.game { background: var(--panel); border: 1px solid var(--line); padding: 26px; position: relative; overflow: hidden; }
+.game .num { position: absolute; right: 14px; top: -14px; font-family: var(--head); font-weight: 700; font-size: 6.5rem; color: var(--accent); opacity: .08; line-height: 1; }
+.badge { display: inline-block; font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+  padding: 3px 10px; border: 1px solid; margin-bottom: 14px; }
+.badge.must { color: var(--red); border-color: var(--red); }
+.badge.opt { color: var(--amber); border-color: var(--amber); }
+.game h3 { margin: 0 0 6px; font-size: 1.5rem; }
+.game p { margin: 0 0 12px; color: var(--muted); font-size: .95rem; }
+.game ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: .92rem; }
+.game li { margin: 3px 0; }
+.game .env { margin-top: 14px; font-family: var(--mono); font-size: 12.5px; color: var(--text); background: var(--code); border: 1px solid var(--line); padding: 8px 10px; display: block; }
+
+/* modes */
+.modes { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.mode { background: var(--panel); border: 1px solid var(--line); overflow: hidden; }
+.mode svg { width: 100%; height: auto; display: block; background: var(--code); border-bottom: 1px solid var(--line); }
+.mode div { padding: 18px 22px 22px; }
+.mode h3 { margin: 0 0 6px; font-size: 1.3rem; }
+.mode p { margin: 0; color: var(--muted); font-size: .95rem; }
+
+/* code */
+pre { background: var(--code); border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 16px 18px; overflow-x: auto; font-size: .88rem; margin: 14px 0; }
+code { font-family: var(--mono); }
+p code, li code, td code { background: var(--code); padding: 1px 6px; font-size: .86em; border: 1px solid var(--line); }
+.steps { display: grid; gap: 14px; counter-reset: s; margin: 0 0 8px; padding: 0; list-style: none; }
+.steps li { counter-increment: s; position: relative; padding-left: 52px; }
+.steps li::before { content: counter(s); position: absolute; left: 0; top: 0; width: 36px; height: 36px; display: grid; place-items: center;
+  font-family: var(--head); font-weight: 700; font-size: 1.1rem; background: var(--accent); color: var(--ink); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; margin-top: 8px; display: block; overflow-x: auto; }
+td, th { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-family: var(--mono); font-weight: 400; font-size: 12px; letter-spacing: .1em; text-transform: uppercase; }
+h4 { font-family: var(--head); text-transform: uppercase; letter-spacing: .05em; font-size: 1.15rem; margin: 30px 0 4px; }
+
+.shots { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.shots img { width: 100%; border: 1px solid var(--line); display: block; }
+
+.notice { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--amber); padding: 22px 24px; max-width: 860px; }
+.notice p { margin: 0 0 12px; color: var(--muted); }
+.notice p:last-child { margin: 0; }
+.notice strong { color: var(--text); }
+footer { padding: 36px 0 56px; color: var(--muted); font-size: .9rem; font-family: var(--mono); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: space-between; }
 </style>
 </head>
 <body>
 
 <nav>
   <div class="wrap">
-    <strong>CoD4 Rewrite</strong>
-    <a href="#features">Features</a>
-    <a href="#modes">Modes</a>
-    <a href="#screenshots" id="nav-shots" hidden>Screenshots</a>
-    <a href="#run">Run it</a>
-    <a href="#legal">Legal</a>
-    <a href="https://github.com/Nilbong/COD4-Rewrite">GitHub</a>
+    <a class="brand" href="#top">
+      <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2"><circle cx="16" cy="16" r="9" style="stroke:var(--accent)"/><path d="M16 2v8M16 22v8M2 16h8M22 16h8" style="stroke:var(--accent)"/></svg>
+      CoD4 Rewrite
+    </a>
+    <a class="l" href="#features">Features</a>
+    <a class="l" href="#requirements">Requirements</a>
+    <a class="l" href="#modes">Modes</a>
+    <a class="l" href="#screenshots" id="nav-shots" hidden>Screenshots</a>
+    <a class="l keep" href="#run">Run it</a>
+    <a class="l keep" href="https://github.com/Nilbong/COD4-Rewrite">GitHub</a>
   </div>
 </nav>
 
-<header class="hero">
+<header class="hero" id="top">
   <div class="wrap">
-    <h1>Call of Duty 4 multiplayer,<br>rebuilt in Rust.</h1>
-    <p>A from-scratch reimplementation on the <a href="https://bevyengine.org">Bevy</a> engine. It reads maps, models and textures from your own CoD4 install at runtime, the way OpenMW does for Morrowind. The repository ships no game data.</p>
-    <div class="btns">
-      <a class="btn primary" href="#run">Get started</a>
-      <a class="btn" href="https://github.com/Nilbong/COD4-Rewrite">View on GitHub</a>
+    <div>
+      <div class="tag"><i></i> Open source &middot; Rust &middot; Bevy 0.19</div>
+      <h1>Call of Duty 4 multiplayer, <em>rebuilt.</em></h1>
+      <p>A from-scratch reimplementation on the Bevy engine. It reads maps, models and textures from your own game installs at runtime, the way OpenMW does for Morrowind. The repository ships no game data.</p>
+      <div class="btns">
+        <a class="btn primary" href="#run">Get started
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 8h10M9 4l4 4-4 4"/></svg></a>
+        <a class="btn" href="https://github.com/Nilbong/COD4-Rewrite">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 00-2.53 15.59c.4.07.55-.17.55-.38v-1.33c-2.23.48-2.7-1.07-2.7-1.07-.36-.93-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.34.67.07-.52.28-.87.5-1.07-1.78-.2-3.65-.89-3.65-3.95 0-.87.31-1.59.83-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 014 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.52.56.83 1.28.83 2.15 0 3.07-1.87 3.75-3.66 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 008 0z"/></svg>
+          Source</a>
+      </div>
+    </div>
+
+    <div class="reticle" aria-hidden="true">
+      <svg viewBox="0 0 500 500" fill="none" stroke="var(--accent)">
+        <circle cx="250" cy="250" r="230" stroke-opacity=".25" stroke-width="1"/>
+        <g class="spin">
+          <circle cx="250" cy="250" r="210" stroke-opacity=".55" stroke-width="1.5" stroke-dasharray="2 14"/>
+          <path d="M250 20v22M250 458v22M20 250h22M458 250h22" stroke-width="3"/>
+        </g>
+        <g class="spin2">
+          <circle cx="250" cy="250" r="170" stroke-opacity=".4" stroke-dasharray="60 20 6 20"/>
+        </g>
+        <circle cx="250" cy="250" r="120" stroke-opacity=".5"/>
+        <circle cx="250" cy="250" r="60" stroke-opacity=".5"/>
+        <path d="M250 70v110M250 320v110M70 250h110M320 250h110" stroke-width="2.5"/>
+        <path d="M250 190v14M250 296v14M190 250h14M296 250h14" stroke-width="2"/>
+        <g stroke-opacity=".6" stroke-width="1.5">
+          <path d="M232 138h36M238 158h24M243 178h14"/>
+          <path d="M232 362h36M238 342h24M243 322h14"/>
+        </g>
+        <g class="sweep">
+          <path d="M250 250 L250 40 A210 210 0 0 1 340 62 Z" fill="var(--accent)" fill-opacity=".08" stroke="none"/>
+          <path d="M250 250V40" stroke-width="2" stroke-opacity=".7"/>
+        </g>
+        <circle class="blip" cx="318" cy="168" r="5" fill="var(--red)" stroke="none"/>
+        <circle class="blip" cx="176" cy="318" r="5" fill="var(--amber)" stroke="none" style="animation-delay:1.2s"/>
+        <circle class="blip" cx="340" cy="320" r="4" fill="var(--red)" stroke="none" style="animation-delay:2s"/>
+        <circle cx="250" cy="250" r="3" fill="var(--accent)" stroke="none"/>
+        <text x="258" y="22" font-family="JetBrains Mono, monospace" font-size="11" fill="var(--accent)" stroke="none" opacity=".7">N</text>
+      </svg>
     </div>
   </div>
 </header>
 
+<div class="stats">
+  <div class="wrap">
+    <div class="stat"><b>55</b><span>Ranks</span></div>
+    <div class="stat"><b>3</b><span>Game modes</span></div>
+    <div class="stat"><b>4</b><span>Splitscreen players</span></div>
+    <div class="stat"><b>3</b><span>Games' weapons</span></div>
+    <div class="stat"><b>0</b><span>Bytes of game data</span></div>
+  </div>
+</div>
+
 <section id="features">
   <div class="wrap">
-    <h2>What it does</h2>
-    <p class="lead">The game's own fastfiles, menus and rules, running on a modern engine.</p>
+    <div class="eyebrow">Features</div>
+    <h2>The real game, on a modern engine</h2>
+    <p class="lead">It uses CoD4's own fastfiles, menus and rules, so it plays like the game you remember.</p>
     <div class="grid">
-      <div class="card"><h3>Loads the real game files</h3><p>Decompresses <code>.ff</code> zones and parses the IW3 asset stream: materials, images, models, world geometry, collision and map entities. Every multiplayer map's zone parses.</p></div>
-      <div class="card"><h3>The original menus</h3><p>An interpreter for the IW3 menu system runs CoD4's own menus from <code>ui_mp.ff</code>: main menu, Private Match and Create a Class, with fonts, sounds and music.</p></div>
-      <div class="card"><h3>Create a Class and progression</h3><p>CoD4's XP, the 55 ranks, per-weapon challenges, attachments and camos, saved locally. Classes can stack a sight, silencer and grip, and weapons are rotatable 3D previews.</p></div>
-      <div class="card"><h3>Bots that play like you</h3><p>Record your own matches, fit a profile with a Python tool, and bots adopt your reaction time, aim speed, strafing and fighting range.</p></div>
-      <div class="card"><h3>Splitscreen co-op</h3><p>Two to four local players, each with their own camera, HUD and controller, including DualSense, DualShock 4, Xbox and Switch Pro.</p></div>
-      <div class="card"><h3>Weapons from three games</h3><p>CoD4 guns plus Black Ops and World at War weapons converted at load time from your installs of those games.</p></div>
-      <div class="card"><h3>Controller support</h3><p>Gamepads map onto the keyboard bindings, with aim assist, controller glyphs and rumble.</p></div>
-      <div class="card"><h3>Built-in debugging aids</h3><p>F10 takes a screenshot, pauses, and saves a bug report with the map, positions and every bot's state. A free-camera spectator mode follows bots by name or role.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M20 4l14 8v16l-14 8-14-8V12z"/><path d="M6 12l14 8 14-8M20 20v16"/></svg>
+        <h3>Loads the real files</h3><p>Decompresses <code>.ff</code> zones and parses the IW3 asset stream: materials, images, models, world geometry, collision and map entities. Every multiplayer map's zone parses.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="5" y="6" width="30" height="28" rx="2"/><path d="M5 14h30M11 21h12M11 27h18"/></svg>
+        <h3>The original menus</h3><p>An interpreter for the IW3 menu system runs CoD4's own menus: main menu, Private Match and Create a Class, with fonts, sounds and music.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M6 30l8-8 6 6 14-16"/><path d="M26 12h8v8"/><path d="M6 6v28h28"/></svg>
+        <h3>Progression</h3><p>CoD4's XP, the 55 ranks and per-weapon challenges, with attachments and camos as unlocks. Stats are saved locally.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M4 22h20l4-6h8v8h-6l-2 4H12l-2 6H6z"/><path d="M24 22v-6"/></svg>
+        <h3>Create a Class</h3><p>Stack a sight, silencer and grip on one gun. Weapons are rotatable 3D previews showing the attachment and camo you picked.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><circle cx="20" cy="13" r="6"/><path d="M8 34c0-7 5-12 12-12s12 5 12 12"/><path d="M30 6l3 3M33 3l3 3"/></svg>
+        <h3>Bots that play like you</h3><p>Record your matches, fit a profile with a Python tool, and bots adopt your reaction time, aim speed, strafing and fighting range.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="4" y="6" width="32" height="28" rx="2"/><path d="M20 6v28M4 20h32"/></svg>
+        <h3>Splitscreen co-op</h3><p>Two to four local players, each with their own camera, HUD and controller: DualSense, DualShock 4, Xbox, Switch Pro, or keyboard and mouse.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="6" y="14" width="28" height="18" rx="8"/><path d="M14 20v6M11 23h6M26 21h.01M30 25h.01"/></svg>
+        <h3>Controller support</h3><p>Gamepads map onto the keyboard bindings, with aim assist, on-screen glyphs for your controller, and rumble.</p></div>
+      <div class="card">
+        <svg class="ic" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M20 6l16 28H4z"/><path d="M20 16v10M20 30h.01"/></svg>
+        <h3>Built-in bug reports</h3><p>F10 screenshots, pauses and saves a report with the map, positions and every bot's state. A free-camera spectator mode follows bots by name or role.</p></div>
     </div>
+  </div>
+</section>
+
+<section id="requirements">
+  <div class="wrap">
+    <div class="eyebrow">Requirements</div>
+    <h2>Bring your own games</h2>
+    <p class="lead">No game data is distributed here. CoD4 is required. Black Ops and World at War are optional installs that add their weapons and characters to the game.</p>
+    <div class="req">
+      <div class="game">
+        <div class="num">1</div>
+        <span class="badge must">Required</span>
+        <h3>Call of Duty 4: Modern Warfare</h3>
+        <p>Steam or retail, patch 1.7. Provides the maps, menus, models, textures and sounds.</p>
+        <span class="env">COD4_PATH → folder with iw3mp.exe</span>
+      </div>
+      <div class="game">
+        <div class="num">2</div>
+        <span class="badge opt">Optional</span>
+        <h3>Call of Duty: Black Ops</h3>
+        <p>Adds Black Ops' weapons, attachments, animations, sounds and characters.</p>
+        <ul><li>Weapons picked from a "Black Ops" list in Create a Class</li><li>Black Ops soldiers</li></ul>
+        <span class="env">BLACKOPS_PATH → folder with BlackOps.exe</span>
+      </div>
+      <div class="game">
+        <div class="num">3</div>
+        <span class="badge opt">Optional</span>
+        <h3>Call of Duty: World at War</h3>
+        <p>Adds World at War's multiplayer guns, equipment and characters, converted at load time.</p>
+        <ul><li>Guns such as the Kar98k, M1 Garand and PTRS-41</li><li>World at War soldiers</li></ul>
+        <span class="env">WAW_PATH → folder with CoDWaWmp.exe</span>
+      </div>
+    </div>
+    <p style="color:var(--muted);margin-top:22px">Installs in common Steam library locations are found automatically. Set the variable only if yours isn't. You also need a <a href="https://rustup.rs">Rust toolchain</a>.</p>
   </div>
 </section>
 
 <section id="modes">
   <div class="wrap">
-    <h2>Game modes</h2>
-    <p class="lead">Playable with bots on the multiplayer maps.</p>
-    <div class="grid">
-      <div class="card"><h3>Free-for-all</h3><p>Everyone against everyone.</p></div>
-      <div class="card"><h3>Domination</h3><p>Hold flags to earn points, with bot flag play learned from recorded demos.</p></div>
-      <div class="card"><h3>Search &amp; Destroy</h3><p>Plant or defuse the bomb, one life per round.</p></div>
+    <div class="eyebrow">Game modes</div>
+    <h2>Pick a fight</h2>
+    <p class="lead">All three are playable against bots on the multiplayer maps.</p>
+    <div class="modes">
+      <div class="mode">
+        <svg viewBox="0 0 320 160" aria-hidden="true">
+          <g stroke="var(--line)" stroke-width="1"><path d="M0 40h320M0 80h320M0 120h320M80 0v160M160 0v160M240 0v160"/></g>
+          <g fill="var(--amber)"><circle cx="50" cy="40" r="6"/><circle cx="130" cy="110" r="6"/><circle cx="210" cy="50" r="6"/><circle cx="270" cy="120" r="6"/><circle cx="180" cy="130" r="6"/><circle cx="90" cy="70" r="6"/></g>
+          <circle cx="160" cy="80" r="7" fill="var(--accent)"/>
+          <g stroke="var(--accent)" stroke-opacity=".5" stroke-dasharray="3 4"><path d="M160 80L90 70M160 80L210 50M160 80L180 130"/></g>
+        </svg>
+        <div><h3>Free-for-all</h3><p>Everyone against everyone. First to the score limit wins.</p></div>
+      </div>
+      <div class="mode">
+        <svg viewBox="0 0 320 160" aria-hidden="true">
+          <g stroke="var(--line)" stroke-width="1"><path d="M0 40h320M0 80h320M0 120h320M80 0v160M160 0v160M240 0v160"/></g>
+          <g font-family="Oswald, sans-serif" font-size="16" text-anchor="middle">
+            <circle cx="60" cy="80" r="22" fill="none" stroke="var(--accent)" stroke-width="2"/><text x="60" y="86" fill="var(--accent)">A</text>
+            <circle cx="160" cy="80" r="22" fill="var(--accent)" fill-opacity=".18" stroke="var(--accent)" stroke-width="2"/><text x="160" y="86" fill="var(--accent)">B</text>
+            <circle cx="260" cy="80" r="22" fill="none" stroke="var(--red)" stroke-width="2"/><text x="260" y="86" fill="var(--red)">C</text>
+          </g>
+          <path d="M82 80h56M182 80h56" stroke="var(--line)" stroke-width="2" stroke-dasharray="4 4"/>
+        </svg>
+        <div><h3>Domination</h3><p>Hold flags to earn points. Bots learned their flag play from recorded human demos.</p></div>
+      </div>
+      <div class="mode">
+        <svg viewBox="0 0 320 160" aria-hidden="true">
+          <g stroke="var(--line)" stroke-width="1"><path d="M0 40h320M0 80h320M0 120h320M80 0v160M160 0v160M240 0v160"/></g>
+          <rect x="196" y="48" width="64" height="64" fill="var(--red)" fill-opacity=".12" stroke="var(--red)" stroke-dasharray="5 4"/>
+          <rect x="216" y="70" width="24" height="20" fill="var(--red)"/>
+          <path d="M222 70v-8h12v8" stroke="var(--red)" stroke-width="2" fill="none"/>
+          <g fill="var(--accent)"><circle cx="40" cy="60" r="6"/><circle cx="60" cy="100" r="6"/><circle cx="90" cy="76" r="6"/></g>
+          <path d="M96 76L190 82" stroke="var(--accent)" stroke-opacity=".5" stroke-dasharray="3 4"/>
+        </svg>
+        <div><h3>Search &amp; Destroy</h3><p>Plant or defuse the bomb. One life per round.</p></div>
+      </div>
     </div>
   </div>
 </section>
 
 <section id="screenshots" hidden>
   <div class="wrap">
-    <h2>Screenshots</h2>
+    <div class="eyebrow">Screenshots</div>
+    <h2>In game</h2>
     <p class="lead">Captured from the game running on a local install.</p>
     <div class="shots" id="shots"></div>
   </div>
@@ -132,18 +361,19 @@ ol.steps li { margin-bottom: 6px; }
 
 <section id="run">
   <div class="wrap">
-    <h2>Run it</h2>
-    <p class="lead">You need a Rust toolchain and an installed copy of CoD4 (Steam or retail, patch 1.7).</p>
+    <div class="eyebrow">Run it</div>
+    <h2>Up and running</h2>
+    <p class="lead">Needs the Rust toolchain and the games from the requirements above.</p>
     <ol class="steps">
-      <li>Clone the repository.</li>
-      <li>Run the game. The install is found automatically in common Steam library locations. If it isn't, set <code>COD4_PATH</code> to the folder containing <code>iw3mp.exe</code>.</li>
+      <li><strong>Install your games.</strong> CoD4 is required. Add Black Ops and World at War for their weapons and characters.</li>
+      <li><strong>Clone and run.</strong> Game folders are found automatically in common Steam locations.</li>
     </ol>
 <pre><code>git clone https://github.com/Nilbong/COD4-Rewrite.git
 cd COD4-Rewrite
 cargo run --release -p game</code></pre>
     <p>Skip the menus and drop straight into a match:</p>
 <pre><code>cargo run --release -p game -- --map mp_killhouse --bots 6</code></pre>
-    <h3>Common options</h3>
+    <h4>Common options</h4>
     <table>
       <tr><th>Flag</th><th>Default</th><th>What it does</th></tr>
       <tr><td><code>--map</code></td><td><code>mp_killhouse</code></td><td>Start this map directly</td></tr>
@@ -159,16 +389,20 @@ cargo run --release -p game</code></pre>
 
 <section id="legal">
   <div class="wrap">
-    <h2>Legal</h2>
+    <div class="eyebrow">Legal</div>
+    <h2>Fan project</h2>
     <div class="notice">
-      <p style="margin:0 0 10px">CoD4 Rewrite is an independent fan project. It is not affiliated with, endorsed by, or sponsored by Activision, Infinity Ward or Microsoft. <em>Call of Duty</em> is a trademark of its owners.</p>
-      <p style="margin:0">This repository contains <strong>no game data</strong>: no maps, models, textures, sounds or fonts. You must own a legitimate copy of the game, and everything is read from your own installation at runtime. The format layouts were derived from community reverse-engineering work, especially <a href="https://github.com/Laupetin/OpenAssetTools">OpenAssetTools</a>, used as documentation only.</p>
+      <p>CoD4 Rewrite is an independent fan project. It is not affiliated with, endorsed by, or sponsored by Activision, Infinity Ward, Treyarch or Microsoft. <em>Call of Duty</em> is a trademark of its owners.</p>
+      <p>This repository contains <strong>no game data</strong>: no maps, models, textures, sounds or fonts, from any of the three games. You must own legitimate copies, and everything is read from your own installations at runtime. The format layouts were derived from community reverse-engineering work, especially <a href="https://github.com/Laupetin/OpenAssetTools">OpenAssetTools</a>, used as documentation only.</p>
     </div>
   </div>
 </section>
 
 <footer>
-  <div class="wrap">CoD4 Rewrite &middot; <a href="https://github.com/Nilbong/COD4-Rewrite">Source on GitHub</a></div>
+  <div class="wrap">
+    <span>CoD4 Rewrite</span>
+    <a href="https://github.com/Nilbong/COD4-Rewrite">github.com/Nilbong/COD4-Rewrite</a>
+  </div>
 </footer>
 
 <script>
@@ -177,7 +411,6 @@ cargo run --release -p game</code></pre>
   var box = document.getElementById('shots');
   var section = document.getElementById('screenshots');
   var nav = document.getElementById('nav-shots');
-  var found = 0;
   for (var i = 1; i <= 8; i++) {
     (function (n) {
       var img = new Image();
@@ -185,7 +418,6 @@ cargo run --release -p game</code></pre>
       img.loading = 'lazy';
       img.onload = function () {
         box.appendChild(img);
-        found++;
         section.hidden = false;
         nav.hidden = false;
       };
