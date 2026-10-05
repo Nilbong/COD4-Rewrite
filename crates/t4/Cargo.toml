@@ -1,0 +1,19 @@
+[package]
+name = "t4"
+description = "Readers for Call of Duty: World at War (T4) data: fastfiles, weapon files, and conversion of its models, animations, materials and images to the iw3 asset types."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+iw3 = { path = "../iw3" }
+# Black Ops' xWMA decoder (Windows' WMA decoder), for World at War's few xWMA sounds.
+t5 = { path = "../t5" }
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2.workspace = true
+
+[dev-dependencies]
+# Only for the render example; the same features as the game, to share its build.
+bevy = { workspace = true, features = ["mp3", "wav"] }

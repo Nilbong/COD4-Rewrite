@@ -1,0 +1,33 @@
+[package]
+name = "game"
+description = "Call of Duty 4 multiplayer rewrite on Bevy, using assets from a local CoD4 install."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cod4rw"
+path = "src/main.rs"
+
+[dependencies]
+iw3 = { path = "../iw3" }
+t5 = { path = "../t5" }
+t4 = { path = "../t4" }
+anyhow.workspace = true
+flate2.workspace = true
+log.workspace = true
+# mp3 and wav for CoD4's music and sounds.
+bevy = { workspace = true, features = ["mp3", "wav", "bevy_solari"] }
+avian3d.workspace = true
+rand = "0.9"
+cod4rw-net = { path = "../net" }
+half = "2"
+
+# DualSense and DualShock 4 rumble: Windows' controller API (through gilrs)
+# can't rumble them, so it goes to them as HID output reports.
+[target.'cfg(windows)'.dependencies]
+hidapi = { version = "2", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+# `examples/padcheck.rs`: what gilrs makes of the controllers.
+gilrs = "0.11"

@@ -1,0 +1,451 @@
+//! Small, fixed-layout packets. Bounds are checked before allocation, no
+//! network-provided strings become file paths, and trailing bytes are rejected.
+
+use anyhow::{Result, bail, ensure};
+
+pub const VERSION: u16 = 1;
+pub const MAX_PACKET: usize = 1100;
+pub const MAX_PLAYERS: usize = 18;
+pub const INPUT_REDUNDANCY: usize = 3;
+pub const MAX_CONTROL: usize = 256;
+pub const TICK_RATE: u32 = 60;
+pub const SNAPSHOT_RATE: u32 = 20;
+pub type PeerId = u16;
+pub const HOST: PeerId = 0;
+
+/// Capability shared only with invited players over a trusted channel.
+/// Debug deliberately does not reveal it. It is not an account identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Invite(pub [u8; 32]);
+
+impl std::fmt::Debug for Invite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Invite([redacted])")
+    }
+}
+
+impl Invite {
+    pub fn generate() -> Self {
+        Self(rand::random())
+    }
+    pub fn to_hex(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    pub fn from_hex(s: &str) -> Result<Self> {
+        ensure!(s.len() == 64 && s.is_ascii(), "invite must be 64 hex characters");
+        let mut bytes = [0; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Hello {
+    Create { map: String },
+    Join { room: u64, invite: Invite },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Control {
+    Welcome { room: u64, peer: PeerId, map: String, invite: Option<Invite> },
+    PeerJoined(PeerId),
+    PeerLeft(PeerId),
+}
+
+/// Only controls are accepted from clients: never positions, damage, health,
+/// speed multipliers, fire rates, or claimed shooter/peer IDs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InputCommand {
+    pub sequence: u32,
+    pub forward: i8,
+    pub right: i8,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub buttons: u16,
+    /// 0 stand, 1 crouch, 2 prone.
+    pub stance: u8,
+}
+
+pub mod button {
+    pub const FIRE: u16 = 1;
+    pub const AIM: u16 = 2;
+    pub const JUMP: u16 = 4;
+    pub const SPRINT: u16 = 8;
+    pub const RELOAD: u16 = 16;
+    pub const FRAG: u16 = 32;
+    pub const SPECIAL: u16 = 64;
+    pub const MELEE: u16 = 128;
+    pub const USE: u16 = 256;
+    pub const SWITCH: u16 = 512;
+    pub const ALL: u16 = 1023;
+}
+
+impl InputCommand {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.forward != i8::MIN && self.right != i8::MIN, "invalid move axis");
+        ensure!(self.yaw.is_finite() && self.yaw.abs() <= std::f32::consts::PI, "invalid yaw");
+        ensure!(self.pitch.is_finite() && self.pitch.abs() <= 1.55, "invalid pitch");
+        ensure!(self.buttons & !button::ALL == 0 && self.stance <= 2, "invalid input flags");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PawnState {
+    /// Stable network ID, never a Bevy Entity or pointer. Bots also need IDs.
+    pub id: u16,
+    pub position: [f32; 3],
+    pub velocity: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub health: u8,
+    pub stance: u8,
+    /// 0 alive, 1 dead. Extend the versioned protocol for other states.
+    pub life: u8,
+}
+
+impl PawnState {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.position.iter().all(|v| v.is_finite() && v.abs() <= 100_000.0), "invalid position");
+        ensure!(self.velocity.iter().all(|v| v.is_finite() && v.abs() <= 1000.0), "invalid velocity");
+        ensure!(self.yaw.is_finite() && self.yaw.abs() <= std::f32::consts::PI, "invalid yaw");
+        ensure!(self.pitch.is_finite() && self.pitch.abs() <= 1.55, "invalid pitch");
+        ensure!(self.health <= 100 && self.stance <= 2 && self.life <= 1, "invalid pawn state");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snapshot {
+    pub tick: u32,
+    /// Last input consumed for the receiving player, not the last received.
+    pub acknowledged_input: u32,
+    pub pawns: Vec<PawnState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Packet {
+    /// Player -> relay -> host (relay stamps the actual peer ID).
+    Inputs(Vec<InputCommand>),
+    RemoteInputs {
+        peer: PeerId,
+        commands: Vec<InputCommand>,
+    },
+    /// Host -> one player. The relay checks the sender's role and recipient.
+    Snapshot {
+        recipient: PeerId,
+        state: Snapshot,
+    },
+}
+
+fn header(kind: u8) -> Vec<u8> {
+    let mut out = b"C4MP".to_vec();
+    out.extend(VERSION.to_le_bytes());
+    out.push(kind);
+    out
+}
+fn u16_out(out: &mut Vec<u8>, v: u16) {
+    out.extend(v.to_le_bytes());
+}
+fn u32_out(out: &mut Vec<u8>, v: u32) {
+    out.extend(v.to_le_bytes());
+}
+fn u64_out(out: &mut Vec<u8>, v: u64) {
+    out.extend(v.to_le_bytes());
+}
+fn f32_out(out: &mut Vec<u8>, v: f32) {
+    out.extend(v.to_le_bytes());
+}
+
+fn map_out(out: &mut Vec<u8>, map: &str) -> Result<()> {
+    ensure!(
+        !map.is_empty() && map.len() <= 48 && map.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+        "invalid map identifier"
+    );
+    out.push(map.len() as u8);
+    out.extend(map.bytes());
+    Ok(())
+}
+
+struct Reader<'a> {
+    rest: &'a [u8],
+}
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8], limit: usize) -> Result<(Self, u8)> {
+        ensure!(data.len() <= limit, "packet too large");
+        let mut r = Self { rest: data };
+        ensure!(r.take(4)? == b"C4MP", "bad packet magic");
+        ensure!(r.u16()? == VERSION, "incompatible protocol version");
+        let kind = r.u8()?;
+        Ok((r, kind))
+    }
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        ensure!(self.rest.len() >= len, "truncated packet");
+        let (head, tail) = self.rest.split_at(len);
+        self.rest = tail;
+        Ok(head)
+    }
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into()?))
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
+    }
+    fn float(&mut self) -> Result<f32> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+    fn map(&mut self) -> Result<String> {
+        let len = self.u8()? as usize;
+        ensure!(len > 0 && len <= 48, "invalid map length");
+        let map = std::str::from_utf8(self.take(len)?)?.to_owned();
+        map_out(&mut Vec::new(), &map)?;
+        Ok(map)
+    }
+    fn done(&self) -> Result<()> {
+        ensure!(self.rest.is_empty(), "trailing packet bytes");
+        Ok(())
+    }
+}
+
+impl Hello {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = header(match self {
+            Self::Create { .. } => 1,
+            Self::Join { .. } => 2,
+        });
+        match self {
+            Self::Create { map } => map_out(&mut out, map)?,
+            Self::Join { room, invite } => {
+                u64_out(&mut out, *room);
+                out.extend(invite.0);
+            }
+        }
+        Ok(out)
+    }
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let (mut r, kind) = Reader::new(data, MAX_CONTROL)?;
+        let hello = match kind {
+            1 => Self::Create { map: r.map()? },
+            2 => Self::Join { room: r.u64()?, invite: Invite(r.take(32)?.try_into()?) },
+            _ => bail!("invalid hello"),
+        };
+        r.done()?;
+        Ok(hello)
+    }
+}
+
+impl Control {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = header(match self {
+            Self::Welcome { .. } => 3,
+            Self::PeerJoined(_) => 4,
+            Self::PeerLeft(_) => 5,
+        });
+        match self {
+            Self::Welcome { room, peer, map, invite } => {
+                u64_out(&mut out, *room);
+                u16_out(&mut out, *peer);
+                map_out(&mut out, map)?;
+                out.push(invite.is_some() as u8);
+                if let Some(invite) = invite {
+                    out.extend(invite.0);
+                }
+            }
+            Self::PeerJoined(peer) | Self::PeerLeft(peer) => u16_out(&mut out, *peer),
+        }
+        Ok(out)
+    }
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let (mut r, kind) = Reader::new(data, MAX_CONTROL)?;
+        let control = match kind {
+            3 => {
+                let room = r.u64()?;
+                let peer = r.u16()?;
+                let map = r.map()?;
+                let invite = match r.u8()? {
+                    0 => None,
+                    1 => Some(Invite(r.take(32)?.try_into()?)),
+                    _ => bail!("invalid invite flag"),
+                };
+                Self::Welcome { room, peer, map, invite }
+            }
+            4 => Self::PeerJoined(r.u16()?),
+            5 => Self::PeerLeft(r.u16()?),
+            _ => bail!("invalid relay control"),
+        };
+        r.done()?;
+        Ok(control)
+    }
+}
+
+fn commands_out(out: &mut Vec<u8>, commands: &[InputCommand]) -> Result<()> {
+    ensure!(!commands.is_empty() && commands.len() <= INPUT_REDUNDANCY, "invalid input count");
+    out.push(commands.len() as u8);
+    for c in commands {
+        c.validate()?;
+        u32_out(out, c.sequence);
+        out.extend([c.forward as u8, c.right as u8]);
+        f32_out(out, c.yaw);
+        f32_out(out, c.pitch);
+        u16_out(out, c.buttons);
+        out.push(c.stance);
+    }
+    Ok(())
+}
+fn commands_in(r: &mut Reader<'_>) -> Result<Vec<InputCommand>> {
+    let count = r.u8()? as usize;
+    ensure!(count > 0 && count <= INPUT_REDUNDANCY, "invalid input count");
+    let mut commands = Vec::with_capacity(count);
+    for _ in 0..count {
+        let c = InputCommand {
+            sequence: r.u32()?,
+            forward: r.u8()? as i8,
+            right: r.u8()? as i8,
+            yaw: r.float()?,
+            pitch: r.float()?,
+            buttons: r.u16()?,
+            stance: r.u8()?,
+        };
+        c.validate()?;
+        commands.push(c);
+    }
+    Ok(commands)
+}
+
+impl Packet {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = header(match self {
+            Self::Inputs(_) => 10,
+            Self::RemoteInputs { .. } => 11,
+            Self::Snapshot { .. } => 12,
+        });
+        match self {
+            Self::Inputs(commands) => commands_out(&mut out, commands)?,
+            Self::RemoteInputs { peer, commands } => {
+                u16_out(&mut out, *peer);
+                commands_out(&mut out, commands)?;
+            }
+            Self::Snapshot { recipient, state } => {
+                ensure!(state.pawns.len() <= MAX_PLAYERS, "too many pawns");
+                u16_out(&mut out, *recipient);
+                u32_out(&mut out, state.tick);
+                u32_out(&mut out, state.acknowledged_input);
+                out.push(state.pawns.len() as u8);
+                let mut ids = std::collections::HashSet::new();
+                for p in &state.pawns {
+                    p.validate()?;
+                    ensure!(ids.insert(p.id), "duplicate pawn ID");
+                    u16_out(&mut out, p.id);
+                    for v in p.position.into_iter().chain(p.velocity) {
+                        f32_out(&mut out, v);
+                    }
+                    f32_out(&mut out, p.yaw);
+                    f32_out(&mut out, p.pitch);
+                    out.extend([p.health, p.stance, p.life]);
+                }
+            }
+        }
+        ensure!(out.len() <= MAX_PACKET, "packet too large");
+        Ok(out)
+    }
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        let (mut r, kind) = Reader::new(data, MAX_PACKET)?;
+        let packet = match kind {
+            10 => Self::Inputs(commands_in(&mut r)?),
+            11 => Self::RemoteInputs { peer: r.u16()?, commands: commands_in(&mut r)? },
+            12 => {
+                let recipient = r.u16()?;
+                let tick = r.u32()?;
+                let acknowledged_input = r.u32()?;
+                let count = r.u8()? as usize;
+                ensure!(count <= MAX_PLAYERS, "too many pawns");
+                let mut pawns = Vec::with_capacity(count);
+                let mut ids = std::collections::HashSet::new();
+                for _ in 0..count {
+                    let p = PawnState {
+                        id: r.u16()?,
+                        position: [r.float()?, r.float()?, r.float()?],
+                        velocity: [r.float()?, r.float()?, r.float()?],
+                        yaw: r.float()?,
+                        pitch: r.float()?,
+                        health: r.u8()?,
+                        stance: r.u8()?,
+                        life: r.u8()?,
+                    };
+                    p.validate()?;
+                    ensure!(ids.insert(p.id), "duplicate pawn ID");
+                    pawns.push(p);
+                }
+                Self::Snapshot { recipient, state: Snapshot { tick, acknowledged_input, pawns } }
+            }
+            _ => bail!("invalid gameplay packet"),
+        };
+        r.done()?;
+        Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn packets_roundtrip_and_fit_datagrams() {
+        let packets = [
+            Packet::Inputs(vec![InputCommand::default(); 3]),
+            Packet::RemoteInputs { peer: 7, commands: vec![InputCommand::default()] },
+            Packet::Snapshot {
+                recipient: 1,
+                state: Snapshot {
+                    tick: 99,
+                    acknowledged_input: 45,
+                    pawns: (0..18).map(|id| PawnState { id, ..Default::default() }).collect(),
+                },
+            },
+        ];
+        for p in packets {
+            let data = p.encode().unwrap();
+            assert!(data.len() <= MAX_PACKET);
+            assert_eq!(Packet::decode(&data).unwrap(), p);
+        }
+    }
+    #[test]
+    fn truncation_unknown_version_and_trailing_bytes_rejected() {
+        let data = Packet::Inputs(vec![InputCommand::default()]).encode().unwrap();
+        for n in 0..data.len() {
+            assert!(Packet::decode(&data[..n]).is_err());
+        }
+        let mut extra = data.clone();
+        extra.push(0);
+        assert!(Packet::decode(&extra).is_err());
+        let mut future = data;
+        future[4] = 2;
+        assert!(Packet::decode(&future).is_err());
+        assert!(Packet::decode(&vec![0; MAX_PACKET + 1]).is_err());
+    }
+    #[test]
+    fn hostile_values_rejected() {
+        assert!(InputCommand { yaw: f32::NAN, ..Default::default() }.validate().is_err());
+        assert!(InputCommand { buttons: 65535, ..Default::default() }.validate().is_err());
+        assert!(PawnState { position: [f32::INFINITY, 0.0, 0.0], ..Default::default() }.validate().is_err());
+        assert!(Hello::Create { map: "../../secret".into() }.encode().is_err());
+        let mut data = Packet::Inputs(vec![InputCommand::default()]).encode().unwrap();
+        data[7] = 255;
+        assert!(Packet::decode(&data).is_err());
+    }
+    #[test]
+    fn invites_are_redacted_and_control_roundtrips() {
+        let invite = Invite::generate();
+        assert_eq!(Invite::from_hex(&invite.to_hex()).unwrap(), invite);
+        assert!(!format!("{invite:?}").contains(&invite.to_hex()));
+        let c = Control::Welcome { room: 123, peer: HOST, map: "mp_crash".into(), invite: Some(invite) };
+        assert_eq!(Control::decode(&c.encode().unwrap()).unwrap(), c);
+    }
+}

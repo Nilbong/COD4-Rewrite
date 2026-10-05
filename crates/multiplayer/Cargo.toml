@@ -1,0 +1,28 @@
+[package]
+name = "cod4rw-multiplayer"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Relay-only multiplayer transport and authoritative netcode foundation for cod4rw."
+
+# Independent while another editor is working in the game workspace. This
+# avoids changing its manifest, lockfile, or sharing Cargo's build lock.
+[workspace]
+resolver = "3"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+rand = "0.9"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+
+[[bin]]
+name = "cod4rw-relay"
+path = "src/bin/relay.rs"
+
+[[bin]]
+name = "net-demo"
+path = "src/bin/demo.rs"

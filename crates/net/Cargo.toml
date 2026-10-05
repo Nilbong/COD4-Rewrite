@@ -1,0 +1,13 @@
+[package]
+name = "cod4rw-net"
+description = "Server queries and the master server for cod4rw: Quake 3/CoD4-style connectionless packets."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rand = "0.9"
+
+[[bin]]
+name = "master"
+path = "src/bin/master.rs"

@@ -1,0 +1,19 @@
+# Bot profile fitted from 1 recording(s), 4.6 minutes of play.
+# fights 72, fight minutes 0.7, acquisitions 16, shots in view 314, accuracy 0.267, kills 22
+reaction = 0.2659
+fitts_a = 0.1118
+fitts_b = 0.02332
+gain_bias = 0.9097
+gain_sd = 0.3396
+mid_strafe_press = 0.3142
+mid_strafe_flip = 0.8333
+ads_range = 30
+fight_crouch = 0
+dropshot = 0
+fight_jumps = 0
+push = 0.0002511
+preferred_range = 1041
+stillness = 0.2661
+sprint = 0.3508
+head_rate = 0.1143
+# not enough data for: close_strafe_press, close_strafe_pause, close_strafe_flip, mid_strafe_pause, far_strafe_press, far_strafe_pause, far_strafe_flip, crouch_taps

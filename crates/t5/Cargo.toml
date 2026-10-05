@@ -1,0 +1,17 @@
+[package]
+name = "t5"
+description = "Readers for Call of Duty: Black Ops (T5) data: fastfiles, weapon files, and conversion of its models, materials and images to the iw3 asset types."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+iw3 = { path = "../iw3" }
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2.workspace = true
+
+[dev-dependencies]
+# Only for the render example; the same features as the game, to share its build.
+bevy = { workspace = true, features = ["mp3", "wav"] }
