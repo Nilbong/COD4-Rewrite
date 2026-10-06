@@ -57,8 +57,9 @@ const MIN_WALK_NORMAL: f32 = 0.7;
 const OVERCLIP: f32 = 1.001;
 /// Traces stop this far from surfaces.
 const SKIN: f32 = u(0.125);
-/// How far beside a trace's contact the face under it is looked for.
-const FACE_PROBE: f32 = u(0.5);
+/// A trace down that hits an edge with a rounded normal this far up hit
+/// it under the hull, not at its side.
+const EDGE_UNDER: f32 = 0.3;
 /// Ground probe distance.
 const GROUND_PROBE: f32 = u(0.25);
 /// When walking, stay glued to the ground over drops this small.
@@ -427,6 +428,8 @@ struct Ctx<'a, 'w, 's> {
     spatial: &'a SpatialQuery<'w, 's>,
     filter: &'a SpatialQueryFilter,
     tuning: MoveTuning,
+    /// The brushes' faces ([`collision::BrushFaces`]).
+    faces: Option<&'a collision::BrushFaces>,
 }
 
 impl Ctx<'_, '_, '_> {
@@ -464,18 +467,19 @@ impl Ctx<'_, '_, '_> {
                     n = -n;
                 }
                 // CoD4's brush traces give the face hit, even at an edge;
-                // the capsule's contact there comes out rounded (a stair's
-                // edge reads as a steep slope underfoot). The face beside
-                // the contact, towards the hull's middle, along the trace:
-                // its own normal, if it's there.
-                let middle = origin + *dir * h.distance;
-                let inward = (middle - h.point1).reject_from_normalized(*dir).normalize_or_zero();
-                if inward != Vec3::ZERO && n.dot(*dir) > -0.999 {
-                    let from = h.point1 + inward * FACE_PROBE - *dir * FACE_PROBE;
-                    let face = self.spatial.cast_ray(from, dir, FACE_PROBE * 3.0, true, self.filter);
-                    if let Some(f) = face.filter(|f| f.entity == h.entity && f.normal.dot(*dir) < -0.05) {
-                        n = f.normal.normalize_or(n);
-                    }
+                // the capsule's contact there comes out rounded (the round
+                // bottom wedged between two stair edges reads as a steep
+                // slope, and you're stuck). Going down onto an edge under
+                // the hull (the ground, landing a step): the brush's face
+                // through the contact, when it's ground to stand on, as
+                // CoD4's. Not an edge at the hull's side (brushing past a
+                // ledge), nor sideways: there the rounded normal slides
+                // over it, and a face picked there pins you.
+                if dir.y < -0.7
+                    && n.y > EDGE_UNDER
+                    && let Some(f) = self.faces.and_then(|f| f.face(h.entity, h.point1, n, *dir)).filter(|f| f.y >= MIN_WALK_NORMAL)
+                {
+                    n = f;
                 }
                 let d = (h.distance - SKIN).clamp(0.0, len);
                 Trace { fraction: d / len, end: start + *dir * d, normal: n, hit: true }
@@ -494,7 +498,7 @@ impl Ctx<'_, '_, '_> {
 /// `mantle_over` surfaces.
 pub fn mantle_landing(spatial: &SpatialQuery, feet: Vec3, yaw: f32, over: &[Entity]) -> Option<(Vec3, Vec3)> {
     let filter = collision::movement_filter();
-    let ctx = Ctx { mantle: None, mantle_over: over, spatial, filter: &filter, tuning: MoveTuning::COD4 };
+    let ctx = Ctx { mantle: None, mantle_over: over, spatial, filter: &filter, tuning: MoveTuning::COD4, faces: None };
     mantle::landing(&ctx, feet, yaw, over)
 }
 
@@ -506,13 +510,14 @@ fn move_pawns(
     mut landed: MessageWriter<Landed>,
     mantle_anims: Option<Res<MantleAnims>>,
     mantle_surfaces: Query<(Entity, &collision::MantleSurface)>,
+    faces: Option<Res<collision::BrushFaces>>,
 ) {
     let dt = time.delta_secs().min(0.1);
     let steps = (dt / MAX_SUBSTEP).ceil().max(1.0);
     let step_dt = dt / steps;
     let filter = collision::movement_filter();
     let over: Vec<Entity> = mantle_surfaces.iter().filter(|(_, s)| s.over).map(|(e, _)| e).collect();
-    let ctx = Ctx { mantle: mantle_anims.as_deref(), mantle_over: &over, spatial: &spatial, filter: &filter, tuning: *tuning };
+    let ctx = Ctx { mantle: mantle_anims.as_deref(), mantle_over: &over, spatial: &spatial, filter: &filter, tuning: *tuning, faces: faces.as_deref() };
     for (entity, mut tf, mut mover, input, view, local) in &mut pawns {
         tf.rotation = Quat::from_rotation_y(view.yaw);
         let mut pos = tf.translation;

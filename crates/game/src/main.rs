@@ -17,6 +17,7 @@ mod collision;
 mod combat;
 mod content;
 mod explosives;
+mod fog;
 mod fx;
 mod gallery;
 mod gamepad;
@@ -26,6 +27,7 @@ mod killcam;
 mod hud;
 mod killstreaks;
 mod lightmaps;
+mod mapfx;
 mod loadout;
 mod model_lighting;
 mod models;
@@ -35,7 +37,15 @@ mod net;
 mod movement;
 mod perf;
 mod perks;
+mod settings;
+mod settings_apply;
+mod bindings;
+mod pickups;
+mod quake;
+mod hq;
+mod ragdoll;
 mod player;
+mod clutter;
 mod props;
 mod rtgi;
 mod state;
@@ -43,6 +53,7 @@ mod session;
 mod splitscreen;
 mod supply;
 mod tdm;
+mod terrain;
 mod textures;
 mod thirdperson;
 mod ui;
@@ -53,6 +64,7 @@ mod wardrobe;
 mod waw;
 mod weapons;
 mod walktest;
+mod window_icon;
 mod world;
 
 use avian3d::prelude::*;
@@ -124,7 +136,7 @@ fn main() -> AppExit {
     // Splitscreen co-op for a run: `kbm,pad,pad` (`crate::splitscreen`).
     let mut splitscreen = std::env::var("COD4RW_SPLITSCREEN").ok();
     // Debug aids drive a match directly, skipping the menus.
-    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER")) {
+    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER" | "COD4RW_RAGDOLL")) {
         state::GameState::InGame
     } else {
         state::GameState::Frontend
@@ -165,13 +177,20 @@ fn main() -> AppExit {
             ..default()
         }
     } else {
-        Window { title: "CoD4 Rewrite".into(), ..default() }
+        // Debug aid: `COD4RW_RES=1920x1080` sizes the window (for timing).
+        let resolution = std::env::var("COD4RW_RES").ok().and_then(|r| {
+            let (w, h) = r.split_once('x')?;
+            Some(bevy::window::WindowResolution::new(w.parse().ok()?, h.parse().ok()?))
+        });
+        Window { title: "CoD4 Rewrite".into(), resolution: resolution.unwrap_or_default(), ..default() }
     };
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(window),
             ..default()
         }))
+        .insert_resource(collision::physics_transform_config())
+        .add_systems(avian3d::schedule::PhysicsSchedule, collision::sync_moved_colliders.in_set(avian3d::physics_transform::PhysicsTransformSystems::TransformToPosition))
         .add_plugins((physics_plugins(), state::StatePlugin(first_state), ui::UiPlugin, gunmodel::GunModelPlugin, audio::AudioPlugin, bo1::Bo1Plugin, waw::WawPlugin))
         .insert_resource(Gravity(Vec3::ZERO))
         // The broad phase's and solver's sets the collider trees' systems
@@ -241,11 +260,14 @@ fn main() -> AppExit {
             model_lighting::ModelLightingPlugin,
             supply::SupplyPlugin,
         ))
+        .add_plugins((ragdoll::RagdollPlugin, pickups::PickupsPlugin, quake::QuakePlugin, hq::HqPlugin))
+        .init_resource::<settings::Settings>()
+        .add_plugins(settings_apply::SettingsApplyPlugin)
         // The characters worn: the player's (F5: third person) and the bots'.
         .add_plugins(wardrobe::WardrobePlugin)
         // G: grenades. 5: equipment and grenade launchers.
         .add_plugins((grenades::GrenadesPlugin, explosives::ExplosivesPlugin, perks::PerksPlugin, killcam::KillcamPlugin))
-        .add_plugins((melee::MeleePlugin, props::PropsPlugin, walktest::WalkTestPlugin))
+        .add_plugins((melee::MeleePlugin, props::PropsPlugin, walktest::WalkTestPlugin, fog::FogPlugin, window_icon::WindowIconPlugin))
         .add_plugins(net::NetPlugin)
         // Muzzle flashes, bullet impacts and blood.
         .add_plugins(fx::FxPlugin)

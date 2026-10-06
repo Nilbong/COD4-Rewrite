@@ -37,6 +37,9 @@ pub type Features = [f32; 6];
 
 pub struct Library {
     features: Vec<Features>,
+    /// The samples as a balanced k-d tree (an implicit one: each slice's
+    /// middle entry splits it on axis depth % 6), for [`Library::best`].
+    tree: Vec<u32>,
     clips: Vec<[Step; CLIP_STEPS]>,
     /// Which track each sample comes from (for carrying on along it).
     track: Vec<u32>,
@@ -63,12 +66,14 @@ impl Library {
     /// `steps` samples later when that still fits.
     pub fn best(&self, f: &Features, from: Option<(usize, usize)>) -> Option<usize> {
         let dist = |g: &Features| (0..6).map(|k| WEIGHTS[k] * (f[k] - g[k]).powi(2)).sum::<f32>();
-        let (i, d) = self
-            .features
-            .iter()
-            .enumerate()
-            .map(|(i, g)| (i, dist(g)))
-            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        // The nearest sample, exactly as a scan of them all would find it
+        // (ties to the lowest index), through the tree.
+        let mut best = (f32::INFINITY, usize::MAX);
+        self.nearest(&self.tree, 0, f, &mut best);
+        let (d, i) = best;
+        if i == usize::MAX {
+            return None;
+        }
         let carry = from
             .map(|(at, steps)| at + steps)
             .filter(|&j| j < self.len() && self.track[j] == self.track[from.unwrap().0])
@@ -77,6 +82,28 @@ impl Library {
             Some((j, dj)) if dj <= d => j,
             _ => i,
         })
+    }
+
+    fn nearest(&self, slice: &[u32], depth: usize, f: &Features, best: &mut (f32, usize)) {
+        if slice.is_empty() {
+            return;
+        }
+        let mid = slice.len() / 2;
+        let i = slice[mid] as usize;
+        let g = &self.features[i];
+        let d = (0..6).map(|k| WEIGHTS[k] * (f[k] - g[k]).powi(2)).sum::<f32>();
+        if d < best.0 || (d == best.0 && i < best.1) {
+            *best = (d, i);
+        }
+        let axis = depth % 6;
+        let diff = f[axis] - g[axis];
+        let (near, far) = if diff < 0.0 { (&slice[..mid], &slice[mid + 1..]) } else { (&slice[mid + 1..], &slice[..mid]) };
+        self.nearest(near, depth + 1, f, best);
+        // The far side can only hold something as near (or a lower index
+        // as near) if the split plane is no further than the best so far.
+        if WEIGHTS[axis] * diff * diff <= best.0 {
+            self.nearest(far, depth + 1, f, best);
+        }
     }
 
     pub fn clip(&self, i: usize) -> &[Step; CLIP_STEPS] {
@@ -169,7 +196,7 @@ fn relative_velocity(track: &[Sample], i: usize) -> (f32, f32) {
 }
 
 pub(super) fn build(demos: &[iw3::demo::Demo]) -> Library {
-    let mut lib = Library { features: Vec::new(), clips: Vec::new(), track: Vec::new(), players: 0, seconds: 0.0 };
+    let mut lib = Library { features: Vec::new(), tree: Vec::new(), clips: Vec::new(), track: Vec::new(), players: 0, seconds: 0.0 };
     let mut track_id = 0u32;
     for demo in demos {
         for (_, track) in tracks(demo) {
@@ -207,7 +234,23 @@ pub(super) fn build(demos: &[iw3::demo::Demo]) -> Library {
             }
         }
     }
+    lib.tree = (0..lib.features.len() as u32).collect();
+    build_tree(&lib.features, &mut lib.tree, 0);
     lib
+}
+
+/// Arrange `idx` as an implicit k-d tree: the middle entry splits the rest
+/// on axis `depth % 6`, each half likewise.
+fn build_tree(features: &[Features], idx: &mut [u32], depth: usize) {
+    if idx.len() <= 1 {
+        return;
+    }
+    let axis = depth % 6;
+    let mid = idx.len() / 2;
+    idx.select_nth_unstable_by(mid, |a, b| features[*a as usize][axis].total_cmp(&features[*b as usize][axis]));
+    let (left, right) = idx.split_at_mut(mid);
+    build_tree(features, left, depth + 1);
+    build_tree(features, &mut right[1..], depth + 1);
 }
 
 /// The library, once built (see [`super::demos`]).
@@ -228,5 +271,33 @@ impl Playing {
     pub fn step(&self, now: f32) -> Option<Step> {
         let k = ((now - self.started) * RATE) as usize;
         self.clip.get(k).copied()
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+    use rand::{Rng, SeedableRng};
+
+    /// The tree finds exactly what scanning every sample finds.
+    #[test]
+    fn tree_search_matches_a_full_scan() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut lib = Library { features: Vec::new(), tree: Vec::new(), clips: Vec::new(), track: Vec::new(), players: 0, seconds: 0.0 };
+        for i in 0..5000 {
+            // Some duplicates, for ties.
+            let f: Features = if i % 50 == 0 { [0.5; 6] } else { std::array::from_fn(|_| rng.random_range(-3.0..3.0)) };
+            lib.features.push(f);
+            lib.track.push(0);
+            lib.clips.push([Step::default(); CLIP_STEPS]);
+        }
+        lib.tree = (0..lib.features.len() as u32).collect();
+        build_tree(&lib.features, &mut lib.tree, 0);
+        for q in 0..500 {
+            let f: Features = if q % 10 == 0 { [0.5; 6] } else { std::array::from_fn(|_| rng.random_range(-3.5..3.5)) };
+            let dist = |g: &Features| (0..6).map(|k| WEIGHTS[k] * (f[k] - g[k]).powi(2)).sum::<f32>();
+            let scan = lib.features.iter().enumerate().map(|(i, g)| (i, dist(g))).min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+            assert_eq!(lib.best(&f, None), Some(scan), "query {q}");
+        }
     }
 }

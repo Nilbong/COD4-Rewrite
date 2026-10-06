@@ -1,0 +1,10 @@
+Generator: built-in image_gen
+Purpose: AK-47 platinum test camo (camo stat 200).
+
+Use case: stylized-concept
+Asset type: seamless square game weapon material texture, base-color/albedo layer, not a picture of a weapon
+Primary request: metallic platinum finish for a standard AK-47 model. Create an original, realistic pale cool silver platinum surface tile.
+Composition: fill the entire square edge to edge with one uniform planar material, viewed perfectly straight on orthographically. Fine delicate brushed-metal grain flowing horizontally, sparse very faint hairline scratches and subtle cloudy crystalline platinum microtexture. Brushed polished platinum, tasteful and expensive, not chrome mirror and not diamond plate.
+Color palette: neutral to subtly cool silver-grey, mid-light grey average, very low contrast so lighting and reflections can be calculated by a game shader.
+Lighting: completely flat diffuse illumination for albedo, evenly lit from edge to edge; no baked directional reflections, no highlight stripe, no gradient or vignette.
+Constraints: seamless tiling edges, uniform density and scale, no UV islands, no weapon, no objects, no embossing, no symbols, no logos, no text, no watermark, no borders, no rust, no gold, no large scratches. Square texture only.

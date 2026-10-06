@@ -92,11 +92,29 @@ const MAX_PARTICLES: usize = 4096;
 const MAX_LIGHTS: usize = 6;
 /// Model particles (spent cases) at most; the oldest make way.
 const MAX_MODELS: usize = 96;
-/// Impact marks kept, and how long.
-const MAX_DECALS: usize = 128;
-const DECAL_SECONDS: f64 = 60.0;
+/// Left on the wall or floor behind someone killed by a bullet.
+const BLOOD_SPLAT: &str = "impacts/flesh_hit_splat_large";
+
+/// Impact marks kept (CoD4's `FX_MARKS_LIMIT`): they stay until newer ones
+/// need the room, oldest first.
+const MAX_DECALS: usize = 512;
+/// How far below a mark with nothing in front or behind finds the floor
+/// (CoD units).
+const DECAL_FLOOR_REACH: f32 = 72.0;
 /// Looping elements that would loop forever stop after this (ms).
 const MAX_LOOPING_MSEC: f64 = 10_000.0;
+/// How far back a map's ambient effect with a negative delay starts.
+const AMBIENT_PREWARM_MSEC: f64 = 4_000.0;
+
+/// How long an effect's looping elements go on (ms): its own looping life,
+/// else (CoD4: until stopped) briefly, or for good for a map's ambient one.
+fn looping_life(def: &FxEffectDef, forever: bool) -> f64 {
+    match def.msec_looping_life {
+        l if l > 0 => l as f64,
+        _ if forever => f64::INFINITY,
+        _ => MAX_LOOPING_MSEC,
+    }
+}
 /// Point light intensity (lumens) per square metre of radius: about 1000 lux
 /// a quarter of the radius out, a third of a well-lit wall's light.
 const LIGHT_LUMENS_PER_M2: f32 = 800.0;
@@ -240,11 +258,13 @@ pub struct Effects {
     new_decals: Vec<DecalSpawn>,
     batches: HashMap<(u16, FxLayer), Batch>,
     lights: Vec<Entity>,
-    decals: VecDeque<(Entity, f64)>,
+    decals: VecDeque<Entity>,
     decal_mesh: Option<Handle<Mesh>>,
     fatal: Vec<PendingFatal>,
     /// The effects clock, ms.
     now: f64,
+    /// The camera: where it is and looks (for CoD4's spawn culling).
+    eye: Option<(Vec3, Vec3)>,
     seed: u32,
     warmed: bool,
     /// Effects to load before they're needed, and the impact types done.
@@ -262,7 +282,20 @@ impl Effects {
         if name.is_empty() {
             return;
         }
-        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None });
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false });
+    }
+
+    /// Start a map's ambient effect (its createfx placements) at `frame`,
+    /// `delay_ms` from now: CoD4's negative delays start it that long ago,
+    /// so smoke is already up (a few seconds' worth here). Its looping
+    /// elements go on for as long as the match.
+    pub fn play_ambient(&mut self, name: &str, frame: Frame, delay_ms: f64) {
+        let name = name.trim_start_matches(',');
+        if name.is_empty() {
+            return;
+        }
+        let at = self.now + delay_ms.max(-AMBIENT_PREWARM_MSEC);
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor: Anchor::Fixed(frame), layer: FxLayer::World, at: Some(at), forever: true });
     }
 
     fn next_seed(&mut self) -> u32 {
@@ -282,6 +315,8 @@ struct Play {
     effect: EffectRef,
     anchor: Anchor,
     layer: FxLayer,
+    /// A map's ambient effect: its looping elements never stop.
+    forever: bool,
     /// When it starts (ms on the effects clock); `None` for this frame.
     at: Option<f64>,
 }
@@ -289,7 +324,7 @@ struct Play {
 impl Play {
     /// A particle's child effect, from now.
     fn child(name: &str, frame: Frame, layer: FxLayer) -> Play {
-        Play { effect: EffectRef::Name(name.trim_start_matches(',').to_owned()), anchor: Anchor::Fixed(frame), layer, at: None }
+        Play { effect: EffectRef::Name(name.trim_start_matches(',').to_owned()), anchor: Anchor::Fixed(frame), layer, at: None, forever: false }
     }
 }
 
@@ -323,6 +358,8 @@ struct Instance {
     /// Looping elements: (element, spawned so far).
     looping: Vec<(u16, u32)>,
     live: u32,
+    /// Looping for good (a map's ambient effect).
+    forever: bool,
 }
 
 struct Particle {
@@ -639,11 +676,11 @@ fn make_material(content: &mut Content, a: &mut FxAssets, name: &str) -> Option<
 impl Effects {
     /// Start an effect: spawn its one-shot elements and set up its looping
     /// ones.
-    fn start(&mut self, id: FxId, frame: Frame, bolt: Option<Entity>, layer: FxLayer, at: f64) {
+    fn start(&mut self, id: FxId, frame: Frame, bolt: Option<Entity>, layer: FxLayer, at: f64, forever: bool) {
         let seed = self.next_seed();
         let def = &self.defs[id.0 as usize].def;
         let looping = def.looping().map(|i| (i as u16, 0)).collect();
-        let instance = Instance { def: id, bolt, frame, layer, start: at, looping, live: 0 };
+        let instance = Instance { def: id, bolt, frame, layer, start: at, looping, live: 0, forever };
         let slot = match self.free.pop() {
             Some(s) => {
                 self.instances[s as usize] = Some(instance);
@@ -661,6 +698,8 @@ impl Effects {
                 Spawn::OneShot { count } => count.at(rand(seed, key::SPAWN_COUNT)),
                 Spawn::Looping { .. } => 1,
             };
+            // The settings' density: fewer particles from the big bursts.
+            let count = if count > 2 { ((count as f32 * crate::settings_apply::fx_density()).round() as i32).max(1) } else { count };
             for sequence in 0..count.clamp(0, 256) {
                 self.spawn_elem(slot, elem, frame, at, sequence as u16);
             }
@@ -673,7 +712,7 @@ impl Effects {
     fn spawn_looping(&mut self, slot: u32) {
         let Some(inst) = self.instances[slot as usize].as_mut() else { return };
         let def = &self.defs[inst.def.0 as usize].def;
-        let life = if def.msec_looping_life > 0 { def.msec_looping_life as f64 } else { MAX_LOOPING_MSEC };
+        let life = looping_life(def, inst.forever);
         let (start, frame) = (inst.start, inst.frame);
         let mut due = Vec::new();
         for (elem, spawned) in inst.looping.iter_mut() {
@@ -688,7 +727,12 @@ impl Effects {
                 *spawned += 1;
             }
         }
+        // The settings' density: some of the stream's particles left out.
+        let keep = crate::settings_apply::fx_density();
         for (elem, at, sequence) in due {
+            if keep < 1.0 && (sequence as f32 * keep).floor() == ((sequence as f32 + 1.0) * keep).floor() {
+                continue;
+            }
             self.spawn_elem(slot, elem, frame, at, sequence);
         }
     }
@@ -696,7 +740,7 @@ impl Effects {
     /// Whether an instance's looping elements have all spawned.
     fn looping_done(&self, inst: &Instance) -> bool {
         let def = &self.defs[inst.def.0 as usize].def;
-        let life = if def.msec_looping_life > 0 { def.msec_looping_life as f64 } else { MAX_LOOPING_MSEC };
+        let life = looping_life(def, inst.forever);
         inst.looping.iter().all(|&(elem, spawned)| match def.elems[elem as usize].spawn {
             Spawn::Looping { interval_msec, count } => {
                 spawned >= count.max(0) as u32 || spawned as f64 * interval_msec.max(1) as f64 > life
@@ -722,6 +766,9 @@ impl Effects {
         let (layer, bolt) = (inst.layer, inst.bolt);
         let loaded = &self.defs[inst.def.0 as usize];
         let e = &loaded.def.elems[elem];
+        if self.eye.is_some_and(|eye| culled_for_spawn(e, frame.origin, eye)) {
+            return;
+        }
         let visuals = &loaded.visuals[elem];
         let visual = if visuals.len() > 1 {
             ((r(key::VISUAL) * visuals.len() as f32) as usize).min(visuals.len() - 1)
@@ -743,7 +790,7 @@ impl Effects {
                     Some(b) => Anchor::Bolted(b),
                     None => Anchor::Fixed(child),
                 };
-                self.queue.push(Play { effect: EffectRef::Id(id), anchor, layer, at: Some(begin) });
+                self.queue.push(Play { effect: EffectRef::Id(id), anchor, layer, at: Some(begin), forever: false });
             }
             ElemType::Decal => {
                 let Vis::Decal(material) = vis else { return };
@@ -1016,6 +1063,33 @@ fn model_rotation(e: &FxElemDef, seed: u32, frame: &Frame, age_ms: f32) -> Quat 
     Quat::from_mat3(&(axes * units::basis().transpose())).normalize()
 }
 
+/// `FX_CullElemForSpawn`: an element isn't spawned with the camera outside
+/// its `spawnRange` (units), nor (flag 4) while a sphere of its
+/// `spawnFrustumCullRadius` round the effect is out of view (here: behind
+/// the camera, or well off to the side).
+fn culled_for_spawn(e: &FxElemDef, origin: Vec3, (eye, forward): (Vec3, Vec3)) -> bool {
+    let to = origin - eye;
+    if e.spawn_range.amplitude != 0.0 {
+        let d = to.length() / units::INCH - e.spawn_range.base;
+        if d < 0.0 || d > e.spawn_range.amplitude {
+            return true;
+        }
+    }
+    if e.flags & 4 != 0 {
+        let radius = u(e.spawn_frustum_cull_radius.max(0.0));
+        let ahead = to.dot(forward);
+        if ahead < -radius {
+            return true;
+        }
+        // Wider than any field of view (about 70 degrees each way).
+        let side = (to - forward * ahead).length();
+        if side - radius > ahead.max(0.0) * 2.8 {
+            return true;
+        }
+    }
+    false
+}
+
 /// `FX_EvaluateDistanceFade`: fading in and out with distance (CoD units).
 fn distance_fade(e: &FxElemDef, dist: f32) -> f32 {
     let ramp = |r: &iw3::fx::FloatRange| {
@@ -1202,6 +1276,7 @@ fn run_effects(
         return;
     };
 
+    fx.eye = Some((view.pos, view.forward));
     fx.warm_up(&mut commands, &mut assets);
     let preloads = std::mem::take(&mut fx.preloads);
     if !preloads.is_empty() {
@@ -1237,7 +1312,7 @@ fn run_effects(
                     Err(_) => continue,
                 },
             };
-            fx.start(id, frame, bolt, play.layer, at);
+            fx.start(id, frame, bolt, play.layer, at, play.forever);
             started = true;
         }
         if !started {
@@ -1469,7 +1544,7 @@ fn run_effects(
 
     draw_batches(&mut commands, fx, &mut assets, quads, &mut batches);
     place_lights(&mut commands, fx, wanted_lights, &mut lights);
-    place_decals(&mut commands, fx, &mut content, &mut assets, now);
+    place_decals(&mut commands, fx, &mut content, &mut assets, &spatial);
     fx.busy.0 += started.elapsed();
     fx.busy.1 += 1;
 }
@@ -1672,28 +1747,61 @@ fn place_lights(
 }
 
 /// Lay new impact marks on their surfaces and clear old ones.
-fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content, assets: &mut FxAssets, now: f64) {
-    while fx.decals.front().is_some_and(|&(_, t)| now - t > DECAL_SECONDS * 1000.0) {
-        if let Some((e, _)) = fx.decals.pop_front() {
-            commands.entity(e).try_despawn();
-        }
-    }
+/// Marks go onto the world (`R_MarkFragments`): CoD4 clips them to the
+/// surfaces within their radius either way along the effect's forward, so a
+/// mark is laid flat on the nearest surface there (behind an impact; behind
+/// someone shot, a wall within reach of the exit wound), or not at all.
+fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content, assets: &mut FxAssets, spatial: &SpatialQuery) {
     for d in std::mem::take(&mut fx.new_decals) {
-        let Some(material) = fx.decal_material(content, assets, &d.material, d.color) else { continue };
+        let forward = d.frame.axis.col(0).normalize_or(Vec3::Y);
+        let reach = u(d.size.max(4.0));
+        let filter = SpatialQueryFilter::from_mask(collision::Layer::World);
+        let cast = |dir: Vec3, reach: f32| {
+            let d3 = Dir3::new(dir).ok()?;
+            // From just in front, so a mark on the surface it starts on
+            // finds it; a ray starting inside something (the other way into
+            // that surface) finds nothing.
+            spatial.cast_ray(d.frame.origin - dir * u(1.0), d3, reach + u(1.0), true, &filter).filter(|h| h.distance > 0.0).map(|h| (h, dir))
+        };
+        let surface = [-forward, forward]
+            .into_iter()
+            .filter_map(|dir| cast(dir, reach))
+            .min_by(|a, b| a.0.distance.total_cmp(&b.0.distance))
+            // Nothing that way: the floor below (blood under someone shot).
+            .or_else(|| cast(Vec3::NEG_Y, u(DECAL_FLOOR_REACH)));
+        let Some((hit, dir)) = surface else {
+            debug!("fx: mark {} found no surface", d.material);
+            continue;
+        };
+        let start = d.frame.origin - dir * u(1.0);
+        let at = start + dir * hit.distance;
+        // Facing the side the ray came from.
+        let n = if hit.normal.dot(start - at) < 0.0 { -hit.normal } else { hit.normal };
+        let Some(material) = fx.decal_material(content, assets, &d.material, d.color) else {
+            debug!("fx: mark material {} not found", d.material);
+            continue;
+        };
+        debug!(
+            "fx: mark {} at {at} size {} colour {:?} {:?}",
+            d.material,
+            d.size,
+            d.color,
+            assets.materials.get(&material).map(|m| (m.alpha_mode, m.unlit, m.depth_bias, m.base_color_texture.is_some()))
+        );
         let mesh = fx.decal_mesh.get_or_insert_with(|| assets.meshes.add(Rectangle::new(1.0, 1.0))).clone();
-        // The quad's +Z faces out of the surface (the effect's forward).
-        let n = d.frame.axis.col(0);
+        // The quad's +Z faces out of the surface, spun as the effect says.
         let (sin, cos) = d.rotation.sin_cos();
-        let (t, b) = (d.frame.axis.col(1), d.frame.axis.col(2));
+        let t = d.frame.axis.col(1).reject_from_normalized(n).normalize_or(n.any_orthonormal_vector());
+        let b = n.cross(t);
         let x = t * cos + b * sin;
         let rotation = Quat::from_mat3(&Mat3::from_cols(x, n.cross(x), n));
-        let tf = Transform { translation: d.frame.origin + n * u(0.05), rotation, scale: Vec3::splat(u(d.size * 2.0)) };
+        let tf = Transform { translation: at + n * u(0.1), rotation, scale: Vec3::splat(u(d.size * 2.0)) };
         let e = commands
             .spawn((Name::new("impact mark"), Mesh3d(mesh), MeshMaterial3d(material), tf, NotShadowCaster))
             .id();
-        fx.decals.push_back((e, now));
+        fx.decals.push_back(e);
         if fx.decals.len() > MAX_DECALS {
-            if let Some((old, _)) = fx.decals.pop_front() {
+            if let Some(old) = fx.decals.pop_front() {
                 commands.entity(old).try_despawn();
             }
         }
@@ -1805,8 +1913,11 @@ fn hit_surface(spatial: &SpatialQuery, surfaces: &Query<&Surfaces>, s: &ShotFire
 fn surface_at(spatial: &SpatialQuery, surfaces: &Query<&Surfaces>, from: Vec3, to: Vec3) -> Option<usize> {
     let dir = (to - from).try_normalize()?;
     let hit = spatial.cast_ray(to - dir * u(4.0), Dir3::new(dir).ok()?, u(8.0), true, &collision::sight_filter())?;
-    let sf = surfaces.get(hit.entity).ok()?;
-    let name = sf.facing(hit.normal);
+    // Brushes know their faces' surfaces; terrain and patches, by place.
+    let name = match surfaces.get(hit.entity) {
+        Ok(sf) => sf.facing(hit.normal),
+        Err(_) => crate::terrain::surface_at(to)?,
+    };
     SURFACE_NAMES.iter().position(|&n| n == name)
 }
 
@@ -2006,10 +2117,13 @@ fn weapon_effects(
         let name = ImpactTable::row(p.impact_type, true)
             .and_then(|row| fx.impact_table(&content)?.flesh(row, kind))
             .map(str::to_owned);
+        let exit = p.point + p.dir * u(8.0);
         if let Some(name) = name {
-            let exit = p.point + p.dir * u(8.0);
             fx.play(&name, Anchor::Fixed(Frame::facing(exit, p.dir, roll())), FxLayer::World);
         }
+        // Beyond CoD4's multiplayer (its blood splat effect goes unused):
+        // blood on the wall behind, or the floor.
+        fx.play(BLOOD_SPLAT, Anchor::Fixed(Frame::facing(exit, p.dir, roll())), FxLayer::World);
     }
     fx.fatal.retain(|p| p.until > now);
 }

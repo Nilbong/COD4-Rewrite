@@ -1,10 +1,14 @@
-//! Headquarters (`_koth.gsc`, CoD4's defaults): an HQ comes up at one of
-//! the map's `hq_hardpoint`s. Standing in its `radiotrigger` with no enemy
-//! there takes it in 20 seconds (leaving starts over). The holders score a
-//! point a second and can't respawn while they hold it, until it goes: the
-//! enemy standing in it for 10 seconds destroys it, or it goes offline after
-//! 60 seconds held. The next HQ comes up elsewhere at once. 250 wins (30
-//! minutes); spawns are Team Deathmatch's.
+//! Headquarters (`koth.gsc` as ranked play ran it): an HQ comes up at one
+//! of the map's `hq_hardpoint`s, 5 seconds into the match. Standing in its
+//! `radiotrigger` with no enemy there takes it in 20 seconds, less with
+//! more of the team in it (leaving for more than a second starts over).
+//! The holders score 5 points every 5 seconds, each of them XP for it
+//! (`awardHQPoints`), and can't respawn while they hold it, until it goes:
+//! the enemy standing in it for 10 seconds destroys it, or it goes offline
+//! after 60 seconds held. The next HQ comes up elsewhere 3 seconds later.
+//! Taking or destroying it is XP to whoever started it; kills in it are
+//! assaults or defences. 250 wins (30 minutes); spawns are Team
+//! Deathmatch's.
 
 use super::{GameMode, Hq, Objectives, brush_box, current};
 use crate::audio::{Sfx, Sides};
@@ -25,7 +29,7 @@ impl Plugin for KothPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(GameState::InGame), setup.in_set(Setup::Spawn)).add_systems(
             Update,
-            (headquarters, hold_respawns, show_radio).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
+            (headquarters, kill_awards, hold_respawns, show_radio).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
         );
     }
 }
@@ -38,8 +42,16 @@ fn playing() -> bool {
 const CAPTURE_TIME: f32 = 20.0;
 const DESTROY_TIME: f32 = 10.0;
 const HOLD_TIME: f32 = 60.0;
-/// The holders' point a second.
-const SCORE_EVERY: f32 = 1.0;
+/// `awardHQPoints`: 5 points every 5 seconds.
+const SCORE_EVERY: f32 = 5.0;
+const SCORE_POINTS: u32 = 5;
+/// The first HQ comes up this long into the match, the next this long
+/// after one goes.
+const FIRST_HQ: f32 = 5.0;
+const NEXT_HQ: f32 = 3.0;
+/// `setClaimTeam`: the takers can step out this long and keep their
+/// progress.
+const CLAIM_GRACE: f32 = 1.0;
 
 /// An HQ spot: the radio, its trigger and its props (`hq_hardpoint` and
 /// what it targets).
@@ -59,6 +71,12 @@ struct Headquarters {
     queue: Vec<usize>,
     next_score: f32,
     match_started: f32,
+    /// None up: when the next comes.
+    next_at: Option<f32>,
+    /// Who started the capture under way (`claimPlayer`), and when its
+    /// takers last stepped out.
+    claimer: Option<Entity>,
+    left_at: Option<f32>,
 }
 
 /// The props of the HQ up now.
@@ -125,8 +143,10 @@ fn setup(
     if radios.is_empty() {
         return;
     }
-    let mut hq = Headquarters { radios, active: 0, queue: Vec::new(), next_score: 0.0, match_started: time.elapsed_secs() };
-    next_hq(&mut hq, &mut objectives);
+    // The first comes up shortly (`onStartGameType`'s `wait 5`).
+    let now = time.elapsed_secs();
+    let mut hq = Headquarters { radios, active: 0, queue: Vec::new(), next_score: 0.0, match_started: now, next_at: Some(now + FIRST_HQ), claimer: None, left_at: None };
+    objectives.hq = None;
     // Debug runs placing the player (`COD4RW_SPAWN`): the first HQ is the
     // one nearest them, for screenshots.
     let spawn: Option<Vec<f32>> = std::env::var("COD4RW_SPAWN").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
@@ -135,6 +155,7 @@ fn setup(
         if let Some(i) = nearest {
             hq.active = i;
             hq.queue.retain(|&q| q != i);
+            hq.next_at = None;
             objectives.hq = Some(hq_at(&hq.radios[i]));
         }
     }
@@ -159,6 +180,7 @@ fn headquarters(
     hq: Option<ResMut<Headquarters>>,
     mut objectives: ResMut<Objectives>,
     pawns: Query<(Entity, &Pawn, &Transform), Without<Dead>>,
+    everyone: Query<(Entity, &Pawn)>,
     me: Query<&Pawn, With<LocalPlayer>>,
     sides: Option<Res<Sides>>,
     mut sfx: ResMut<Sfx>,
@@ -167,16 +189,26 @@ fn headquarters(
     let (Some(mut state), Some(mut hq)) = (state, hq) else { return };
     let (now, dt) = (time.elapsed_secs(), time.delta_secs());
     let mut lines: Vec<(Option<Team>, &str)> = Vec::new();
-    // A new match: a fresh HQ.
+    // A new match: a fresh HQ, shortly.
     if hq.match_started != state.started {
         hq.match_started = state.started;
-        next_hq(&mut hq, &mut objectives);
-        lines.push((None, "hq_located"));
+        objectives.hq = None;
+        hq.next_at = Some(now + FIRST_HQ);
     }
     if state.ended.is_some() {
         return;
     }
-    let Some(mut current) = objectives.hq.clone() else { return };
+    if hq.next_at.is_some_and(|at| now >= at) {
+        hq.next_at = None;
+        next_hq(&mut hq, &mut objectives);
+        (hq.claimer, hq.left_at) = (None, None);
+        info!("koth: HQ up at {:?}", objectives.hq.as_ref().map(|h| h.pos));
+        lines.push((None, "hq_located"));
+    }
+    let Some(mut current) = objectives.hq.clone() else {
+        announce(lines, &me, sides.as_deref(), &mut sfx);
+        return;
+    };
     let mut inside: Vec<(Entity, Team)> = Vec::new();
     for (e, p, tf) in &pawns {
         if current.contains(tf.translation) {
@@ -196,47 +228,39 @@ fn headquarters(
         // Up for grabs: taken by a team alone in it.
         None => match alone {
             Some(team) => {
-                let progress = current.capture.filter(|c| c.0 == team).map_or(0.0, |c| c.1) + dt / CAPTURE_TIME;
-                if progress >= 1.0 {
+                if take(&mut hq, &mut current, &inside, team, dt / CAPTURE_TIME, &mut awards) {
                     info!("koth: {:?} took the HQ", team);
                     (current.owner, current.capture, current.expires_at) = (Some(team), None, Some(now + HOLD_TIME));
                     hq.next_score = now + SCORE_EVERY;
                     lines.push((Some(team), "hq_secured"));
                     lines.push((Some(team.other()), "hq_captured"));
-                    for &(e, _) in inside.iter().filter(|x| x.1 == team) {
-                        awards.write(Award { pawn: e, kind: AwardKind::Capture });
-                    }
-                } else {
-                    current.capture = Some((team, progress));
                 }
             }
-            None if current.contested => {}
-            None => current.capture = None,
+            None => lapse(&mut hq, &mut current, now),
         },
         // Held: scoring, until destroyed or offline.
         Some(owner) => {
             if now >= hq.next_score {
                 hq.next_score += SCORE_EVERY;
                 match owner {
-                    Team::Allies => state.allies += 1,
-                    Team::Axis => state.axis += 1,
+                    Team::Allies => state.allies += SCORE_POINTS,
+                    Team::Axis => state.axis += SCORE_POINTS,
+                }
+                for (e, p) in &everyone {
+                    if p.team == owner {
+                        awards.write(Award { pawn: e, kind: AwardKind::Defend });
+                    }
                 }
             }
             let enemy = owner.other();
             if alone == Some(enemy) {
-                let progress = current.capture.filter(|c| c.0 == enemy).map_or(0.0, |c| c.1) + dt / DESTROY_TIME;
-                if progress >= 1.0 {
+                if take(&mut hq, &mut current, &inside, enemy, dt / DESTROY_TIME, &mut awards) {
                     info!("koth: {:?} destroyed the HQ", enemy);
                     lines.push((None, "hq_destroyed"));
-                    for &(e, _) in inside.iter().filter(|x| x.1 == enemy) {
-                        awards.write(Award { pawn: e, kind: AwardKind::Capture });
-                    }
                     gone = true;
-                } else {
-                    current.capture = Some((enemy, progress));
                 }
-            } else if !current.contested {
-                current.capture = None;
+            } else {
+                lapse(&mut hq, &mut current, now);
             }
             if !gone && current.expires_at.is_some_and(|at| now >= at) {
                 info!("koth: the HQ went offline");
@@ -246,16 +270,79 @@ fn headquarters(
         }
     }
     if gone {
-        next_hq(&mut hq, &mut objectives);
-        lines.push((None, "hq_located"));
+        objectives.hq = None;
+        hq.next_at = Some(now + NEXT_HQ);
     } else {
         objectives.hq = Some(current);
     }
-    // The announcer: to one team, or both.
+    announce(lines, &me, sides.as_deref(), &mut sfx);
+}
+
+/// Take (or destroy) it a step: `updateUseRate`, each taker in it speeds it
+/// up. Done, the credit is whoever started it, if still there.
+fn take(hq: &mut Headquarters, current: &mut Hq, inside: &[(Entity, Team)], team: Team, step: f32, awards: &mut MessageWriter<Award>) -> bool {
+    hq.left_at = None;
+    let start = match current.capture {
+        Some((t, p)) if t == team => p,
+        _ => {
+            hq.claimer = inside.iter().find(|x| x.1 == team).map(|x| x.0);
+            0.0
+        }
+    };
+    let progress = start + step * inside.iter().filter(|x| x.1 == team).count() as f32;
+    if progress < 1.0 {
+        current.capture = Some((team, progress));
+        return false;
+    }
+    let credit = hq.claimer.filter(|c| inside.iter().any(|x| x.0 == *c)).or_else(|| inside.iter().find(|x| x.1 == team).map(|x| x.0));
+    if let Some(e) = credit {
+        awards.write(Award { pawn: e, kind: AwardKind::Capture });
+    }
+    hq.claimer = None;
+    true
+}
+
+/// Nobody's taking it: `setClaimTeam`, a second out keeps the progress
+/// (contested, it holds).
+fn lapse(hq: &mut Headquarters, current: &mut Hq, now: f32) {
+    if current.capture.is_some() && !current.contested && now - *hq.left_at.get_or_insert(now) > CLAIM_GRACE {
+        current.capture = None;
+    }
+}
+
+/// The announcer: to one team, or both.
+fn announce(lines: Vec<(Option<Team>, &str)>, me: &Query<&Pawn, With<LocalPlayer>>, sides: Option<&Sides>, sfx: &mut Sfx) {
     let mine = me.single().ok().map(|p| p.team);
     if let (Some(sides), Some(mine)) = (sides, mine) {
         for (_, line) in lines.into_iter().filter(|(t, _)| t.is_none_or(|t| t == mine)) {
             sfx.play(format!("{}_1mc_{line}", sides.of(mine).voice), None);
+        }
+    }
+}
+
+/// Kills in the held HQ (`onPlayerKilled`): of its holders there, an
+/// assault, of their enemies a defence; and killing from in it, a defence
+/// for its holders, an assault for the rest.
+fn kill_awards(
+    mut killed: MessageReader<crate::combat::Killed>,
+    objectives: Res<Objectives>,
+    pawns: Query<(&Pawn, &Transform)>,
+    mut awards: MessageWriter<Award>,
+) {
+    for k in killed.read() {
+        let Some(attacker) = k.attacker.filter(|&a| a != k.victim) else { continue };
+        let (Some(hq), Ok((a, a_at)), Ok((v, v_at))) = (objectives.hq.as_ref(), pawns.get(attacker), pawns.get(k.victim)) else { continue };
+        let Some(owner) = hq.owner else { continue };
+        if !crate::combat::hostile(a, v) {
+            continue;
+        }
+        if hq.contains(v_at.translation) {
+            let kind = if v.team == owner { AwardKind::Assault } else { AwardKind::Defend };
+            awards.write(Award { pawn: attacker, kind });
+        }
+        if hq.contains(a_at.translation) {
+            let kind = if a.team == owner { AwardKind::Defend } else { AwardKind::Assault };
+            awards.write(Award { pawn: attacker, kind });
         }
     }
 }
@@ -327,7 +414,7 @@ mod tests {
     #[test]
     fn hq_spots_take_turns() {
         let radio = |x: f32| Radio { pos: Vec3::X * x, min: Vec3::ZERO, max: Vec3::ONE, models: Vec::new() };
-        let mut hq = Headquarters { radios: (0..3).map(|i| radio(i as f32)).collect(), active: 0, queue: Vec::new(), next_score: 0.0, match_started: 0.0 };
+        let mut hq = Headquarters { radios: (0..3).map(|i| radio(i as f32)).collect(), active: 0, queue: Vec::new(), next_score: 0.0, match_started: 0.0, next_at: None, claimer: None, left_at: None };
         let mut o = Objectives::default();
         let mut last = hq.active;
         for _ in 0..10 {

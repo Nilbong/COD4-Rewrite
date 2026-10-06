@@ -97,7 +97,6 @@ impl GameMode {
     pub fn default_time_limit(self) -> u32 {
         match self {
             GameMode::Dom | GameMode::Koth => 30,
-            GameMode::Sab => 20,
             _ => 10,
         }
     }
@@ -163,7 +162,8 @@ pub struct Objectives {
     pub round_over: Option<(Team, &'static str, &'static str)>,
     /// Headquarters: the HQ up now.
     pub hq: Option<Hq>,
-    /// Sabotage's overtime: no respawns, the first target or side down wins.
+    /// Sabotage's overtime: no respawns, the first target or side down
+    /// wins; 90 seconds without, a tie.
     pub sudden_death: bool,
 }
 

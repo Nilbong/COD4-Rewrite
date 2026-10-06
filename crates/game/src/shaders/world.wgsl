@@ -14,9 +14,11 @@
 //   with a sun glint.
 // IW3 lit in gamma space, so its results are linearised with pow 2.2.
 
+#import bevy_pbr::shadows::fetch_directional_shadow
+#import bevy_pbr::mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT
 #import bevy_pbr::{
     lighting::{F_AB, EnvBRDFApprox},
-    mesh_view_bindings::{view, globals},
+    mesh_view_bindings::{view, globals, lights},
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     pbr_types::STANDARD_MATERIAL_FLAGS_UNLIT_BIT,
@@ -38,6 +40,8 @@ struct WorldParams {
     sun_diffuse: vec4<f32>,
     // Distance falloff: metres scale, offset, the blend's scale, 1 if on.
     dist_falloff: vec4<f32>,
+    // Ray-traced lighting's (`world_deferred.wgsl`).
+    traced: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> params: WorldParams;
@@ -158,23 +162,60 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     }
 #endif
 
-#ifdef LIGHTMAP
+    // The baked light, added here (without Bevy's `Lightmap`, whose per-slab
+    // bind groups the render thread rebuilt every frame) or, with it
+    // (`LIGHTMAP`), through Bevy's lightmap path.
+    var baked = vec3(0.0);
+    let ao = pbr_input.diffuse_occlusion;
 #ifdef VERTEX_UVS_B
     if (params.flags.z > 0.5) {
         let a = textureSample(lightmap, lightmap_sampler, vec2(in.uv_b.x, in.uv_b.y * 0.5));
         let b = textureSample(lightmap, lightmap_sampler, vec2(in.uv_b.x, in.uv_b.y * 0.5 + 0.5));
         let l = normalize(iw3_slope(a.a, b.a));
-        let lit = a.rgb * n_t.z + b.rgb * saturate(dot(n_t, l));
-        pbr_input.lightmap_light = pow(lit, vec3(2.2)) * params.flags.w;
+        var lit = a.rgb * n_t.z + b.rgb * saturate(dot(n_t, l));
+        if (params.traced.y > 0.5 && params.water_color.w < 0.5) {
+            // CoD4's `lm_sm_sun`: the live sun added to the baked light in
+            // gamma space, shadowed, before linearising.
+            let ndl = saturate(dot(pbr_input.N, params.sun_dir.xyz));
+            var shadow = 0.0;
+            if (ndl > 0.0) {
+                // The map's sun among the view's directional lights (the
+                // viewmodels' suns come first in some frames): the one along
+                // this sun's direction that casts shadows.
+                let view_z = dot(vec4(view.view_from_world[0].z, view.view_from_world[1].z, view.view_from_world[2].z, view.view_from_world[3].z), in.world_position);
+                shadow = 1.0;
+                for (var i: u32 = 0u; i < lights.n_directional_lights; i = i + 1u) {
+                    let light = &lights.directional_lights[i];
+                    if (((*light).flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u
+                        && dot((*light).direction_to_light, params.sun_dir.xyz) > 0.999) {
+                        shadow = fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.position.xy);
+                        break;
+                    }
+                }
+            }
+            lit += params.sun_diffuse.rgb * ndl * shadow;
+        }
+        baked = pow(lit, vec3(2.2)) * params.flags.w;
     }
 #endif
-    pbr_input.lightmap_light *= pbr_input.diffuse_occlusion;
+#ifdef LIGHTMAP
+    pbr_input.lightmap_light = baked * ao;
+#else
+    if (params.flags.z > 0.5) {
+        // Lightmapped surfaces take no ambient or light grid light: their
+        // lightmap has it.
+        pbr_input.diffuse_occlusion = vec3(0.0);
+    }
 #endif
 
     var out: FragmentOutput;
     // As in Bevy's own pbr.wgsl: `apply_pbr_lighting` ignores the unlit flag.
     if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
         out.color = apply_pbr_lighting(pbr_input);
+#ifndef LIGHTMAP
+        let diffuse_color = pbr_input.material.base_color.rgb * (1.0 - pbr_input.material.metallic);
+        out.color = vec4(out.color.rgb + baked * ao * diffuse_color * view.exposure, out.color.a);
+#endif
         if (params.probe.x > 0.5) {
             let v = normalize(view.world_position - in.world_position.xyz);
             let n = pbr_input.N;

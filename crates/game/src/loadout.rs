@@ -35,11 +35,21 @@ impl Plugin for LoadoutPlugin {
         // equipment, `COD4RW_PERKS` those perks.
         let choice = std::env::var("COD4RW_LOADOUT").ok().map(|v| {
             let (spec, camo) = v.split_once('@').map_or((v.as_str(), 0), |(s, c)| (s, c.parse().unwrap_or(0)));
-            let gun = |spec: &str, camo| Gun { spec: spec.into(), camo, name: spec.to_ascii_uppercase(), variant: None };
+            let gun =
+                |spec: &str, camo| Gun { spec: spec.into(), camo, name: spec.to_ascii_uppercase(), variant: None };
             let inventory = std::env::var("COD4RW_INVENTORY").ok();
             // `COD4RW_PERKS=specialty_a,specialty_b`: and those perks.
-            let perks = std::env::var("COD4RW_PERKS").map_or_else(|_| Vec::new(), |p| p.split(',').map(str::to_owned).collect());
-            ClassLoadout { name: "Debug".into(), guns: vec![gun(spec, camo), gun("beretta", 0)], perks, special: None, inventory }
+            let perks = std::env::var("COD4RW_PERKS")
+                .map_or_else(|_| Vec::new(), |p| p.split(',').map(str::to_owned).collect());
+            let inventory_camo = std::env::var("COD4RW_INVENTORY_CAMO").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            ClassLoadout {
+                name: "Debug".into(),
+                guns: vec![gun(spec, camo), gun("beretta", 0)],
+                perks,
+                special: None,
+                inventory,
+                inventory_camo,
+            }
         });
         // The debug class is everyone's (splitscreen players too).
         app.insert_resource(ClassChoice { next: std::array::from_fn(|_| choice.clone()) }).add_systems(
@@ -78,6 +88,8 @@ pub struct ClassLoadout {
     pub special: Option<String>,
     /// The perk-1 equipment (`c4_mp`, `claymore_mp`, `rpg_mp`), if any.
     pub inventory: Option<String>,
+    /// The equipped RPG's camo. Other equipment stays unchanged.
+    pub inventory_camo: usize,
 }
 
 /// The class picked in the menu for each local player's next spawn (by
@@ -137,7 +149,7 @@ impl Loadout {
                 let Some(d) = weapon_def(content, &gun, &self.class.perks) else { return };
                 self.guns.push(gun);
                 self.defs.push(d);
-                self.stowed.push(Some(fresh(d, 0)));
+                self.stowed.push(Some(fresh(d, false)));
                 self.defs.len() - 1
             }
         };
@@ -147,10 +159,77 @@ impl Loadout {
             self.stowed[current] = Some(std::mem::replace(weapon, next));
             self.current = slot;
         }
+        // A full magazine and all the spare rounds (`giveMaxAmmo`).
+        weapon.clip = weapon.def.clip_size;
         weapon.reserve = weapon.def.max_ammo;
         weapon.reload_until = None;
         weapon.ads = 0.0;
         self.switching = Some(Switching { to: slot, raising: true, alt: false, started: now, until: now + weapon.def.raise_time.max(0.05) });
+    }
+
+    /// Every weapon carried: its slot, def and clip and reserve (the one in
+    /// hand's from `in_hand`).
+    pub fn carried(&self, in_hand: &WeaponState) -> Vec<(usize, &'static WeaponDef, u32, u32)> {
+        (0..self.defs.len())
+            .filter_map(|i| match (i == self.current, &self.stowed[i]) {
+                (true, _) => Some((i, in_hand.def, in_hand.clip, in_hand.reserve)),
+                (false, Some(w)) => Some((i, w.def, w.clip, w.reserve)),
+                (false, None) => None,
+            })
+            .collect()
+    }
+
+    /// Walking over a dropped copy of a weapon carried
+    /// ([`crate::pickups`]): up to `amount` more spare rounds for it (in
+    /// hand or not), as many as it can carry. How many it took.
+    pub fn give_ammo(&mut self, in_hand: &mut WeaponState, def: &WeaponDef, amount: u32) -> u32 {
+        let w = if std::ptr::eq(in_hand.def, def) {
+            in_hand
+        } else {
+            match self.stowed.iter_mut().flatten().find(|w| std::ptr::eq(w.def, def)) {
+                Some(w) => w,
+                None => return 0,
+            }
+        };
+        let took = amount.min(w.def.max_ammo.saturating_sub(w.reserve));
+        w.reserve += took;
+        took
+    }
+
+    /// Picking up a dropped weapon ([`crate::pickups`]): it takes the place
+    /// of the one in hand, with its ammo, and comes up (its raise, no
+    /// putting away). What was in hand, to drop: its gun, def, clip and
+    /// reserve. Not from the extra slot, while switching, or with a grenade
+    /// in hand (the caller's to check: [`Loadout::may_swap`]).
+    pub fn swap_in_hand(
+        &mut self,
+        weapon: &mut WeaponState,
+        gun: Gun,
+        def: &'static WeaponDef,
+        clip: u32,
+        reserve: u32,
+        now: f32,
+    ) -> (Gun, &'static WeaponDef, u32, u32) {
+        let slot = self.current;
+        let old_gun = std::mem::replace(&mut self.guns[slot], gun);
+        self.defs[slot] = def;
+        let old = (old_gun, weapon.def, weapon.clip, weapon.reserve);
+        *weapon = WeaponState { def, clip: clip.min(def.clip_size), reserve: reserve.min(def.max_ammo), ..WeaponState::default() };
+        // A grenade launcher went with the rifle (`itemRemoveAmmoFromAltModes`):
+        // the slot stays, empty.
+        if let Some(x) = self.extra.filter(|x| x.alt_raise.is_some() && slot == 0) {
+            if let Some(w) = self.stowed[x.slot].as_mut() {
+                (w.clip, w.reserve) = (0, 0);
+            }
+        }
+        self.switching = Some(Switching { to: slot, raising: true, alt: false, started: now, until: now + def.raise_time.max(0.05) });
+        old
+    }
+
+    /// May the weapon in hand be swapped for a pickup now? Not the extra
+    /// slot's, not while switching (or with a grenade in hand: the caller's).
+    pub fn may_swap(&self) -> bool {
+        self.switching.is_none() && self.extra_slot() != Some(self.current)
     }
 
     /// The slot on 5: the equipment, or the primary's grenade launcher.
@@ -195,10 +274,8 @@ const DOUBLE_TAP: f32 = 0.75;
 const STEADY_AIM: f32 = 0.65;
 /// `perk_sprintMultiplier`.
 const EXTREME_CONDITIONING: f32 = 2.0;
-/// Spare magazines at spawn (about `iStartAmmo`), and with Bandolier
-/// (`giveMaxAmmo`: up to `iMaxAmmo`).
+/// Spare magazines at spawn when a weapon doesn't give its `iStartAmmo`.
 const MAGAZINES: u32 = 3;
-const BANDOLIER_MAGAZINES: u32 = 6;
 
 fn has(perks: &[String], perk: &str) -> bool {
     perks.iter().any(|p| p.eq_ignore_ascii_case(perk))
@@ -223,7 +300,7 @@ pub(crate) fn merge(out: &mut WeaponDef, base: &WeaponDef, variant: &WeaponDef) 
         ads_kick_pitch, ads_kick_yaw, move_speed_scale, ads_move_speed_scale, ads_fov, ads_view_bob_mult,
         ads_bob_factor, hip_idle_amount, hip_idle_speed, ads_idle_amount, ads_idle_speed,
         idle_crouch_factor, idle_prone_factor, xanims, sounds, impact_type, class, kill_icon, kill_icon_ratio,
-        ammo_counter, reticle, display_key, ads_overlay,
+        ammo_counter, reticle, display_key, ads_overlay, gunplay,
     );
 }
 
@@ -310,8 +387,10 @@ fn weapon_def(content: &Content, gun: &Gun, perks: &[String]) -> Option<&'static
             *t *= SLEIGHT_OF_HAND;
         }
     }
+    // Firing and rechambering (`BG_WeaponFireRate`'s states).
     if has(perks, "specialty_rof") {
         d.fire_time *= DOUBLE_TAP;
+        d.rechamber_time *= DOUBLE_TAP;
     }
     if has(perks, "specialty_bulletaccuracy") {
         d.hip_spread_min = d.hip_spread_min.map(|s| s * STEADY_AIM);
@@ -344,9 +423,12 @@ fn equipment_name(weapon: &str) -> &'static str {
     }
 }
 
-/// A weapon fresh from spawning: full magazine and the spare ones.
-pub fn fresh(def: &'static WeaponDef, magazines: u32) -> WeaponState {
-    WeaponState { def, clip: def.clip_size, reserve: def.max_ammo.min(def.clip_size * magazines), ..WeaponState::default() }
+/// A weapon fresh from spawning: a full magazine and `iStartAmmo` spare
+/// (`GiveWeapon`), or with Bandolier all it can carry (`giveMaxAmmo`).
+pub fn fresh(def: &'static WeaponDef, bandolier: bool) -> WeaponState {
+    let start = if def.start_ammo > 0 { def.start_ammo } else { def.clip_size * MAGAZINES };
+    let reserve = if bandolier { def.max_ammo } else { start.min(def.max_ammo) };
+    WeaponState { def, clip: def.clip_size, reserve, ..WeaponState::default() }
 }
 
 /// A pawn's class (any pawn: the player's from the class menu, bots'
@@ -395,7 +477,18 @@ fn equip(
         if equipped && !respawned.contains(&entity) {
             continue;
         }
-        let class = class.0.clone();
+        let mut class = class.0.clone();
+        // Without Overkill the second weapon is a pistol (`_class.gsc`): a
+        // CoD4 class with another gun there gets the Beretta.
+        if !has(&class.perks, "specialty_twoprimaries") {
+            if let Some(second) = class.guns.get_mut(1) {
+                let gun = crate::gunmodel::parse(&second.spec).0;
+                let cod4 = !crate::bo1::is_bo1(gun) && !crate::waw::is_waw(gun);
+                if cod4 && weapon_def(&content, second, &class.perks).is_some_and(|d| d.class != 4) {
+                    *second = Gun { spec: "beretta:".into(), camo: 0, name: "M9".into(), variant: None };
+                }
+            }
+        }
         let (guns, defs): (Vec<Gun>, Vec<&'static WeaponDef>) =
             class.guns.iter().filter_map(|g| Some((g.clone(), weapon_def(&content, g, &class.perks)?))).unzip();
         if defs.is_empty() {
@@ -403,8 +496,8 @@ fn equip(
             continue;
         }
         let perks = &class.perks;
-        let magazines = if has(perks, "specialty_extraammo") { BANDOLIER_MAGAZINES } else { MAGAZINES };
-        *weapon = fresh(defs[0], magazines);
+        let bandolier = has(perks, "specialty_extraammo");
+        *weapon = fresh(defs[0], bandolier);
         mover.sprint_time_scale = if has(perks, "specialty_longersprint") { EXTREME_CONDITIONING } else { 1.0 };
         let armor = if has(perks, "specialty_armorvest") { JUGGERNAUT } else { 1.0 };
         if local {
@@ -417,7 +510,7 @@ fn equip(
                 class.inventory
             );
         }
-        let mut stowed: Vec<Option<WeaponState>> = defs.iter().map(|&d| Some(fresh(d, magazines))).collect();
+        let mut stowed: Vec<Option<WeaponState>> = defs.iter().map(|&d| Some(fresh(d, bandolier))).collect();
         stowed[0] = None;
         // The equipment, or the primary's grenade launcher (its alternate
         // weapon, `szAltWeaponName`).
@@ -440,7 +533,13 @@ fn equip(
         let extra_weapon = class.inventory.clone().map(|i| (i, None)).or_else(launcher);
         let mut extra = None;
         if let Some((weapon, alt_raise)) = extra_weapon {
-            let gun = Gun { spec: format!("{}:", weapon.trim_end_matches("_mp")), camo: 0, name: equipment_name(&weapon).into(), variant: None };
+            let camo = if weapon == "rpg_mp" { class.inventory_camo } else { 0 };
+            let gun = Gun {
+                spec: format!("{}:", weapon.trim_end_matches("_mp")),
+                camo,
+                name: equipment_name(&weapon).into(),
+                variant: None,
+            };
             if let Some(d) = weapon_def(&content, &gun, &[]) {
                 extra = Some(Extra { slot: defs.len(), alt_raise });
                 guns.push(gun);

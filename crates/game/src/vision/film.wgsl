@@ -16,7 +16,8 @@ struct Film {
     bias: vec4<f32>,
     // w: the glow's intensity.
     glow: vec4<f32>,
-    // y: 1 when the glow is on.
+    // y: 1 when the glow is on; z: how much brighter than `w` is stretched
+    // (this game's highlight gain, 0 for CoD4's film).
     glow_blur: vec4<f32>,
 }
 
@@ -47,6 +48,7 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     if film.tint_base.w > 0.5 {
         out = vec3<f32>(1.0) - out;
     }
+    out += max(out - vec3<f32>(film.glow_blur.w), vec3<f32>(0.0)) * film.glow_blur.z;
     if film.glow_blur.y > 0.5 {
         out += textureSampleLevel(glow, screen_sampler, in.uv, 0.0).rgb * film.glow.w;
     }

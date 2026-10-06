@@ -266,7 +266,14 @@ pub fn sync_nodes(
             match pool.nodes[layer].get(i).and_then(|&e| nodes.get_mut(e).ok()) {
                 Some((mut n, mut im, mut t, mut v)) => {
                     n.set_if_neq(node);
-                    *im = image;
+                    let same = im.image == image.image
+                        && im.color == image.color
+                        && im.rect == image.rect
+                        && im.flip_x == image.flip_x
+                        && im.flip_y == image.flip_y;
+                    if !same {
+                        *im = image;
+                    }
                     t.set_if_neq(turn);
                     v.set_if_neq(Visibility::Inherited);
                 }

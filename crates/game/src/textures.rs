@@ -87,6 +87,14 @@ fn load(name: &str, srgb: bool, vfs: &Vfs) -> Option<Image> {
     to_image(&iwi, srgb)
 }
 
+/// The settings' texture filtering: 0 bilinear, 1 trilinear, else the
+/// anisotropy (from the next map's textures).
+static ANISOTROPY: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(16);
+
+pub fn set_anisotropy(v: u16) {
+    ANISOTROPY.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn to_image(iwi: &Iwi, srgb: bool) -> Option<Image> {
     let size = Extent3d { width: iwi.width, height: iwi.height, depth_or_array_layers: 1 };
     let (format, data, mips) = if iwi.format.is_compressed() {
@@ -116,8 +124,11 @@ pub fn to_image(iwi: &Iwi, srgb: bool) -> Option<Image> {
         address_mode_v: ImageAddressMode::Repeat,
         mag_filter: ImageFilterMode::Linear,
         min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        anisotropy_clamp: 16,
+        mipmap_filter: match ANISOTROPY.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => ImageFilterMode::Nearest,
+            _ => ImageFilterMode::Linear,
+        },
+        anisotropy_clamp: ANISOTROPY.load(std::sync::atomic::Ordering::Relaxed).max(1),
         ..default()
     });
     Some(image)

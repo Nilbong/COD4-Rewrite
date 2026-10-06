@@ -191,7 +191,11 @@ impl Default for MoveStyle {
             // Real players in the demos move on 54% of their shots: shorter
             // stops at mid and long range than first fitted.
             pause: [0.3, 0.35, 1.2],
-            flip: [0.88, 0.72, 0.35],
+            // Straight back the other way: half as often as first fitted
+            // (bot lab, 2026-10-06: real players in the demos reverse a
+            // strafe about half as often as bots did, the "bot" A-D-A-D
+            // look; flips fell on all six suite maps).
+            flip: [0.45, 0.36, 0.18],
             ads_range: u(170.0),
             crouch: 0.35,
             crouch_any_range: false,

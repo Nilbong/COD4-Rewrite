@@ -22,8 +22,12 @@ pub mod demos;
 mod grenade;
 mod hardpoints;
 mod objective;
+pub mod lab;
+mod resupply;
 pub mod learned;
+mod lookstat;
 pub mod motion;
+pub mod nets;
 pub mod nav;
 pub mod perception;
 pub mod profile;
@@ -58,7 +62,7 @@ impl Plugin for BotsPlugin {
             .init_resource::<NavTrouble>()
             .add_systems(
                 Update,
-                (class::class_bots, floor_line, build_nav, build_tactics, check_objectives, hardpoints::hardpoints, grenade::plan_grenades, equipment::plan_gear, think, knife, objective::use_objectives)
+                (class::class_bots, floor_line, build_nav, build_tactics, check_objectives, hardpoints::hardpoints, grenade::plan_grenades, equipment::plan_gear, think, resupply::resupply, knife, objective::use_objectives)
                     .chain()
                     .before(crate::movement::MovementSet)
                     .run_if(crate::state::in_game),
@@ -81,6 +85,7 @@ impl Plugin for BotsPlugin {
             app.add_systems(Update, (debug_log, behaviour_log, grenade::tally).run_if(crate::state::in_game));
         }
         record::setup(app);
+        lookstat::setup(app);
         profile::setup(app);
         demos::setup(app);
         spectate::setup(app);
@@ -401,6 +406,12 @@ pub struct Bot {
     role: Role,
     aim_profile: AimProfile,
     aim: AimState,
+    /// Owns this bot's route searches (spread over frames, one at a time:
+    /// [`nav::NavGraph::path_sliced`]); and whether one is under way.
+    route_id: u64,
+    routing: bool,
+    /// The learned aim model's state ([`nets`], with `COD4RW_NETAIM`).
+    net_aim: nets::NetAimState,
     /// Mean reaction time in seconds.
     reaction: f32,
     know: Knowledge,
@@ -621,6 +632,9 @@ impl Bot {
             role,
             aim_profile,
             aim: AimState::default(),
+            route_id: rand::random(),
+            routing: false,
+            net_aim: nets::NetAimState::default(),
             reaction,
             personality,
             know: Knowledge::default(),
@@ -910,6 +924,21 @@ static THINK_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 static PATH_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PATH_MAX_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PATHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Route searches this frame, and how many a frame may have (they're the
+/// costliest thing a bot does: spread out, no frame gets several).
+static ROUTES_THIS_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const ROUTES_PER_FRAME: u32 = 1;
+/// Expansions a route search gets a frame (about 0.3 ms).
+const ROUTE_SLICE: usize = 1500;
+static DECIDES_THIS_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const DECIDES_PER_FRAME: u32 = 3;
+/// Phases of [`think`] (µs over the log period): the shared start (team
+/// info, claims, plans), perception, decide, act.
+static PHASE_US: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static PHASE_SHARED_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn phase(i: usize, since: std::time::Instant) {
+    PHASE_US[i].fetch_add(since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Add a timing to a total and its worst.
 fn clock(total: &std::sync::atomic::AtomicU64, max: &std::sync::atomic::AtomicU64, since: std::time::Instant) {
@@ -951,7 +980,7 @@ fn think(
         ),
         Without<Dead>,
     >,
-    pawns: Query<(Entity, &Pawn, &Transform, &Mover), Without<Dead>>,
+    pawns: Query<(Entity, &Pawn, &Transform, &Mover, Option<&crate::loadout::Loadout>), Without<Dead>>,
     (hitboxes, objectives): (Query<&crate::combat::Hitbox>, Option<Res<crate::modes::Objectives>>),
 ) {
     let Some(map) = map else { return };
@@ -966,7 +995,7 @@ fn think(
     let hits: Vec<(Entity, Entity)> = damage.read().filter_map(|d| d.attacker.map(|a| (d.target, a))).collect();
     let snapshot: Vec<PawnView> = pawns
         .iter()
-        .map(|(e, p, tf, m)| PawnView {
+        .map(|(e, p, tf, m, loadout)| PawnView {
             entity: e,
             team: p.team,
             id: p.id,
@@ -975,6 +1004,7 @@ fn think(
             vel: m.velocity,
             stance: m.stance,
             sprinting: m.sprinting,
+            quiet: crate::perks::has(loadout, "specialty_quieter"),
         })
         .collect();
     let alive: Vec<Entity> = snapshot.iter().map(|p| p.entity).collect();
@@ -988,7 +1018,7 @@ fn think(
             intel.decayed_at = now;
         }
         for k in &deaths {
-            let victim_team = pawns.get(k.victim).map(|(_, p, _, _)| p.team).ok();
+            let victim_team = pawns.get(k.victim).map(|(_, p, _, _, _)| p.team).ok();
             let killer = k.attacker.and_then(|a| snapshot.iter().find(|p| p.entity == a));
             if let (Some(team), Some(killer)) = (victim_team, killer) {
                 if killer.team != team || crate::combat::free_for_all() {
@@ -997,6 +1027,9 @@ fn think(
             }
         }
     }
+    let t_shared = std::time::Instant::now();
+    ROUTES_THIS_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
+    DECIDES_THIS_FRAME.store(0, std::sync::atomic::Ordering::Relaxed);
     // Per team: where its enemies will spawn next, and where the fight is.
     let team_info = |team: Team| {
         let mine: Vec<Vec3> = snapshot.iter().filter(|p| p.team == team).map(|p| p.feet).collect();
@@ -1028,6 +1061,9 @@ fn think(
     for (me, mut bot, pawn, tf, mover, weapon, health, mut view, mut mv, mut wi, flashed, stunned, downed) in &mut bots {
         // Flashbanged: blind (nothing seen, nobody kept in sight) until it
         // fades. Stunned: slow to move and turn.
+        if PHASE_SHARED_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) == false {
+            phase(0, t_shared);
+        }
         let blind = flashed.map_or(0.0, |f| f.strength(now)) > 0.35;
         let stun = stunned.map_or(0.0, |s| s.strength(now));
         let bot = &mut *bot;
@@ -1054,6 +1090,7 @@ fn think(
         bot.last_feet = feet;
 
         // --- Perception.
+        let t_look = std::time::Instant::now();
         let enemies: Vec<PawnView> = snapshot.iter().filter(|p| p.hostile_to(pawn)).copied().collect();
         if blind {
             for c in bot.know.contacts.values_mut() {
@@ -1061,7 +1098,9 @@ fn think(
             }
         } else if now - bot.last_look >= LOOK_INTERVAL {
             let look_dt = (now - bot.last_look).min(0.25);
-            bot.last_look = now;
+            // A little jitter, so bots that spawned together don't all look
+            // in the same frame (the same rate on average).
+            bot.last_look = now + rng.random_range(-0.01..0.01);
             let noticed =
                 perception::look(&mut bot.know, &spatial, eye, view.forward(), &enemies, &fired_at, bot.skill, now, look_dt);
             for e in noticed {
@@ -1119,6 +1158,7 @@ fn think(
             bot.next_decide = now;
         }
 
+        phase(1, t_look);
         // --- Tactics.
         let (enemy_spawns, front, lateral) = match pawn.team {
             Team::Allies => (&allies_spawns, allies_front, allies_lateral),
@@ -1135,15 +1175,20 @@ fn think(
             lateral,
             trouble: &trouble.0,
             motion: motion_lib.as_deref().map(|m| &*m.0),
-            objectives: objectives.as_deref().filter(|o| !o.flags.is_empty() || !o.sites.is_empty()),
+            objectives: objectives.as_deref().filter(|o| !o.flags.is_empty() || !o.sites.is_empty() || o.hq.is_some()),
         };
-        if now >= bot.next_decide {
+        // At most a few decisions a frame: one over waits a frame.
+        if now >= bot.next_decide && DECIDES_THIS_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < DECIDES_PER_FRAME {
             bot.next_decide = now + DECIDE_INTERVAL * rng.random_range(0.8..1.2);
+            let t = std::time::Instant::now();
             decide(bot, me, &spatial, nav.as_deref(), &tc, &map, pawn, feet, eye, health, weapon, now, &mut rng);
+            phase(2, t);
         }
 
         // --- Movement, looking and shooting.
+        let t_act = std::time::Instant::now();
         let mut plan = act(bot, &spatial, nav.as_deref(), &tc, feet, eye, mover, &view, weapon, now, &mut rng);
+        phase(3, t_act);
         grenade::steer(bot, &mut plan, feet, eye, &view, now);
         equipment::shoot_heli(bot, &mut plan, &view, eye, feet, now, &mut rng);
         equipment::steer(bot, &mut plan, &view, eye, now);
@@ -1166,7 +1211,14 @@ fn think(
 
         // Aim: the hand model moves the view towards the chosen goal.
         let yaw_before = view.yaw;
-        bot.aim.update(&bot.aim_profile, &mut view, plan.look, now, dt, &mut rng);
+        // A learned aim model (`COD4RW_NETAIM`) takes over while engaging.
+        let moving = Vec2::new(mover.velocity.x, mover.velocity.z).length() > crate::units::u(20.0);
+        let net = nets::aim_net().is_some_and(|n| bot.net_aim.update(n, &mut view, plan.look, moving, dt, &mut rng));
+        if net {
+            bot.aim.sync(&view);
+        } else {
+            bot.aim.update(&bot.aim_profile, &mut view, plan.look, now, dt, &mut rng);
+        }
         // Motion matching turns the view the way the matched player did.
         if plan.turn.is_some() || plan.pitch.is_some() {
             if let Some(rate) = plan.turn {
@@ -1176,6 +1228,24 @@ fn think(
                 view.pitch += (p - view.pitch) * (dt * 6.0).min(1.0);
             }
             bot.aim.sync(&view);
+        }
+        // Walking about (not fighting, not turning to a noise), real players
+        // rarely look more than 100 degrees off the way they're going (8% of
+        // the time; bots 15-22%): ease the view back within that (bot lab,
+        // 2026-10-06: looking backwards roughly halved on five of six maps).
+        if !matches!(bot.mode, Mode::Engage | Mode::Cover) && bot.look_src != "alarm" {
+            let v = Vec2::new(mover.velocity.x, mover.velocity.z);
+            if v.length() > crate::units::u(80.0) {
+                let travel = (-v.x).atan2(-v.y);
+                let off = wrap_angle(view.yaw - travel);
+                // Bot lab experiment `look75`: a tighter limit.
+                let limit = if lab::on("look75") { 75f32 } else { 100f32 }.to_radians();
+                if off.abs() > limit {
+                    let excess = off.abs() - limit;
+                    view.yaw -= off.signum() * excess.min(3.5 * dt);
+                    bot.aim.sync(&view);
+                }
+            }
         }
         if stun > 0.0 {
             // As the player's: turning damped to about a third.
@@ -1223,6 +1293,7 @@ fn think(
         };
     }
     callouts.0.extend(new_callouts);
+    PHASE_SHARED_DONE.store(false, std::sync::atomic::Ordering::Relaxed);
     clock(&THINK_US, &THINK_MAX_US, started);
     THINK_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(nav) = nav.as_deref() {
@@ -1394,7 +1465,13 @@ fn decide(
                     target,
                     react_at: noticed + reaction,
                     aim_head: rng.random::<f32>() < p.head_bias * (1.0 - (dist / u(2500.0)).min(1.0) * 0.5),
-                    crouch: (bot.style.crouch_any_range || dist > u(700.0)) && rng.random::<f32>() < bot.style.crouch,
+                    // Bot lab experiment `crouchfight`: real players spend
+                    // 32-48% of fighting crouched or prone, bots 25%.
+                    crouch: if lab::on("crouchfight") {
+                        dist > u(300.0) && rng.random::<f32>() < 0.55
+                    } else {
+                        (bot.style.crouch_any_range || dist > u(700.0)) && rng.random::<f32>() < bot.style.crouch
+                    },
                     last_visible: now,
                     seen_at: c.visible_since,
                     first_shot: None,
@@ -1846,7 +1923,6 @@ fn act(
     } else {
         None
     };
-
     if bot.mode == Mode::Engage {
         let Some(dist) = fight_dist else { return plan };
         // Fight movement: A/D tap strafing, a press one way, then straight
@@ -1932,7 +2008,9 @@ fn act(
     if bot.dest.is_none() && bot.mode == Mode::Hold {
         // Arrived (or no cover): just hold.
     }
+    let t_follow = std::time::Instant::now();
     let arrived = follow_path(bot, spatial, nav, tc, feet, mover, now, rng, &mut plan, view);
+    phase(5, t_follow);
     if arrived {
         match bot.mode {
             Mode::Hunt => {
@@ -2074,7 +2152,12 @@ fn act(
         // Walking a route: move and look the way a real player did in the
         // same situation (motion matching), when there are demos to learn from.
         let matched = match (tc.motion, nav, bot.steer, bot.path.is_empty()) {
-            (Some(lib), Some(nav), Some(_), false) => motion_step(bot, lib, nav, spatial, feet, mover, view, now),
+            (Some(lib), Some(nav), Some(_), false) => {
+                let t = std::time::Instant::now();
+                let step = motion_step(bot, lib, nav, spatial, feet, mover, view, now);
+                phase(4, t);
+                step
+            }
             _ => {
                 bot.playing = None;
                 None
@@ -2338,7 +2421,17 @@ fn fight_aim(
     }
     let pos = c.predicted(now);
     let dist = pos.distance(feet);
-    let point = if eng.aim_head { pos + Vec3::Y * u(62.0) } else { pos + Vec3::Y * u(44.0) };
+    // Bot lab experiment `stanceaim`: at their head and chest as they stand
+    // or crouch (head 4 above the eyes, chest about 0.71 of the eye height:
+    // 64/43 standing, 44/28 crouched), not fixed heights that went over a
+    // crouched target.
+    let point = if lab::on("stanceaim") {
+        pos + Vec3::Y * if eng.aim_head { c.eye_height + u(4.0) } else { c.eye_height * 0.71 }
+    } else if eng.aim_head {
+        pos + Vec3::Y * u(62.0)
+    } else {
+        pos + Vec3::Y * u(44.0)
+    };
     let half = if eng.aim_head { u(5.0) } else { u(9.0) };
     let width = 2.0 * (half / dist.max(u(16.0))).atan();
     let goal = angles_to(eye, point);
@@ -2526,9 +2619,13 @@ fn follow_path(
         return true;
     }
 
-    // Plan a route.
-    if bot.path.is_empty() || now >= bot.next_repath {
-        bot.next_repath = now + 3.0;
+    // Plan a route: a search at a time, a slice of it a frame (the rest keep
+    // their way a little longer).
+    let wants_route = bot.path.is_empty() || now >= bot.next_repath || bot.routing;
+    if wants_route && ROUTES_THIS_FRAME.load(std::sync::atomic::Ordering::Relaxed) < ROUTES_PER_FRAME {
+        if !bot.routing {
+            bot.next_repath = now + 3.0;
+        }
         if let Some(nav) = nav {
             if let (Some(a), Some(b)) = (reachable_node(nav, spatial, feet), nav.nearest(dest)) {
                 // Prefer routes along walls and cover over open ground;
@@ -2540,11 +2637,20 @@ fn follow_path(
                 // And not the way a teammate is already going, least of all
                 // one we've caught ourselves following.
                 let leader = bot.leader.filter(|l| now < l.1).map(|l| l.0);
+                // Per cell: how many teammates' routes pass (up to 2), and
+                // whether the leader's does; counted once, not per point.
+                let mut on_routes: bevy::platform::collections::HashMap<Cell, (u8, bool)> = Default::default();
+                for m in &tc.mates {
+                    for c in &m.route {
+                        let e = on_routes.entry(*c).or_default();
+                        e.0 = e.0.saturating_add(1);
+                        e.1 |= Some(m.entity) == leader;
+                    }
+                }
                 let shared = |i: u32| {
-                    let c = cell(nav.nodes[i as usize].pos);
-                    let on = |m: &&&MatePlan| m.route.contains(&c);
-                    let n = tc.mates.iter().filter(on).count().min(2) as f32;
-                    n + if tc.mates.iter().filter(on).any(|m| Some(m.entity) == leader) { 2.0 } else { 0.0 }
+                    on_routes
+                        .get(&cell(nav.nodes[i as usize].pos))
+                        .map_or(0.0, |&(n, led)| n.min(2) as f32 + if led { 2.0 } else { 0.0 })
                 };
                 let cost = |i: u32| {
                     let lane = match role {
@@ -2554,7 +2660,7 @@ fn follow_path(
                     };
                     let pos = nav.nodes[i as usize].pos;
                     let side = tc.lateral.map_or(0.0, |l| (l.of(pos) - bot.lane).abs().min(1.5));
-                    let trouble = tc.trouble.get(&i).map_or(0.0, |&n| n.min(4) as f32 * u(300.0));
+                    let trouble = if tc.trouble.is_empty() { 0.0 } else { tc.trouble.get(&i).map_or(0.0, |&n| n.min(4) as f32 * u(300.0)) };
                     // In front of a known enemy claymore (its 192 units and
                     // 70 degrees, with room to spare).
                     let claymore = claymores
@@ -2564,15 +2670,23 @@ fn follow_path(
                     nav.nodes[i as usize].exposure * caution * u(24.0) + lane + shared(i) * u(16.0) + side * u(24.0) + trouble + claymore
                 };
                 let t0 = std::time::Instant::now();
-                let found = nav.path(a, b, 60_000, cost);
-                clock(&PATH_US, &PATH_MAX_US, t0);
-                PATHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let found = nav.path_sliced(bot.route_id, a, b, now, 60_000, ROUTE_SLICE, cost);
+                if !matches!(found, nav::Step::Busy) {
+                    ROUTES_THIS_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    clock(&PATH_US, &PATH_MAX_US, t0);
+                }
+                bot.routing = matches!(found, nav::Step::Working);
                 match found {
-                    Some(path) => {
+                    // Not done (or another bot's search running): ask again
+                    // next frame.
+                    nav::Step::Working => {}
+                    nav::Step::Busy => bot.next_repath = now,
+                    nav::Step::Found(path) => {
+                        PATHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         bot.path = path;
                         bot.path_i = 0;
                     }
-                    None => {
+                    nav::Step::NoWay => {
                         // Unreachable: give up on this destination (and
                         // for a while on an objective there).
                         bot.dest = None;
@@ -2946,9 +3060,9 @@ struct Behaviour {
     /// doing as it stopped), and finished stops' lengths by that.
     stop: HashMap<Entity, (f32, String)>,
     stops: std::collections::BTreeMap<String, Vec<f32>>,
-    /// Moving out of fights, per look source: seconds, of them sideways
+    /// Moving and not firing, per look source (fights by mode): seconds, of them sideways
     /// (60-120 degrees off the view), diagonal (30-60).
-    sideways: std::collections::BTreeMap<&'static str, [f32; 3]>,
+    sideways: std::collections::BTreeMap<&'static str, [f32; 5]>,
 }
 
 /// With `COD4RW_SIM` set: how natural the bots look. Out of fights: how
@@ -2979,14 +3093,21 @@ fn behaviour_log(
         let k = if moving { 0 } else { 2 };
         a[k] += dt;
         a[k + 1] += if wi.ads { dt } else { 0.0 };
-        if !fighting && moving {
+        if moving && !wi.fire {
             let heading = Vec3::new(mover.velocity.x, 0.0, mover.velocity.z).normalize_or_zero();
             let facing = Vec3::new(view.forward().x, 0.0, view.forward().z).normalize_or_zero();
             let off = heading.dot(facing).clamp(-1.0, 1.0).acos().to_degrees();
-            let s = b.sideways.entry(bot.look_src).or_default();
+            let key = match bot.mode {
+                Mode::Engage => "Engage",
+                Mode::Cover => "Cover",
+                _ => bot.look_src,
+            };
+            let s = b.sideways.entry(key).or_default();
             s[0] += dt;
             s[1] += if (60.0..120.0).contains(&off) { dt } else { 0.0 };
             s[2] += if (30.0..60.0).contains(&off) { dt } else { 0.0 };
+            s[3] += if off >= 90.0 { dt } else { 0.0 };
+            s[4] += if off >= 135.0 { dt } else { 0.0 };
         }
         if !fighting && !moving {
             b.stop.entry(e).or_insert_with(|| (now, format!("{:?}/{}", bot.mode, bot.look_src)));
@@ -3082,8 +3203,20 @@ fn behaviour_log(
             THINK_US.swap(0, Relaxed) as f32 / frames as f32 / 1000.0,
             THINK_MAX_US.swap(0, Relaxed) as f32 / 1000.0,
             paths,
-            PATH_US.swap(0, Relaxed) as f32 / paths.max(1) as f32 / 1000.0,
+            PATH_US.load(Relaxed) as f32 / paths.max(1) as f32 / 1000.0,
             PATH_MAX_US.swap(0, Relaxed) as f32 / 1000.0
+        );
+        let per = |us: u64| us as f32 / frames as f32 / 1000.0;
+        info!(
+            "behaviour cost phases (ms/frame): shared {:.2}, perception {:.2}, decide {:.2}, act {:.2} (routes {:.2}, motion {:.2}, follow {:.2}); {} points expanded a route",
+            per(PHASE_US[0].swap(0, Relaxed)),
+            per(PHASE_US[1].swap(0, Relaxed)),
+            per(PHASE_US[2].swap(0, Relaxed)),
+            per(PHASE_US[3].swap(0, Relaxed)),
+            per(PATH_US.swap(0, Relaxed)),
+            per(PHASE_US[4].swap(0, Relaxed)),
+            per(PHASE_US[5].swap(0, Relaxed)),
+            nav::EXPANDED.swap(0, Relaxed) / paths.max(1)
         );
     }
     let mut stops: Vec<(usize, String)> = b
@@ -3099,7 +3232,10 @@ fn behaviour_log(
     let side: Vec<String> = b
         .sideways
         .iter()
-        .map(|(k, s)| format!("{k} {:.0}s ({:.0}% sideways, {:.0}% diagonal)", s[0], 100.0 * s[1] / s[0].max(1e-3), 100.0 * s[2] / s[0].max(1e-3)))
+        .map(|(k, s)| {
+            let pct = |v: f32| 100.0 * v / s[0].max(1e-3);
+            format!("{k} {:.0}s ({:.0}% sideways, {:.0}% diagonal, {:.0}% over 90, {:.0}% backwards)", s[0], pct(s[1]), pct(s[2]), pct(s[3]), pct(s[4]))
+        })
         .collect();
     info!("behaviour moving: {}", side.join(", "));
     info!("behaviour stops: {}", stops.iter().take(12).map(|s| s.1.as_str()).collect::<Vec<_>>().join("; "));

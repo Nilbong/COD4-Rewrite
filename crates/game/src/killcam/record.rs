@@ -38,6 +38,10 @@ pub struct PawnSample {
     /// it (a knife swing), and the body's turn.
     pub anim: Option<(Arc<XAnim>, f32)>,
     pub overlay: Option<(Arc<XAnim>, f32)>,
+    /// How much of the overlay showed (a torso animation blending in or out).
+    pub overlay_weight: f32,
+    /// Its lean (-1..1).
+    pub lean: f32,
     pub body_turn: Quat,
     /// A knife swing: when it started, and whether a lunge.
     pub melee: Option<(f32, bool)>,
@@ -152,9 +156,10 @@ pub fn record(
     let pawns = pawns
         .iter()
         .map(|(entity, tf, mover, view, w, loadout, body, dead, melee)| {
-            let (anim, overlay, body_turn) = body.and_then(|b| bodies.get(b.0).ok()).map_or((None, None, Quat::IDENTITY), |(player, btf)| {
-                (player.anim.clone().map(|a| (a, player.time)), player.overlay.clone(), btf.rotation)
-            });
+            let (anim, overlay, overlay_weight, body_turn) =
+                body.and_then(|b| bodies.get(b.0).ok()).map_or((None, None, 1.0, Quat::IDENTITY), |(player, btf)| {
+                    (player.anim.clone().map(|a| (a, player.time)), player.overlay.clone(), player.overlay_weight, btf.rotation)
+                });
             PawnSample {
                 entity,
                 feet: tf.translation,
@@ -169,6 +174,8 @@ pub fn record(
                 dead,
                 anim,
                 overlay,
+                overlay_weight,
+                lean: mover.lean,
                 body_turn,
                 melee: melee.map(|m| (m.started, m.charge)),
             }

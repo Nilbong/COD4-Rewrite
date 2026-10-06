@@ -252,6 +252,9 @@ pub struct FxElemDef {
     /// Distance fades (`spawnRange` culls spawning; the others fade in
     /// between `base` and `base + amplitude` units from the camera).
     pub spawn_range: FloatRange,
+    /// With flag 4: not spawned while a sphere this big (units) around the
+    /// effect is out of view.
+    pub spawn_frustum_cull_radius: f32,
     pub fade_in_range: FloatRange,
     pub fade_out_range: FloatRange,
     pub spawn_delay_msec: IntRange,
@@ -439,6 +442,7 @@ fn elem_def(zone: &Zone, e: &GNode) -> FxElemDef {
         elem_type,
         spawn: Spawn::Looping { interval_msec: spawn_raw.0, count: spawn_raw.1 },
         spawn_range: float_range(e, "spawnRange"),
+        spawn_frustum_cull_radius: e.float("spawnFrustumCullRadius"),
         fade_in_range: float_range(e, "fadeInRange"),
         fade_out_range: float_range(e, "fadeOutRange"),
         spawn_delay_msec: int_range(e, "spawnDelayMsec"),

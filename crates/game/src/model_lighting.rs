@@ -42,6 +42,10 @@ const CROP_MARGIN: u32 = 2;
 /// volume would have more voxels than this (24 bytes each).
 const MAX_VOXELS: usize = 1_500_000;
 
+/// Grid layers added over the grid's top (CoD4's grid is 64 units high a
+/// layer: about 20 m).
+const LAYERS_ABOVE: u32 = 12;
+
 /// Black Ops' light grid tweaks: its maps use 1.1-1.5 and 0.2-0.4; CoD4's
 /// set none, so these are Black Ops' usual values. Its contrast is off: on
 /// CoD4's grids (lit from one side much more than the other) pushing the
@@ -84,6 +88,10 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
         .map(bounds)
         .find(|&b| size(b) <= MAX_VOXELS)
         .unwrap_or_else(|| bounds(0.08));
+    // The grid stops a little over the playable space; trees, poles and
+    // roofs above it took no light (Bloc's trees were black). The layers
+    // above take the top samples' light (filled below).
+    let hi = [hi[0], hi[1], hi[2] + LAYERS_ABOVE];
     let n = [0, 1, 2].map(|i| (hi[i] - lo[i] + 1) as usize);
     let index = |p: [usize; 3]| p[0] + n[0] * (p[1] + n[1] * p[2]);
 
@@ -132,6 +140,17 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
                 queue.push_back(r);
             }
         }
+    }
+
+    // Ray-traced lighting lights props from one sample each, as CoD4 did
+    // (`crate::rtgi`): keep each cell's mean light for looking up.
+    if crate::rtgi::lighting() != crate::rtgi::Lighting::Baked {
+        let mean = cells
+            .iter()
+            .map(|c| c.map_or([0.0; 3], |c| std::array::from_fn(|k| c.iter().map(|f| f[k]).sum::<f32>() / 6.0)))
+            .collect();
+        let scale = LIGHTMAP_EXPOSURE * if crate::vision::disabled() { 1.0 } else { LIGHT_GRID_INTENSITY };
+        commands.insert_resource(LightGridLookup { lo, n, mean, scale });
     }
 
     // Bevy's layout: a (Rx, 2Ry, 3Rz) texture over Bevy axes, positive sides
@@ -190,6 +209,32 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
         RenderLayers::from_layers(&std::iter::once(0).chain(crate::splitscreen::viewmodel_layers()).collect::<Vec<_>>()),
     ));
     true
+}
+
+/// The light grid's mean light per cell (the irradiance volume's cells),
+/// for lighting a whole model from one point, as CoD4 lit static models
+/// (from the light grid at their bounds' centre).
+#[derive(Resource)]
+pub struct LightGridLookup {
+    lo: [u32; 3],
+    n: [usize; 3],
+    mean: Vec<[f32; 3]>,
+    /// To Bevy light units (as the irradiance volume's intensity).
+    scale: f32,
+}
+
+impl LightGridLookup {
+    /// The light around Bevy-space point `at` (zero outside the grid).
+    pub fn at(&self, at: Vec3) -> Vec3 {
+        let cod = units::to_cod(at);
+        let spacing = LightGrid::SPACING;
+        let q: [i64; 3] = std::array::from_fn(|i| ((cod[i] + 131_072.0) / spacing[i]).round() as i64 - self.lo[i] as i64);
+        if (0..3).any(|i| q[i] < 0 || q[i] >= self.n[i] as i64) {
+            return Vec3::ZERO;
+        }
+        let index = q[0] as usize + self.n[0] * (q[1] as usize + self.n[1] * q[2] as usize);
+        Vec3::from(self.mean[index]) * self.scale
+    }
 }
 
 /// Pack linear RGB into `Rgb9e5Ufloat`.

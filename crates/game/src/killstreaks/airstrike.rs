@@ -85,6 +85,32 @@ impl Airstrikes {
         self.strikes.iter().any(|s| now - s.called < IN_PROGRESS)
     }
 
+    /// How dangerous a strike under way makes `at` for spawning
+    /// (`getAirstrikeDanger`): from the planes' coming until they're gone,
+    /// 1 inside 300 units of a spot pushed 675 units along the heading,
+    /// falling to 0 at 450, the circle stretched six times along it; more
+    /// than one strike adds up.
+    pub fn danger(&self, at: Vec3, now: f32) -> f32 {
+        let (near, far, push, stretch) = (300.0, 450.0, 1.5, 6.0);
+        self.strikes
+            .iter()
+            .filter(|s| (DELAY..IN_PROGRESS).contains(&(now - s.called)))
+            .map(|s| {
+                let center = s.target + s.dir * u(push * far);
+                let diff = (at - center).with_y(0.0) / u(1.0);
+                let along = diff.dot(s.dir) * s.dir;
+                let dist = (diff - along + along / stretch).length();
+                if dist > far {
+                    0.0
+                } else if dist < near {
+                    1.0
+                } else {
+                    1.0 - (dist - near) / (far - near)
+                }
+            })
+            .sum()
+    }
+
     /// Call one on `target` (a ground point, Bevy space).
     pub fn call(&mut self, owner: Entity, target: Vec3, now: f32) {
         let yaw = rand::random::<f32>() * std::f32::consts::TAU;
@@ -119,6 +145,7 @@ pub(super) fn run(
     pawns: Query<(Entity, &Pawn, &Transform), Without<Dead>>,
     spatial: SpatialQuery,
     mut damage: MessageWriter<Damage>,
+    mut quakes: MessageWriter<crate::quake::Quake>,
 ) {
     let now = time.elapsed_secs();
     let fly_time = 2.0 * HALF_PATH / FLY_SPEED;
@@ -188,6 +215,8 @@ pub(super) fn run(
                 if let Some(fx) = fx.as_deref_mut() {
                     fx.play("explosions/clusterbomb", Anchor::Fixed(Frame::facing(at, strike.dir, 0.0)), FxLayer::World);
                 }
+                // `callStrike_bombEffect`'s earthquake.
+                quakes.write(crate::quake::Quake { at, scale: 0.7, length: 0.75, radius: 1000.0 });
                 at
             });
             // The bomblets, one every 0.05 s.

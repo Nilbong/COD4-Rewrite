@@ -180,6 +180,11 @@ impl FilmUniform {
 
     /// The film without its colour: each tint the grey of its luminance
     /// (`film.wgsl`'s weights), so it still darkens and lightens as much.
+    /// The film without its glow (the Bloom setting off).
+    fn unglowing(self) -> FilmUniform {
+        FilmUniform { glow_blur: Vec4::new(self.glow_blur.x, 0.0, self.glow_blur.z, self.glow_blur.w), ..self }
+    }
+
     fn untinted(self) -> FilmUniform {
         let grey = |v: Vec4| Vec3::splat(v.truncate().dot(Vec3::new(0.299, 0.587, 0.114))).extend(v.w);
         FilmUniform { tint_base: grey(self.tint_base), tint_delta: grey(self.tint_delta), ..self }
@@ -201,7 +206,7 @@ impl FilmUniform {
     /// highlights out and crushed the shadows. Here the tints and
     /// desaturation keep each map's mood, but mid-grey (0.5 on screen) stays
     /// mid-grey (no added contrast: AgX gives the curve), black lifts a
-    /// touch (`FILM_LIFT`) so backlit trees and guns keep some shape, and
+    /// touch (`FILM_LIFT`), highlights stretch (`HIGHLIGHT_GAIN`) so backlit trees and guns keep some shape, and
     /// the desaturation is gentler (AgX already desaturates).
     /// Maps the file lowers contrast on (Bog's 0.82) keep a little of that.
     fn balanced(self, contrast: f32) -> FilmUniform {
@@ -209,7 +214,13 @@ impl FilmUniform {
             return self;
         }
         const MID: f32 = 0.5;
-        const FILM_LIFT: f32 = 0.02;
+        const FILM_LIFT: f32 = 0.035;
+        // Highlights stretched (twice as steep over 0.6 on screen): AgX
+        // rolls them off well below white, which with the brighter middle
+        // CoD4's look lost to left Crash's ground flat and pale.
+        const HIGHLIGHT_GAIN: f32 = 1.0;
+        const HIGHLIGHT_FROM: f32 = 0.6;
+
         let luma = Vec3::new(0.299, 0.587, 0.114);
         let slope = (1.0 + (contrast - 1.0) * 0.5).clamp(0.9, 1.0);
         let at_mid = (self.tint_base.truncate() + self.tint_delta.truncate() * MID).dot(luma).max(0.05);
@@ -218,6 +229,7 @@ impl FilmUniform {
             tint_base: (self.tint_base.truncate() * gain).extend(self.tint_base.w),
             tint_delta: self.tint_delta * gain,
             bias: Vec3::splat(MID * (1.0 - slope) + FILM_LIFT).extend(self.bias.w * 0.3),
+            glow_blur: Vec4::new(self.glow_blur.x, self.glow_blur.y, HIGHLIGHT_GAIN, HIGHLIGHT_FROM),
             ..self
         }
     }
@@ -271,7 +283,8 @@ fn film_of(content: &Content, map: &str) -> Option<(FilmUniform, f32)> {
         .or_else(|| raw_file(content, &format!("maps/mp/createart/{map}_art.gsc")));
     let vision = art
         .and_then(|t| {
-            let at = t.find("VisionSetNaked(")?;
+            // Multiplayer's call, or the campaign's `set_vision_set( "name" )`.
+            let at = t.find("VisionSetNaked(").or_else(|| t.find("set_vision_set("))?;
             t[at..].split('"').nth(1).map(str::to_owned)
         })
         .unwrap_or_else(|| map.to_owned());
@@ -297,7 +310,9 @@ fn apply_film(
 ) {
     // The map's film tints grey unless the Film Tint setting is on; night
     // vision's keeps its green. Each player's view by their goggles.
+    // The Bloom setting off takes the map's glow off too.
     let base = look.film.map(|f| if crate::ui::film_tint() { f } else { f.untinted() });
+    let base = base.map(|f| if crate::settings_apply::bloom() { f } else { f.unglowing() });
     for (e, film, bloom, slot) in &cameras {
         let nv = night_vision.get(slot.map_or(0, |s| s.0));
         let wanted = if nv.showing(time.elapsed_secs()) { look.night.or(base) } else { base };
@@ -865,7 +880,8 @@ r_filmDarkTint \"1.08003 1.08 1.13691\"
             let (b, d) = (f.tint_base.truncate(), f.tint_delta.truncate());
             ((b + d * c) * c + f.bias.truncate()).dot(Vec3::new(0.299, 0.587, 0.114))
         };
-        assert!((grade(0.5) - 0.5).abs() < 0.01, "{}", grade(0.5));
+        // Mid-grey stays, give or take half the black lift.
+        assert!((grade(0.5) - 0.5).abs() < 0.025, "{}", grade(0.5));
         assert!(grade(0.9) < 1.0 && grade(0.1) > 0.08, "{} {}", grade(0.9), grade(0.1));
     }
 

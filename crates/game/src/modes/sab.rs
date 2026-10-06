@@ -1,11 +1,14 @@
-//! Sabotage (`_sab.gsc`): one bomb in the middle of the map (`sab_bomb`)
+//! Sabotage (`sab.gsc`): one bomb in the middle of the map (`sab_bomb`)
 //! and a target for each team (`sab_bomb_allies`, `sab_bomb_axis`). Either
 //! team picks the bomb up and plants it at the other's target (hold use for
-//! 2.5 seconds); it goes off 30 seconds later unless the target's team
-//! defuses it (2.5 seconds), when it lies there for anyone to take again.
-//! Destroying the enemy's target wins the round (the default limit is one).
-//! When the time runs out with no bomb planted, overtime: sudden death, no
-//! respawns, until a target goes up or a side is wiped out.
+//! 5 seconds); it goes off 45 seconds later unless the target's team
+//! defuses it (5 seconds), when the defuser takes it, and its timer keeps
+//! only what was left (`hotpotato`). The match clock stops while it's
+//! planted; dropped, it goes home after a minute. Destroying the enemy's
+//! target wins the round (the default limit is one). When the time runs
+//! out with no bomb planted, overtime: everyone back in, then sudden death
+//! with no respawns, for 90 seconds (not counting while the bomb's down),
+//! then a draw.
 
 use super::{Bomb, BombSite, GameMode, Objectives, UseObjective, brush_box, current, sd::in_pickup_reach};
 use crate::audio::{Sfx, Sides};
@@ -36,9 +39,13 @@ fn playing() -> bool {
 }
 
 /// `scr_sab_planttime`, `_defusetime`, `_bombtimer`.
-const PLANT_TIME: f32 = 2.5;
-const DEFUSE_TIME: f32 = 2.5;
-const BOMB_TIMER: f32 = 30.0;
+const PLANT_TIME: f32 = 5.0;
+const DEFUSE_TIME: f32 = 5.0;
+const BOMB_TIMER: f32 = 45.0;
+/// `autoResetTime`: a dropped bomb goes home after this long.
+const BOMB_RESET: f32 = 60.0;
+/// `onOvertime`: sudden death lasts this long, the bomb's time down aside.
+const OVERTIME: f32 = 90.0;
 const DEFUSE_RANGE: f32 = 64.0;
 /// From a round's end to the next.
 const ROUND_DELAY: f32 = 7.0;
@@ -58,6 +65,19 @@ struct SabRound {
     planter: Option<Entity>,
     tick: f32,
     carrier_at: Vec3,
+    /// The bomb's timer this round (`hotpotato`: what a defuse leaves).
+    bomb_timer: f32,
+    /// When it was planted (the clock stops meanwhile), and when it was
+    /// last dropped.
+    planted_at: Option<f32>,
+    dropped_at: Option<f32>,
+    /// Sudden death's time left.
+    overtime_left: f32,
+    /// In sudden death the planting team is all dead with the bomb down
+    /// (`plantingTeamDead`): it's up to the bomb.
+    planters_dead: bool,
+    /// The round's length before the clock stopped for the bomb.
+    full_length: f32,
     /// Debug aid (`COD4RW_SDBOMB=1`): the player starts with the bomb.
     hand_bomb: bool,
 }
@@ -120,6 +140,12 @@ fn setup(
         planter: None,
         tick: now,
         carrier_at: home,
+        bomb_timer: BOMB_TIMER,
+        planted_at: None,
+        dropped_at: None,
+        overtime_left: OVERTIME,
+        planters_dead: false,
+        full_length: length,
         hand_bomb: std::env::var_os("COD4RW_SDBOMB").is_some(),
     });
 }
@@ -160,12 +186,17 @@ fn bomb(
     round: Option<ResMut<SabRound>>,
     mut objectives: ResMut<Objectives>,
     pawns: Query<(Entity, &Pawn, &Transform, &UseObjective, Has<Dead>)>,
+    // In Last Stand the bomb is dropped and can't be taken, planted or
+    // defused (`_gameobjects::onPlayerLastStand`).
+    downed: Query<(), With<crate::perks::Downed>>,
     me: Query<(Entity, &Pawn), With<LocalPlayer>>,
     sides: Option<Res<Sides>>,
     mut sfx: ResMut<Sfx>,
     mut effects: ResMut<Effects>,
     mut damage: MessageWriter<Damage>,
+    mut awards: MessageWriter<crate::ui::progression::Award>,
 ) {
+    use crate::ui::progression::{Award, AwardKind};
     let Some(mut round) = round else { return };
     if round.over.is_some() {
         objectives.using.clear();
@@ -185,19 +216,27 @@ fn bomb(
 
     if let Some(c) = b.carrier {
         match pawns.get(c) {
-            Ok((_, _, tf, _, false)) => round.carrier_at = tf.translation,
+            Ok((_, _, tf, _, false)) if !downed.contains(c) => round.carrier_at = tf.translation,
             _ => {
                 if let Some(t) = team_of(c) {
                     lines.push((t, "bomb_lost"));
                 }
                 b.carrier = None;
                 b.pos = round.carrier_at;
+                round.dropped_at = Some(now);
             }
         }
     }
+    // Left lying a minute, it goes home.
+    if b.carrier.is_none() && b.planted.is_none() && round.dropped_at.is_some_and(|t| now - t >= BOMB_RESET) {
+        b.pos = round.bomb_home;
+        round.dropped_at = None;
+    }
     if b.carrier.is_none() && b.planted.is_none() {
-        if let Some((e, p, ..)) = pawns.iter().find(|(_, _, tf, _, dead)| !dead && in_pickup_reach(tf.translation, b.pos)) {
+        if let Some((e, p, ..)) = pawns.iter().find(|(e, _, tf, _, dead)| !dead && !downed.contains(*e) && in_pickup_reach(tf.translation, b.pos)) {
             b.carrier = Some(e);
+            round.dropped_at = None;
+            info!("sab: {} took the bomb", p.name);
             lines.push((p.team, "bomb_taken"));
         }
     }
@@ -206,7 +245,7 @@ fn bomb(
     let progress_of = |e: Entity| previous.iter().find(|u| u.0 == e).map(|u| u.1);
     let planted_site = b.planted.and_then(|l| objectives.sites.iter().position(|s| s.label == l));
     for (e, p, tf, use_input, dead) in &pawns {
-        if dead || !use_input.0 {
+        if dead || downed.contains(e) || !use_input.0 {
             continue;
         }
         let at = tf.translation;
@@ -230,16 +269,30 @@ fn bomb(
         let other = p.team.other();
         if defusing {
             info!("sab: {} defused the bomb", p.name);
+            awards.write(Award { pawn: e, kind: AwardKind::Defuse });
             sfx.play("MP_bomb_defuse", Some(b.pos));
-            // It lies there for anyone to take again.
-            b = Bomb { pos: b.pos, carrier: None, planted: None, explodes_at: None };
+            // The defuser takes it; its timer keeps what was left, and the
+            // clock goes on from where it stopped.
+            if let Some(at) = round.planted_at.take() {
+                round.bomb_timer = (round.bomb_timer - (now - at)).max(1.0);
+                round.length += now - at;
+            }
+            b = Bomb { pos: b.pos, carrier: Some(e), planted: None, explodes_at: None };
+            round.carrier_at = at;
             objectives.timer = (!round.overtime).then_some((round.started + round.length, false));
+            // Sudden death with the planters gone: the defusers win.
+            if round.overtime && round.planters_dead {
+                objectives.round_over = Some((p.team, "MP_ENEMIES_ELIMINATED", "Enemies Eliminated"));
+            }
             lines.extend([(p.team, "bomb_defused"), (other, "bomb_defused")]);
         } else {
             info!("sab: {} planted the bomb at the {:?} target", p.name, objectives.sites[site].team);
-            b = Bomb { pos: objectives.sites[site].pos, carrier: None, planted: Some(objectives.sites[site].label), explodes_at: Some(now + BOMB_TIMER) };
+            awards.write(Award { pawn: e, kind: AwardKind::Plant });
+            let timer = round.bomb_timer;
+            b = Bomb { pos: objectives.sites[site].pos, carrier: None, planted: Some(objectives.sites[site].label), explodes_at: Some(now + timer) };
             round.planter = Some(e);
-            objectives.timer = Some((now + BOMB_TIMER, true));
+            round.planted_at = Some(now);
+            objectives.timer = Some((now + timer, true));
             lines.extend([(p.team, "bomb_planted"), (other, "bomb_planted")]);
         }
         break;
@@ -303,22 +356,74 @@ fn rounds(
     match round.over {
         None => {
             let planted = objectives.bomb.is_some_and(|b| b.planted.is_some());
-            // Time's up with no bomb down: sudden death.
+            // Time's up with no bomb down: overtime. Everyone comes back,
+            // then sudden death (`onOvertime`).
             if !round.overtime && !planted && now >= round.started + round.length {
                 info!("sab: overtime");
                 round.overtime = true;
+                round.overtime_left = OVERTIME;
                 objectives.sudden_death = true;
-                objectives.timer = None;
+                objectives.timer = Some((now + OVERTIME, false));
+                for (e, _, dead) in &pawns {
+                    if dead {
+                        commands.entity(e).insert(Dead { respawn_at: now, killer: None });
+                    }
+                }
                 if let (Some(s), Some(t)) = (&sides, mine) {
                     sfx.play(format!("{}_1mc_overtime", s.of(t).voice), None);
                 }
             }
+            // Its clock runs while the bomb isn't down; out of time, a tie.
+            let mut tie = false;
+            if round.overtime && !planted {
+                round.overtime_left -= time.delta_secs();
+                objectives.timer = Some((now + round.overtime_left.max(0.0), false));
+                tie = round.overtime_left <= 0.0;
+            }
+            // `onDeadEvent` (sudden death only: before it, the dead come
+            // back): everyone dead is the planters' with the bomb down, else
+            // a tie; the planters dead with it down, wait for it; anyone
+            // else dead loses.
             let wiped = |team: Team| pawns.iter().any(|(_, p, _)| p.team == team) && !pawns.iter().any(|(_, p, dead)| p.team == team && !dead);
-            let result = objectives.round_over.or_else(|| match (round.overtime, wiped(Team::Allies), wiped(Team::Axis)) {
-                (true, true, false) => Some((Team::Axis, "MP_ENEMIES_ELIMINATED", "Enemies Eliminated")),
-                (true, false, true) => Some((Team::Allies, "MP_ENEMIES_ELIMINATED", "Enemies Eliminated")),
-                _ => None,
+            let planters = round.planter.and_then(|e| pawns.get(e).ok()).map(|x| x.1.team).filter(|_| planted);
+            let eliminated = Some((Team::Allies, "MP_ENEMIES_ELIMINATED", "Enemies Eliminated"));
+            let result = objectives.round_over.or_else(|| {
+                if !round.overtime || objectives.round_over.is_some() {
+                    return None;
+                }
+                let (allies, axis) = (wiped(Team::Allies), wiped(Team::Axis));
+                match (allies, axis) {
+                    (true, true) => match planters {
+                        Some(t) => Some((t, "MP_TARGET_DESTROYED", "Target Destroyed")),
+                        None => {
+                            tie = true;
+                            None
+                        }
+                    },
+                    (true, false) | (false, true) => {
+                        let dead_team = if allies { Team::Allies } else { Team::Axis };
+                        if planters == Some(dead_team) {
+                            round.planters_dead = true;
+                            None
+                        } else {
+                            eliminated.map(|(_, k, t)| (dead_team.other(), k, t))
+                        }
+                    }
+                    _ => None,
+                }
             });
+            if tie {
+                // No winner: with its one round, the match is a draw
+                // (`endGame("tie")`).
+                info!("sab: a tie");
+                round.over = Some(now);
+                state.ended = Some((None, now));
+                objectives.using.clear();
+                for (e, ..) in &pawns {
+                    commands.entity(e).insert(Frozen);
+                }
+                return;
+            }
             let Some((winner, key, text)) = result else { return };
             info!("sab: round to {:?} ({text})", winner);
             match winner {
@@ -339,6 +444,9 @@ fn rounds(
 
 fn start_round(commands: &mut Commands, round: &mut SabRound, objectives: &mut Objectives, now: f32, pawns: &Query<(Entity, &Pawn, Has<Dead>)>, respawn: bool) {
     (round.started, round.over, round.overtime, round.planter, round.carrier_at) = (now, None, false, None, round.bomb_home);
+    (round.bomb_timer, round.planted_at, round.dropped_at, round.overtime_left) = (BOMB_TIMER, None, None, OVERTIME);
+    round.planters_dead = false;
+    round.length = round.full_length;
     objectives.bomb = Some(Bomb { pos: round.bomb_home, carrier: None, planted: None, explodes_at: None });
     objectives.timer = Some((now + round.length, false));
     objectives.using.clear();

@@ -9,7 +9,7 @@ use crate::content::Content;
 use crate::fx::{Anchor, Effects, Frame as FxFrame, FxLayer};
 use crate::gunmodel::{CamoCache, CamoMaterial, GunAssets, GunTarget};
 use crate::models::{AnimPlayer, Skeleton, SpawnModel, spawn_model};
-use crate::player::{HIP_FOV, MainCamera, VIEWMODEL_LAYER, ViewModelCamera};
+use crate::player::{MainCamera, VIEWMODEL_LAYER, ViewModelCamera, hip_fov};
 use crate::thirdperson::Body;
 use crate::units::u;
 use crate::viewmodel::{WeaponAnims, anim_slot};
@@ -19,13 +19,26 @@ use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::prelude::*;
 use std::collections::HashMap;
 
-/// After a death, how long until the killcam, and how much of the past it
-/// shows: before the kill and after (`scr_killcam_time`'s 5 s and a little).
-pub const DELAY: f32 = 1.5;
-pub const BEFORE: f32 = 5.0;
-pub const AFTER: f32 = 1.5;
-/// The final killcam's share of the match's 10 s end: less before.
-pub const FINAL_BEFORE: f32 = 4.5;
+/// After a death, how long until the killcam (`_globallogic.gsc`'s
+/// `postDeathDelay`), and how much of the past it shows after the kill
+/// (`_killcam.gsc`'s `postdelay`).
+pub const DELAY: f32 = 1.75;
+pub const AFTER: f32 = 2.0;
+/// The longest it shows before the kill ([`before`]).
+pub const BEFORE: f32 = 4.5;
+/// The final killcam (no respawn after it): `_killcam.gsc`'s 5 s.
+pub const FINAL_BEFORE: f32 = 5.0;
+
+/// How much `_killcam.gsc` shows before a kill (`camtime`): 2.5 s, long
+/// enough to see a grenade thrown (4.5 s), an airstrike's last moment
+/// (1.3 s).
+pub fn before(weapon: &str) -> f32 {
+    match weapon {
+        w if w == crate::killstreaks::airstrike::WEAPON => 1.3,
+        "Frag Grenade" => 4.5,
+        _ => 2.5,
+    }
+}
 
 /// A kill being played back.
 pub struct Replay {
@@ -119,6 +132,8 @@ fn pawn_at<'a>(a: &'a Frame, b: &'a Frame, k: f32, e: Entity) -> Option<(PawnSam
     s.eye_height = pa.eye_height + (pb.eye_height - pa.eye_height) * k;
     s.ads = pa.ads + (pb.ads - pa.ads) * k;
     s.body_turn = pa.body_turn.slerp(pb.body_turn, k);
+    s.overlay_weight = pa.overlay_weight + (pb.overlay_weight - pa.overlay_weight) * k;
+    s.lean = pa.lean + (pb.lean - pa.lean) * k;
     s.anim = match (&pa.anim, &pb.anim) {
         (Some((x, tx)), Some((y, ty))) if std::sync::Arc::ptr_eq(x, y) && ty >= tx => Some((x.clone(), tx + (ty - tx) * k)),
         _ if k > 0.5 => pb.anim.clone(),
@@ -160,7 +175,17 @@ pub fn pose_anims(
         // The spine turned as it was (the body's own turn is a quarter turn
         // less its twist; see `thirdperson::turn_bodies`).
         let (turn, _, _) = s.body_turn.to_euler(EulerRot::YXZ);
-        poses.0.insert(body.0, (s.yaw, s.pitch, std::f32::consts::FRAC_PI_2 - turn, s.dead));
+        poses.0.insert(
+            body.0,
+            super::ReplayPose {
+                yaw: s.yaw,
+                pitch: s.pitch,
+                twist: std::f32::consts::FRAC_PI_2 - turn,
+                dead: s.dead,
+                lean: s.lean,
+                body_turn: s.body_turn,
+            },
+        );
         let Some((anim, t)) = s.anim else { continue };
         let Ok(mut player) = players.get_mut(body.0) else { continue };
         // Posed outright: no crossfade from whatever the live game played,
@@ -168,6 +193,7 @@ pub fn pose_anims(
         // old one's bone mapping is what made bodies warp).
         player.pose(anim, t);
         player.overlay = s.overlay.clone();
+        player.overlay_weight = s.overlay_weight;
     }
 }
 
@@ -204,11 +230,11 @@ pub fn place_camera(
     let ride = r.ride.filter(|_| r.projectile.is_some());
     if let Some(ride) = ride {
         **cam_tf = ride;
-        set_fov(proj, &mut vm_camera, HIP_FOV);
+        set_fov(proj, &mut vm_camera, hip_fov());
     } else if let Some((s, _)) = pawn_at(a, b, k, r.kill.attacker) {
         cam_tf.translation = s.feet + Vec3::Y * s.eye_height;
         cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, s.yaw, s.pitch, 0.0);
-        let fov = HIP_FOV + (s.weapon.ads_fov.max(1.0) - HIP_FOV) * s.ads * f32::from(s.weapon.ads_fov > 0.0);
+        let fov = hip_fov() + (s.weapon.ads_fov.max(1.0) - hip_fov()) * s.ads * f32::from(s.weapon.ads_fov > 0.0);
         set_fov(proj, &mut vm_camera, fov);
     }
     // Test aid (`COD4RW_KILLCAMTEST_ORBIT=1`): watch the victim's replayed
@@ -217,7 +243,7 @@ pub fn place_camera(
         if let Some((s, _)) = pawn_at(a, b, k, r.kill.victim) {
             let back = Quat::from_rotation_y(s.yaw) * Vec3::new(u(70.0), u(60.0), u(150.0));
             **cam_tf = Transform::from_translation(s.feet + back).looking_at(s.feet + Vec3::Y * u(40.0), Vec3::Y);
-            set_fov(proj, &mut vm_camera, HIP_FOV);
+            set_fov(proj, &mut vm_camera, hip_fov());
         }
     }
     // The past's grenades and projectiles.

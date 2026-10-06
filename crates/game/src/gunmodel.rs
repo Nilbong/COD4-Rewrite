@@ -31,6 +31,11 @@ use iw3::zone::AssetType;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+mod diamond;
+#[cfg(test)]
+mod coverage_tests;
+pub(crate) mod platinum;
+
 pub struct GunModelPlugin;
 
 impl Plugin for GunModelPlugin {
@@ -111,7 +116,9 @@ fn light_reflex_dots(
         let grain = grain.clone().unwrap_or_else(|| white.get_or_insert_with(|| images.add(Image::default())).clone());
         let material = made
             .entry((dot.id(), Some(grain.id())))
-            .or_insert_with(|| materials.add(ReflexMaterial { scale: scale.extend(0.0).extend(0.0), dot: dot.clone(), grain }))
+            .or_insert_with(|| {
+                materials.add(ReflexMaterial { scale: scale.extend(0.0).extend(0.0), dot: dot.clone(), grain })
+            })
             .clone();
         commands.entity(e).remove::<(ReflexDot, MeshMaterial3d<StandardMaterial>)>().insert(MeshMaterial3d(material));
     }
@@ -136,7 +143,8 @@ pub struct CamoDetail {
     /// `detailScale`: the camo's tiling over the gun's UVs (xy); z = 1 masks
     /// it by the colour map's alpha (Black Ops' `colorDetailMap`), z = 2 is
     /// Black Ops' gold (the camo replaces the colour and shines like CoD4's
-    /// gold guns); w = 1 when there is a camo.
+    /// gold guns); z = 3 platinum, 4 universal gold, 5 raised diamond;
+    /// w = 1 with a camo.
     #[uniform(100)]
     pub scale: Vec4,
     #[texture(101)]
@@ -158,10 +166,17 @@ pub struct CamoDetail {
     #[uniform(108)]
     pub shine: Vec4,
     /// Beyond CoD4 ([`GunLook`]): x: the camo's contrast, y: its
-    /// saturation, z: 1 lets the specular map's gloss sharpen the lights'
-    /// highlights.
+    /// saturation, z: how much of it is painted on, w: the reflection's
+    /// strength (over 1 also tints polished metal's by its colour). Not
+    /// tried again: the specular map's gloss lowering Bevy's roughness, as
+    /// Bevy's untinted ambient reflection then washed colours out (gold went
+    /// grey).
     #[uniform(109)]
     pub look: Vec4,
+    /// The colour map, for its local average under painted camo.
+    #[texture(110)]
+    #[sampler(111)]
+    pub color: Option<Handle<Image>>,
 }
 
 /// How gun surfaces look: `COD4RW_GUNLOOK=cod4` keeps CoD4's (no normal
@@ -184,15 +199,19 @@ impl GunLook {
 
     fn uniform(self) -> Vec4 {
         match self {
-            GunLook::Cod4 => Vec4::new(1.0, 1.0, 0.0, 0.0),
-            GunLook::Improved => Vec4::new(CAMO_CONTRAST, CAMO_SATURATION, 1.0, 0.0),
+            GunLook::Cod4 => Vec4::new(1.0, 1.0, 0.0, 1.0),
+            GunLook::Improved => Vec4::new(CAMO_CONTRAST, CAMO_SATURATION, CAMO_PAINT, SHEEN),
         }
     }
 }
 
 /// The camo layer's contrast and saturation over CoD4's.
 const CAMO_CONTRAST: f32 = 1.35;
-const CAMO_SATURATION: f32 = 1.25;
+const CAMO_SATURATION: f32 = 1.35;
+/// How much of the camo is painted on rather than added.
+const CAMO_PAINT: f32 = 0.6;
+/// The specular map's reflection over CoD4's, past its 8-bit white.
+const SHEEN: f32 = 1.6;
 
 impl MaterialExtension for CamoDetail {
     fn fragment_shader() -> ShaderRef {
@@ -206,11 +225,20 @@ pub fn parse(spec: &str) -> (&str, Vec<&str>) {
     (weapon, list.split('+').filter(|a| !a.is_empty()).collect())
 }
 
+/// The camo cache third-person guns share: held ([`crate::thirdperson`])
+/// and dropped ([`crate::pickups`]). It must be one: it's built from the
+/// models' meshes while they're still readable, before they go to the GPU.
+#[derive(Resource, Default)]
+pub struct WorldCamos(pub CamoCache);
+
 /// Camo materials made so far, by base material and camo texture.
 #[derive(Default)]
 pub struct CamoCache {
     textures: TextureCache,
     camos: HashMap<(AssetId<StandardMaterial>, String), Handle<CamoMaterial>>,
+    platinum: Option<Handle<Image>>,
+    /// Diamond geometry, cached by source mesh. The original remains intact.
+    diamond_meshes: HashMap<AssetId<Mesh>, Handle<Mesh>>,
     /// Gun models with their normal maps (the shared model materials leave
     /// them out), by the plain model's first mesh: guns come from more than
     /// one content.
@@ -235,7 +263,9 @@ impl CamoCache {
         let dressing = &mut self.dressing;
         self.dressed
             .entry(key)
-            .or_insert_with(|| dressing.dressed(content, name, m, meshes, materials, images).map_or_else(|| m.clone(), Arc::new))
+            .or_insert_with(|| {
+                dressing.dressed(content, name, m, meshes, materials, images).map_or_else(|| m.clone(), Arc::new)
+            })
             .clone()
     }
 }
@@ -325,6 +355,10 @@ fn spawn_model_of(
 ) -> Option<((Vec3, Vec3), Vec<Entity>)> {
     let (meshes, materials, images) = (&mut *a.meshes, &mut *a.materials, &mut *a.images);
     let (weapon, attachments) = parse(spec);
+    let finish = platinum::Finish::selected(weapon, camo);
+    let camo = finish.map_or(camo, |f| f.model_camo(weapon));
+    // Keep the native gold models and materials where CoD4 supplies them.
+    let finish = finish.filter(|f| *f != platinum::Finish::Gold || !platinum::Finish::native_gold(weapon));
     let bo1 = crate::bo1::is_bo1(weapon);
     let waw = crate::waw::is_waw(weapon);
     let gl = !bo1 && !waw && attachments.contains(&"gl");
@@ -338,7 +372,8 @@ fn spawn_model_of(
         let (name, hide) = crate::waw::data()?.model(weapon, &attachments, field == WORLD_MODEL)?;
         (crate::waw::model_name(content, &name)?, hide)
     } else {
-        let (model_name, base_hide) = gun_model(content, &format!("{weapon}_{}mp", if gl { "gl_" } else { "" }), camo, field)?;
+        let (model_name, base_hide) =
+            gun_model(content, &format!("{weapon}_{}mp", if gl { "gl_" } else { "" }), camo, field)?;
         let mut hide: BTreeSet<String> = base_hide.clone();
         if !gl {
             let (mut shown, mut hidden) = (BTreeSet::new(), BTreeSet::new());
@@ -354,7 +389,7 @@ fn spawn_model_of(
     };
     let prepared = content.model(&model_name, meshes, materials, images, a.bindposes)?;
     // What's spawned; `prepared`'s materials still key the tables below.
-    let worn = camos.dress(content, &model_name, &prepared, meshes, materials, images);
+    let mut worn = camos.dress(content, &model_name, &prepared, meshes, materials, images);
     let camo_surfaces = if bo1 {
         bo1_camo_surfaces(content, &model_name, weapon, camo, materials, images)
     } else if waw {
@@ -362,6 +397,15 @@ fn spawn_model_of(
     } else {
         camo_surfaces(content, &model_name, materials, images)
     };
+    let finish_surfaces: HashSet<_> = if finish.is_some() {
+        platinum::surfaces(content, &model_name, materials, images)
+    } else {
+        HashSet::new()
+    };
+    if finish == Some(platinum::Finish::Diamond) {
+        worn =
+            diamond_model(content, &model_name, &prepared, &worn, &finish_surfaces, meshes, &mut camos.diamond_meshes);
+    }
     let reflex_surfaces = reflex_surfaces(content, &model_name, materials, images);
     let mut shine_surfaces = shine_surfaces(content, &model_name, materials, images);
     if waw {
@@ -395,15 +439,17 @@ fn spawn_model_of(
     }
 
     let GunTarget { owner, attach_to, layers } = target;
+    // Held guns cast the sun's shadow with their holder (the viewmodel's
+    // layer has no shadowing sun, so first-person guns are unaffected).
     let surfaces = spawn_model(
         commands,
         skeleton,
-        SpawnModel { model: &worn, owner, attach_to, layers: layers.clone(), shadows: false },
+        SpawnModel { model: &worn, owner, attach_to, layers: layers.clone(), shadows: true },
     );
     let mut spawned = surfaces.clone();
     if let Some((model, keep)) = &suppressor {
         // Joints shared with the base model are reused; drop all but the suppressor.
-        let parts = spawn_model(commands, skeleton, SpawnModel { model, owner, attach_to, layers, shadows: false });
+        let parts = spawn_model(commands, skeleton, SpawnModel { model, owner, attach_to, layers, shadows: true });
         for (entity, (_, material)) in parts.into_iter().zip(&model.surfaces) {
             if !keep.contains(&material.id()) {
                 commands.entity(entity).despawn();
@@ -418,6 +464,26 @@ fn spawn_model_of(
             if let Some(dot) = camos.textures.get(&info.dot, true, &vfs, images) {
                 let grain = info.grain.as_ref().and_then(|g| camos.textures.get(g, true, &vfs, images));
                 commands.entity(entity).insert(ReflexDot(dot, grain, info.scale));
+                continue;
+            }
+        }
+        if let Some(finish) = finish.filter(|_| finish_surfaces.contains(&material.id())) {
+            let key = (worn.id(), finish.cache_key().to_owned());
+            let handle = camos.camos.get(&key).cloned().or_else(|| {
+                let detail = camos.platinum.clone().or_else(|| {
+                    let h = platinum::texture(images)?;
+                    camos.platinum = Some(h.clone());
+                    Some(h)
+                })?;
+                let base = materials.get(worn)?.clone();
+                let specular =
+                    shine_surfaces.get(&material.id()).and_then(|(s, _)| camos.textures.get(s, false, &vfs, images));
+                let h = a.camo_materials.add(platinum::material(base, detail, specular, finish));
+                camos.camos.insert(key, h.clone());
+                Some(h)
+            });
+            if let Some(handle) = handle {
+                commands.entity(entity).remove::<MeshMaterial3d<StandardMaterial>>().insert(MeshMaterial3d(handle));
                 continue;
             }
         }
@@ -442,9 +508,19 @@ fn spawn_model_of(
                 let env = if gold { GOLD_ENV } else { shine.map_or(Vec4::ZERO, |(_, env)| *env) };
                 let on = (specular.is_some() || gold) && std::env::var_os("COD4RW_NOSHINE").is_none();
                 let flags = Vec4::new(on as u32 as f32, 0.0, 0.0, crate::lightmaps::LIGHTMAP_EXPOSURE);
+                let color = base.base_color_texture.clone();
                 let h = a.camo_materials.add(CamoMaterial {
                     base,
-                    extension: CamoDetail { scale, detail, specular, probe: None, env, shine: flags, look: GunLook::get().uniform() },
+                    extension: CamoDetail {
+                        scale,
+                        detail,
+                        specular,
+                        probe: None,
+                        env,
+                        shine: flags,
+                        look: GunLook::get().uniform(),
+                        color,
+                    },
                 });
                 camos.camos.insert(key, h.clone());
                 h
@@ -464,6 +540,73 @@ fn spawn_model_of(
     Some(((lo, hi), spawned))
 }
 
+/// Diamond geometry is made from the native CPU model, so switching to it
+/// after Bevy has extracted the original mesh still works. The studs share
+/// the gun's skinning and draw calls, and cached meshes are reused.
+fn diamond_model(
+    content: &Content,
+    name: &str,
+    prepared: &PreparedModel,
+    worn: &Arc<PreparedModel>,
+    covered: &HashSet<AssetId<StandardMaterial>>,
+    meshes: &mut Assets<Mesh>,
+    cache: &mut HashMap<AssetId<Mesh>, Handle<Mesh>>,
+) -> Arc<PreparedModel> {
+    let Some((zi, id)) = content.find(name) else { return worn.clone() };
+    let Some(xm) = content.zones[zi].xmodel(id) else { return worn.clone() };
+    let Some(lod) = xm.lods.first() else { return worn.clone() };
+    let kept: Vec<_> = (lod.surf_index as usize..(lod.surf_index + lod.num_surfs) as usize)
+        .filter(|&s| xm.materials.get(s).copied().flatten().is_some())
+        .filter(|&s| xm.surfs.get(s).is_some_and(|s| !s.verts.is_empty() && !s.tris.is_empty()))
+        .collect();
+    if kept.len() != prepared.surfaces.len() {
+        return worn.clone();
+    }
+    let coated_count = prepared.surfaces.iter().filter(|(_, m)| covered.contains(&m.id())).count().max(1);
+    let stud_budget = (2400 / coated_count).min(diamond::MAX_STUDS);
+    let surfaces = kept
+        .iter()
+        .zip(prepared.surfaces.iter().zip(&worn.surfaces))
+        .map(|(&surf, ((_, original), (mesh, material)))| {
+            if !covered.contains(&original.id()) {
+                return (mesh.clone(), material.clone());
+            }
+            let made = cache.get(&mesh.id()).cloned().or_else(|| {
+                let mut source = crate::content::surface_mesh(xm, surf, true)?;
+                let tangents: Vec<_> = xm.surfs[surf]
+                    .verts
+                    .iter()
+                    .map(|v| {
+                        let t = crate::units::dir(iw3::unpack::unit_vec(v.tangent)).normalize_or(Vec3::X);
+                        [t.x, t.y, t.z, if v.binormal_sign < 0.0 { -1.0 } else { 1.0 }]
+                    })
+                    .collect();
+                source.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
+                let h = meshes.add(diamond::studded_with_budget(&source, stud_budget)?);
+                cache.insert(mesh.id(), h.clone());
+                Some(h)
+            });
+            (made.unwrap_or_else(|| mesh.clone()), material.clone())
+        })
+        .collect();
+    let bones = worn
+        .bones
+        .iter()
+        .map(|b| crate::content::PreparedBone {
+            name: b.name.clone(),
+            parent: b.parent,
+            bind_local: b.bind_local,
+            anim_base: b.anim_base,
+        })
+        .collect();
+    Arc::new(PreparedModel {
+        name: worn.name.clone(),
+        bones,
+        surfaces,
+        inverse_bindposes: worn.inverse_bindposes.clone(),
+    })
+}
+
 /// The surfaces of a model whose material has a camo: its standard material
 /// -> (camo texture, [`CamoDetail::scale`]).
 fn camo_surfaces(
@@ -481,8 +624,13 @@ fn camo_surfaces(
     let mut found = Vec::new();
     for mat_id in range.filter_map(|s| xm.materials.get(s).copied().flatten()) {
         let Some(mat) = zone.material(mat_id) else { continue };
-        let detail = mat.textures.iter().find(|t| t.name_hash == DETAIL_MAP).and_then(|t| t.image).and_then(|i| zone.image(i));
-        let scale = mat.constants.iter().find(|c| c.name == "detailScale").map(|c| Vec4::new(c.literal[0], c.literal[1], 0.0, 0.0));
+        let detail =
+            mat.textures.iter().find(|t| t.name_hash == DETAIL_MAP).and_then(|t| t.image).and_then(|i| zone.image(i));
+        let scale = mat
+            .constants
+            .iter()
+            .find(|c| c.name == "detailScale")
+            .map(|c| Vec4::new(c.literal[0], c.literal[1], 0.0, 0.0));
         if let (Some(detail), Some(scale)) = (detail, scale) {
             found.push((mat_id, detail.name.clone(), scale));
         }
@@ -527,7 +675,8 @@ fn shine_surfaces(
             .and_then(|i| zone.image(i))
             .map(|i| i.name.clone())
             .filter(|n| !n.starts_with('$'));
-        let env = mat.constants.iter().find(|c| c.name == "envMapParms").map_or(DEFAULT_ENV, |c| Vec4::from_array(c.literal));
+        let env =
+            mat.constants.iter().find(|c| c.name == "envMapParms").map_or(DEFAULT_ENV, |c| Vec4::from_array(c.literal));
         if let Some(spec) = spec {
             found.push((mat_id, spec, env));
         }
@@ -554,7 +703,8 @@ fn follow_reflection_probe(
         added.read().filter_map(|e| if let AssetEvent::Added { id } = e { Some(*id) } else { None }).collect();
     let (Some(probes), Ok(camera)) = (probes, camera.single()) else { return };
     let at = camera.translation();
-    let nearest = probes.0.iter().enumerate().min_by(|a, b| a.1.0.distance(at).total_cmp(&b.1.0.distance(at))).map(|(i, _)| i);
+    let nearest =
+        probes.0.iter().enumerate().min_by(|a, b| a.1.0.distance(at).total_cmp(&b.1.0.distance(at))).map(|(i, _)| i);
     let changed = nearest != *current;
     *current = nearest;
     let Some((_, probe, mip)) = nearest.and_then(|i| probes.0.get(i)) else { return };
@@ -583,7 +733,9 @@ fn bo1_model(weapon: &str, attachments: &[&str], world: bool) -> Option<(String,
     let data = crate::bo1::data()?;
     let gun = data.gun(weapon)?;
     let base = data.weapon(&format!("{}_mp", gun.name))?;
-    let tags = |w: &t5::weapons::WeaponFile| -> BTreeSet<String> { w.hide_tags().iter().map(|t| t.to_ascii_lowercase()).collect() };
+    let tags = |w: &t5::weapons::WeaponFile| -> BTreeSet<String> {
+        w.hide_tags().iter().map(|t| t.to_ascii_lowercase()).collect()
+    };
     let base_hide = tags(base);
     let (mut shown, mut hidden) = (BTreeSet::new(), BTreeSet::new());
     for att in attachments {
@@ -625,13 +777,20 @@ fn bo1_camo_surfaces(
             .and_then(|t| t.image)
             .and_then(|i| zone.image(i))
             .map(|i| i.name.clone());
-        let Some(detail) = gun.0.camo_detail(&gun.1.name, &mat.name, crate::bo1::camo_of_stat(camo), own.as_deref()) else { continue };
+        let Some(detail) = gun.0.camo_detail(&gun.1.name, &mat.name, crate::bo1::camo_of_stat(camo), own.as_deref())
+        else {
+            continue;
+        };
         // `weapon_camo_off` and `weapon_camo_neutral` are flat grey.
         if detail.starts_with("weapon_camo_") {
             continue;
         }
         // Constant names are cut to 12 characters (`colorDetailS`).
-        let scale = mat.constants.iter().find(|c| c.name.starts_with("colorDetail")).map_or([1.0, 1.0], |c| [c.literal[0], c.literal[1]]);
+        let scale = mat
+            .constants
+            .iter()
+            .find(|c| c.name.starts_with("colorDetail"))
+            .map_or([1.0, 1.0], |c| [c.literal[0], c.literal[1]]);
         // Gold replaces the colour rather than adding to it.
         let mode = if detail == crate::bo1::GOLD_CAMO_TEXTURE { 2.0 } else { 1.0 };
         found.push((mat_id, detail, Vec4::new(scale[0], scale[1], mode, 0.0)));
@@ -690,7 +849,8 @@ fn reflex_surfaces(
 fn gun_model(content: &Content, def: &str, camo: usize, field: &str) -> Option<(String, BTreeSet<String>)> {
     let (zi, def) = content.generic(AssetType::Weapon, def)?;
     let zone = &content.zones[zi];
-    let models: Vec<String> = def.assets(field).into_iter().flatten().map(|id| zone.get(id).name().to_owned()).collect();
+    let models: Vec<String> =
+        def.assets(field).into_iter().flatten().map(|id| zone.get(id).name().to_owned()).collect();
     let model = models.get(camo).or(models.first())?.clone();
     let hide = (0..8)
         .map(|i| def.int(&format!("hideTags[{i}]")) as usize)
@@ -717,7 +877,9 @@ fn own_materials(
         Some((zi, range.filter_map(|s| xm.materials.get(s).copied().flatten()).collect()))
     };
     let (Some((zi, own)), Some((_, used))) = (lod0(content, model), lod0(content, base)) else { return HashSet::new() };
-    let names = |ids: &[iw3::zone::AssetId]| -> HashSet<String> { ids.iter().map(|&m| content.zones[zi].get(m).name().to_owned()).collect() };
+    let names = |ids: &[iw3::zone::AssetId]| -> HashSet<String> {
+        ids.iter().map(|&m| content.zones[zi].get(m).name().to_owned()).collect()
+    };
     let used = names(&used);
     let own: Vec<_> = own.into_iter().filter(|&m| !used.contains(content.zones[zi].get(m).name())).collect();
     own.into_iter().filter_map(|m| content.material(zi, m, materials, images)).map(|info| info.handle.id()).collect()

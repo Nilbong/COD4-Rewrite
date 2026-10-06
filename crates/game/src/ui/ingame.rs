@@ -5,6 +5,7 @@
 //! (or a default class, `"assault_mp,0"`), which [`crate::loadout`] equips.
 
 use super::Frontend;
+use super::hq;
 use super::attachments;
 use super::draw::DrawList;
 use super::hud::HudState;
@@ -59,6 +60,10 @@ pub(super) fn start(
     let team = if pawn.team == crate::combat::Team::Axis { "opfor" } else { "marines" };
     fe.locals.insert("ui_team".into(), team.into());
     fe.menu_slot = 0;
+    // Headquarters has no class to pick (its Escape menu edits them).
+    if crate::hq::active() {
+        return;
+    }
     // Splitscreen: everyone picks at once, each in their own part of the
     // window ([`super::split`]).
     if crate::splitscreen::active() {
@@ -102,7 +107,7 @@ pub(super) fn update(
     respond(&mut fe, 0, (awaiting, dead, equipped), &mut choice, &mut hud, time.elapsed_secs());
     if fe.stack.is_empty() && !fe.esc_used && !awaiting && keys.just_pressed(KeyCode::Escape) {
         fe.menu_slot = 0;
-        fe.open("class");
+        fe.open(if crate::hq::active() { hq::PAUSE_MENU } else { "class" });
     }
     // The menus draw CoD's cursor; the game takes the mouse back after.
     let open = !fe.stack.is_empty();
@@ -183,7 +188,7 @@ pub(super) fn paint(
 impl Frontend {
     /// A class by the name the class menu responds with: `customN` (from
     /// Create a Class) or one of CoD4's default classes.
-    fn class_loadout(&self, class: &str) -> Option<ClassLoadout> {
+    pub(super) fn class_loadout(&self, class: &str) -> Option<ClassLoadout> {
         let custom = class.strip_prefix("custom").and_then(|n| n.parse::<i32>().ok()).filter(|n| (1..=5).contains(n));
         let (base, name) = match custom {
             Some(n) => (200 + 10 * (n - 1), self.localize(&self.dvar(&format!("customclass{n}")))),
@@ -221,8 +226,9 @@ impl Frontend {
                 variant: variant.map(|v| v.id.clone()),
             })
         };
-        let camo = custom.map_or(0, |_| self.stat(base + 9).max(0) as usize);
-        let guns: Vec<Gun> = [gun(1, camo), gun(3, 0)].into_iter().flatten().collect();
+        let camo = custom.map_or(0, |_| self.class_camo(base + 1).max(0) as usize);
+        let secondary_camo = custom.map_or(0, |_| self.class_camo(base + 3).max(0) as usize);
+        let guns: Vec<Gun> = [gun(1, camo), gun(3, secondary_camo)].into_iter().flatten().collect();
         let perks = (5..=7).map(item).filter(|p| p.starts_with("specialty_") && p != "specialty_null").collect();
         let special = Some(item(8)).filter(|g| g.ends_with("_grenade"));
         // C4, claymores or an RPG-7 in the perk-1 slot (as `_class.gsc`
@@ -233,6 +239,7 @@ impl Frontend {
             "specialty_weapon_rpg" | "rpg_mp" => Some("rpg_mp".to_owned()),
             _ => None,
         };
-        (!guns.is_empty()).then_some(ClassLoadout { name, guns, perks, special, inventory })
+        let inventory_camo = custom.map_or(0, |_| self.class_camo(base + 5).max(0) as usize);
+        (!guns.is_empty()).then_some(ClassLoadout { name, guns, perks, special, inventory, inventory_camo })
     }
 }

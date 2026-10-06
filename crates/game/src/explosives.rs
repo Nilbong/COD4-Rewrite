@@ -48,7 +48,7 @@ impl Plugin for ExplosivesPlugin {
             .add_systems(OnEnter(crate::state::GameState::InGame), load_defs.after(crate::world::load_map).in_set(crate::state::Setup::Content))
             .add_systems(
                 Update,
-                (launch, fly, detonate, claymores, explode).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+                (launch, fly, detonate, damaged, claymores, explode).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
             );
         if let Ok(dir) = std::env::var("COD4RW_EQUIPTEST") {
             app.insert_resource(TestDir(dir.into()))
@@ -74,9 +74,11 @@ pub enum Behaviour {
 #[derive(Clone, Debug)]
 pub struct ExplosiveDef {
     pub behaviour: Behaviour,
-    /// CoD units a second, along the aim and upward.
+    /// CoD units a second, along the aim, upward and level forward
+    /// (`Weapon_Throw_Grenade`: a claymore goes down and ahead at once).
     pub speed: f32,
     pub speed_up: f32,
+    pub speed_forward: f32,
     /// Seconds into the fire animation it leaves the hand.
     pub delay: f32,
     /// How far (CoD units) a launched grenade flies before it can go off,
@@ -86,6 +88,11 @@ pub struct ExplosiveDef {
     pub radius: f32,
     pub inner_damage: f32,
     pub outer_damage: f32,
+    /// How long it flies before going off anyway (`projLifetime`, s).
+    pub lifetime: f32,
+    /// The blast reaches this far round its front (`damageConeAngle`,
+    /// degrees: a claymore's 60; 180 all round).
+    pub cone: f32,
     pub model: String,
     pub trail: String,
     pub effect: String,
@@ -125,6 +132,20 @@ pub fn is_explosive(weapon: &str) -> bool {
 /// (`perk_explosiveDamage`).
 pub const SONIC_BOOM: f32 = 1.25;
 
+/// An explosion's damage scale from its owner's perks against the target's
+/// (`cac_modified_damage`): Sonic Boom's 1.25, except that against
+/// Juggernaut the two cancel out (Juggernaut's own 0.75 is applied later,
+/// to everything, by `crate::combat`, so this undoes it).
+pub fn blast_scale(attacker: Option<&crate::loadout::Loadout>, target: Option<&crate::loadout::Loadout>) -> f32 {
+    if !crate::perks::has(attacker, "specialty_explosivedamage") {
+        1.0
+    } else if crate::perks::has(target, "specialty_armorvest") {
+        1.0 / 0.75
+    } else {
+        SONIC_BOOM
+    }
+}
+
 /// CoD4's equipment and launchers.
 fn load_defs(mut defs: ResMut<ExplosiveDefs>, content: Res<Content>) {
     let zone = &content.zones[crate::content::COMMON_ZONE];
@@ -153,12 +174,21 @@ fn load_defs(mut defs: ResMut<ExplosiveDefs>, content: Res<Content>) {
             behaviour,
             speed: w.int("iProjectileSpeed") as f32,
             speed_up: w.int("iProjectileSpeedUp") as f32,
+            speed_forward: w.int("iProjectileSpeedForward") as f32,
             delay: w.int("iFireDelay") as f32 / 1000.0,
             arming: w.int("iProjectileActivateDist") as f32,
             impact_damage: w.int("damage") as f32,
             radius: w.int("iExplosionRadius") as f32,
             inner_damage: w.int("iExplosionInnerDamage") as f32,
             outer_damage: w.int("iExplosionOuterDamage") as f32,
+            lifetime: match w.float("projLifetime") {
+                l if l > 0.0 => l,
+                _ => ROCKET_LIFE,
+            },
+            cone: match w.float("damageConeAngle") {
+                c if c > 0.0 => c,
+                _ => 180.0,
+            },
             model: asset("projectileModel").unwrap_or_default(),
             trail: asset("projTrailEffect").unwrap_or_default(),
             effect: asset("projExplosionEffect").unwrap_or_else(|| "explosions/grenadeexp_default".into()),
@@ -225,23 +255,35 @@ pub enum State {
     Dud(f32),
 }
 
-/// Projectiles to set off this frame.
+/// Projectiles to set off this frame: the weapon, its owner, where, and
+/// which way it faced (a claymore's blast goes forward).
 #[derive(Resource, Default)]
-struct Blasts(Vec<(String, Entity, Vec3)>);
+struct Blasts(Vec<(String, Entity, Vec3, Vec3)>);
 
 /// CoD4's gravity, `g_gravity`.
 const GRAVITY: f32 = 800.0;
-/// The longest a rocket flies before it goes off anyway, and how long a dud
-/// lies about.
+/// A projectile's flight when its weapon gives none, and how long a dud lies
+/// about.
 const ROCKET_LIFE: f32 = 10.0;
 const DUD_LIFE: f32 = 10.0;
+/// C4 goes off this long after the detonator (`waitAndDetonate( 0.1 )`).
+const C4_DELAY: f32 = 0.1;
+/// Equipment hit by a blast for this much goes off, after a moment
+/// (`claymoreDetonation`'s damage check, 0.1..0.5 s when others went too).
+const CHAIN_DAMAGE: f32 = 5.0;
+const CHAIN_DELAY: (f32, f32) = (0.1, 0.5);
+/// A placed C4 or claymore's middle above its origin, and how near it a
+/// bullet hits it (inches).
+const EQUIPMENT_HEIGHT: f32 = 4.0;
+const EQUIPMENT_SIZE: f32 = 6.0;
 /// `level.claymoreDetonateRadius`, `claymoreDetectionConeAngle` (70°),
 /// `claymoreDetectionMinDist`, `claymoreDetectionGracePeriod`.
 const CLAYMORE_RADIUS: f32 = 192.0;
 const CLAYMORE_DOT: f32 = 0.342_020_14;
 const CLAYMORE_MIN_DIST: f32 = 20.0;
 const CLAYMORE_DELAY: f32 = 0.75;
-/// Two presses of F within this detonate C4 (`watchC4AltDetonation`).
+/// `watchC4AltDetonation`: a press of F held no longer than this, then
+/// another within this of letting go, sets off the C4 (not with it in hand).
 const DOUBLE_TAP: f32 = 0.5;
 
 /// Projectiles leaving their weapons, after their fire delay.
@@ -259,6 +301,7 @@ fn launch(
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut sfx: ResMut<crate::audio::Sfx>,
     mut waw: ResMut<crate::waw::MatchContent>,
+    movers: Query<&Mover>,
 ) {
     let now = time.elapsed_secs();
     for l in launches.read() {
@@ -269,11 +312,17 @@ fn launch(
     *waiting = later;
     for (_, l) in due {
         let Some(def) = defs.get(&l.weapon) else { continue };
+        // With the shooter's own speed: all of it for a rocket (`gunVel`),
+        // its part along the throw for the rest (`G_GrenadeLaunch`).
+        let own = movers.get(l.shooter).map_or(Vec3::ZERO, |m| m.velocity);
         let velocity = match def.behaviour {
-            Behaviour::Rocket => l.dir * u(def.speed),
-            Behaviour::Launched | Behaviour::Sticky => l.dir * u(def.speed) + Vec3::Y * u(def.speed_up),
-            // Set down a little ahead.
-            Behaviour::Claymore => Quat::from_rotation_y(l.yaw) * Vec3::NEG_Z * u(80.0),
+            Behaviour::Rocket => l.dir * u(def.speed) + own,
+            Behaviour::Launched | Behaviour::Sticky | Behaviour::Claymore => {
+                let level = Quat::from_rotation_y(l.yaw) * Vec3::NEG_Z;
+                let thrown = l.dir * u(def.speed) + Vec3::Y * u(def.speed_up) + level * u(def.speed_forward);
+                // A claymore is set down: none of its owner's speed.
+                if def.behaviour == Behaviour::Claymore { thrown } else { thrown + l.dir * own.dot(l.dir).max(0.0) }
+            }
         };
         // Models face +X; along the way they're thrown.
         let facing = match def.behaviour {
@@ -334,8 +383,8 @@ fn fly(
             State::Flying => {}
             _ => continue,
         }
-        if def.behaviour == Behaviour::Rocket && now - p.born > ROCKET_LIFE {
-            blasts.0.push((p.weapon.clone(), p.owner, tf.translation));
+        if matches!(def.behaviour, Behaviour::Rocket | Behaviour::Launched) && now - p.born > def.lifetime {
+            blasts.0.push((p.weapon.clone(), p.owner, tf.translation, Vec3::Y));
             commands.entity(e).despawn();
             continue;
         }
@@ -367,7 +416,8 @@ fn fly(
             Behaviour::Launched if p.travelled < def.arming => {
                 // A dud: it hurts whoever it hits, then bounces off inert.
                 if let Some(target) = pawn {
-                    damage.write(Damage { target, attacker: Some(owner), amount: def.impact_damage, location: HitLocation::Torso, weapon: def.display });
+                    let location = hitboxes.get(hit.entity).map_or(HitLocation::Torso, |h| h.location);
+                    damage.write(Damage { target, attacker: Some(owner), amount: def.impact_damage, location, weapon: def.display });
                 }
                 let n = hit.normal;
                 p.velocity = (p.velocity - 2.0 * p.velocity.dot(n) * n) * 0.3;
@@ -375,7 +425,7 @@ fn fly(
                 p.state = State::Dud(now + DUD_LIFE);
             }
             Behaviour::Rocket | Behaviour::Launched => {
-                blasts.0.push((p.weapon.clone(), owner, at - dir * u(4.0)));
+                blasts.0.push((p.weapon.clone(), owner, at - dir * u(4.0), Vec3::Y));
                 commands.entity(e).despawn();
             }
             Behaviour::Sticky => {
@@ -398,35 +448,65 @@ fn fly(
 /// Owners detonate their C4: aiming with C4 in hand, or a double tap of F
 /// (the player).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn detonate(
     time: Res<Time>,
     defs: Res<ExplosiveDefs>,
     pawns: Query<(Entity, &WeaponState, &WeaponInput, Option<&crate::splitscreen::PlayerInput>), Without<Dead>>,
-    projectiles: Query<(Entity, &Explosive, &Transform)>,
+    mut projectiles: Query<(Entity, &mut Explosive, &Transform)>,
     mut commands: Commands,
     mut held: Local<HashMap<Entity, bool>>,
-    mut last_f: Local<HashMap<Entity, f32>>,
+    // F: when the last press began and ended.
+    mut presses: Local<HashMap<Entity, (f32, f32)>>,
+    mut respawned: RemovedComponents<Dead>,
     mut blasts: ResMut<Blasts>,
 ) {
     let now = time.elapsed_secs();
     let mut detonating = Vec::new();
     for (e, w, input, local) in &pawns {
         let c4_in_hand = defs.get(&w.def.name).is_some_and(|d| d.behaviour == Behaviour::Sticky);
-        let was = held.insert(e, input.ads).unwrap_or(false);
-        let mut go = c4_in_hand && input.ads && !was;
-        if local.is_some_and(|p| p.live && p.keys.just_pressed(KeyCode::KeyF)) {
-            let last = last_f.insert(e, now).unwrap_or(f32::NEG_INFINITY);
-            go |= now - last < DOUBLE_TAP;
+        // With C4 in hand the player's fire button is the detonator (aim
+        // throws: see `crate::weapons`); a bot's aim is its detonator.
+        let button = if local.is_some() { input.fire } else { input.ads };
+        let was = held.insert(e, button).unwrap_or(false);
+        let mut go = c4_in_hand && button && !was;
+        if let Some(p) = local.filter(|p| p.live) {
+            let f = p.keys.pressed(KeyCode::KeyF) || p.pad.interact;
+            let press = presses.entry(e).or_insert((f32::NEG_INFINITY, f32::NEG_INFINITY));
+            if p.keys.just_pressed(KeyCode::KeyF) {
+                // A quick press, let go, and pressed again soon after.
+                let quick = press.1 - press.0 <= DOUBLE_TAP && press.1 >= press.0;
+                go |= !c4_in_hand && quick && now - press.1 <= DOUBLE_TAP;
+                press.0 = now;
+            } else if p.keys.just_released(KeyCode::KeyF) || (!f && press.1 < press.0) {
+                press.1 = now;
+            }
         }
         if go {
             detonating.push(e);
         }
     }
-    for (pe, p, tf) in &projectiles {
-        let sticky = defs.get(&p.weapon).is_some_and(|d| d.behaviour == Behaviour::Sticky);
-        if sticky && detonating.contains(&p.owner) {
-            blasts.0.push((p.weapon.clone(), p.owner, tf.translation));
+    // Respawning, an owner's claymores and C4 go (`deleteExplosivesOnSpawn`);
+    // so do those whose owner has left.
+    let respawned: Vec<Entity> = respawned.read().collect();
+    for (pe, mut p, tf) in &mut projectiles {
+        let Some(def) = defs.get(&p.weapon) else { continue };
+        let placed = matches!(def.behaviour, Behaviour::Sticky | Behaviour::Claymore);
+        if placed && (respawned.contains(&p.owner) || pawns.get(p.owner).is_err() && commands.get_entity(p.owner).is_err()) {
             commands.entity(pe).despawn();
+            continue;
+        }
+        if def.behaviour != Behaviour::Sticky {
+            continue;
+        }
+        if detonating.contains(&p.owner) && !matches!(p.state, State::Triggered(_)) {
+            p.state = State::Triggered(now + C4_DELAY);
+        }
+        if let State::Triggered(at) = p.state {
+            if now >= at {
+                blasts.0.push((p.weapon.clone(), p.owner, tf.translation, Vec3::Y));
+                commands.entity(pe).despawn();
+            }
         }
     }
 }
@@ -451,7 +531,7 @@ fn claymores(
         }
         match p.state {
             State::Triggered(at) if now >= at => {
-                blasts.0.push((p.weapon.clone(), p.owner, tf.translation + Vec3::Y * u(4.0)));
+                blasts.0.push((p.weapon.clone(), p.owner, tf.translation + Vec3::Y * u(4.0), tf.rotation * Vec3::X));
                 commands.entity(e).despawn();
                 continue;
             }
@@ -485,6 +565,68 @@ fn claymores(
     }
 }
 
+/// Placed C4 and claymores hit by a player's bullet, or caught in a blast
+/// for at least [`CHAIN_DAMAGE`], go off a moment later, for whoever set
+/// them off (`c4Damage`: not a teammate's, friendly fire off).
+#[allow(clippy::type_complexity)]
+fn damaged(
+    time: Res<Time>,
+    defs: Res<ExplosiveDefs>,
+    mut shots: MessageReader<crate::weapons::ShotFired>,
+    mut exploded: MessageReader<Exploded>,
+    pawns: Query<&Pawn>,
+    mut equipment: Query<(&mut Explosive, &Transform)>,
+    mut last: Local<f32>,
+) {
+    let now = time.elapsed_secs();
+    // Who did it and where: bullets as segments, blasts as points with
+    // their damage reaching out.
+    let mut hits: Vec<(Entity, Vec3, Vec3, Option<(f32, f32, f32)>)> = Vec::new();
+    for s in shots.read().filter(|s| s.weapon.is_some()) {
+        hits.push((s.shooter, s.from, s.to, None));
+    }
+    for x in exploded.read().filter(|x| x.radius > 0.0 && x.inner.max(x.outer) >= CHAIN_DAMAGE) {
+        hits.push((x.owner, x.at, x.at, Some((x.radius, x.inner, x.outer))));
+    }
+    if hits.is_empty() {
+        return;
+    }
+    for (mut p, tf) in &mut equipment {
+        if p.state != State::Stuck || defs.get(&p.weapon).is_none_or(|d| !matches!(d.behaviour, Behaviour::Sticky | Behaviour::Claymore)) {
+            continue;
+        }
+        let middle = tf.translation + Vec3::Y * u(EQUIPMENT_HEIGHT);
+        let by = hits.iter().find(|&&(attacker, from, to, blast)| {
+            let allowed = attacker == p.owner
+                || match (pawns.get(attacker), pawns.get(p.owner)) {
+                    (Ok(a), Ok(b)) => crate::combat::hostile(a, b),
+                    // Not a player's, no harm; an owner gone, anyone's.
+                    (Err(_), _) => false,
+                    (_, Err(_)) => true,
+                };
+            allowed
+                && match blast {
+                    Some((radius, inner, outer)) => {
+                        let dist = middle.distance(from) / crate::units::INCH;
+                        dist <= radius && inner + (outer - inner) * (dist / radius) >= CHAIN_DAMAGE
+                    }
+                    None => {
+                        let along = to - from;
+                        let t = ((middle - from).dot(along) / along.length_squared().max(1e-6)).clamp(0.0, 1.0);
+                        (from + along * t).distance(middle) <= u(EQUIPMENT_SIZE)
+                    }
+                }
+        });
+        if let Some(&(attacker, ..)) = by {
+            // A moment longer when another just went (`c4explodethisframe`).
+            let wait = if now - *last < 0.05 { rand::random_range(CHAIN_DELAY.0..CHAIN_DELAY.1) } else { 0.05 };
+            *last = now;
+            p.state = State::Triggered(now + wait);
+            p.owner = attacker;
+        }
+    }
+}
+
 /// Set projectiles off: everyone in sight within the radius is hurt, from
 /// the inner to the outer damage, with the effect and sound.
 #[allow(clippy::too_many_arguments)]
@@ -494,27 +636,39 @@ fn explode(
     spatial: SpatialQuery,
     pawns: Query<(Entity, &Transform, &Mover, &Pawn), Without<Dead>>,
     loadouts: Query<&crate::loadout::Loadout>,
+    spawned: Query<&crate::combat::Spawned>,
+    time: Res<Time>,
     mut damage: MessageWriter<Damage>,
     mut effects: ResMut<Effects>,
     mut sfx: ResMut<crate::audio::Sfx>,
     mut exploded: MessageWriter<Exploded>,
 ) {
-    for (weapon, owner, at) in std::mem::take(&mut blasts.0) {
+    for (weapon, owner, at, front) in std::mem::take(&mut blasts.0) {
         let Some(def) = defs.get(&weapon) else { continue };
         let boom = if crate::perks::has(loadouts.get(owner).ok(), "specialty_explosivedamage") { SONIC_BOOM } else { 1.0 };
         let from = at + Vec3::Y * u(4.0);
-        let seen = |to: Vec3| {
-            let d = to - from;
-            Dir3::new(d).ok().is_none_or(|dir| spatial.cast_ray(from, dir, d.length(), true, &collision::sight_filter()).is_none())
-        };
+        let cone = def.cone.to_radians().cos();
         let mut hurt = Vec::new();
         for (target, tf, mover, pawn) in &pawns {
-            let (centre, eye) = (tf.translation + Vec3::Y * u(32.0), mover.eye(tf.translation));
-            let dist = ((centre - at).length() / crate::units::INCH - 16.0).max(0.0);
-            if dist > def.radius || !(seen(centre) || seen(eye)) {
+            // From the blast to the feet (the player's origin).
+            let dist = (tf.translation - at).length() / crate::units::INCH;
+            if dist > def.radius {
                 continue;
             }
-            let amount = (def.inner_damage + (def.outer_damage - def.inner_damage) * (dist / def.radius.max(1.0))) * boom;
+            // A claymore's blast goes forward only.
+            if def.cone < 180.0 && (tf.translation + Vec3::Y * u(32.0) - at).normalize_or_zero().dot(front) < cone {
+                continue;
+            }
+            let cover = exposure(&spatial, from, tf.translation, mover.eye(tf.translation));
+            if cover <= 0.0 {
+                continue;
+            }
+            // Grenades (not rockets) spare players just spawned near them.
+            if def.behaviour != Behaviour::Rocket && crate::combat::spawn_protected(spawned.get(target).ok(), at, time.elapsed_secs()) {
+                continue;
+            }
+            let scale = blast_scale(loadouts.get(owner).ok(), loadouts.get(target).ok()) * cover;
+            let amount = (def.inner_damage + (def.outer_damage - def.inner_damage) * (dist / def.radius.max(1.0))) * scale;
             damage.write(Damage { target, attacker: Some(owner), amount, location: HitLocation::Torso, weapon: def.display });
             hurt.push(format!("{} {amount:.0}", pawn.name));
         }
@@ -532,6 +686,21 @@ fn explode(
             at,
         });
     }
+}
+
+/// How much of a body a blast at `from` reaches (`G_GetDamageScale`'s
+/// five traces): its middle, head and feet and either side, a third each,
+/// at most whole.
+pub fn exposure(spatial: &SpatialQuery, from: Vec3, feet: Vec3, eye: Vec3) -> f32 {
+    let centre = feet + Vec3::Y * u(32.0);
+    let side = (centre - from).with_y(0.0).normalize_or(Vec3::X).cross(Vec3::Y) * u(15.0);
+    let filter = collision::sight_filter();
+    let clear = |to: Vec3| {
+        let d = to - from;
+        Dir3::new(d).ok().is_none_or(|dir| spatial.cast_ray(from, dir, d.length(), true, &filter).is_none())
+    };
+    let hits = [centre, eye, feet + Vec3::Y * u(8.0), centre + side, centre - side].into_iter().filter(|&p| clear(p)).count();
+    (hits as f32 / 3.0).min(1.0)
 }
 
 #[derive(Resource)]
@@ -562,7 +731,10 @@ fn test(
     for (key, at) in [(KeyCode::Digit5, 5.5)] {
         if held(at) { keys.press(key) } else { keys.release(key) }
     }
-    for (button, at) in [(MouseButton::Left, 7.0), (MouseButton::Right, 9.0)] {
+    // C4 is thrown with aim and set off with fire; the rest fire.
+    let c4 = std::env::var("COD4RW_INVENTORY").is_ok_and(|i| i == "c4_mp");
+    let (throw, set_off) = if c4 { (MouseButton::Right, MouseButton::Left) } else { (MouseButton::Left, MouseButton::Right) };
+    for (button, at) in [(throw, 7.0), (set_off, 9.0)] {
         if held(at) { mouse.press(button) } else { mouse.release(button) }
     }
     if let Ok(mut view) = player.single_mut() {

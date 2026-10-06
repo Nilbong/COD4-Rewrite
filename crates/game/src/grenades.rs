@@ -336,13 +336,23 @@ pub struct SmokeCloud {
     pub until: f32,
 }
 
-/// The longest a flashbang blinds (at the centre, looking at it), and how
-/// long it takes to wear off at the end.
-const FLASH_MAX: f32 = 4.5;
-pub const FLASH_FADE: f32 = 1.5;
-/// A stun's slowing: moving at this fraction, turning at this.
-const STUN_MOVE: f32 = 0.55;
-const STUN_TURN: f32 = 0.35;
+/// The longest a flashbang blinds (at the centre, looking at it:
+/// `_flashgrenades.gsc`'s `percent_distance * percent_angle * 6`), and how
+/// long the white takes to wear off at the end (`flashbang.shock`'s
+/// `screenFlashWhiteFadeTime`).
+const FLASH_MAX: f32 = 6.0;
+pub const FLASH_FADE: f32 = 3.5;
+/// A stun's slowing (`concussion_grenade_mp.shock`, `PM_CmdScale`): moving
+/// at 0.4, the mouse at a tenth and turning at most 35°/s, easing off over
+/// the last 2 s.
+const STUN_MOVE: f32 = 0.4;
+const STUN_TURN: f32 = 0.1;
+const STUN_MAX_TURN: f32 = 35.0;
+const STUN_FADE: f32 = 2.0;
+/// Martyrdom's grenade (`G_PlayerDie`): from 40 units up, tossed up to 160
+/// u/s each way.
+const MARTYRDOM_HEIGHT: f32 = 40.0;
+const MARTYRDOM_TOSS: f32 = 160.0;
 /// How long smoke pours out (`smoke_grenade_11sec_mp`, then it thins) and
 /// how wide it spreads, in CoD units.
 const SMOKE_TIME: f32 = 15.0;
@@ -363,9 +373,9 @@ impl Flashed {
 }
 
 impl Stunned {
-    /// How stunned (1, easing to 0 over the last second).
+    /// How stunned (1, easing to 0 over the last [`STUN_FADE`] seconds).
     pub fn strength(&self, now: f32) -> f32 {
-        (self.until - now).clamp(0.0, 1.0)
+        ((self.until - now) / STUN_FADE).clamp(0.0, 1.0)
     }
 }
 
@@ -401,6 +411,12 @@ fn stock(
             Some(l) => l.class.special.as_deref().and_then(Kind::special),
             None => Some(DEFAULT_SPECIAL),
         };
+        // Smoke doesn't come three at a time: Special Grenades x3 makes it
+        // flashbangs (`_class.gsc`).
+        let special = match special {
+            Some(Kind::Smoke) if perk("specialty_specialgrenade") => Some(Kind::Flash),
+            s => s,
+        };
         let specials = if special.is_none() { 0 } else if perk("specialty_specialgrenade") { SPECIALS_PERK } else { SPECIALS };
         match g {
             None => {
@@ -424,7 +440,8 @@ fn martyrdom(
 ) {
     for (e, tf, loadout) in &died {
         if loadout.class.perks.iter().any(|p| p.eq_ignore_ascii_case("specialty_grenadepulldeath")) {
-            pending.throws.push((Kind::Frag, e, tf.translation + Vec3::Y * u(16.0), DROPPED, time.elapsed_secs() + defs.1, How::Martyrdom));
+            let toss = Vec3::new(rand::random_range(-1.0..1.0), rand::random_range(-1.0..1.0), rand::random_range(-1.0..1.0)) * u(MARTYRDOM_TOSS);
+            pending.throws.push((Kind::Frag, e, tf.translation + Vec3::Y * u(MARTYRDOM_HEIGHT), toss, time.elapsed_secs() + defs.1, How::Martyrdom));
         }
     }
 }
@@ -518,7 +535,9 @@ fn throw(
                 .ok()
                 .and_then(|d| spatial.cast_ray(eye, d, u(16.0), true, &collision::sight_filter()))
                 .map_or(u(16.0), |h| (h.distance - u(4.0)).max(0.0));
-            let velocity = forward * u(stats.speed) + Vec3::Y * u(stats.speed_up);
+            // And the thrower's own way along the throw (`G_GrenadeLaunch`).
+            let carried = forward * mover.velocity.dot(forward).max(0.0);
+            let velocity = forward * u(stats.speed) + Vec3::Y * u(stats.speed_up) + carried;
             let explode_at = o.explode_at.unwrap_or(now + stats.fuse);
             let how = if explode_at - now <= stats.fuse - COOKED { How::Cooked } else { How::Thrown };
             pending.throws.push((o.kind, e, eye + forward * reach, velocity, explode_at, how));
@@ -588,8 +607,11 @@ const DROPPED: Vec3 = Vec3::new(0.0, -0.1, 0.0);
 const GRAVITY: f32 = 800.0;
 /// A grenade's size, for touching walls.
 const RADIUS: f32 = 2.0;
-/// Bouncing slower than this off the floor, it settles.
-const SETTLE_SPEED: f32 = 30.0;
+/// Bouncing slower than this off the floor, it settles (`G_BounceMissile`).
+const SETTLE_SPEED: f32 = 20.0;
+/// Smoke pours out once the canister lies still, trying this long
+/// (`G_RunMissile`'s 60 s of 50 ms retries).
+const SMOKE_WAIT: f32 = 60.0;
 
 /// Fly, bounce and settle grenades, and set them off.
 #[allow(clippy::too_many_arguments)]
@@ -607,8 +629,10 @@ fn fly(
     let (now, dt) = (time.elapsed_secs(), time.delta_secs());
     for (e, mut g, mut tf) in &mut grenades {
         if now >= g.explode_at {
-            // Smoke pours out of the canister, which stays.
-            if g.kind == Kind::Smoke && !g.popped {
+            // Smoke pours out of the canister, which stays, once it's down.
+            if g.kind == Kind::Smoke && !g.popped && !g.resting && now < g.explode_at + SMOKE_WAIT {
+                // (Still rolling: it waits.)
+            } else if g.kind == Kind::Smoke && !g.popped {
                 pending.blasts.push((g.kind, g.thrower, tf.translation, g.how));
                 g.popped = true;
                 g.explode_at = now + SMOKE_TIME;
@@ -669,6 +693,7 @@ fn explode(
     spatial: SpatialQuery,
     pawns: Query<(Entity, &Transform, &Mover, &ViewAngles, &Pawn, Option<&Flashed>), Without<Dead>>,
     loadouts: Query<&Loadout>,
+    spawned: Query<&crate::combat::Spawned>,
     mut damage: MessageWriter<Damage>,
     mut exploded: MessageWriter<crate::explosives::Exploded>,
     mut went_off: MessageWriter<WentOff>,
@@ -689,8 +714,8 @@ fn explode(
         let mut caught = Vec::new();
         for (target, tf, mover, view, pawn, flashed) in &pawns {
             let (centre, eye) = (tf.translation + Vec3::Y * u(32.0), mover.eye(tf.translation));
-            // From the blast to the edge of the body, roughly.
-            let dist = ((centre - at).length() / crate::units::INCH - 16.0).max(0.0);
+            // From the blast to the feet (the player's origin).
+            let dist = (tf.translation - at).length() / crate::units::INCH;
             if dist > stats.radius {
                 continue;
             }
@@ -698,8 +723,12 @@ fn explode(
             let teammate = target != thrower && thrower_pawn.is_some_and(|t| !crate::combat::hostile(t, pawn));
             match kind {
                 Kind::Frag | Kind::Stun if !(seen(centre) || seen(eye)) => {}
+                // Not a player just spawned near it.
+                Kind::Frag if crate::combat::spawn_protected(spawned.get(target).ok(), at, now) => {}
                 Kind::Frag => {
-                    let boom = if crate::perks::has(loadouts.get(thrower).ok(), "specialty_explosivedamage") { crate::explosives::SONIC_BOOM } else { 1.0 };
+                    // Partly behind cover, partly hurt.
+                    let cover = crate::explosives::exposure(&spatial, from, tf.translation, eye);
+                    let boom = crate::explosives::blast_scale(loadouts.get(thrower).ok(), loadouts.get(target).ok()) * cover;
                     let amount = (stats.inner_damage + (stats.outer_damage - stats.inner_damage) * (dist / stats.radius.max(1.0))) * boom;
                     damage.write(Damage { target, attacker: Some(thrower), amount, location: HitLocation::Torso, weapon: kind.display() });
                     caught.push(format!("{} {amount:.0}", pawn.name));
@@ -790,9 +819,11 @@ fn stun_controls(
         let Some(s) = stunned.map(|s| s.strength(time.elapsed_secs())).filter(|s| *s > 0.0) else { continue };
         mv.speed_scale *= 1.0 - (1.0 - STUN_MOVE) * s;
         if let Some(&(yaw, pitch)) = last.0.get(&e) {
+            // The mouse at a tenth, and no faster than 35°/s.
             let turn = 1.0 - (1.0 - STUN_TURN) * s;
-            view.yaw = yaw + (view.yaw - yaw) * turn;
-            view.pitch = pitch + (view.pitch - pitch) * turn;
+            let most = (STUN_MAX_TURN / s).to_radians() * time.delta_secs();
+            view.yaw = yaw + ((view.yaw - yaw) * turn).clamp(-most, most);
+            view.pitch = pitch + ((view.pitch - pitch) * turn).clamp(-most, most);
         }
     }
 }

@@ -4,7 +4,7 @@
 use crate::content::{Content, MAP_ZONE};
 use crate::units;
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::visibility::RenderLayers;
+use bevy::camera::visibility::{RenderLayers, VisibilityRange};
 use bevy::light::{CascadeShadowConfigBuilder, NotShadowCaster};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{ExtendedMaterial, Lightmap, MaterialExtension};
@@ -23,6 +23,11 @@ impl Plugin for WorldPlugin {
             std::path::PathBuf::from(file!()).with_file_name("shaders/world.wgsl"),
             std::path::Path::new(WORLD_SHADER),
             include_bytes!("shaders/world.wgsl").as_slice(),
+        );
+        app.world().resource::<bevy::asset::io::embedded::EmbeddedAssetRegistry>().insert_asset(
+            std::path::PathBuf::from(file!()).with_file_name("shaders/world_deferred.wgsl"),
+            std::path::Path::new("cod4rw/world_deferred.wgsl"),
+            include_bytes!("shaders/world_deferred.wgsl").as_slice(),
         );
         app.add_plugins(MaterialPlugin::<WorldMaterial>::default()).add_systems(OnEnter(crate::state::GameState::InGame), load_map.in_set(crate::state::Setup::Content));
     }
@@ -82,6 +87,10 @@ pub struct WorldParams {
     /// multiplies the scene behind, scaled by z (2 for DESTCOLOR/SRCCOLOR);
     /// w = 1 for these.
     pub dist_falloff: Vec4,
+    /// Ray-traced lighting (`crate::rtgi`, which draws world surfaces
+    /// deferred, `shaders/world_deferred.wgsl`): x is how much of the
+    /// lightmap the traced light sits on.
+    pub traced: Vec4,
 }
 
 impl WorldLighting {
@@ -127,6 +136,10 @@ const WORLD_SHADER: &str = "cod4rw/world.wgsl";
 impl MaterialExtension for WorldLighting {
     fn fragment_shader() -> ShaderRef {
         "embedded://cod4rw/world.wgsl".into()
+    }
+
+    fn deferred_fragment_shader() -> ShaderRef {
+        "embedded://cod4rw/world_deferred.wgsl".into()
     }
 }
 
@@ -238,6 +251,7 @@ pub fn load_map(
 
     if let Some(clip) = content.map().clip_map() {
         crate::collision::spawn_collision(&mut commands, clip);
+        crate::collision::spawn_static_model_collision(&mut commands, content.map(), clip);
     }
     let spawns =
         content.map().map_ents().map(|e| read_spawns(&iw3::ents::parse(&e.entity_string))).unwrap_or_default();
@@ -271,7 +285,30 @@ fn spawn_world_geometry(
             groups.entry((m, s.lightmap_index, s.reflection_probe_index)).or_default().push(i);
         }
     }
+    // One group per material and lightmap, with the probe most of its
+    // triangles use: split per probe the world was five times as many
+    // materials (and draws in every view), which the render thread was
+    // bound by; the probe only gives reflections, which barely differ
+    // between neighbouring probes. `COD4RW_PROBESPLIT` keeps them split.
+    if std::env::var_os("COD4RW_PROBESPLIT").is_none() {
+        let surfaces = &content.map().gfx_world().expect("gfxworld").surfaces;
+        let mut merged: HashMap<(AssetId, u8), (HashMap<u8, usize>, Vec<usize>)> = HashMap::new();
+        for ((m, lm, probe), list) in groups.drain() {
+            let entry = merged.entry((m, lm)).or_default();
+            *entry.0.entry(probe).or_default() += list.iter().map(|&i| surfaces[i].tri_count as usize).sum::<usize>();
+            entry.1.extend(list);
+        }
+        for ((m, lm), (probes, list)) in merged {
+            let probe = probes.into_iter().max_by_key(|&(p, n)| (n, p)).map_or(0, |(p, _)| p);
+            groups.insert((m, lm, probe), list);
+        }
+    }
     let mut world_mats: HashMap<(AssetId, u8, u8), Handle<WorldMaterial>> = HashMap::new();
+    {
+        let by_lightmap: std::collections::HashSet<(AssetId, u8)> = groups.keys().map(|k| (k.0, k.1)).collect();
+        let by_material: std::collections::HashSet<AssetId> = groups.keys().map(|k| k.0).collect();
+        info!("world groups: {} (material, lightmap, probe), {} (material, lightmap), {} materials", groups.len(), by_lightmap.len(), by_material.len());
+    }
 
     let root = commands.spawn((Name::new("world"), Transform::default(), Visibility::default())).id();
     let mut total_tris = 0;
@@ -330,6 +367,12 @@ fn spawn_world_geometry(
                     .map(|t| t.name.as_str())
                     .unwrap_or("");
                 WorldLighting::falloff(zone_mat, technique_set, &mut params);
+                if cod4_sun() {
+                    let sun = &content.map().gfx_world().expect("gfxworld").sun;
+                    params.sun_dir = to_sun(sun).extend(0.0);
+                    params.sun_diffuse = live_sun(sun).extend(0.0);
+                    params.traced.y = 1.0;
+                }
                 if technique_set.starts_with("wc_water") {
                     WorldLighting::water(zone_mat, content.map().gfx_world().expect("gfxworld"), &mut params);
                 }
@@ -415,7 +458,13 @@ fn spawn_world_geometry(
             e.insert(NotShadowCaster);
         }
         if let Some(image) = lightmap {
-            e.insert(Lightmap { image, uv_rect: Rect::new(0.0, 0.0, 1.0, 1.0), bicubic_sampling: false });
+            // Bevy's lightmap only where its sun must leave the world alone
+            // (the cod4 sun trial) or for comparing (`COD4RW_BEVYLIGHTMAP`):
+            // the world shader samples its lightmap itself, and Bevy's
+            // rebuilt a bind group per lightmap and phase every frame.
+            if cod4_sun() || std::env::var_os("COD4RW_BEVYLIGHTMAP").is_some() {
+                e.insert(Lightmap { image, uv_rect: Rect::new(0.0, 0.0, 1.0, 1.0), bicubic_sampling: false });
+            }
         }
     }
     if !proxy_indices.is_empty() {
@@ -450,6 +499,7 @@ fn spawn_static_models(
     // as the world's do: the world material, with nothing else of it.
     let mut falloff_mats: HashMap<(usize, AssetId), Option<Handle<WorldMaterial>>> = HashMap::new();
     let instances: Vec<_> = content.map().gfx_world().expect("gfxworld").static_models.clone();
+    let mut batches: HashMap<(BatchMaterial, IVec3, u32), Vec<(Handle<Mesh>, Transform)>> = HashMap::new();
     // Models drawn with surfaces missing, or not at all (their collision
     // still stands): name -> (instances, surfaces missed, why).
     let mut missed: std::collections::BTreeMap<String, (usize, usize, &'static str)> = Default::default();
@@ -471,7 +521,10 @@ fn spawn_static_models(
             rotation: units::axis_rotation(sm.axis),
             scale: Vec3::splat(sm.scale),
         };
-        let parent = commands.spawn((Name::new(name.clone()), transform, Visibility::default(), ChildOf(root))).id();
+        // CoD4's own draw distance for the model (0: always), bucketed so
+        // models with near distances share batches.
+        let cull = if sm.cull_dist > 0.0 { (units::u(sm.cull_dist) / CULL_STEP).ceil() as u32 } else { 0 };
+        let cell = (transform.translation / BATCH_CELL).floor().as_ivec3();
         let first = lod.surf_index as usize;
         let miss = |why: &'static str, missed: &mut std::collections::BTreeMap<String, (usize, usize, &'static str)>| {
             missed.entry(name.clone()).or_insert((0, 0, why)).1 += 1;
@@ -500,20 +553,168 @@ fn spawn_static_models(
                         .then(|| world_materials.add(WorldMaterial { base, extension: WorldLighting { params, ..default() } }))
                 })
                 .clone();
-            match falloff {
-                Some(material) => commands.spawn((Mesh3d(mesh), MeshMaterial3d(material), NotShadowCaster, ChildOf(parent))),
-                None => commands.spawn((Mesh3d(mesh), MeshMaterial3d(mat.handle), ChildOf(parent))),
+            let material = match falloff {
+                Some(m) => BatchMaterial::World(m),
+                None => BatchMaterial::Standard(mat.handle.clone()),
             };
+            batches.entry((material, cell, cull)).or_default().push((mesh, transform));
         }
     }
+    // Static models merged into one mesh per material, cell and draw
+    // distance: thousands of entities became a few hundred draws, which the
+    // render thread (extraction, bind groups, instance buffers) was bound by.
+    // They're lit per pixel from the light grid, so merging changes nothing.
+    let mut entities = 0;
+    // Debug aid: `COD4RW_NOBATCH` spawns each model surface on its own, as
+    // before batching, for comparing.
+    if std::env::var_os("COD4RW_NOBATCH").is_some() {
+        for ((material, _, _), parts) in batches {
+            for (mesh, transform) in parts {
+                let mut e = commands.spawn((Mesh3d(mesh), transform, ChildOf(root)));
+                match &material {
+                    BatchMaterial::World(m) => e.insert((MeshMaterial3d(m.clone()), NotShadowCaster)),
+                    BatchMaterial::Standard(m) => e.insert(MeshMaterial3d(m.clone())),
+                };
+                entities += 1;
+            }
+        }
+        info!("static models: {} placed, {entities} surfaces unbatched", instances.len());
+        return;
+    }
+    // Opaque ones cast the sun's shadow through one merged mesh, as the
+    // world does (each batch drawn again in every cascade cost the render
+    // thread more than the models themselves); alpha-tested ones (foliage)
+    // keep casting their own for their cutouts.
+    let mut proxy: Vec<(Handle<Mesh>, Transform)> = Vec::new();
+    for ((material, _, cull), parts) in batches {
+        let opaque = matches!(&material, BatchMaterial::Standard(m) if std_materials.get(m).is_some_and(|m| m.alpha_mode == AlphaMode::Opaque));
+        if opaque && std::env::var_os("COD4RW_NOBATCH").is_none() {
+            proxy.extend(parts.iter().cloned());
+        }
+        let Some(mesh) = merge_meshes(&parts, meshes) else { continue };
+        let mut e = commands.spawn((Name::new("static models batch"), Mesh3d(meshes.add(mesh)), Transform::default(), ChildOf(root)));
+        match material {
+            BatchMaterial::World(m) => e.insert((MeshMaterial3d(m), NotShadowCaster)),
+            BatchMaterial::Standard(m) => e.insert(MeshMaterial3d(m)),
+        };
+        if opaque {
+            e.insert(NotShadowCaster);
+        }
+        if cull > 0 {
+            let end = cull as f32 * CULL_STEP;
+            e.insert(VisibilityRange { start_margin: 0.0..0.0, end_margin: end..end + CULL_STEP, use_aabb: true });
+        }
+        entities += 1;
+    }
+    if let Some(mesh) = merge_meshes(&proxy, meshes) {
+        let material = std_materials.add(StandardMaterial { unlit: true, cull_mode: None, ..default() });
+        commands.spawn((
+            Name::new("static models shadow caster"),
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(material),
+            Transform::default(),
+            RenderLayers::layer(SHADOW_PROXY_LAYER),
+            ChildOf(root),
+        ));
+    }
+    info!("static models: {} placed, drawn in {entities} batches", instances.len());
     for (name, (instances, surfaces, why)) in &missed {
         warn!("static model {name}: {surfaces} surfaces not drawn ({why}){}", if *instances > 0 { format!(", {instances} placed not drawn") } else { String::new() });
     }
 }
 
+/// Static models are batched per this many metres each way.
+const BATCH_CELL: f32 = 32.0;
+
+/// Static models' draw distances are rounded up to this many metres.
+const CULL_STEP: f32 = 16.0;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum BatchMaterial {
+    Standard(Handle<StandardMaterial>),
+    World(Handle<WorldMaterial>),
+}
+
+/// The meshes, placed by their transforms, as one: positions, normals, UVs
+/// and (if all have them) colours. `None` if none could be read.
+fn merge_meshes(parts: &[(Handle<Mesh>, Transform)], meshes: &Assets<Mesh>) -> Option<Mesh> {
+    use bevy::mesh::VertexAttributeValues as V;
+    let read: Vec<(&Mesh, &Transform)> = parts.iter().filter_map(|(h, t)| meshes.get(h).map(|m| (m, t))).collect();
+    let colours = read.iter().all(|(m, _)| m.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
+    let (mut pos, mut nrm, mut uv, mut col, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::<u32>::new());
+    for (m, t) in read {
+        let (Some(V::Float32x3(p)), Some(V::Float32x3(n)), Some(V::Float32x2(u))) =
+            (m.attribute(Mesh::ATTRIBUTE_POSITION), m.attribute(Mesh::ATTRIBUTE_NORMAL), m.attribute(Mesh::ATTRIBUTE_UV_0))
+        else {
+            continue;
+        };
+        let base = pos.len() as u32;
+        let matrix = t.to_matrix();
+        pos.extend(p.iter().map(|v| matrix.transform_point3(Vec3::from(*v)).to_array()));
+        nrm.extend(n.iter().map(|v| (t.rotation * Vec3::from(*v)).to_array()));
+        uv.extend_from_slice(u);
+        if colours {
+            if let Some(V::Float32x4(c)) = m.attribute(Mesh::ATTRIBUTE_COLOR) {
+                col.extend_from_slice(c);
+            }
+        }
+        match m.indices() {
+            Some(i) => idx.extend(i.iter().map(|i| base + i as u32)),
+            None => idx.extend(base..pos.len() as u32),
+        }
+    }
+    if idx.is_empty() {
+        return None;
+    }
+    let mut out = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+    out.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
+    out.insert_attribute(Mesh::ATTRIBUTE_NORMAL, nrm);
+    out.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
+    if colours && !col.is_empty() {
+        out.insert_attribute(Mesh::ATTRIBUTE_COLOR, col);
+    }
+    out.insert_indices(Indices::U32(idx));
+    Some(out)
+}
+
 /// How much of the map's flat ambient light models still get when the light
 /// grid lights them: a floor for anything outside the grid's volume.
 const AMBIENT_WITH_LIGHT_GRID: f32 = 0.15;
+
+/// The sun's illuminance (lux) for a `sunlight` of 1.
+pub const SUN_ILLUMINANCE: f32 = 8_000.0;
+
+/// Trial (`COD4RW_SUNMODEL=cod4`): light the world as CoD4's `lm_sm_sun`
+/// shaders do. The live sun is `sunColor * (sunLight - ambientScale) *
+/// (1 - diffuseFraction)` (the rest is baked into the lightmaps), added to
+/// the lightmap's light in gamma space and shadowed by the sun's shadow map,
+/// before the sum is linearised (`shaders/world.wgsl`); Bevy's sun then
+/// lights only models, at the matching strength.
+pub fn cod4_sun() -> bool {
+    std::env::var("COD4RW_SUNMODEL").is_ok_and(|v| v.eq_ignore_ascii_case("cod4"))
+}
+
+/// The sun as strong as CoD4's live sun ([`live_sun`]), not its
+/// `sunLight`, which includes the part already baked into the lightmaps
+/// (with that, shade came out too dark beside the sunlit ground). The
+/// default; `COD4RW_SUNMODEL=now` for the older, stronger sun.
+fn live_sun_model() -> bool {
+    !std::env::var("COD4RW_SUNMODEL").is_ok_and(|v| v.eq_ignore_ascii_case("now"))
+}
+
+/// The sun's illuminance (lux) for a live sun ([`live_sun`]) of 1.
+const LIVE_SUN_ILLUMINANCE: f32 = 12_000.0;
+
+/// CoD4's live sun (gamma-space colour, see [`cod4_sun`]).
+fn live_sun(sun: &zone::SunParse) -> Vec3 {
+    Vec3::from(sun.sun_color) * ((sun.sun_light - sun.ambient_scale) * (1.0 - sun.diffuse_fraction)).max(0.0)
+}
+
+/// The direction to the sun, Bevy space.
+fn to_sun(sun: &zone::SunParse) -> Vec3 {
+    let (pitch, yaw) = (sun.angles[0].to_radians(), sun.angles[1].to_radians());
+    units::dir([pitch.cos() * yaw.cos(), pitch.cos() * yaw.sin(), -pitch.sin()]).normalize()
+}
 
 fn spawn_sun(commands: &mut Commands, world: &zone::GfxWorld, light_grid: bool) {
     let sun = &world.sun;
@@ -526,7 +727,20 @@ fn spawn_sun(commands: &mut Commands, world: &zone::GfxWorld, light_grid: bool) 
         Name::new("sun"),
         DirectionalLight {
             color: Color::linear_rgb(c[0], c[1], c[2]),
-            illuminance: 12_000.0 * sun.sun_light.max(0.5),
+            // Against the lightmaps' 3000 (`crate::lightmaps`): at 12000 shade
+            // came out half as bright as CoD4's against sunlit ground, which
+            // on snow and overcast maps (Bloc) left black shade and white snow.
+            illuminance: if cod4_sun() {
+                // For models: what the world's gamma-space sum adds over a
+                // typical baked 0.3, in the lightmaps' units (lux = pi * nits).
+                let live = live_sun(sun).max_element();
+                std::f32::consts::PI * crate::lightmaps::LIGHTMAP_EXPOSURE * ((0.3 + live).powf(2.2) - 0.3f32.powf(2.2)) / live.max(1e-3) * live
+            } else if live_sun_model() {
+                LIVE_SUN_ILLUMINANCE * live_sun(sun).max_element()
+            } else {
+                SUN_ILLUMINANCE * sun.sun_light.max(0.5)
+            },
+            affects_lightmapped_mesh_diffuse: !cod4_sun(),
             shadow_maps_enabled: true,
             ..default()
         },
@@ -538,10 +752,15 @@ fn spawn_sun(commands: &mut Commands, world: &zone::GfxWorld, light_grid: bool) 
             &[0, SHADOW_PROXY_LAYER].into_iter().chain((0..crate::splitscreen::MAX_PLAYERS).map(crate::splitscreen::body_layer)).collect::<Vec<_>>(),
         ),
     ));
-    let a = sun.ambient_color;
+    // District's is [0.74, 0.68, 56]: a typo CoD4 never shows (its models
+    // take their light from the grid), which here turned every model blue.
+    // A colour past 1 is the sun's instead.
+    let a = if sun.ambient_color.iter().all(|v| (0.0..=1.0).contains(v)) { sun.ambient_color } else { c };
     commands.insert_resource(GlobalAmbientLight {
         color: Color::linear_rgb(a[0], a[1], a[2]),
-        brightness: 2500.0 * sun.ambient_scale.max(0.05) * 4.0 * if light_grid { AMBIENT_WITH_LIGHT_GRID } else { 1.0 },
+        // At least 0.1: overcast maps (Bloc, Farm) set 0, which left models
+        // outside the light grid (tree crowns) black.
+        brightness: 2500.0 * sun.ambient_scale.max(0.1) * 4.0 * if light_grid { AMBIENT_WITH_LIGHT_GRID } else { 1.0 },
         // Lightmapped world surfaces get their indirect light from the lightmap.
         affects_lightmapped_meshes: false,
         ..default()

@@ -91,10 +91,14 @@ pub(super) fn plan_gear(
             }
             let Ok(owner) = owners.get(ex.owner) else { continue };
             let at = ctf.translation;
-            if !crate::combat::hostile(owner, pawn) || at.distance(eye) > u(if bomb_squad { 1500.0 } else { 700.0 }) {
+            // Bomb Squad marks them through walls within CoD4's 512 across
+            // and 128 up or down from the feet (about 60 below the eye).
+            let off = at - eye;
+            let marked = bomb_squad && off.with_y(0.0).length() <= u(512.0) && (off.y + u(60.0)).abs() <= u(128.0);
+            if !crate::combat::hostile(owner, pawn) || (!marked && at.distance(eye) > u(700.0)) {
                 continue;
             }
-            let seen = bomb_squad
+            let seen = marked
                 || Dir3::new(at - eye).ok().is_some_and(|d| spatial.cast_ray(eye, d, at.distance(eye) - u(6.0), true, &sight).is_none());
             if !seen {
                 continue;

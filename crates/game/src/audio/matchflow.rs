@@ -1,7 +1,8 @@
 //! The match's music and voices: the team's spawn music and the announcer
 //! opening Team Deathmatch, lead changes, the closing minute and the last
 //! ten seconds' ticks, victory or defeat, squad chatter when a teammate
-//! kills nearby, and the map's ambience.
+//! kills nearby, and the map's ambience: its looping track and the sound
+//! emitters its createfx script places (palms rustling, generators, flies).
 
 use super::{Bank, Sfx, Sides};
 use crate::combat::{Dead, Killed, Pawn};
@@ -14,7 +15,17 @@ use bevy::prelude::*;
 use std::cmp::Ordering;
 
 pub(super) fn build(app: &mut App) {
-    app.add_systems(Update, (spawn_cue, lead_changes, closing_time, match_end, chatter, ambience).run_if(crate::state::in_game));
+    app.init_resource::<Ambience>()
+        .add_systems(OnEnter(crate::state::GameState::InGame), |mut a: ResMut<Ambience>| *a = Ambience::default())
+        .add_systems(Update, (spawn_cue, lead_changes, closing_time, match_end, chatter, ambience, emitters).run_if(crate::state::in_game));
+}
+
+/// The map's ambience still to start this match: its track, and its
+/// emitters (read from its createfx script on the first frame).
+#[derive(Resource, Default)]
+struct Ambience {
+    track_done: bool,
+    emitters: Option<Vec<([f32; 3], String)>>,
 }
 
 /// The round the player last heard the spawn music in.
@@ -143,8 +154,8 @@ fn chatter(
 
 /// The map script's `ambientPlay("ambient_...")`, looped once its alias
 /// has loaded.
-fn ambience(mut sfx: ResMut<Sfx>, content: Res<Content>, map: Res<crate::world::MapName>, bank: Option<Res<Bank>>, mut done: Local<bool>) {
-    if *done {
+fn ambience(mut sfx: ResMut<Sfx>, content: Res<Content>, map: Res<crate::world::MapName>, bank: Option<Res<Bank>>, mut state: ResMut<Ambience>) {
+    if state.track_done {
         return;
     }
     let script = format!("maps/mp/{}.gsc", map.0);
@@ -157,11 +168,80 @@ fn ambience(mut sfx: ResMut<Sfx>, content: Res<Content>, map: Res<crate::world::
         _ => None,
     });
     let Some(alias) = alias else {
-        *done = true;
+        state.track_done = true;
         return;
     };
     if bank.is_some_and(|b| b.has(&alias)) {
         sfx.play(alias, None);
-        *done = true;
+        state.track_done = true;
+    }
+}
+
+/// The map's ambient emitters: `maps/createfx/<map>_fx.gsc`'s
+/// `createLoopSound()`s, each a loop at its `origin`, fading with distance
+/// as its alias says. Started once their aliases have loaded.
+fn emitters(
+    mut commands: Commands,
+    mut sfx: ResMut<Sfx>,
+    content: Res<Content>,
+    map: Res<crate::world::MapName>,
+    bank: Option<Res<Bank>>,
+    mut state: ResMut<Ambience>,
+) {
+    let list = state.emitters.get_or_insert_with(|| {
+        let script = format!("maps/createfx/{}_fx.gsc", map.0);
+        let text = content.zones.iter().flat_map(|z| &z.assets).find_map(|a| match a {
+            iw3::zone::Asset::RawFile(r) if r.name.eq_ignore_ascii_case(&script) => Some(String::from_utf8_lossy(&r.data).into_owned()),
+            _ => None,
+        });
+        let list = text.map(|t| loop_sounds(&t)).unwrap_or_default();
+        if !list.is_empty() {
+            info!("audio: {} ambient emitters", list.len());
+        }
+        list
+    });
+    let Some(bank) = bank else { return };
+    list.retain(|(origin, alias)| {
+        if !bank.has(alias) {
+            // Not loaded yet (localized_common_mp's come in the background).
+            return true;
+        }
+        let at = crate::units::pos(*origin);
+        let e = commands.spawn((Name::new(format!("emitter {alias}")), Transform::from_translation(at), GlobalTransform::from_translation(at))).id();
+        sfx.play_on(alias.clone(), e);
+        false
+    });
+}
+
+/// The loop sounds of a createfx script's entities: its `createLoopSound()`s
+/// and any effect with a `soundalias` (`CG_AddClientEntSound`): origin and
+/// alias.
+fn loop_sounds(script: &str) -> Vec<([f32; 3], String)> {
+    script
+        .split("ent = ")
+        .skip(1)
+        .filter_map(|block| {
+            let origin = block.split("\"origin\" ] = (").nth(1)?.split(')').next()?;
+            let v: Vec<f32> = origin.split(',').filter_map(|c| c.trim().parse().ok()).collect();
+            let alias = block.split("\"soundalias\" ] = \"").nth(1)?.split('"').next()?;
+            (v.len() == 3 && !alias.is_empty()).then(|| ([v[0], v[1], v[2]], alias.to_owned()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod emitter_tests {
+    #[test]
+    fn reads_loop_sounds() {
+        let s = r#"
+     	ent = maps\mp\_createfx::createLoopSound();
+     	ent.v[ "origin" ] = ( 4166.18, -42.8449, 277.479 );
+     	ent.v[ "angles" ] = ( 270, 0, 0 );
+     	ent.v[ "soundalias" ] = "emt_tree_palm_rustle";
+
+     	ent = maps\mp\_utility::createOneshotEffect( "smoke" );
+     	ent.v[ "origin" ] = ( 1, 2, 3 );
+"#;
+        assert_eq!(super::loop_sounds(s), vec![([4166.18, -42.8449, 277.479], "emt_tree_palm_rustle".to_owned())]);
     }
 }

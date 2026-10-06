@@ -31,12 +31,14 @@ pub struct GamepadPlugin;
 
 impl Plugin for GamepadPlugin {
     fn build(&self, app: &mut App) {
+        app.add_systems(PreUpdate, take_settings.before(PadSet));
         app.insert_resource(PadSettings::from_env())
             .init_resource::<ActiveDevice>()
             .init_resource::<PadFrame>()
             .init_resource::<Bindings>()
             .add_systems(Startup, glyphs::build)
             .init_resource::<SlotPads>()
+            .init_resource::<PadInjected>()
             .init_resource::<Devices>()
             .add_systems(
                 PreUpdate,
@@ -89,6 +91,8 @@ pub struct ActiveDevice {
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct PadSettings {
     pub sensitivity: f32,
+    /// Aiming down the sights' share of that.
+    pub ads_sensitivity: f32,
     pub invert_pitch: bool,
     pub aim_assist: bool,
     pub force_kind: Option<PadKind>,
@@ -100,6 +104,7 @@ impl PadSettings {
         let var = |k: &str| std::env::var(k).ok();
         PadSettings {
             sensitivity: var("COD4RW_PAD_SENS").and_then(|s| s.parse().ok()).unwrap_or(1.0f32).clamp(0.1, 5.0),
+            ads_sensitivity: 1.0,
             invert_pitch: var("COD4RW_PAD_INVERT").is_some_and(|s| s == "1"),
             aim_assist: var("COD4RW_PAD_AIM_ASSIST").is_none_or(|s| s != "0"),
             force_kind: var("COD4RW_PAD").and_then(|s| match s.to_ascii_lowercase().as_str() {
@@ -143,6 +148,49 @@ pub struct PadFrame {
 
 /// Radial deadzone, then rescaled to 0..1.
 const STICK_DEADZONE: f32 = 0.16;
+/// The settings' deadzones (left, right), as f32 bits.
+static DEADZONES: [std::sync::atomic::AtomicU32; 2] =
+    [std::sync::atomic::AtomicU32::new(0x3E23_D70A), std::sync::atomic::AtomicU32::new(0x3E23_D70A)];
+/// The settings' Tactical button layout: melee on B, crouch on R3.
+static TACTICAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn tactical() -> bool {
+    TACTICAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A stick after the settings' deadzone (0 left, 1 right).
+fn stick(v: Vec2, which: usize) -> Vec2 {
+    let dz = f32::from_bits(DEADZONES[which].load(std::sync::atomic::Ordering::Relaxed)).clamp(0.0, 0.9);
+    let len = v.length();
+    if len <= dz {
+        return Vec2::ZERO;
+    }
+    v / len * ((len - dz) / (1.0 - dz)).min(1.0)
+}
+
+/// The settings' controller options ([`crate::settings_apply`]), when they
+/// change.
+fn take_settings(mut settings: ResMut<PadSettings>) {
+    let Some(v) = crate::settings_apply::PAD.lock().ok().and_then(|mut p| p.take()) else { return };
+    // The environment's debug settings still win.
+    if std::env::var_os("COD4RW_PAD_SENS").is_none() {
+        settings.sensitivity = v.sensitivity.clamp(0.1, 5.0);
+    }
+    settings.ads_sensitivity = v.ads.clamp(0.1, 4.0);
+    settings.invert_pitch = v.invert || std::env::var("COD4RW_PAD_INVERT").is_ok_and(|s| s == "1");
+    settings.aim_assist = v.aim_assist;
+    settings.rumble = v.rumble;
+    if std::env::var_os("COD4RW_PAD").is_none() {
+        settings.force_kind = match v.glyphs.as_str() {
+            "xbox" => Some(PadKind::Xbox),
+            "ps" => Some(PadKind::PlayStation),
+            _ => None,
+        };
+    }
+    DEADZONES[0].store(v.deadzones.0.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    DEADZONES[1].store(v.deadzones.1.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    TACTICAL.store(v.tactical, std::sync::atomic::Ordering::Relaxed);
+}
 /// Triggers count as pressed past this.
 const TRIGGER_PRESS: f32 = 0.3;
 const TRIGGER_RELEASE: f32 = 0.2;
@@ -280,8 +328,8 @@ fn pad_frame(g: &Gamepad, ctx: Context, prev: &PadFrame, held_dir: &mut Option<(
         let v = g.get(b).unwrap_or(0.0).max(if g.pressed(b) { 1.0 } else { 0.0 });
         if was { v > TRIGGER_RELEASE } else { v > TRIGGER_PRESS }
     };
-    let movement = deadzone(g.left_stick());
-    let look = look_curve(deadzone(g.right_stick()));
+    let movement = stick(g.left_stick(), 0);
+    let look = look_curve(stick(g.right_stick(), 1));
     let in_game = ctx == Context::Game;
     let fire = in_game && trigger(GamepadButton::RightTrigger2, prev.fire);
     let ads = in_game && trigger(GamepadButton::LeftTrigger2, prev.ads);
@@ -392,7 +440,9 @@ fn binding(ctx: Context, b: GamepadButton, lean: bool, view: bool) -> Option<Bou
         (Context::Game, P::LeftThumb) if lean => Key(KeyCode::KeyQ),
         (Context::Game, P::RightThumb) if lean => Key(KeyCode::KeyE),
         (Context::Game, P::RightThumb) if view => Key(KeyCode::F5),
+        (Context::Game, P::RightThumb) if tactical() => return None,
         (Context::Game, P::RightThumb) => Key(KeyCode::KeyV),
+        (Context::Game, P::East) if tactical() => Key(KeyCode::KeyV),
         // Night vision (CoD4's action slot 1); D-pad down inspects the gun,
         // or with View held switches the gunplay.
         (Context::Game, P::DPadUp) => Key(KeyCode::KeyN),
@@ -420,6 +470,7 @@ fn feed_bindings(
     mut mouse: ResMut<ButtonInput<MouseButton>>,
     mut scroll: ResMut<AccumulatedMouseScroll>,
     gunplay: Res<crate::bodycam::Gunplay>,
+    mut injected: ResMut<PadInjected>,
 ) {
     let ctx = context(state.as_deref(), fe.as_deref());
     // Typing into a text field: A and B only end it (`ui::pad`).
@@ -427,6 +478,24 @@ fn feed_bindings(
     let g = active.entity.and_then(|e| pads.get(e).ok()).filter(|_| !(crate::splitscreen::active() && ctx == Context::Game));
     let lean = gunplay.is_bodycam();
     feed(g, ctx, &frame, &mut bindings, (&mut keys, &mut mouse, &mut scroll.delta.y), lean, typing, time.elapsed_secs());
+    // What it pressed: the game's own keys, which rebinding leaves alone.
+    injected.keys.clear();
+    injected.mouse.clear();
+    for bound in bindings.held.iter().map(|h| h.1).chain(bindings.taps.iter().copied()) {
+        match bound {
+            Bound::Key(k) => injected.keys.push(k),
+            Bound::Mouse(m) => injected.mouse.push(m),
+        }
+    }
+}
+
+/// The keys and buttons the pad has down this frame (in the keyboard's and
+/// mouse's resources): the game's own keys, passed through rebinding as
+/// they are ([`crate::bindings`]).
+#[derive(Resource, Default)]
+pub struct PadInjected {
+    pub keys: Vec<KeyCode>,
+    pub mouse: Vec<MouseButton>,
 }
 
 /// Feed one pad's buttons (none: let go of everything) into `keys`,
@@ -500,12 +569,13 @@ fn feed(
     if g.just_pressed(GamepadButton::North) {
         *wheel += 1.0;
     }
-    // B: crouch on a tap, prone once held.
-    if g.just_pressed(GamepadButton::East) {
+    // B: crouch on a tap, prone once held (R3 in the Tactical layout).
+    let crouch = if tactical() { GamepadButton::RightThumb } else { GamepadButton::East };
+    if g.just_pressed(crouch) {
         b.b_down = Some(now);
     }
     if let Some(down) = b.b_down {
-        let tap = if !g.pressed(GamepadButton::East) {
+        let tap = if !g.pressed(crouch) {
             Some(KeyCode::KeyC)
         } else if now - down >= PRONE_HOLD {
             Some(KeyCode::ControlLeft)

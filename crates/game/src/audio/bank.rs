@@ -16,6 +16,9 @@ use std::sync::Arc;
 
 /// `snd_alias_t::flags`: the sound loops.
 const LOOPING: i64 = 1;
+/// ... ducks slave sounds while it plays; is ducked.
+const MASTER: i64 = 2;
+const SLAVE: i64 = 4;
 /// `AILSOUNDINFO::format` for plain PCM.
 const PCM: i64 = 1;
 /// Channels (`flags >> 8 & 63`) heard without position: auto2d, menu,
@@ -54,6 +57,10 @@ pub struct Variant {
     pub curve: Vec<[f32; 2]>,
     /// An alias played along with this one (layers).
     pub secondary: Option<String>,
+    /// CoD4's ducking: while a master sound plays, slave ones drop to their
+    /// percentage (`flags` 2 and 4, `slavePercentage`).
+    pub master: bool,
+    pub slave: Option<f32>,
 }
 
 impl Variant {
@@ -144,6 +151,8 @@ fn variant(zone: &Zone, h: &GNode, wavs: &mut HashMap<AssetId, Option<Arc<[u8]>>
         two_d: CHANNELS_2D.contains(&((flags >> 8) & 63)),
         curve,
         secondary: h.string("secondaryAliasName").filter(|s| !s.is_empty()).map(str::to_ascii_lowercase),
+        master: flags & MASTER != 0,
+        slave: (flags & SLAVE != 0).then(|| h.float("slavePercentage").clamp(0.0, 1.0)),
     })
 }
 
@@ -272,6 +281,8 @@ pub fn bo1_aliases(bank: &Arc<t5::sound::SoundBank>) -> Vec<(String, Vec<Variant
                         two_d: !a.spatialized(),
                         curve: Vec::new(),
                         secondary: a.secondary.clone().filter(|s| !s.is_empty()),
+                        master: false,
+                        slave: None,
                     })
                 })
                 .collect();
@@ -327,6 +338,8 @@ pub fn waw_aliases(
                     two_d: !v.spatial,
                     curve: mixer.and_then(|m| m.curves.get(v.curve)).map(|c| c.knots.clone()).unwrap_or_default(),
                     secondary: secondary.map(|s| crate::waw::sound_alias(&s)),
+                    master: false,
+                    slave: None,
                 })
             })
             .collect();
@@ -366,6 +379,8 @@ mod tests {
             two_d: false,
             curve,
             secondary: None,
+            master: false,
+            slave: None,
         }
     }
 

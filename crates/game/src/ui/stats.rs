@@ -12,14 +12,12 @@ use bevy::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Unlocked, with every attachment and camo except gold (bits from
-/// `mp/attachmenttable.csv`, column 10).
+/// Unlocked, with native attachments and ordinary camos (bits from
+/// `mp/attachmenttable.csv`, column 10). Mastery camos are refreshed by
+/// `mastery` after loading saved progress and the unlock setting.
 const WEAPON_UNLOCKED: i32 = 1 | 2 | 4 | 8 | 16 | 32 | 256 | 512 | 1024 | 2048 | 4096;
-const GOLD_CAMO: i32 = 8192;
 /// Black Ops' and World at War's attachment bits (see `attachments`).
 const OTHER_GAME_ATTACHMENTS: i32 = ((1 << 28) - (1 << 6)) & !65536;
-/// The weapons with a gold camo model.
-const GOLD_WEAPONS: &[&str] = &["ak47"];
 
 pub struct Stats {
     values: HashMap<i32, i32>,
@@ -38,6 +36,11 @@ fn data_dir() -> Option<PathBuf> {
 }
 
 impl Stats {
+    #[cfg(test)]
+    pub(super) fn in_memory() -> Self {
+        Self { values: HashMap::new(), dvars: HashMap::new(), path: None, dirty: false }
+    }
+
     /// Defaults (every class from `mp/classtable.csv`, everything unlocked),
     /// overridden by the saved file. Debug runs (`persist: false`) neither
     /// read nor write it.
@@ -61,11 +64,10 @@ impl Stats {
             for r in 0..t.rows {
                 let named = t.get(r, 3).is_some_and(|n| !n.is_empty());
                 let Some(stat) = num(t.get(r, 1)).filter(|_| named) else { continue };
-                let gold = t.get(r, 4).is_some_and(|w| GOLD_WEAPONS.contains(&w));
                 // Black Ops' and World at War's guns: every attachment too
                 // (bits past CoD4's; 65536 stays the "new" mark).
                 let other_game = if stat >= 3000 + crate::bo1::FIRST_INDEX { OTHER_GAME_ATTACHMENTS } else { 0 };
-                let v = if stat >= 3000 { WEAPON_UNLOCKED | other_game | if gold { GOLD_CAMO } else { 0 } } else { 1 };
+                let v = if stat >= 3000 { WEAPON_UNLOCKED | other_game } else { 1 };
                 values.insert(stat, v);
                 unlocked.insert(stat, v);
             }
@@ -127,6 +129,8 @@ impl Stats {
             || name == super::scope::SCOPE_STYLE_DVAR
             || name == super::options::FILM_TINT_DVAR
             || name == super::options::LIGHTING_DVAR
+            || crate::settings::is_setting(name)
+            || super::combat_record::keeps_dvar(name)
     }
 
     pub fn set_dvar(&mut self, name: &str, value: &str) {

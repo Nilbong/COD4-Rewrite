@@ -3,3 +3,12 @@
 /dump
 /recordings
 /bugreports
+# The launcher's downloaded game (Launcher.exe puts it in game\).
+/game/
+# Local data: recorded players' tracks, training data, screenshots.
+/data/
+/output/
+# Never ship the games' own files.
+*.ff
+*.iwd
+*.iwi

@@ -417,6 +417,10 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
         m if m <= 20 => m * clip,
         m => m,
     };
+    let start_ammo = match w.int("startAmmo").max(0) as u32 {
+        m if m <= 20 => m * clip,
+        m => m,
+    };
     let name = |k: &str| Some(w.get(k).trim()).filter(|v| !v.is_empty() && *v != "none").unwrap_or("").to_owned();
     // CoD4's `szXAnims` slots (see `viewmodel::anim_slot`).
     const ANIMS: [(usize, &str); 22] = [
@@ -459,6 +463,7 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
         rechamber_time: if w.get("boltAction").trim() == "1" { fo("rechamberTime", 0.0) } else { 0.0 },
         clip_size: clip,
         max_ammo,
+        start_ammo,
         reload_time: fo("reloadTime", fb.reload_time),
         reload_empty_time: fo("reloadEmptyTime", fb.reload_empty_time),
         segmented_reload: w.get("segmentedReload").trim() == "1",
@@ -514,6 +519,9 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             reload: w.get("reloadSound").to_owned(),
             raise_player: w.get("raiseSoundPlayer").to_owned(),
             putaway_player: w.get("putawaySoundPlayer").to_owned(),
+            pullback: w.get("pullbackSound").to_owned(),
+            pullback_player: w.get("pullbackSoundPlayer").to_owned(),
+            rechamber: w.get("rechamberSound").to_owned(),
         },
         penetrate_type: crate::weapons::penetrate_type_named(w.get("penetrateType")),
         impact_type: match w.get("impactType") {
@@ -522,6 +530,7 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             "shotgun" | "shotgun_ap" => 4,
             _ => 2,
         },
+        player_anim: crate::weapons::player_anim_named(w.get("playerAnimType")),
         class: match (w.get("weaponClass"), group) {
             ("mg", _) => 1,
             ("smg", _) => 2,
@@ -552,6 +561,19 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             width: fo("adsOverlayWidth", 480.0),
             height: fo("adsOverlayHeight", 480.0),
         }),
+        gunplay: crate::weapons::Gunplay {
+            location_mult: [fo("locHead", 1.4), fo("locNeck", 1.0), fo("locTorsoUpper", 1.0), fo("locRightLegUpper", 1.0)],
+            kick_center: (fo("hipViewKickCenterSpeed", 1500.0), fo("adsViewKickCenterSpeed", 1500.0)),
+            reduced_kick: [
+                (fo("hipGunKickReducedKickBullets", 0.0), fo("hipGunKickReducedKickPercent", 0.0)),
+                (fo("adsGunKickReducedKickBullets", 0.0), fo("adsGunKickReducedKickPercent", 0.0)),
+            ],
+            spread_decay_stance: (fo("hipSpreadDuckedDecay", 1.0), fo("hipSpreadProneDecay", 1.0)),
+            spread_turn_add: fo("hipSpreadTurnAdd", 0.0),
+            fire_delay: fo("fireDelay", 0.0) / 1000.0,
+            gun_kick: [crate::weapons::GunKick::read(&|k| fo(&lower_first(k), 0.0), "Hip"), crate::weapons::GunKick::read(&|k| fo(&lower_first(k), 0.0), "Ads")],
+            gun_max: (fo("gunMaxPitch", 6.0), fo("gunMaxYaw", 6.0)),
+        },
     }
 }
 
@@ -684,4 +706,10 @@ mod tests {
         println!("camos: {:?}", d.camos.iter().map(|c| d.strings.get(&c.key).map_or("?", String::as_str)).collect::<Vec<_>>());
         assert!(d.guns.len() > 30);
     }
+}
+
+/// `HipGunKickAccel` as the weapon files spell it: `hipGunKickAccel`.
+fn lower_first(k: &str) -> String {
+    let mut c = k.chars();
+    c.next().map(|f| f.to_ascii_lowercase().to_string() + c.as_str()).unwrap_or_default()
 }

@@ -49,6 +49,8 @@ pub struct WeaponDef {
     pub rechamber_time: f32,
     pub clip_size: u32,
     pub max_ammo: u32,
+    /// Spare rounds at spawn (`iStartAmmo`; 0: three magazines).
+    pub start_ammo: u32,
     pub reload_time: f32,
     pub reload_empty_time: f32,
     /// Segmented reloads (shotguns, bolt actions: `bSegmentedReload`): a
@@ -116,6 +118,9 @@ pub struct WeaponDef {
     pub penetrate_type: u8,
     /// `weapClass`: 0 rifle, 1 machine gun, 2 SMG, 3 shotgun, 4 pistol, ...
     pub class: i32,
+    /// `playerAnimType`, an index into [`PLAYER_ANIM_TYPES`]: how other
+    /// players are seen holding, firing and reloading it.
+    pub player_anim: u8,
     /// HUD: the kill feed icon and its width:height ratio (1 or 2), and the
     /// ammo counter's bullet style (`ammoCounterClip`: 1 magazine, 2 short
     /// magazine, 3 shotgun, 4 rocket, 5 belt).
@@ -127,6 +132,91 @@ pub struct WeaponDef {
     pub display_key: String,
     /// A scope's full-screen picture once fully aimed (`ui::scope`).
     pub ads_overlay: Option<AdsOverlay>,
+    /// The rest of CoD4's gunplay numbers ([`Gunplay`]).
+    pub gunplay: Gunplay,
+}
+
+/// CoD4's gunplay numbers past the basics: hit locations, how the view
+/// kick settles, the first shots' reduced kick and how stance and turning
+/// change the hip spread.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gunplay {
+    /// `locationDamageMultipliers` for the head, neck, upper torso and
+    /// upper legs (the hitboxes there are).
+    pub location_mult: [f32; 4],
+    /// `hipViewKickCenterSpeed`, `adsViewKickCenterSpeed`: how fast the
+    /// view kick is pulled back (degrees/s²).
+    pub kick_center: (f32, f32),
+    /// `*GunKickReducedKickBullets` and `*Percent`, hip then ADS: the first
+    /// shots of a burst kick this much (`weaponRestrictKickTime`).
+    pub reduced_kick: [(f32, f32); 2],
+    /// `fHipSpreadDuckedDecay`, `fHipSpreadProneDecay`: the spread decay
+    /// rate's scale crouched and prone.
+    pub spread_decay_stance: (f32, f32),
+    /// `fHipSpreadTurnAdd`: spread from turning.
+    pub spread_turn_add: f32,
+    /// `iFireDelay` (s): the first shot's wait.
+    pub fire_delay: f32,
+    /// How the gun in hand kicks ([`GunKick`]): hip, then fully aimed.
+    pub gun_kick: [GunKick; 2],
+    /// `fGunMaxPitch`, `fGunMaxYaw`: how far it can kick (degrees).
+    pub gun_max: (f32, f32),
+}
+
+/// The gun's own kick in the hands (`BG_CalculateWeaponPosition_GunRecoil`):
+/// each shot adds a speed (degrees/s; CoD's pitch is down), a spring pulls
+/// the gun back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GunKick {
+    pub pitch: (f32, f32),
+    pub yaw: (f32, f32),
+    pub accel: f32,
+    pub speed_max: f32,
+    pub speed_decay: f32,
+    pub static_decay: f32,
+}
+
+impl GunKick {
+    /// Read from a weapon's fields, `name(key)` giving `hip`/`ads` keys
+    /// spelt as the game does.
+    pub fn read(f: &dyn Fn(&str) -> f32, prefix: &str) -> GunKick {
+        GunKick {
+            pitch: (f(&format!("{prefix}GunKickPitchMin")), f(&format!("{prefix}GunKickPitchMax"))),
+            yaw: (f(&format!("{prefix}GunKickYawMin")), f(&format!("{prefix}GunKickYawMax"))),
+            accel: f(&format!("{prefix}GunKickAccel")),
+            speed_max: f(&format!("{prefix}GunKickSpeedMax")),
+            speed_decay: f(&format!("{prefix}GunKickSpeedDecay")),
+            static_decay: f(&format!("{prefix}GunKickStaticDecay")),
+        }
+    }
+
+    /// Blended between hip and fully aimed.
+    fn lerp(&self, ads: &GunKick, t: f32) -> GunKick {
+        let l = |a: f32, b: f32| a + (b - a) * t;
+        GunKick {
+            pitch: self.pitch,
+            yaw: self.yaw,
+            accel: l(self.accel, ads.accel),
+            speed_max: l(self.speed_max, ads.speed_max),
+            speed_decay: l(self.speed_decay, ads.speed_decay),
+            static_decay: l(self.static_decay, ads.static_decay),
+        }
+    }
+}
+
+impl Default for Gunplay {
+    fn default() -> Self {
+        Gunplay {
+            location_mult: [1.4, 1.0, 1.0, 1.0],
+            kick_center: (1500.0, 1500.0),
+            reduced_kick: [(0.0, 0.0), (0.0, 0.0)],
+            spread_decay_stance: (1.0, 1.0),
+            spread_turn_add: 0.0,
+            fire_delay: 0.0,
+            gun_kick: [GunKick::default(), GunKick::default()],
+            gun_max: (0.0, 0.0),
+        }
+    }
 }
 
 /// A weapon's crosshair: side pieces `side_size` virtual pixels square at
@@ -162,6 +252,20 @@ pub struct WeaponSounds {
     pub reload: String,
     pub raise_player: String,
     pub putaway_player: String,
+    /// A grenade's pin (`pullbackSound`).
+    pub pullback: String,
+    pub pullback_player: String,
+    /// A bolt being worked (`rechamberSound`).
+    pub rechamber: String,
+}
+
+/// `mp/playeranimtypes.txt`: the `playerAnimType`s, in order.
+pub const PLAYER_ANIM_TYPES: [&str; 15] =
+    ["none", "other", "pistol", "smg", "autorifle", "mg", "sniper", "rocketlauncher", "explosive", "grenade", "turret", "c4", "m203", "hold", "briefcase"];
+
+/// A weapon file's `playerAnimType` by name (a rifle's if unknown).
+pub fn player_anim_named(name: &str) -> u8 {
+    PLAYER_ANIM_TYPES.iter().position(|t| t.eq_ignore_ascii_case(name.trim())).unwrap_or(4) as u8
 }
 
 impl WeaponDef {
@@ -184,6 +288,7 @@ impl WeaponDef {
             rechamber_time: 0.0,
             clip_size: 30,
             max_ammo: 180,
+            start_ammo: 90,
             reload_time: 2.5,
             reload_empty_time: 3.25,
             segmented_reload: false,
@@ -231,12 +336,14 @@ impl WeaponDef {
             impact_type: 2,
             penetrate_type: 2,
             class: 0,
+            player_anim: 4,
             kill_icon: "hud_icon_ak47".into(),
             kill_icon_ratio: 2,
             ammo_counter: 1,
             reticle: Reticle { side: "reticle_side_small".into(), side_size: 8.0, min_ofs: 0.0, center: String::new(), center_size: 0.0 },
             display_key: "WEAPON_AK47".into(),
             ads_overlay: None,
+            gunplay: Gunplay::default(),
         }
     }
 
@@ -249,19 +356,19 @@ impl WeaponDef {
             let (x, y) = (w.float(a) / 100.0, w.float(b) / 100.0);
             (x.min(y), x.max(y))
         };
-        let fb = WeaponDef::fallback();
         WeaponDef {
             name: w.string("szInternalName").unwrap_or("weapon").to_owned(),
             display_name: "AK-47",
             damage: w.int("damage") as f32,
-            min_damage: (w.int("damage") as f32 * 0.75).round(),
-            max_damage_range: fb.max_damage_range,
-            min_damage_range: fb.min_damage_range,
+            min_damage: w.int("minDamage") as f32,
+            max_damage_range: w.float("fMaxDamageRange"),
+            min_damage_range: w.float("fMinDamageRange"),
             fire_time: ms("iFireTime").max(0.01),
             fire_type: w.int("fireType") as i32,
             rechamber_time: if w.int("bBoltAction") != 0 { ms("iRechamberTime") } else { 0.0 },
             clip_size: w.int("iClipSize").max(1) as u32,
             max_ammo: w.int("iMaxAmmo").max(0) as u32,
+            start_ammo: w.int("iStartAmmo").max(0) as u32,
             reload_time: ms("iReloadTime"),
             reload_empty_time: ms("iReloadEmptyTime"),
             segmented_reload: w.int("bSegmentedReload") != 0,
@@ -308,17 +415,21 @@ impl WeaponDef {
             sounds: WeaponSounds {
                 fire: sound(w, "fireSound"),
                 fire_player: sound(w, "fireSoundPlayer"),
-                fire_last: sound(w, "fireLastSound"),
-                fire_last_player: sound(w, "fireLastSoundPlayer"),
+                fire_last: sound(w, "lastShotSound"),
+                fire_last_player: sound(w, "lastShotSoundPlayer"),
                 empty: sound(w, "emptyFireSound"),
                 empty_player: sound(w, "emptyFireSoundPlayer"),
                 reload: sound(w, "reloadSound"),
                 raise_player: sound(w, "raiseSoundPlayer"),
                 putaway_player: sound(w, "putawaySoundPlayer"),
+                pullback: sound(w, "pullbackSound"),
+                pullback_player: sound(w, "pullbackSoundPlayer"),
+                rechamber: sound(w, "rechamberSound"),
             },
             impact_type: w.int("impactType") as i32,
             penetrate_type: w.int("penetrateType").clamp(0, 3) as u8,
             class: w.int("weapClass") as i32,
+            player_anim: w.int("playerAnimType").clamp(0, PLAYER_ANIM_TYPES.len() as i64 - 1) as u8,
             kill_icon: w.asset("killIcon").map(|i| zone.get(i).name().trim_start_matches(',').to_owned()).unwrap_or_default(),
             kill_icon_ratio: w.int("killIconRatio") as i32,
             ammo_counter: w.int("ammoCounterClip") as i32,
@@ -335,6 +446,21 @@ impl WeaponDef {
                 .map(|i| zone.get(i).name().trim_start_matches(',').to_owned())
                 .filter(|m| !m.is_empty())
                 .map(|material| AdsOverlay { material, width: w.float("overlayWidth"), height: w.float("overlayHeight") }),
+            gunplay: Gunplay {
+                // `hitLocation_t`: 2 head, 3 neck, 4 upper torso, 12 upper
+                // right leg.
+                location_mult: [2, 3, 4, 12].map(|i| w.float(&format!("locationDamageMultipliers[{i}]"))),
+                kick_center: (w.float("fHipViewKickCenterSpeed"), w.float("fAdsViewKickCenterSpeed")),
+                reduced_kick: [
+                    (w.float("hipGunKickReducedKickBullets"), w.float("hipGunKickReducedKickPercent")),
+                    (w.float("adsGunKickReducedKickBullets"), w.float("adsGunKickReducedKickPercent")),
+                ],
+                spread_decay_stance: (w.float("fHipSpreadDuckedDecay"), w.float("fHipSpreadProneDecay")),
+                spread_turn_add: w.float("fHipSpreadTurnAdd"),
+                fire_delay: ms("iFireDelay"),
+                gun_kick: [GunKick::read(&|k| w.float(&format!("f{k}")), "Hip"), GunKick::read(&|k| w.float(&format!("f{k}")), "Ads")],
+                gun_max: (w.float("fGunMaxPitch"), w.float("fGunMaxYaw")),
+            },
         }
     }
 }
@@ -474,10 +600,26 @@ pub struct WeaponState {
     pub fire_held: bool,
     /// 0 = hip, 1 = fully aimed down sights.
     pub ads: f32,
-    /// Current hip spread bloom in degrees above the minimum.
+    /// CoD4's `aimSpreadScale` (0 to 1): where the spread is between its
+    /// minimum and maximum ([`WeaponState::spread`]).
     pub bloom: f32,
-    /// Recoil still to be applied to the view (pitch, yaw) in degrees.
+    /// The view kick's speed (pitch up, yaw left; degrees/s), and its
+    /// angle now (CoD4's `kickAVel`, `kickAngles`: the aim is the view plus
+    /// this, so it's moved along with it).
     pub pending_kick: Vec2,
+    pub kick_angles: Vec2,
+    /// The first shots' reduced kick lasts until this runs out (s).
+    pub restrict_kick: f32,
+    /// No firing until then: sprinting's end (`sprintOutTime`).
+    pub sprint_out_until: f32,
+    /// A pull's first shot waits for the weapon's `iFireDelay`: until then.
+    pub first_shot_at: Option<f32>,
+    /// The gun's kick in the hands (CoD angles: pitch down, yaw left;
+    /// degrees) and its speed (`vGunOffset`, `vGunSpeed`).
+    pub gun_offset: Vec2,
+    pub gun_speed: Vec2,
+    /// Last frame's view (pitch, yaw; radians), for the spread from turning.
+    pub last_view: Option<Vec2>,
     pub shots_fired: u32,
     /// Monotonic shot counter (drives fire animations).
     pub shots_fired_total: u32,
@@ -501,6 +643,13 @@ impl Default for WeaponState {
             ads: 0.0,
             bloom: 0.0,
             pending_kick: Vec2::ZERO,
+            kick_angles: Vec2::ZERO,
+            restrict_kick: 0.0,
+            sprint_out_until: 0.0,
+            first_shot_at: None,
+            gun_offset: Vec2::ZERO,
+            gun_speed: Vec2::ZERO,
+            last_view: None,
             shots_fired: 0,
             shots_fired_total: 0,
             mounted: None,
@@ -593,7 +742,9 @@ impl WeaponState {
         self.reserve -= take;
     }
 
-    /// Current cone half-angle in degrees.
+    /// Current cone half-angle in degrees (`Weapon_Fire`): fully aimed, from
+    /// the ADS spread towards the stance's maximum; otherwise from the
+    /// stance's minimum towards its maximum; by the aim spread scale.
     pub fn spread(&self, mover: &Mover) -> f32 {
         let d = self.mounted.unwrap_or(self.def);
         let i = match mover.stance {
@@ -601,11 +752,124 @@ impl WeaponState {
             Stance::Crouch => 1,
             Stance::Prone => 2,
         };
-        let moving = (mover.horizontal_speed() / crate::movement::RUN_SPEED).min(1.0);
-        let airborne = if mover.on_ground { 0.0 } else { d.hip_spread_max[0] };
-        let hip = (d.hip_spread_min[i] + moving * d.hip_spread_move_add * 0.4 + self.bloom + airborne)
-            .min(d.hip_spread_max[i].max(airborne));
-        hip + (d.ads_spread - hip) * self.ads
+        let (min, max) = (d.hip_spread_min[i], d.hip_spread_max[i]);
+        if self.ads >= 1.0 { d.ads_spread + (max - d.ads_spread) * self.bloom } else { min + (max - min) * self.bloom }
+    }
+
+    /// `PM_AdjustAimSpreadScale`: the scale grows while not fully aimed
+    /// (moving, turning, in the air), else decays by the weapon's rate
+    /// (scaled by stance; halved in the air).
+    fn adjust_spread(&mut self, mover: &Mover, view: Vec2, dt: f32) {
+        let d = self.mounted.unwrap_or(self.def);
+        let turned = self.last_view.map_or(Vec2::ZERO, |l| (view - l).abs());
+        self.last_view = Some(view);
+        if d.hip_spread_decay == 0.0 {
+            self.bloom = 0.0;
+            return;
+        }
+        let mut rate = d.hip_spread_decay;
+        if !mover.on_ground {
+            rate *= 0.5;
+        } else if mover.stance == Stance::Prone {
+            rate *= d.gunplay.spread_decay_stance.1;
+        } else if mover.stance == Stance::Crouch {
+            rate *= d.gunplay.spread_decay_stance.0;
+        }
+        let mut increase = 0.0;
+        if self.ads < 1.0 {
+            // Turning: a hundredth per degree, times the weapon's add.
+            increase += (turned.x.to_degrees() + turned.y.to_degrees()) * 0.01 * d.gunplay.spread_turn_add;
+            let speed = mover.horizontal_speed();
+            if d.hip_spread_move_add != 0.0 && speed > u(SPREAD_MOVE_THRESHOLD) {
+                increase += d.hip_spread_move_add * (speed / crate::movement::RUN_SPEED) * dt;
+            }
+            if !mover.on_ground {
+                increase += 2.0 * 1.28 * dt;
+            }
+        }
+        self.bloom = if increase > 0.0 { self.bloom + increase } else { self.bloom - rate * dt }.clamp(0.0, 1.0);
+    }
+
+    /// `BG_CalculateWeaponPosition_GunRecoil`: the gun's kick in 5 ms
+    /// steps per axis: capped, sprung back by `accel`, its speed decaying
+    /// in proportion and by a constant, never faster than `speed_max`;
+    /// stopped once small.
+    fn settle_gun(&mut self, dt: f32) {
+        let d = self.mounted.unwrap_or(self.def);
+        let g = &d.gunplay;
+        let k = g.gun_kick[0].lerp(&g.gun_kick[1], self.ads);
+        let caps = [g.gun_max.0, g.gun_max.1];
+        let mut left = dt;
+        while left > 0.0 {
+            let ft = left.min(0.005);
+            left -= ft;
+            for i in 0..2 {
+                let (mut o, mut s) = (self.gun_offset[i], self.gun_speed[i]);
+                if o.abs() < 0.25 && s.abs() < 1.0 {
+                    self.gun_offset[i] = 0.0;
+                    self.gun_speed[i] = 0.0;
+                    continue;
+                }
+                o += s * ft;
+                if o > caps[i] {
+                    o = caps[i];
+                    s = s.min(0.0);
+                } else if o < -caps[i] {
+                    o = -caps[i];
+                    s = s.max(0.0);
+                }
+                if o > 0.0 {
+                    s -= k.accel * ft;
+                } else if o < 0.0 {
+                    s += k.accel * ft;
+                }
+                s -= s * k.speed_decay * ft;
+                s = if s <= 0.0 { (s + k.static_decay * ft).min(0.0) } else { (s - k.static_decay * ft).max(0.0) };
+                s = s.clamp(-k.speed_max, k.speed_max);
+                self.gun_offset[i] = o;
+                self.gun_speed[i] = s;
+            }
+        }
+    }
+
+    /// `CG_KickAngles`: the view kick in 5 ms steps, per axis: pulled back
+    /// to centre at the weapon's centre speed (hip below half aimed), only
+    /// 6% as fast on the way back, never past 10 degrees.
+    fn settle_kick(&mut self, dt: f32) {
+        let d = self.mounted.unwrap_or(self.def);
+        let center = if self.ads > 0.5 { d.gunplay.kick_center.1 } else { d.gunplay.kick_center.0 };
+        let mut left = dt;
+        while left > 0.0 {
+            let ft = left.min(0.005);
+            left -= ft;
+            for i in 0..2 {
+                let (mut angle, mut speed) = (self.kick_angles[i], self.pending_kick[i]);
+                if speed == 0.0 && angle == 0.0 {
+                    continue;
+                }
+                if angle != 0.0 {
+                    speed += if angle <= 0.0 { center } else { -center } * ft;
+                }
+                let mut change = speed * ft;
+                if angle * change < 0.0 {
+                    change *= 0.06;
+                }
+                if (angle + change) * angle < 0.0 {
+                    angle = 0.0;
+                    speed = 0.0;
+                } else {
+                    angle += change;
+                    if angle == 0.0 {
+                        speed = 0.0;
+                    } else if angle.abs() > MAX_KICK {
+                        angle = MAX_KICK.copysign(angle);
+                        speed = 0.0;
+                    }
+                }
+                self.kick_angles[i] = angle;
+                self.pending_kick[i] = speed;
+            }
+        }
     }
 
     /// The weapon's scale on movement speed. Aiming down sights is CoD4's
@@ -626,6 +890,41 @@ impl WeaponState {
         d.move_speed_scale + (ads - d.move_speed_scale) * self.ads
     }
 }
+
+/// Stopping Power's and Juggernaut's scales (`perk_bulletDamage` 40,
+/// `perk_armorVest` 75), as `crate::loadout` and `crate::combat` apply them.
+const STOPPING_POWER: f32 = 1.4;
+const JUGGERNAUT: f32 = 0.75;
+
+/// A bullet's damage (`Bullet_GetDamage`, `G_GetWeaponHitLocationMultiplier`):
+/// full to `max_damage_range` units, down to `min_damage` at
+/// `min_damage_range`, in whole points; times what's left of it after
+/// walls (whole points), times the weapon's multiplier where it hit.
+pub fn bullet_damage(def: &WeaponDef, dist_units: f32, strength: f32, location: HitLocation) -> f32 {
+    let range = def.min_damage_range - def.max_damage_range;
+    let base = if def.damage == def.min_damage || range == 0.0 || dist_units <= def.max_damage_range {
+        def.damage
+    } else if dist_units >= def.min_damage_range {
+        def.min_damage
+    } else {
+        let t = (dist_units - def.max_damage_range) / range;
+        (def.min_damage * t + def.damage * (1.0 - t)).trunc()
+    };
+    let after_walls = (base * strength).trunc();
+    let i = match location {
+        HitLocation::Head => 0,
+        HitLocation::Neck => 1,
+        HitLocation::Torso => 2,
+        HitLocation::Legs => 3,
+    };
+    after_walls * def.gunplay.location_mult[i]
+}
+
+/// `bg_aimSpreadMoveSpeedThreshold`: slower than this (units/s), moving
+/// doesn't spread the aim.
+const SPREAD_MOVE_THRESHOLD: f32 = 11.0;
+/// The view kick goes no further than this (degrees).
+const MAX_KICK: f32 = 10.0;
 
 /// `player_burstFireCooldown`: the pause after a burst.
 const BURST_COOLDOWN: f32 = 0.2;
@@ -662,6 +961,9 @@ pub struct FreeAim {
 #[derive(Message, Clone, Copy)]
 pub struct ShotFired {
     pub shooter: Entity,
+    /// Captured at firing time for weapon records; synthetic HUD events
+    /// have no weapon and must not add to a player's weapon totals.
+    pub weapon: Option<&'static WeaponDef>,
     pub from: Vec3,
     pub to: Vec3,
     pub hit_pawn: bool,
@@ -698,11 +1000,13 @@ fn update_weapons(
             Option<&FreeAim>,
             Has<crate::grenades::Offhand>,
             Option<&crate::loadout::Loadout>,
+            Has<crate::splitscreen::LocalSlot>,
         ),
         Without<Dead>,
     >,
     hitboxes: Query<&Hitbox>,
     pawns: Query<(&crate::combat::Pawn, Has<Dead>)>,
+    loadouts: Query<&crate::loadout::Loadout>,
     mut damage: MessageWriter<Damage>,
     mut shots: MessageWriter<ShotFired>,
     mut hits: MessageWriter<HitConfirmed>,
@@ -717,9 +1021,18 @@ fn update_weapons(
     let filter = collision::bullet_filter();
     let mut rng = rand::rng();
     let idle = WeaponInput::default();
-    for (shooter, tf, mover, mut view, mut w, input, free_aim, throwing, loadout) in &mut shooters {
+    for (shooter, tf, mover, mut view, mut w, input, free_aim, throwing, loadout, player) in &mut shooters {
         // Throwing a grenade: the gun is down.
         let input = if throwing { &idle } else { input };
+        // C4 in a player's hand: aim (`+speed_throw`) throws it, fire is the
+        // detonator ([`crate::explosives`]).
+        let c4_throw;
+        let input = if player && w.def.name == "c4_mp" {
+            c4_throw = WeaponInput { fire: input.ads, ads: false, ..*input };
+            &c4_throw
+        } else {
+            input
+        };
         // On a deployed bipod, its stats (the same gun otherwise).
         let def = w.mounted.unwrap_or(w.def);
         let blocked = free_aim.is_some_and(|a| a.blocked);
@@ -732,13 +1045,20 @@ fn update_weapons(
         } else {
             (w.ads - dt / def.ads_trans_out.max(0.01)).max(0.0)
         };
-        w.bloom = (w.bloom - def.hip_spread_decay * dt).max(0.0);
+        w.adjust_spread(mover, Vec2::new(view.pitch, view.yaw), dt);
+        w.restrict_kick = (w.restrict_kick - dt).max(0.0);
 
-        // Apply recoil smoothly over a few frames.
-        let kick = w.pending_kick * (1.0 - (-30.0 * dt).exp());
-        w.pending_kick -= kick;
-        view.pitch = (view.pitch + kick.x.to_radians()).clamp(-1.5, 1.5);
-        view.yaw += kick.y.to_radians();
+        // The view kick: the view moves with it as it settles.
+        w.settle_gun(dt);
+        let before = w.kick_angles;
+        w.settle_kick(dt);
+        let moved = w.kick_angles - before;
+        view.pitch = (view.pitch + moved.x.to_radians()).clamp(-1.5, 1.5);
+        view.yaw += moved.y.to_radians();
+        // Back from sprinting, the gun comes up before it fires.
+        if mover.sprinting {
+            w.sprint_out_until = now + def.sprint_out_time;
+        }
 
         // CoD4's fire types (`ShotLimitReached`, `BurstFirePending`): a
         // single shot per pull, or a burst that finishes even if the trigger
@@ -749,7 +1069,14 @@ fn update_weapons(
             w.shots_fired = 0;
         }
         let pulled = (input.fire || mid_burst) && !w.trigger_spent();
-        let can_fire = pulled && w.clip > 0 && !w.reloading() && !mover.sprinting && !blocked && now >= w.next_fire;
+        // `PM_Weapon_StartFiring`: a fresh pull fires after `iFireDelay`.
+        if !pulled || w.shots_fired > 0 {
+            w.first_shot_at = None;
+        } else if w.first_shot_at.is_none() {
+            w.first_shot_at = Some(now + def.gunplay.fire_delay);
+        }
+        let delayed = w.first_shot_at.is_some_and(|at| now < at);
+        let can_fire = pulled && w.clip > 0 && !w.reloading() && !mover.sprinting && !blocked && now >= w.next_fire && now >= w.sprint_out_until && !delayed;
         if !can_fire {
             continue;
         }
@@ -761,19 +1088,36 @@ fn update_weapons(
         }
         w.shots_fired_total += 1;
 
-        // Spread: random direction within the cone.
+        // Spread: a random direction within the cone, its distance from the
+        // middle uniform (`Bullet_RandomDir`: more shots near the middle).
         let spread = free_aim.map_or_else(|| w.spread(mover), |a| a.spread).to_radians();
-        let r = spread * rng.random::<f32>().sqrt();
+        let r = spread * rng.random::<f32>();
         let theta = rng.random_range(0.0..std::f32::consts::TAU);
         let (eye, base) = free_aim.map_or_else(|| (mover.eye(tf.translation), view.rotation()), |a| (a.origin, a.rotation));
         let aim = base * Quat::from_euler(EulerRot::YXZ, r * theta.cos(), r * theta.sin(), 0.0);
         let dir = aim * Vec3::NEG_Z;
 
-        let (kp, ky) = if w.ads > 0.5 { (def.ads_kick_pitch, def.ads_kick_yaw) } else { (def.kick_pitch, def.kick_yaw) };
-        let mut range = |r: (f32, f32)| if r.1 > r.0 { rng.random_range(r.0..r.1) } else { r.0 };
-        let kick = Vec2::new(range(kp), range(ky));
-        w.pending_kick += kick * free_aim.map_or(1.0, |a| a.view_kick);
-        w.bloom += def.hip_spread_fire_add;
+        // `BG_WeaponFireRecoil`: the kick's speed, set afresh each shot
+        // (the weapon's numbers are degrees/s; stored in hundredths), less
+        // over a burst's first shots.
+        let aimed = w.ads >= 1.0;
+        if w.shots_fired == 1 {
+            let (bullets, _) = def.gunplay.reduced_kick[aimed as usize];
+            w.restrict_kick = def.gunplay.fire_delay + bullets * def.fire_time;
+        }
+        let reduce = if w.restrict_kick > 0.0 { def.gunplay.reduced_kick[aimed as usize].1 * 0.01 } else { 1.0 };
+        let (kp, ky) = if aimed { (def.ads_kick_pitch, def.ads_kick_yaw) } else { (def.kick_pitch, def.kick_yaw) };
+        // `random() * (max - min) + min`: either way round.
+        let mut range = |r: (f32, f32)| r.0 + rng.random::<f32>() * (r.1 - r.0);
+        let kick = Vec2::new(range(kp), range(ky)) * 100.0 * reduce;
+        w.pending_kick = kick * free_aim.map_or(1.0, |a| a.view_kick);
+        // The gun in hand kicks too (hip until fully aimed).
+        let gk = &def.gunplay.gun_kick[(w.ads > 0.0) as usize];
+        w.gun_speed += Vec2::new(range(gk.pitch), range(gk.yaw)) * reduce;
+        // `PM_Weapon_AddFiringAimSpreadScale`: not when fully aimed.
+        if !aimed {
+            w.bloom = (w.bloom + def.hip_spread_fire_add).min(1.0);
+        }
 
         // An explosive weapon launches its projectile along the aim
         // ([`crate::explosives`]).
@@ -785,7 +1129,7 @@ fn update_weapons(
                 dir: base * Vec3::NEG_Z,
                 yaw: view.yaw,
             });
-            shots.write(ShotFired { shooter, from: eye, to: eye, hit_pawn: false, normal: Vec3::Y, hit_world: false });
+            shots.write(ShotFired { shooter, weapon: Some(def), from: eye, to: eye, hit_pawn: false, normal: Vec3::Y, hit_world: false });
             continue;
         }
 
@@ -807,13 +1151,17 @@ fn update_weapons(
             first.get_or_insert((point, h.normal, hitbox.is_some(), hitbox.is_none()));
             let surface = match hitbox {
                 Some(hb) => {
-                    let dist_units = travelled / crate::units::INCH;
-                    let falloff = ((dist_units - def.max_damage_range) / (def.min_damage_range - def.max_damage_range)).clamp(0.0, 1.0);
-                    let base = def.damage + (def.min_damage - def.damage) * falloff;
+                    let amount = bullet_damage(def, travelled / crate::units::INCH, strength, hb.location);
+                    // Stopping Power against Juggernaut: they cancel
+                    // (`cac_modified_damage`), where they'd otherwise
+                    // make 1.4 x 0.75.
+                    let attacker_power = loadout.is_some_and(|l| crate::perks::has(Some(l), "specialty_bulletdamage"));
+                    let armoured = crate::perks::has(loadouts.get(hb.owner).ok(), "specialty_armorvest");
+                    let amount = if attacker_power && armoured { amount / (STOPPING_POWER * JUGGERNAUT) } else { amount };
                     damage.write(Damage {
                         target: hb.owner,
                         attacker: Some(shooter),
-                        amount: base * hb.location.multiplier() * strength,
+                        amount,
                         location: hb.location,
                         weapon: def.display_name,
                     });
@@ -852,7 +1200,7 @@ fn update_weapons(
             origin = exit + dir * u(0.5);
         }
         let (to, normal, hit_pawn, hit_world) = first.unwrap_or((eye + dir * max_dist, Vec3::Y, false, false));
-        shots.write(ShotFired { shooter, from: eye, to, hit_pawn, normal, hit_world });
+        shots.write(ShotFired { shooter, weapon: Some(def), from: eye, to, hit_pawn, normal, hit_world });
     }
 }
 
@@ -924,6 +1272,43 @@ mod tests {
         run(&mut w, &mut t, 1.75, false, 0.0..0.0);
         assert!(!w.reloading());
         assert_eq!(w.clip, 1);
+    }
+
+    #[test]
+    fn bullet_damage_follows_cod4() {
+        // The M4: 30 to 1500 units, 20 from 2000, head 1.4.
+        let m4 = WeaponDef {
+            damage: 30.0,
+            min_damage: 20.0,
+            max_damage_range: 1500.0,
+            min_damage_range: 2000.0,
+            gunplay: Gunplay { location_mult: [1.4, 1.0, 1.0, 1.0], ..Gunplay::default() },
+            ..WeaponDef::fallback()
+        };
+        assert_eq!(bullet_damage(&m4, 1000.0, 1.0, HitLocation::Torso), 30.0);
+        assert_eq!(bullet_damage(&m4, 1750.0, 1.0, HitLocation::Torso), 25.0);
+        assert_eq!(bullet_damage(&m4, 1800.0, 1.0, HitLocation::Torso), 24.0, "whole points");
+        assert_eq!(bullet_damage(&m4, 5000.0, 1.0, HitLocation::Legs), 20.0);
+        assert!((bullet_damage(&m4, 100.0, 1.0, HitLocation::Head) - 42.0).abs() < 1e-4);
+        // Through a wall at 60%: 18 of 30.
+        assert_eq!(bullet_damage(&m4, 100.0, 0.6, HitLocation::Torso), 18.0);
+    }
+
+    #[test]
+    fn view_kick_rises_then_settles() {
+        let mut w = WeaponState { pending_kick: Vec2::new(60.0, 0.0), ..default() };
+        // An AK's hardest hip kick, 60 degrees/s, against 1500: up about
+        // 1.2-1.4 degrees in 40 ms (in 5 ms steps).
+        w.settle_kick(0.04);
+        assert!((1.1..1.5).contains(&w.kick_angles.x), "{:?}", w.kick_angles);
+        let peak = w.kick_angles.x;
+        // Then back down: a tenth of a second later it is lower (back in
+        // about 0.17 s), and in the end centred.
+        w.settle_kick(0.1);
+        assert!(w.kick_angles.x < peak && w.kick_angles.x > 0.0);
+        w.settle_kick(3.0);
+        assert_eq!(w.kick_angles, Vec2::ZERO);
+        assert_eq!(w.pending_kick, Vec2::ZERO);
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Rows this game adds to Options > Game (`options_game`), below CoD4's own:
-//! the sniper scope's style ([`super::scope`]), the film's tint and the
-//! lighting (baked or ray traced, [`crate::rtgi`]). Each is
+//! the sniper scope's style ([`super::scope`]), the film's tint, the
+//! lighting (baked or ray traced, [`crate::rtgi`]) and ragdolls
+//! ([`crate::ragdoll`]). Each is
 //! made from CoD4's Yes/No row there (`monkeytoy`'s label and choice).
 
 use super::Frontend;
 use bevy::prelude::*;
-use iw3::menu::{ItemData, Menu, Multi, item_type};
+use iw3::menu::{ItemData, Menu};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -32,7 +33,14 @@ static LIGHTING: AtomicU8 = AtomicU8::new(0);
 /// The lighting the setting asks for.
 pub fn lighting() -> crate::rtgi::Lighting {
     use crate::rtgi::Lighting;
-    match LIGHTING.load(Ordering::Relaxed) {
+    // `COD4RW_LIGHTING` holds from the start, before the menus are up (a
+    // run straight into a map loads it first).
+    let from_env = std::env::var("COD4RW_LIGHTING").ok().map(|v| match v.to_ascii_lowercase().as_str() {
+        "rt_low" => 1,
+        "rt_high" => 2,
+        _ => 0,
+    });
+    match from_env.unwrap_or_else(|| LIGHTING.load(Ordering::Relaxed)) {
         1 => Lighting::RayTracedLow,
         2 => Lighting::RayTracedHigh,
         _ => Lighting::Baked,
@@ -43,7 +51,7 @@ pub(super) fn build(app: &mut App) {
     app.add_systems(Update, sync.run_if(resource_exists::<Frontend>));
 }
 
-fn sync(mut fe: ResMut<Frontend>, mut from_env: Local<bool>) {
+fn sync(mut fe: ResMut<Frontend>, mut from_env: Local<bool>, mut settings: ResMut<crate::settings::Settings>) {
     if !std::mem::replace(&mut *from_env, true) {
         if let Ok(tint) = std::env::var("COD4RW_FILMTINT") {
             fe.set_dvar(FILM_TINT_DVAR, &tint);
@@ -58,46 +66,32 @@ fn sync(mut fe: ResMut<Frontend>, mut from_env: Local<bool>) {
         _ => 0,
     };
     LIGHTING.store(lighting, Ordering::Relaxed);
+    crate::ragdoll::set_enabled(fe.dvars.get(crate::ragdoll::RAGDOLL_DVAR).is_none_or(|v| v != "0"));
     FILM_TINT.store(fe.dvars.get(FILM_TINT_DVAR).is_some_and(|v| v.eq_ignore_ascii_case("on")), Ordering::Relaxed);
+    // The settings for the game, when they change.
+    let mut fresh = settings.clone();
+    if fresh.update(|d| fe.dvars.get(&d.to_ascii_lowercase()).cloned()) {
+        *settings = fresh;
+    }
 }
 
-/// Add the rows.
+/// Build the settings pages ([`super::settings_menu`]).
 pub(super) fn add(menus: &mut HashMap<String, Arc<Menu>>) {
-    add_row(menus, super::scope::SCOPE_STYLE_DVAR, "Sniper Scope", &[("Classic", "classic"), ("Lens", "lens")]);
-    add_row(menus, FILM_TINT_DVAR, "Film Tint", &[("Off", "off"), ("On", "on")]);
-    // Ray tracing needs a GPU with ray queries; without one the row says so.
-    if crate::rtgi::supported() {
-        add_row(menus, LIGHTING_DVAR, "Lighting", &[("Baked", "baked"), ("Ray Traced Low", "rt_low"), ("Ray Traced High", "rt_high")]);
-    } else {
-        add_row(menus, LIGHTING_DVAR, "Lighting (no ray tracing GPU)", &[("Baked", "baked")]);
+    super::settings_menu::build(menus);
+    // Ray tracing needs a GPU with ray queries; without one Lighting is
+    // Baked only.
+    if !crate::rtgi::supported() {
+        if let Some(menu) = menus.get_mut("options_graphics") {
+            for it in &mut Arc::make_mut(menu).items {
+                if it.dvar.eq_ignore_ascii_case(LIGHTING_DVAR) {
+                    if let ItemData::Multi(m) = &mut it.data {
+                        m.labels.truncate(1);
+                        m.strings.truncate(1);
+                        m.values.truncate(1);
+                    }
+                }
+            }
+        }
     }
 }
 
-/// A row below Options > Game's last: `label`, and a choice of `dvar`'s
-/// values (shown, set).
-fn add_row(menus: &mut HashMap<String, Arc<Menu>>, dvar: &str, label: &str, choices: &[(&str, &str)]) {
-    let Some(menu) = menus.get_mut("options_game") else { return };
-    let menu = Arc::make_mut(menu);
-    let Some(choice) = menu.items.iter().position(|it| it.dvar.eq_ignore_ascii_case("monkeytoy")) else { return };
-    let row_y = menu.items[choice].window.rect.y;
-    let label_item = menu.items.iter().position(|it| it.window.rect.y == row_y && it.ty == item_type::BUTTON && !it.text_exp.is_empty());
-    let last = menu.items.iter().filter(|it| !it.dvar.is_empty()).map(|it| it.window.rect.y).fold(row_y, f32::max);
-    let y = last + 22.0;
-    let mut value = menu.items[choice].clone();
-    value.window.rect.y = y;
-    value.dvar = dvar.into();
-    value.data = ItemData::Multi(Multi {
-        labels: choices.iter().map(|(l, _)| (*l).into()).collect(),
-        strings: choices.iter().map(|(_, v)| (*v).into()).collect(),
-        values: (0..choices.len()).map(|i| i as f32).collect(),
-        str_def: true,
-    });
-    if let Some(i) = label_item {
-        let mut item = menu.items[i].clone();
-        item.window.rect.y = y;
-        item.text_exp.clear();
-        item.text = label.into();
-        menu.items.push(item);
-    }
-    menu.items.push(value);
-}

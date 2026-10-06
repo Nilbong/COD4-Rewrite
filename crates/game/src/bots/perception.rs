@@ -58,7 +58,13 @@ pub struct Contact {
     pub last_visible: f32,
     /// The enemy shot at us recently.
     pub shot_us_at: Option<f32>,
+    /// Their eye height when last seen (standing until then): where their
+    /// head and chest are.
+    pub eye_height: f32,
 }
+
+/// A standing player's eye height, for enemies not yet seen.
+const STAND_EYE: f32 = u(60.0);
 
 impl Contact {
     /// Where the enemy probably is now.
@@ -97,6 +103,8 @@ pub struct PawnView {
     pub vel: Vec3,
     pub stance: Stance,
     pub sprinting: bool,
+    /// Dead Silence (`specialty_quieter`): no footsteps to hear.
+    pub quiet: bool,
 }
 
 impl PawnView {
@@ -130,7 +138,7 @@ pub fn look(
     now: f32,
     dt: f32,
 ) -> Vec<Entity> {
-    let sight = collision::sight_filter();
+    let sight = collision::ai_sight_filter();
     let mut newly_noticed = Vec::new();
     for e in enemies {
         let to = e.chest() - eye;
@@ -156,6 +164,7 @@ pub fn look(
             shot_us_at: None,
             visible_since: now,
             last_visible: f32::MIN,
+            eye_height: STAND_EYE,
         });
         if visible {
             // Seconds to notice, from a quick glance in the centre of view
@@ -192,6 +201,7 @@ pub fn look(
             c.last_visible = now;
             if c.noticed_at.is_some() {
                 c.pos = e.feet;
+                c.eye_height = e.eye_height;
                 c.vel = e.vel;
                 c.time = now;
                 c.source = Source::Seen;
@@ -235,7 +245,7 @@ pub fn listen(
         let dist = e.feet.distance(me);
         let fired = recently_fired.get(&e.entity).is_some_and(|&t| now - t < 0.3);
         let range = if e.sprinting { FOOTSTEP_RANGE * 1.6 } else { FOOTSTEP_RANGE };
-        let footsteps = dist < range && e.vel.length() > u(150.0) && e.stance == Stance::Stand;
+        let footsteps = dist < range && e.vel.length() > u(150.0) && e.stance == Stance::Stand && !e.quiet;
         if !(fired && dist < GUNFIRE_RANGE || footsteps) {
             continue;
         }
@@ -259,6 +269,7 @@ pub fn listen(
             shot_us_at: None,
             visible_since: now,
             last_visible: f32::MIN,
+            eye_height: STAND_EYE,
         });
         if !c.visible && (c.source != Source::Seen || c.age(now) > 1.0) {
             c.pos = e.feet + noise;
@@ -284,6 +295,7 @@ pub fn shot_by(know: &mut Knowledge, attacker: Entity, from: Vec3, now: f32, rng
         shot_us_at: None,
         visible_since: now,
             last_visible: f32::MIN,
+            eye_height: STAND_EYE,
     });
     c.shot_us_at = Some(now);
     if !c.visible {
@@ -312,6 +324,7 @@ pub fn hear_callouts(know: &mut Knowledge, team: crate::combat::Team, callouts: 
             shot_us_at: None,
             visible_since: now,
             last_visible: f32::MIN,
+            eye_height: STAND_EYE,
         });
         if !c.visible && time > c.time {
             c.pos = pos;
@@ -334,6 +347,7 @@ pub fn radar(know: &mut Knowledge, enemy: Entity, pos: Vec3, now: f32) {
         shot_us_at: None,
         visible_since: now,
         last_visible: f32::MIN,
+        eye_height: STAND_EYE,
     });
     if !c.visible {
         c.pos = pos;

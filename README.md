@@ -5,6 +5,21 @@ A reimplementation of *Call of Duty 4: Modern Warfare* multiplayer on [Bevy](htt
 The repository contains **no game data**. Maps, models and textures are read at runtime from your own
 CoD4 installation, the way OpenMW works for Morrowind.
 
+## Download and play
+
+1. Download this repository (Code > Download ZIP) and unzip it anywhere.
+2. Double-click **`Launcher.exe`**. It downloads the latest build of the game from this repository's
+   [Releases](https://github.com/Nilbong/COD4-Rewrite/releases) into a `game` folder beside it, keeps it up to
+   date (it checks each time it starts, in about a second) and starts the game.
+
+No Rust or other tools are needed: GitHub builds `cod4rw.exe` for every release. You need Windows, a graphics
+card with Vulkan, and your own installed copy of CoD4 (Steam or retail, patch 1.7); the game reads its maps,
+models and sounds from it, and none of them are downloaded. `Launcher.exe --build` builds from this folder's
+source instead (needs Rust, see below).
+
+For maintainers: pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) makes the `Release`
+workflow (`.github/workflows/release.yml`) build `cod4rw.exe` and `Launcher.exe` and attach them to the release.
+
 ## Running
 
 You need a Rust toolchain and an installed copy of CoD4 (Steam or retail, patch 1.7).
@@ -50,6 +65,15 @@ Options:
    still and sprint. The profile is plain `key = value` lines you can read and edit.
 3. Play with `--bot-profile profiles/me.txt`. `--skill 0.5` makes bots your level; higher or lower scales their
    timing from there, and each bot still varies a little.
+
+Real play is also recorded on its own (any match without `COD4RW_*` debug variables) to
+`%LOCALAPPDATA%\cod4rw\recordings`, for training **learned models** of how you play (`tools/learn`,
+`crates/game/src/bots/nets`): small networks run on the CPU. The first is aim: `python tools/learn/aim_data.py
+<recording dirs> -o aim.npz`, `python tools/learn/train_aim.py aim.npz -o aim_model.json` (it reports how the model
+aims at held-out sightings against you), then `COD4RW_NETAIM=aim_model.json` makes bots aim with it while engaging.
+`python tools/learn/aim_eval.py player=<dir> bots=<dir>` compares any recordings' flicks (time to settle, overshoot,
+tracking error). With minutes of recordings the hand-built aim is still closer to the player, so it stays the default;
+the learned one needs hours. CoD4X demos (10 snapshots a second) are too coarse for aim but fine for movement.
 
 ### Controls
 
@@ -283,6 +307,8 @@ back to that). Looking for newly plugged-in pads runs on a thread of its own: li
   - the map's baked lightmaps as indirect light (CoD4's directional lightmap formula, evaluated per pixel with the
     normal map) under a real-time sun with cascaded shadows;
   - CoD4's normal and specular maps;
+  - the live sun at CoD4's own strength over the lightmaps (`sunColor * (sunLight - ambientScale) * (1 - diffuseFraction)`,
+    the rest being baked in), so shade keeps its detail (`COD4RW_SUNMODEL=now` for the older, stronger sun);
   - the map's baked reflection probes through a physically based environment BRDF;
   - characters, guns and props lit from the map's light grid (the baked light CoD4 stores through the playable
     space), as an irradiance volume, so they darken indoors and pick up bounce light like the world around them;
@@ -311,9 +337,11 @@ back to that). Looking for newly plugged-in pads runs on a thread of its own: li
   - optional ray-traced lighting (Options > Game > Lighting: Baked, Ray Traced Low or High, `r_lighting`, or
     `COD4RW_LIGHTING=baked|rt_low|rt_high`; from the next match), with Bevy's Solari on GPUs with ray queries: the
     sun, a sky-tinted dome only the rays see and lit-up fixtures (opaque unlit materials) traced through the map with
-    bounce light, in place of the lightmaps, light grid and shadow maps (`crate::rtgi`). Outdoors it works well;
-    interiors lit only by CoD4's baked lights come out dark, and without DLSS there's grain in shade. Splitscreen
-    always uses Baked. `COD4RW_RES=1920x1080` sizes the window for timing;
+    bounce light, in place of the light grid and shadow maps (`crate::rtgi`). World surfaces keep their baked
+    lightmap as a floor under the traced light (`shaders/world_deferred.wgsl`, with CoD4's normal maps), so
+    interiors are never darker than Baked. Without DLSS there's some grain in shade. Solari's shaders take about
+    10 s to compile the first time it's used (the map shows a flat colour until then). Splitscreen always uses
+    Baked. `COD4RW_RES=1920x1080` sizes the window for timing;
   - alpha test/blend/decal state from the original material state bits, including the screen-add blend of lamps'
     fake light beams and flares (which fade as they turn edge-on, on the world and on props) and the 2x multiply of
     doorways' HDR portals (`hdrportal_lighten`/`_darken`: what's seen through a doorway brightens or darkens with
@@ -338,6 +366,13 @@ back to that). Looking for newly plugged-in pads runs on a thread of its own: li
   (`bSegmentedReload`: the W1200, M1014, M40A3, R700, Black Ops' Ithaca, SPAS-12, HS10 and Python, World at War's
   trench gun): the reload's start loads one, each cycle of its loop another, then its end, each with its own
   animation and time; a fresh trigger pull cuts it to the end once there's a round to fire.
+* **Map props and clutter** (`crates/game/src/props.rs`): the maps' `script_model` props (destructible cars and
+  glass, barrels, pipes, palms, cameras; game-mode objects only in their mode) and their dynamic entities
+  (`dynEntDefList`: hundreds of cinder blocks, cans, bottles, boxes, crates and tyres a map) are drawn where CoD4
+  puts them. Static models kept in `common_mp` (`,name`: rubble bricks, flags, cluster bombs) are found there.
+* **Fog** (`crates/game/src/fog.rs`): each map's own, from its art script (`setExpFog(start, halfway, r, g, b)`;
+  CoD4's density ln 2 / halfway), so the distance fades into the map's colour; none where CoD4 has none (Killhouse,
+  Wet Work).
 * **Bullet penetration** (every shot, players' and bots'): bullets go through surfaces as deep as CoD4's
   `info/bullet_penetration_mp` table allows for the gun's `penetrateType` (small, medium or large) and the surface
   type (6 units of concrete for a small round, 12 for medium; 12-16 of wood; 72 of glass or cloth; players' flesh
@@ -665,6 +700,12 @@ Any `COD4RW_*` variable (other than `COD4RW_UNLOCKS`) makes a debug run, which n
 * `COD4RW_LOADOUT=<gun spec>[@camo]`: start with that primary (`ak47@6` is the gold AK-47, `t5_ak47:reflex@115` a
   gold Black Ops AK-47 with a reflex sight).
 * `COD4RW_NOSHINE=1`: guns without their specular reflections, for comparison.
+* `COD4RW_CLUTTERTEST=<dir>` (with `COD4RW_SPAWN` by some clutter): shoot every piece of the map's clutter in view
+  within 12 m, then set off a blast 3 m ahead, screenshotting before and as things fly and settle; logs what moved.
+  `iw3 --example dynents <map> [filter]` lists a map's clutter and breakables with their physics presets.
+  `iw3 --example impactaudit <map>` lists the bullet impact effects by surface and which impact sounds exist;
+  `iw3 --example terrainsurf <map>...` what each map's terrain and patch collision is made of.
+* `COD4RW_NOMAPFX=1`: without the map's ambient effects (its createfx smoke, fires, dust and birds), for comparison.
 * `COD4RW_GUNLOOK=cod4`: guns as CoD4 drew them, for comparison. By default they're normal-mapped (as characters
   are), their camos have more contrast and colour, and their specular reflection is stronger.
 * `COD4RW_VMTEST=<dir>`: screenshot the viewmodel idle, firing, in ADS, reloading, sprinting (in, loop, out),
@@ -733,6 +774,10 @@ Any `COD4RW_*` variable (other than `COD4RW_UNLOCKS`) makes a debug run, which n
   `COD4RW_SPAWN` at a target, to test planting). In Headquarters, `COD4RW_SPAWN` makes the first HQ the nearest.
 * `COD4RW_BIPODSCAN=1`: 3 s into a match, log whether the player faces a ledge a bipod rests on, and up to twelve
   standing spots nearby that do, as `COD4RW_SPAWN` values.
+* `COD4RW_WALK=<seconds>` (with `COD4RW_SPAWN`): Player 1 walks forward (`COD4RW_WALK_KEYS=KeyW,Space@0.05,KeyC@0.25`:
+  held keys, `Key@t` tapped once at t; Space alone taps each second), logging position, speed and ground every
+  frame, then exits; for movement bugs (stairs, gaps). `cargo run -p iw3 --example pathcheck|brushbox|planeat|trisat
+  -- <map> ...` find the collision at a spot.
 * `COD4RW_SPLITSCREEN=kbm,pad,...`: like `--splitscreen`. `COD4RW_SPLITTEST=<dir>` (with it): virtual controllers
   play Players 2 to 4 (Player 2 walks and turns, 3 fires and aims, 4 crouches, stands and throws a frag) while each
   player's state is logged and the window screenshot, then exit.

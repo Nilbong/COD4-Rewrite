@@ -95,6 +95,7 @@ impl UiAssets {
         // attachments, for Create a Class.
         super::bo1::extend(&mut out.strings, &mut out.tables);
         super::waw::extend(&mut out.strings, &mut out.tables);
+        super::camos::add(&mut out.strings, &mut out.tables, &mut out.menus);
         // Options > Game's rows for the sniper scope's style and the film's
         // tint.
         super::options::add(&mut out.menus);
@@ -171,6 +172,16 @@ impl UiAssets {
         let key = name.trim_start_matches(',').to_ascii_lowercase();
         if let Some(m) = self.materials.get(&key) {
             return m.clone();
+        }
+        if key == super::camos::PLATINUM_SWATCH || key == super::camos::DIAMOND_SWATCH {
+            let handle = if key == super::camos::DIAMOND_SWATCH {
+                crate::gunmodel::platinum::diamond_texture(images)?
+            } else {
+                crate::gunmodel::platinum::texture(images)?
+            };
+            let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
         }
         // World at War's own materials, from its zones and iwds; a kill icon
         // only once its guns' content has loaded, so not found isn't kept.

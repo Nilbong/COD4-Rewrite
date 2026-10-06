@@ -421,12 +421,15 @@ impl Data {
                     behaviour: crate::explosives::Behaviour::Launched,
                     speed: f("projectileSpeed"),
                     speed_up: f("projectileSpeedUp"),
+                    speed_forward: f("projectileSpeedForward"),
                     delay: f("fireDelay"),
                     arming: f("projectileActivateDist"),
                     impact_damage: f("damage"),
                     radius: f("explosionRadius"),
                     inner_damage: f("explosionInnerDamage"),
                     outer_damage: f("explosionOuterDamage"),
+                    lifetime: 10.0,
+                    cone: 180.0,
                     model: name("projectileModel").map_or_else(String::new, |m| format!("{MATERIAL_PREFIX}{m}")),
                     display: "Rifle Grenade",
                     icon: name("killIcon").map_or_else(|| standin.icon.clone(), |i| format!("{MATERIAL_PREFIX}{i}")),
@@ -478,7 +481,7 @@ impl Data {
 }
 
 /// The weapon file fields naming sounds the game plays.
-const SOUND_FIELDS: [&str; 10] = [
+const SOUND_FIELDS: [&str; 13] = [
     "fireSound",
     "fireSoundPlayer",
     "lastShotSound",
@@ -489,6 +492,9 @@ const SOUND_FIELDS: [&str; 10] = [
     "raiseSoundPlayer",
     "putawaySoundPlayer",
     "rechamberSoundPlayer",
+    "rechamberSound",
+    "pullbackSound",
+    "pullbackSoundPlayer",
 ];
 
 /// A [`WeaponDef`] from a WaW weapon file. Like Black Ops', WaW gives times
@@ -558,6 +564,7 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
         rechamber_time: 0.0,
         clip_size: clip,
         max_ammo: w.int("maxAmmo").max(0) as u32,
+        start_ammo: w.int("startAmmo").max(0) as u32,
         reload_time: fo("reloadTime", fb.reload_time),
         reload_empty_time: fo("reloadEmptyTime", fo("reloadTime", fb.reload_empty_time)),
         segmented_reload: w.get("segmentedReload").trim() == "1",
@@ -613,6 +620,9 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             reload: sound("reloadSound"),
             raise_player: sound("raiseSoundPlayer"),
             putaway_player: sound("putawaySoundPlayer"),
+            pullback: sound("pullbackSound"),
+            pullback_player: sound("pullbackSoundPlayer"),
+            rechamber: sound("rechamberSound"),
         },
         penetrate_type: crate::weapons::penetrate_type_named(w.get("penetrateType")),
         impact_type: match w.get("impactType") {
@@ -622,6 +632,7 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             _ => 2,
         },
         class: group.class(),
+        player_anim: crate::weapons::player_anim_named(w.get("playerAnimType")),
         // Drawn from WaW's own materials (see `Data::material_image`).
         kill_icon: Some(name("killIcon")).filter(|n| !n.is_empty()).map_or_else(String::new, |n| format!("{MATERIAL_PREFIX}{n}")),
         kill_icon_ratio: w.get("killIconRatio").split(':').next().and_then(|r| r.trim().parse().ok()).unwrap_or(1),
@@ -647,6 +658,19 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             width: fo("adsOverlayWidth", 480.0),
             height: fo("adsOverlayHeight", 480.0),
         }),
+        gunplay: crate::weapons::Gunplay {
+            location_mult: [fo("locHead", 1.4), fo("locNeck", 1.0), fo("locTorsoUpper", 1.0), fo("locRightLegUpper", 1.0)],
+            kick_center: (fo("hipViewKickCenterSpeed", 1500.0), fo("adsViewKickCenterSpeed", 1500.0)),
+            reduced_kick: [
+                (fo("hipGunKickReducedKickBullets", 0.0), fo("hipGunKickReducedKickPercent", 0.0)),
+                (fo("adsGunKickReducedKickBullets", 0.0), fo("adsGunKickReducedKickPercent", 0.0)),
+            ],
+            spread_decay_stance: (fo("hipSpreadDuckedDecay", 1.0), fo("hipSpreadProneDecay", 1.0)),
+            spread_turn_add: fo("hipSpreadTurnAdd", 0.0),
+            fire_delay: fo("fireDelay", 0.0) / 1000.0,
+            gun_kick: [crate::weapons::GunKick::read(&|k| fo(&lower_first(k), 0.0), "Hip"), crate::weapons::GunKick::read(&|k| fo(&lower_first(k), 0.0), "Ads")],
+            gun_max: (fo("gunMaxPitch", 6.0), fo("gunMaxYaw", 6.0)),
+        },
     }
 }
 
@@ -816,4 +840,10 @@ mod tests {
         println!("attachments: {:?}", d.attachments.iter().map(|a| format!("{}={}", a.name, a.display)).collect::<Vec<_>>());
         assert!(d.guns.len() > 20);
     }
+}
+
+/// `HipGunKickAccel` as the weapon files spell it: `hipGunKickAccel`.
+fn lower_first(k: &str) -> String {
+    let mut c = k.chars();
+    c.next().map(|f| f.to_ascii_lowercase().to_string() + c.as_str()).unwrap_or_default()
 }

@@ -390,57 +390,123 @@ impl NavGraph {
         if from == to {
             return Some(vec![to]);
         }
-        let n = self.nodes.len();
+        // The working arrays (a path can touch thousands of points) live on
+        // between searches; only what a search touched is reset after it.
+        // (Its own: a sliced search may be part way through the others.)
+        PLAIN_SCRATCH.with(|s| {
+            let mut s = s.borrow_mut();
+            s.fit(self.nodes.len());
+            let found = self.search(&mut s, from, to, budget, extra);
+            s.reset();
+            found
+        })
+    }
+
+    fn search(&self, s: &mut Scratch, from: u32, to: u32, budget: usize, extra: impl Fn(u32) -> f32) -> Option<Vec<u32>> {
+        let mut job = Job::start(self, s, from, to);
+        match self.step(&mut job, s, budget, usize::MAX, extra) {
+            Step::Found(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Carry a search on for at most `slice` more expansions (and `budget`
+    /// in all): A*, the same as [`NavGraph::path`], a piece at a time.
+    fn step(&self, job: &mut Job, s: &mut Scratch, budget: usize, slice: usize, extra: impl Fn(u32) -> f32) -> Step {
+        let to = job.to;
         let goal = self.nodes[to as usize].pos;
         let h = |i: u32| self.nodes[i as usize].pos.distance(goal);
-        // Flat arrays (a path can touch thousands of points), and each
-        // point's extra cost worked out once.
-        let mut g = vec![f32::INFINITY; n];
-        let mut came = vec![u32::MAX; n];
-        let mut closed = vec![false; n];
-        let mut extras = vec![f32::NAN; n];
-        let mut open = BinaryHeap::new();
-        g[from as usize] = 0.0;
-        open.push(Reverse((h(from).to_bits(), from)));
-        let mut expanded = 0;
-        while let Some(Reverse((_, i))) = open.pop() {
+        let open = &mut job.open;
+        let mut expanded = job.expanded;
+        let stop_at = expanded.saturating_add(slice);
+        loop {
+            if expanded >= stop_at {
+                job.expanded = expanded;
+                return Step::Working;
+            }
+            let Some(Reverse((_, i))) = open.pop() else { return Step::NoWay };
             if i == to {
+                EXPANDED.fetch_add(expanded as u64, std::sync::atomic::Ordering::Relaxed);
                 let mut path = vec![to];
                 let mut cur = to;
-                while came[cur as usize] != u32::MAX {
-                    cur = came[cur as usize];
+                while s.came[cur as usize] != u32::MAX {
+                    cur = s.came[cur as usize];
                     path.push(cur);
                 }
                 path.reverse();
-                return Some(path);
+                return Step::Found(path);
             }
             // A stale entry for a point already done.
-            if std::mem::replace(&mut closed[i as usize], true) {
+            if std::mem::replace(&mut s.closed[i as usize], true) {
                 continue;
             }
             expanded += 1;
             if expanded > budget {
-                return None;
+                return Step::NoWay;
             }
-            let gi = g[i as usize];
+            let gi = s.g[i as usize];
             for link in &self.nodes[i as usize].links {
                 let j = link.to as usize;
-                if closed[j] {
+                if s.closed[j] {
                     continue;
                 }
-                if extras[j].is_nan() {
-                    extras[j] = extra(link.to);
+                s.touch(link.to);
+                if s.extras[j].is_nan() {
+                    s.extras[j] = extra(link.to);
                 }
-                let cost = gi + link.cost + extras[j];
-                if cost < g[j] {
-                    g[j] = cost;
-                    came[j] = i;
+                let cost = gi + link.cost + s.extras[j];
+                if cost < s.g[j] {
+                    s.g[j] = cost;
+                    s.came[j] = i;
                     // Non-negative f32 bit patterns order like the floats.
                     open.push(Reverse(((cost + h(link.to)).to_bits(), link.to)));
                 }
             }
         }
-        None
+    }
+
+    /// A route search spread over frames: started by one bot, carried on a
+    /// slice of expansions each frame it asks, until found or given up.
+    /// One at a time (it uses [`NavGraph::path`]'s working arrays): a
+    /// different bot asking while one runs gets [`Step::Busy`].
+    pub fn path_sliced(&self, owner: u64, from: u32, to: u32, now: f32, budget: usize, slice: usize, extra: impl Fn(u32) -> f32) -> Step {
+        thread_local! {
+            static JOB: std::cell::RefCell<Option<(u64, f32, Job)>> = const { std::cell::RefCell::new(None) };
+        }
+        let scratch = &SCRATCH;
+        JOB.with(|job| {
+            let mut job = job.borrow_mut();
+            scratch.with(|s| {
+                let mut s = s.borrow_mut();
+                s.fit(self.nodes.len());
+                // Another bot's search: wait, unless it's stale (its bot gone
+                // quiet for a second) or this bot now wants somewhere else.
+                if let Some((who, since, j)) = job.as_ref() {
+                    let stale = now - since > 1.0;
+                    let mine = *who == owner;
+                    if !mine && !stale {
+                        return Step::Busy;
+                    }
+                    if stale || j.to != to {
+                        *job = None;
+                        s.reset();
+                    }
+                }
+                if job.is_none() {
+                    if from == to {
+                        return Step::Found(vec![to]);
+                    }
+                    *job = Some((owner, now, Job::start(self, &mut s, from, to)));
+                }
+                let (_, _, j) = job.as_mut().expect("job");
+                let result = self.step(j, &mut s, budget, slice, extra);
+                if !matches!(result, Step::Working) {
+                    *job = None;
+                    s.reset();
+                }
+                result
+            })
+        })
     }
 
     /// The link from `a` to `b`, if any.
@@ -507,5 +573,110 @@ mod tests {
         let p = g.path(0, 9, 10_000, avoid).unwrap();
         assert!(p.iter().filter(|&&i| i % 10 == 5).all(|&i| i / 10 == 9));
         assert_eq!(g.nearest(Vec3::new(CELL * 3.2, 0.0, CELL * 4.9)), Some(53));
+    }
+
+    /// Spread over frames, a search finds what it would in one go; another
+    /// bot asking meanwhile waits; a new target starts afresh.
+    #[test]
+    fn sliced_search_matches_one_go() {
+        let g = grid(30, 30);
+        let avoid = |i: u32| if i % 30 == 15 && i / 30 < 25 { 500.0 } else { (i % 7) as f32 };
+        let whole = g.path(0, 899, 100_000, avoid).unwrap();
+        let mut frames = 0;
+        let sliced = loop {
+            frames += 1;
+            match g.path_sliced(1, 0, 899, frames as f32 * 0.016, 100_000, 50, avoid) {
+                Step::Found(p) => break p,
+                Step::Working => {
+                    assert!(matches!(g.path_sliced(2, 5, 10, frames as f32 * 0.016, 100_000, 50, avoid), Step::Busy));
+                }
+                _ => panic!("no way"),
+            }
+        };
+        assert!(frames > 2, "it should have taken several slices");
+        assert_eq!(sliced, whole);
+        // Free again, and the one-off search still agrees.
+        assert!(matches!(g.path_sliced(2, 0, 899, 100.0, 100_000, usize::MAX, avoid), Step::Found(p) if p == whole));
+    }
+}
+
+thread_local! {
+    /// The sliced search's working arrays, and the one-off searches'.
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+    static PLAIN_SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// Where a sliced search stands ([`NavGraph::path_sliced`]).
+pub enum Step {
+    Found(Vec<u32>),
+    NoWay,
+    /// Not done yet: ask again next frame.
+    Working,
+    /// Another bot's search is running.
+    Busy,
+}
+
+/// A search's open list and progress.
+pub struct Job {
+    to: u32,
+    open: BinaryHeap<Reverse<(u32, u32)>>,
+    expanded: usize,
+}
+
+impl Job {
+    fn start(nav: &NavGraph, s: &mut Scratch, from: u32, to: u32) -> Job {
+        let goal = nav.nodes[to as usize].pos;
+        let mut open = BinaryHeap::new();
+        s.touch(from);
+        s.g[from as usize] = 0.0;
+        open.push(Reverse((nav.nodes[from as usize].pos.distance(goal).to_bits(), from)));
+        Job { to, open, expanded: 0 }
+    }
+}
+
+/// Points expanded by successful searches (for the bots' cost log).
+pub static EXPANDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A* working arrays, kept between searches ([`NavGraph::path`]).
+#[derive(Default)]
+struct Scratch {
+    g: Vec<f32>,
+    came: Vec<u32>,
+    closed: Vec<bool>,
+    extras: Vec<f32>,
+    /// Points this search has written to (to put back afterwards).
+    touched: Vec<u32>,
+    seen: Vec<bool>,
+}
+
+impl Scratch {
+    fn fit(&mut self, n: usize) {
+        if self.g.len() != n {
+            *self = Scratch {
+                g: vec![f32::INFINITY; n],
+                came: vec![u32::MAX; n],
+                closed: vec![false; n],
+                extras: vec![f32::NAN; n],
+                touched: Vec::new(),
+                seen: vec![false; n],
+            };
+        }
+    }
+
+    fn touch(&mut self, i: u32) {
+        if !std::mem::replace(&mut self.seen[i as usize], true) {
+            self.touched.push(i);
+        }
+    }
+
+    fn reset(&mut self) {
+        for i in self.touched.drain(..) {
+            let i = i as usize;
+            self.g[i] = f32::INFINITY;
+            self.came[i] = u32::MAX;
+            self.closed[i] = false;
+            self.extras[i] = f32::NAN;
+            self.seen[i] = false;
+        }
     }
 }

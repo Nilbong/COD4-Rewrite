@@ -39,9 +39,9 @@ pub(super) fn class_for(gun: &str, kind: GunKind, p: &Personality, skill: f32, r
         GunKind::Shotgun => pick(rng, &[("", 0.5), ("grip", 0.3), ("reflex", 0.2)]),
         GunKind::Sniper => pick(rng, &[("", 0.7), ("acog", 0.3)]),
     };
-    // Perk 1: equipment, or more grenades or ammo (the grenade launcher
-    // takes its place).
-    let perk1 = (attachment != "gl").then(|| {
+    // Perk 1: equipment, or more grenades or ammo (the grenade launcher or
+    // a grip takes its place, as in CoD4's class rules).
+    let perk1 = (attachment != "gl" && attachment != "grip").then(|| {
         pick(
             rng,
             &[
@@ -76,7 +76,6 @@ pub(super) fn class_for(gun: &str, kind: GunKind, p: &Personality, skill: f32, r
                 ("specialty_quieter", 0.1),
                 ("specialty_grenadepulldeath", 0.14 * (1.2 - skill)),
                 ("specialty_pistoldeath", 0.12 * (1.2 - skill)),
-                ("specialty_parabolic", 0.05),
             ],
         ),
     };
@@ -106,6 +105,7 @@ pub(super) fn class_for(gun: &str, kind: GunKind, p: &Personality, skill: f32, r
         perks,
         special: Some(special.into()),
         inventory: inventory.map(str::to_owned),
+        inventory_camo: 0,
     }
 }
 
@@ -145,10 +145,13 @@ mod tests {
                 let c = class_for("m4", kind, &p, 0.5, (30, 0), &mut rng);
                 assert_eq!(c.guns.len(), 2);
                 assert!(c.special.is_some());
-                // Two or three perks: perk 1 is equipment or the launcher.
-                let gl = c.guns[0].spec.ends_with(":gl");
+                // Two or three perks: perk 1 is equipment, or the launcher
+                // or grip takes it.
+                let gl = c.guns[0].spec.ends_with(":gl") || c.guns[0].spec.ends_with(":grip");
                 assert_eq!(c.perks.len(), if gl || c.inventory.is_some() { 2 } else { 3 }, "{c:?}");
                 assert!(!(gl && c.inventory.is_some()));
+                // Eavesdrop does nothing here (no voice chat).
+                assert!(!c.perks.iter().any(|p| p == "specialty_parabolic"));
             }
         }
     }

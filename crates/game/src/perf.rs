@@ -9,13 +9,24 @@
 //! `noviewmodel` (its camera, which also finishes the frame), `nofx`
 //! (effects aren't drawn, though still run), `cascades2` (the sun's shadows
 //! in two cascades), `nopropshadows` (static models cast none), `noprops`
-//! (static models hidden) and `ads` (the player holds aim, to measure
-//! scopes: `COD4RW_SCOPE`, `COD4RW_LOADOUT`).
+//! (static models hidden), `nohud` (the HUD and in-game menus aren't
+//! painted) and `ads` (the player holds aim, to measure scopes:
+//! `COD4RW_SCOPE`, `COD4RW_LOADOUT`). The log also counts what's redone
+//! each frame: UI nodes changed, and images, materials and meshes added or
+//! modified (each a GPU upload).
 //!
 //! `COD4RW_SHADOWTEST=<dir>` screenshots the same three views under each of
 //! [`SHADOW_TRIALS`]' sun shadow settings (`<trial>_<view>.png`), then exits.
 
 use bevy::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static NO_HUD: AtomicBool = AtomicBool::new(false);
+
+/// `COD4RW_PERF=nohud`: the HUD and in-game menus go unpainted.
+pub fn no_hud() -> bool {
+    NO_HUD.load(Ordering::Relaxed)
+}
 
 pub struct PerfPlugin;
 
@@ -37,11 +48,13 @@ impl Plugin for PerfPlugin {
                 props: off("noprops"),
                 ads: off("ads"),
             };
+            NO_HUD.store(off("nohud"), Ordering::Relaxed);
             info!("perf: leaving out {without:?}");
             app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
                 .init_resource::<FrameTimes>()
                 .insert_resource(without)
-                .add_systems(Last, (leave_out, log_frames))
+                .init_resource::<Redone>()
+                .add_systems(Last, (leave_out, count_redone, log_frames).chain())
                 .add_systems(
                     Update,
                     hold_aim.run_if(|w: Res<Without>| w.ads).after(crate::player::InputSet).before(crate::weapons::WeaponSet),
@@ -112,8 +125,15 @@ fn leave_out(
             info!("perf: {count} static model entities cast no shadows");
         }
     }
-    if without.vsync && window.present_mode != bevy::window::PresentMode::AutoNoVsync {
-        window.present_mode = bevy::window::PresentMode::AutoNoVsync;
+    // `COD4RW_PRESENT=immediate|mailbox` asks for that presentation mode
+    // outright (AutoNoVsync falls back to one of them, or to FIFO).
+    let unsynced = match std::env::var("COD4RW_PRESENT").as_deref() {
+        Ok("immediate") => bevy::window::PresentMode::Immediate,
+        Ok("mailbox") => bevy::window::PresentMode::Mailbox,
+        _ => bevy::window::PresentMode::AutoNoVsync,
+    };
+    if without.vsync && window.present_mode != unsynced {
+        window.present_mode = unsynced;
     }
     if without.shadows {
         for mut sun in &mut suns {
@@ -215,6 +235,31 @@ fn hold_aim(mut player: Query<&mut crate::weapons::WeaponInput, With<crate::play
     }
 }
 
+/// What's redone each frame, summed over the log's window.
+#[derive(Resource, Default, Debug)]
+struct Redone {
+    frames: u32,
+    nodes: u32,
+    images: u32,
+    materials: u32,
+    meshes: u32,
+}
+
+#[allow(clippy::type_complexity)]
+fn count_redone(
+    mut redone: ResMut<Redone>,
+    nodes: Query<(), Or<(Changed<Node>, Changed<ImageNode>, Changed<Text>, Changed<UiTransform>)>>,
+    mut images: MessageReader<AssetEvent<Image>>,
+    mut materials: MessageReader<AssetEvent<StandardMaterial>>,
+    mut meshes: MessageReader<AssetEvent<Mesh>>,
+) {
+    redone.frames += 1;
+    redone.nodes += nodes.iter().count() as u32;
+    redone.images += images.read().filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. })).count() as u32;
+    redone.materials += materials.read().filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. })).count() as u32;
+    redone.meshes += meshes.read().filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. })).count() as u32;
+}
+
 /// Settling time after a match starts.
 const WARMUP: f32 = 10.0;
 const EVERY: f32 = 5.0;
@@ -250,6 +295,7 @@ fn log_frames(
     ),
     mut exit: MessageReader<AppExit>,
     diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
+    mut redone: ResMut<Redone>,
 ) {
     let now = time.elapsed_secs();
     let in_game = state.is_some_and(|s| *s.get() == crate::state::GameState::InGame);
@@ -282,6 +328,15 @@ fn log_frames(
             pawns.iter().count()
         );
         frames.window.clear();
+        let n = redone.frames.max(1) as f32;
+        info!(
+            "perf: per frame {:.0} UI nodes changed, {:.1} images, {:.1} materials, {:.1} meshes added or modified",
+            redone.nodes as f32 / n,
+            redone.images as f32 / n,
+            redone.materials as f32 / n,
+            redone.meshes as f32 / n
+        );
+        *redone = Redone::default();
         // The GPU's time per pass (top level and their parts), longest first.
         let mut gpu: Vec<(String, f64)> = diagnostics
             .iter()

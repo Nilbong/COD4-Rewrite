@@ -25,6 +25,7 @@ pub(super) fn build(app: &mut App) {
         (
             gunfire,
             hit_marker,
+            offhand_sounds,
             footsteps,
             landings,
             pain_and_death,
@@ -57,7 +58,12 @@ fn shot_surface(spatial: &SpatialQuery, surfaces: &Query<&Surfaces>, from: Vec3,
     Dir3::new(dir)
         .ok()
         .and_then(|d| spatial.cast_ray(to - dir * u(4.0), d, u(8.0), true, &collision::sight_filter()))
-        .map_or("default", |h| surfaces.get(h.entity).map_or("default", |sf| sf.facing(h.normal)))
+        .map_or("default", |h| surfaces.get(h.entity).map_or_else(|_| terrain_or_default(to), |sf| sf.facing(h.normal)))
+}
+
+/// Terrain and patches have no faces' surfaces: theirs by place.
+fn terrain_or_default(at: Vec3) -> &'static str {
+    crate::terrain::surface_at(at).unwrap_or("default")
 }
 
 /// Where a helicopter's rounds land ([`crate::fx::BulletImpact`]).
@@ -89,7 +95,7 @@ fn listener_pos(listener: &Query<&GlobalTransform, With<SpatialListener>>) -> Op
 fn ground_surface(spatial: &SpatialQuery, surfaces: &Query<&Surfaces>, feet: Vec3) -> &'static str {
     spatial
         .cast_ray(feet + Vec3::Y * u(8.0), Dir3::NEG_Y, u(40.0), true, &collision::movement_filter())
-        .map_or("default", |h| surfaces.get(h.entity).map_or("default", |s| s.facing(h.normal)))
+        .map_or("default", |h| surfaces.get(h.entity).map_or_else(|_| terrain_or_default(feet), |s| s.facing(h.normal)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -120,6 +126,10 @@ fn gunfire(
         } else {
             let alias = if last && !snd.fire_last.is_empty() { &snd.fire_last } else { &snd.fire };
             sfx.play(alias.clone(), Some(s.from));
+            // A bolt-action's bolt, once the shot's done.
+            if !snd.rechamber.is_empty() && !last {
+                sfx.play_later(snd.rechamber.clone(), Some(s.from), now, w.def.fire_time);
+            }
         }
 
         let kind = impact_kind(w.def.impact_type);
@@ -137,22 +147,57 @@ fn gunfire(
             sfx.play(format!("{kind}_{}", shot_surface(&spatial, &surfaces, s.from, s.to)), Some(s.to));
         }
 
-        // Someone else's bullet passing close by.
+        // Someone else's bullet passing close by (CoD4's `WhizbySound`):
+        // the ear at least 64 units down the shot, the bullet going 64 past
+        // it, within 140 of it; heard 16 units short of there.
         if let Some(ear) = ear.filter(|_| !local) {
-            let seg = s.to - s.from;
-            let t = ((ear - s.from).dot(seg) / seg.length_squared().max(1e-6)).clamp(0.0, 1.0);
-            let closest = s.from + seg * t;
-            if t > 0.05 && t < 0.98 && closest.distance(ear) < u(80.0) && now - *last_whizby > 0.12 {
+            let along = s.to - s.from;
+            let length = along.length();
+            let dir = along / length.max(1e-6);
+            let ear_along = (ear - s.from).dot(dir);
+            let passing = s.from + dir * ear_along;
+            if ear_along >= u(64.0) && length >= ear_along + u(64.0) && passing.distance(ear) <= u(140.0) && now - *last_whizby > 0.03 {
                 *last_whizby = now;
-                sfx.play("whizby", Some(closest));
+                sfx.play("whizby", Some(passing - dir * u(16.0)));
             }
         }
     }
 }
 
+/// A grenade's pin and throw (CoD4's `pullbackSound` as the pin comes
+/// out, its `fireSound` as it leaves the hand), and others' bolts being
+/// worked after a shot (`rechamberSound`; the player's own come from the
+/// viewmodel's notetracks).
+fn offhand_sounds(
+    mut sfx: ResMut<Sfx>,
+    throws: Query<(Entity, &crate::grenades::Offhand, &Transform, Has<LocalPlayer>)>,
+    mut last: Local<HashMap<Entity, crate::grenades::Phase>>,
+) {
+    use crate::grenades::Phase;
+    let mut seen = HashSet::new();
+    for (e, o, tf, local) in &throws {
+        seen.insert(e);
+        if last.insert(e, o.phase) == Some(o.phase) {
+            continue;
+        }
+        let s = &o.def.sounds;
+        let (own, others) = match o.phase {
+            Phase::Pullback => (&s.pullback_player, &s.pullback),
+            Phase::Throw => (&s.fire_player, &s.fire),
+            _ => continue,
+        };
+        if local && !own.is_empty() {
+            sfx.play(own.clone(), None);
+        } else if !local && !others.is_empty() {
+            sfx.play(others.clone(), Some(tf.translation + Vec3::Y * u(48.0)));
+        }
+    }
+    last.retain(|e, _| seen.contains(e));
+}
+
 fn hit_marker(mut sfx: ResMut<Sfx>, mut hits: MessageReader<HitConfirmed>, local: Query<(), With<crate::splitscreen::LocalSlot>>) {
     for h in hits.read() {
-        if local.contains(h.shooter) {
+        if local.contains(h.shooter) && crate::settings_apply::hud(crate::settings_apply::Hud::HitMarkerSound) {
             sfx.play("mp_hit_alert", None);
         }
     }
@@ -161,46 +206,65 @@ fn hit_marker(mut sfx: ResMut<Sfx>, mut hits: MessageReader<HitConfirmed>, local
 /// CoD4 steps when the bob cycle passes a quarter or three quarters.
 fn footsteps(
     mut sfx: ResMut<Sfx>,
-    pawns: Query<(Entity, &Mover, &Transform, Has<LocalPlayer>, Option<&crate::loadout::Loadout>), Without<Dead>>,
+    mut fx: Option<ResMut<crate::fx::Effects>>,
+    pawns: Query<(Entity, &Mover, &Transform, Has<LocalPlayer>, Option<&crate::loadout::Loadout>, Option<&WeaponState>), Without<Dead>>,
     spatial: SpatialQuery,
     surfaces: Query<&Surfaces>,
     mut last: Local<HashMap<Entity, f32>>,
 ) {
     let half = |c: f32| ((c + 0.25) * 2.0).floor() as i32 % 2;
     let mut seen = HashSet::new();
-    for (e, m, tf, local, loadout) in &pawns {
+    for (e, m, tf, local, loadout, weapon) in &pawns {
         seen.insert(e);
         let prev = last.insert(e, m.bob_cycle).unwrap_or(m.bob_cycle);
         if !m.on_ground || half(prev) == half(m.bob_cycle) || m.horizontal_speed() < u(20.0) {
             continue;
         }
-        // Dead Silence (`specialty_quieter`): no footsteps for anyone else.
-        if !local && crate::perks::has(loadout, "specialty_quieter") {
+        // CoD4's multiplayer (`PM_ShouldMakeFootsteps`): no steps crouched,
+        // prone or walking aimed in (not while reloading); running steps,
+        // or sprinting ones.
+        let aimed = weapon.is_some_and(|w| w.ads > 0.5 && w.reload_until.is_none());
+        if m.stance != Stance::Stand || aimed {
             continue;
         }
-        let kind = if m.sprinting {
-            "step_sprint"
-        } else if m.stance == Stance::Prone {
-            "step_prone"
-        } else if m.stance == Stance::Crouch {
-            "qstep_run"
-        } else if m.horizontal_speed() < u(110.0) {
-            "step_walk"
-        } else {
-            "step_run"
-        };
+        let kind = if m.sprinting { "step_sprint" } else { "step_run" };
+        // Dead Silence (`specialty_quieter`): the quiet steps, for everyone.
+        let kind = quiet(kind, loadout);
         let surface = ground_surface(&spatial, &surfaces, tf.translation);
         if local {
             sfx.play(format!("{kind}_plr_{surface}"), None);
         } else {
             sfx.play(format!("{kind}_{surface}"), Some(tf.translation));
         }
+        splash(fx.as_deref_mut(), surface, tf.translation);
     }
     last.retain(|e, _| seen.contains(e));
 }
 
+/// Dead Silence's quiet variant of a step or landing (`qstep_run`,
+/// `qland`), as CoD4 swaps them in for players with the perk.
+fn quiet(kind: &'static str, loadout: Option<&Loadout>) -> String {
+    if crate::perks::has(loadout, "specialty_quieter") { format!("q{kind}") } else { kind.to_owned() }
+}
+
+/// Beyond CoD4 (its footsteps only sound): a splash where feet go into water
+/// or mud, with its own `impacts/footstep_*` effects.
+fn splash(fx: Option<&mut crate::fx::Effects>, surface: &str, feet: Vec3) {
+    let effect = match surface {
+        "water" => "impacts/footstep_water",
+        "mud" => "impacts/footstep_mud",
+        _ => return,
+    };
+    if let Some(fx) = fx {
+        let frame = crate::fx::Frame::facing(feet, Vec3::Y, 0.0);
+        fx.play(effect, crate::fx::Anchor::Fixed(frame), crate::fx::FxLayer::World);
+    }
+}
+
 fn landings(
     mut sfx: ResMut<Sfx>,
+    mut fx: Option<ResMut<crate::fx::Effects>>,
+    loadouts: Query<Option<&Loadout>>,
     mut landed: MessageReader<Landed>,
     pawns: Query<(&Transform, Has<LocalPlayer>)>,
     spatial: SpatialQuery,
@@ -208,13 +272,22 @@ fn landings(
 ) {
     for l in landed.read() {
         let Ok((tf, local)) = pawns.get(l.entity) else { continue };
-        let kind = if l.fall_height < 40.0 { "qland" } else { "land" };
+        // CoD4's landings by fall height (units): a walking step, a running
+        // one, then a landing.
+        let kind = match l.fall_height {
+            h if h <= 4.0 => continue,
+            h if h < 8.0 => "step_walk",
+            h if h < 12.0 => "step_run",
+            _ => "land",
+        };
+        let kind = quiet(kind, loadouts.get(l.entity).ok().flatten());
         let surface = ground_surface(&spatial, &surfaces, tf.translation);
         if local {
             sfx.play(format!("{kind}_plr_{surface}"), None);
         } else {
             sfx.play(format!("{kind}_{surface}"), Some(tf.translation));
         }
+        splash(fx.as_deref_mut(), surface, tf.translation);
     }
 }
 
@@ -306,8 +379,12 @@ fn viewmodel_notes(
         // Black Ops marks its sound notes `sndnt#<alias>`.
         let name = n.name.strip_prefix("sndnt#").unwrap_or(&n.name);
         let name: std::borrow::Cow<str> = if waw { crate::waw::sound_alias(name).into() } else { name.into() };
-        if at > from && at <= player.time && bank.has(&name) {
-            sfx.play(name.into_owned(), None);
+        if at > from && at <= player.time {
+            if bank.has(&name) {
+                sfx.play(name.into_owned(), None);
+            } else {
+                debug!("audio: viewmodel note {name} has no sound");
+            }
         }
     }
     *last = Some((key, player.time));

@@ -2,6 +2,9 @@
 //! together with the enemy nearest its crosshair, so a real player's habits
 //! can be measured (`tools/fit_player.py`) and bots made to play like them.
 //!
+//! Real play is recorded on its own, for training bots to play like the
+//! player (`tools/learn`): every match without a `COD4RW_*` debug variable
+//! writes `%LOCALAPPDATA%\cod4rw\recordings\<map>-<unix time>.csv`.
 //! `--record` writes `recordings/<map>-<unix time>.csv` for the local player;
 //! `COD4RW_RECORD=<file.csv>` writes to a given file, and with
 //! `COD4RW_RECORD_WHO=<bot name>` records a bot instead (for checking the
@@ -34,6 +37,8 @@ pub struct RecordArg(pub bool);
 pub struct Recorder {
     /// Where to write; files are created on the first in-game frame.
     path: Option<PathBuf>,
+    /// Where a match's file goes when no file is given.
+    dir: PathBuf,
     files: Vec<(Entity, std::io::BufWriter<std::fs::File>)>,
     who: Option<String>,
     started: bool,
@@ -45,17 +50,36 @@ x,y,z,stance,sprint,jump,ground,health,dead,reloading,shots,hits,heads,kills,tea
 pub fn setup(app: &mut App) {
     let flag = app.world().get_resource::<RecordArg>().is_some_and(|a| a.0);
     let path = std::env::var("COD4RW_RECORD").ok().map(PathBuf::from);
-    if !flag && path.is_none() {
-        return;
-    }
-    app.insert_resource(Recorder { path, files: Vec::new(), who: std::env::var("COD4RW_RECORD_WHO").ok(), started: false })
+    // Real play (no debug variables): kept with the player's data.
+    let auto = !flag && path.is_none() && !debug_run();
+    let dir = match auto.then(data_dir).flatten() {
+        Some(d) => d,
+        None if flag || path.is_some() => PathBuf::from("recordings"),
+        None => return,
+    };
+    app.insert_resource(Recorder { path, dir, files: Vec::new(), who: std::env::var("COD4RW_RECORD_WHO").ok(), started: false })
         .add_systems(Update, record.after(crate::weapons::WeaponSet).run_if(crate::state::in_game));
 }
 
-/// The file `--record` writes: one per match, named after the map.
-fn default_path(map: &str) -> PathBuf {
+/// The file a match is recorded to: one per match, named after the map.
+fn default_path(dir: &std::path::Path, map: &str) -> PathBuf {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    PathBuf::from("recordings").join(format!("{map}-{secs}.csv"))
+    dir.join(format!("{map}-{secs}.csv"))
+}
+
+/// Debug and test runs set `COD4RW_*` variables (the network settings
+/// aside): they aren't real play.
+fn debug_run() -> bool {
+    std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !crate::net::setting(&k))
+}
+
+/// `%LOCALAPPDATA%\cod4rw\recordings` (or the platform's equivalent).
+fn data_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_DATA_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("cod4rw").join("recordings"))
 }
 
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
@@ -85,7 +109,7 @@ fn record(
     if !rec.started {
         rec.started = true;
         let all = rec.who.as_deref().is_some_and(|w| w.eq_ignore_ascii_case("all"));
-        let base = rec.path.clone().unwrap_or_else(|| default_path(map.as_ref().map_or("map", |m| m.0.as_str())));
+        let base = rec.path.clone().unwrap_or_else(|| default_path(&rec.dir, map.as_ref().map_or("map", |m| m.0.as_str())));
         for (e, pawn, ..) in pawns.iter().filter(|p| match &rec.who {
             Some(_) if all => bots.contains(p.0),
             Some(name) => p.1.name.eq_ignore_ascii_case(name),

@@ -21,7 +21,7 @@ impl Plugin for CombatPlugin {
             .add_systems(OnEnter(crate::state::GameState::InGame), setup_pawn_assets.in_set(crate::state::Setup::Content))
             .add_systems(
                 Update,
-                (fall_damage, apply_damage, regen_health, respawn, update_hitboxes)
+                (fall_damage, apply_damage, regen_health, respawn, mark_spawned, update_hitboxes)
                     .chain()
                     .after(crate::movement::MovementSet)
                     .run_if(crate::state::in_game),
@@ -37,9 +37,18 @@ pub const HARDCORE_HEALTH: f32 = 30.0;
 pub fn max_health() -> f32 {
     if crate::tdm::hardcore() { HARDCORE_HEALTH } else { MAX_HEALTH }
 }
+/// `_healthoverlay.gsc`: 5 s after the last hurt, health comes back: all
+/// at once, or from at or below 55% (`healthOverlayCutoff`) a tenth of it
+/// every 0.05 s.
 const REGEN_DELAY: f32 = 5.0;
-const REGEN_RATE: f32 = 40.0;
-const RESPAWN_DELAY: f32 = 3.0;
+const VERY_HURT: f32 = 0.55;
+const VERY_HURT_REGEN: f32 = 0.1 / 0.05;
+/// `TimeUntilSpawn`: the death's 0.25 + 1.75 s, no respawn delay.
+const RESPAWN_DELAY: f32 = 2.0;
+
+/// When someone last hurt an enemy (`useStartSpawns` ends with the
+/// match's first such damage), as f32 bits.
+static LAST_HOSTILE_DAMAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Hardcore's (`scr_player_respawndelay 10`).
 const HARDCORE_RESPAWN_DELAY: f32 = 10.0;
 
@@ -124,18 +133,10 @@ pub struct Dead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HitLocation {
     Head,
+    /// CoD4's neck: snipers do more there (1.5), it isn't a headshot.
+    Neck,
     Torso,
     Legs,
-}
-
-impl HitLocation {
-    pub fn multiplier(self) -> f32 {
-        match self {
-            HitLocation::Head => 1.4,
-            HitLocation::Torso => 1.0,
-            HitLocation::Legs => 0.9,
-        }
-    }
 }
 
 /// A hitbox collider, child of its pawn.
@@ -159,6 +160,9 @@ pub struct Damage {
 pub struct Killed {
     pub victim: Entity,
     pub attacker: Option<Entity>,
+    /// The finishing hit, retained even if the killer has switched guns.
+    pub weapon: &'static str,
+    pub location: HitLocation,
 }
 
 pub struct KillFeedEntry {
@@ -204,18 +208,22 @@ pub fn spawn_pawn(commands: &mut Commands, _assets: &PawnAssets, name: &str, tea
             ChildOf(pawn),
         )
     };
-    commands.spawn(hitbox(HitLocation::Head, Collider::sphere(u(6.0))));
-    commands.spawn(hitbox(HitLocation::Torso, Collider::cuboid(u(20.0), u(26.0), u(14.0))));
+    commands.spawn(hitbox(HitLocation::Head, Collider::sphere(u(5.0))));
+    commands.spawn(hitbox(HitLocation::Neck, Collider::sphere(u(3.5))));
+    commands.spawn(hitbox(HitLocation::Torso, Collider::cuboid(u(20.0), u(22.0), u(14.0))));
     commands.spawn(hitbox(HitLocation::Legs, Collider::cuboid(u(16.0), u(34.0), u(12.0))));
     pawn
 }
+
+/// Where the neck is between the head and the chest's middle.
+const NECK_ALONG: f32 = 0.36;
 
 /// Hitbox and body placement for a stance. Returns (head, torso, legs) local
 /// centres and whether the pawn is lying down.
 fn body_layout(stance: Stance) -> (Vec3, Vec3, Vec3, bool) {
     match stance {
-        Stance::Stand => (Vec3::Y * u(64.0), Vec3::Y * u(45.0), Vec3::Y * u(17.0), false),
-        Stance::Crouch => (Vec3::Y * u(44.0), Vec3::Y * u(30.0), Vec3::Y * u(10.0), false),
+        Stance::Stand => (Vec3::Y * u(65.0), Vec3::Y * u(43.0), Vec3::Y * u(17.0), false),
+        Stance::Crouch => (Vec3::Y * u(45.0), Vec3::Y * u(28.0), Vec3::Y * u(10.0), false),
         Stance::Prone => {
             (Vec3::new(0.0, u(10.0), -u(30.0)), Vec3::new(0.0, u(8.0), -u(10.0)), Vec3::new(0.0, u(6.0), u(20.0)), true)
         }
@@ -233,6 +241,8 @@ fn update_hitboxes(pawns: Query<(&Mover, &Children), With<Pawn>>, mut hitboxes: 
             if let Ok((hb, mut tf)) = hitboxes.get_mut(child) {
                 tf.translation = match hb.location {
                     HitLocation::Head => head,
+                    // A third of the way from the head to the chest.
+                    HitLocation::Neck => head.lerp(torso, NECK_ALONG),
                     HitLocation::Torso => torso,
                     HitLocation::Legs => legs,
                 };
@@ -262,6 +272,9 @@ fn fall_damage(mut landed: MessageReader<Landed>, mut damage: MessageWriter<Dama
     }
 }
 
+/// `lastStandWait`'s invulnerability on going down (s).
+const LAST_STAND_GRACE: f32 = 0.5;
+
 fn apply_damage(
     mut commands: Commands,
     time: Res<Time>,
@@ -271,6 +284,7 @@ fn apply_damage(
     scales: Query<&DamageScale>,
     mut feed: ResMut<KillFeed>,
     last_stand: Query<(Option<&crate::loadout::Loadout>, Has<crate::perks::Downed>)>,
+    downed_at: Query<&crate::perks::Downed>,
 ) {
     let now = time.elapsed_secs();
     for d in damage.read() {
@@ -288,8 +302,17 @@ fn apply_damage(
         if dead || health.current <= 0.0 {
             continue;
         }
-        health.current -= d.amount * scales.get(d.target).map_or(1.0, |s| s.0);
+        // Last Stand: half a second's grace on going down.
+        if last_stand.get(d.target).is_ok_and(|(_, down)| down) && downed_at.get(d.target).is_ok_and(|t| t.since(now) < LAST_STAND_GRACE) {
+            continue;
+        }
+        // Juggernaut is against players' damage, not a fall's.
+        let scale = if d.attacker.is_some() { scales.get(d.target).map_or(1.0, |s| s.0) } else { 1.0 };
+        health.current -= d.amount * scale;
         health.last_damage = now;
+        if d.attacker.is_some_and(|a| a != d.target) && !friendly {
+            LAST_HOSTILE_DAMAGE.store(now.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
         if health.current > 0.0 {
             continue;
         }
@@ -318,7 +341,7 @@ fn apply_damage(
             let killer = attacker_name.filter(|_| d.attacker != Some(d.target));
             let delay = if crate::tdm::hardcore() { HARDCORE_RESPAWN_DELAY } else { RESPAWN_DELAY };
             commands.entity(d.target).insert((Dead { respawn_at: now + delay, killer }, Frozen));
-            killed.write(Killed { victim: d.target, attacker: d.attacker });
+            killed.write(Killed { victim: d.target, attacker: d.attacker, weapon: d.weapon, location: d.location });
         }
         // A teammate killed (Hardcore) isn't a kill.
         if let Some(a) = d.attacker.filter(|&a| a != d.target && !friendly) {
@@ -332,10 +355,13 @@ fn apply_damage(
 fn regen_health(time: Res<Time>, mut q: Query<&mut Health, Without<Dead>>) {
     let now = time.elapsed_secs();
     for mut h in &mut q {
-        // As fast in Hardcore, for its 30 health.
         let max = max_health();
         if h.current < max && now - h.last_damage > REGEN_DELAY {
-            h.current = (h.current + REGEN_RATE * max / MAX_HEALTH * time.delta_secs()).min(max);
+            h.current = if h.current <= max * VERY_HURT {
+                (h.current + VERY_HURT_REGEN * max * time.delta_secs()).min(max)
+            } else {
+                max
+            };
         }
     }
 }
@@ -350,6 +376,7 @@ fn respawn(
     alive: Query<(Entity, &Pawn, &Transform, &ViewAngles), Without<Dead>>,
     grenades: Query<&GlobalTransform, With<crate::grenades::LiveGrenade>>,
     objectives: Option<Res<crate::modes::Objectives>>,
+    strikes: Option<Res<crate::killstreaks::airstrike::Airstrikes>>,
     mut recent: Local<Vec<(Vec3, f32, Entity)>>,
     mut last: Local<std::collections::HashMap<Entity, Vec3>>,
 ) {
@@ -361,7 +388,10 @@ fn respawn(
     let bombs: Vec<Vec3> = grenades.iter().map(|g| g.translation()).collect();
     // CoD4's grace period (`level.gracePeriod`): the first 15 s respawn at
     // the team's start.
-    let grace = state.as_ref().is_some_and(|s| now - s.started < GRACE_PERIOD);
+    // `useStartSpawns`: the team's start points until the match's first
+    // hostile damage.
+    let first_hurt = f32::from_bits(LAST_HOSTILE_DAMAGE.load(std::sync::atomic::Ordering::Relaxed));
+    let grace = state.as_ref().is_some_and(|s| first_hurt < s.started);
     for (e, d, pawn, mut tf, mut health, mut mover, mut view, mut weapon) in &mut dead {
         if now < d.respawn_at {
             continue;
@@ -389,6 +419,7 @@ fn respawn(
             last: last.get(&e).copied(),
             reused,
             grenades: bombs.clone(),
+            airstrike: &|at| strikes.as_ref().map_or(0.0, |s| s.danger(at, now)),
             sees: &sees,
         };
         let spawn = pick_spawn(&map, &spawning);
@@ -408,9 +439,43 @@ fn respawn(
     }
 }
 
-/// `level.gracePeriod`: seconds into a match that spawns are the team's
-/// start points.
-const GRACE_PERIOD: f32 = 15.0;
+/// Where and when a pawn last spawned, for the grenade spawn protection.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Spawned {
+    pub at: Vec3,
+    pub time: f32,
+}
+
+/// Grenades (frags, C4, claymores, launched grenades) don't hurt a player
+/// for 3.5 s after spawning when they go off within 250 units of the
+/// spawn (`Callback_PlayerDamage`'s "spawnkill grenades" check).
+const GRENADE_SPAWN_PROTECTION: f32 = 3.5;
+const GRENADE_SPAWN_RADIUS: f32 = 250.0;
+
+/// Whether a grenade going off at `at` spares a pawn that spawned so.
+pub fn spawn_protected(spawned: Option<&Spawned>, at: Vec3, now: f32) -> bool {
+    spawned.is_some_and(|s| now - s.time < GRENADE_SPAWN_PROTECTION && s.at.distance(at) < u(GRENADE_SPAWN_RADIUS))
+}
+
+/// Note each spawn: a pawn's first and every respawn.
+fn mark_spawned(
+    mut commands: Commands,
+    time: Res<Time>,
+    new: Query<(Entity, &Transform), Added<Pawn>>,
+    mut respawned: RemovedComponents<Dead>,
+    pawns: Query<&Transform, (With<Pawn>, Without<Dead>)>,
+) {
+    let now = time.elapsed_secs();
+    for (e, tf) in &new {
+        commands.entity(e).insert(Spawned { at: tf.translation, time: now });
+    }
+    for e in respawned.read() {
+        if let Ok(tf) = pawns.get(e) {
+            commands.entity(e).insert(Spawned { at: tf.translation, time: now });
+        }
+    }
+}
+
 /// `avoidSpawnReuse`: an enemy's spawn is avoided for 10 s while they're
 /// within 800 units of it.
 const SPAWN_REUSE_TIME: f32 = 10.0;
@@ -447,6 +512,8 @@ pub struct Spawning<'a> {
     pub reused: Vec<(Vec3, f32, f32)>,
     /// Live grenades.
     pub grenades: Vec<Vec3>,
+    /// An airstrike under way's danger to a point (0 none, 1 full).
+    pub airstrike: &'a dyn Fn(Vec3) -> f32,
     /// Whether there's a clear line between two points.
     pub sees: &'a dyn Fn(Vec3, Vec3) -> bool,
 }
@@ -464,6 +531,7 @@ impl Spawning<'_> {
             last: None,
             reused: Vec::new(),
             grenades: Vec::new(),
+            airstrike: &|_| 0.0,
             sees: &|_, _| false,
         }
     }
@@ -564,6 +632,8 @@ pub fn pick_spawn(map: &MapInfo, sp: &Spawning) -> SpawnPoint {
             }
         }
         w -= DANGER_PENALTY * sp.grenades.iter().filter(|g| cod(g.distance(s.pos)) < GRENADE_DANGER).count() as f32;
+        // An airstrike coming down there, as much as its danger.
+        w -= DANGER_PENALTY * (sp.airstrike)(s.pos);
         // Enemies that can see it (`spawnPerFrameUpdate`'s sight checks).
         let facing = Vec3::new(-s.yaw.sin(), 0.0, -s.yaw.cos());
         let seen = sp

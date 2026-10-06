@@ -160,6 +160,10 @@ impl Content {
         let zone = &self.zones[zi];
         let mat = zone.material(id)?;
         let techset = mat.technique_set.and_then(|t| zone.technique_set(t)).map(|t| t.name.as_str()).unwrap_or("");
+        // Never drawn: shadow-only casters (the campaign levels have them).
+        if techset.trim_start_matches(',').ends_with("_shadowcaster") {
+            return None;
+        }
         let sky = techset.contains("sky");
         let image_name = |sem: TextureSemantic| {
             mat.textures.iter().find(|t| t.semantic == sem).and_then(|t| t.image).and_then(|i| zone.image(i)).map(|i| i.name.clone())

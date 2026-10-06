@@ -185,6 +185,21 @@ fn start_mantle(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, anims: &MantleAnims, d
     m.jump_held = true;
 }
 
+impl Mantle {
+    /// The body's animation now and how far into it (s): the climb, then
+    /// the over (`mp_mantle_over_low` for the low one: the third-person
+    /// version of `player_mantle_over_low`).
+    pub fn body_anim(&self, anims: &MantleAnims) -> Option<(&'static str, f32)> {
+        let (up, _, _) = anims.0.get(self.trans)?;
+        let (up_name, over_name, _) = TRANSITIONS[self.trans];
+        if self.timer <= up.duration() || !self.over {
+            return Some((up_name, self.timer));
+        }
+        let over_name = if over_name == "player_mantle_over_low" { "mp_mantle_over_low" } else { over_name };
+        Some((over_name, self.timer - up.duration()))
+    }
+}
+
 fn duration(anims: &MantleAnims, mt: &Mantle) -> f32 {
     let (up, over, _) = &anims.0[mt.trans];
     up.duration() + if mt.over { over.duration() } else { 0.0 }

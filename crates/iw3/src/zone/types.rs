@@ -314,6 +314,14 @@ pub struct PhysPreset {
     pub mass: f32,
     pub bounce: f32,
     pub friction: f32,
+    /// How hard bullets and blasts push it, over the usual.
+    pub bullet_force_scale: f32,
+    pub explosive_force_scale: f32,
+    /// Its broken pieces: how far they fly apart, and up (units/s).
+    pub pieces_spread_fraction: f32,
+    pub pieces_upward_velocity: f32,
+    /// Its impact sounds: `{prefix}_{surface}`, else `{prefix}_default`.
+    pub sound_prefix: String,
 }
 
 #[derive(Debug)]
@@ -626,6 +634,26 @@ pub struct Brush {
     pub axial_materials: [[i16; 3]; 2],
 }
 
+/// A dynamic entity (`DynEntityDef`): a model (or brush model) the world
+/// places, that bullets and blasts can push or break.
+#[derive(Debug, Clone, Copy)]
+pub struct DynEntDef {
+    /// `DynEntityType`: 1 clutter, 2 destructible.
+    pub kind: i32,
+    /// Rotation as a quaternion (x, y, z, w) and position, CoD space.
+    pub quat: [f32; 4],
+    pub origin: [f32; 3],
+    pub model: Option<AssetId>,
+    /// A brush model instead (`*n`), 0 for none.
+    pub brush_model: u16,
+    pub physics_brush_model: u16,
+    pub destroy_fx: Option<AssetId>,
+    pub destroy_pieces: Option<AssetId>,
+    pub phys_preset: Option<AssetId>,
+    pub health: i32,
+    pub contents: i32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ClipStaticModel {
     pub model: Option<AssetId>,
@@ -677,6 +705,9 @@ pub struct ClipMap {
     pub cmodels: Vec<CModel>,
     pub map_ents: Option<AssetId>,
     pub dyn_ent_counts: [u16; 2],
+    /// The map's dynamic entities (`dynEntDefList`): clutter (cinder blocks,
+    /// boxes, cans, bottles) and destructibles, each list in turn.
+    pub dyn_ents: Vec<DynEntDef>,
     /// The brush tree each model's leaf points into (`CModel::leaf_brush_node`).
     pub leaf_brush_nodes: Vec<LeafBrushNode>,
 }

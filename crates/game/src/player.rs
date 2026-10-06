@@ -55,7 +55,10 @@ fn override_ssao_shader(app: &mut App) {
 }
 
 pub const VIEWMODEL_LAYER: usize = 1;
-pub const HIP_FOV: f32 = 65.0;
+/// The hip field of view: the settings' (CoD4's 65 by default).
+pub fn hip_fov() -> f32 {
+    crate::settings_apply::hip_fov()
+}
 /// Radians per mouse count, roughly CoD's default sensitivity.
 const SENSITIVITY: f32 = 0.0022;
 
@@ -79,8 +82,10 @@ const EXPOSURE_TARGET_EV: f32 = -2.5;
 const EXPOSURE_RANGE_EV: f32 = 3.0;
 
 /// Sky luminance in cd/m^2 for a fully white sky texel, tuned to sit
-/// alongside sunlit surfaces.
-const SKY_BRIGHTNESS: f32 = 3_000.0;
+/// alongside sunlit surfaces: at 3000 (and 1500, with the exposure set by the
+/// darker part of the view) overcast skies (Bloc, Vacant) clipped
+/// to white.
+const SKY_BRIGHTNESS: f32 = 800.0;
 
 pub fn spawn_camera(
     mut commands: Commands,
@@ -129,12 +134,16 @@ fn spawn_view(commands: &mut Commands, slot: usize, count: usize, compensation_c
                 clear_color: ClearColorConfig::Custom(Color::srgb(0.55, 0.65, 0.78)),
                 ..default()
             },
-            Projection::from(PerspectiveProjection { fov: HIP_FOV.to_radians(), near: 0.05, far: 2000.0, ..default() }),
+            Projection::from(PerspectiveProjection { fov: hip_fov().to_radians(), near: 0.05, far: 2000.0, ..default() }),
             // HDR, left un-tonemapped: the viewmodel camera draws over this
             // image and then exposes, blooms and tonemaps the whole frame once.
             Hdr,
             Tonemapping::None,
             Msaa::Off,
+            // Only the effects' few muzzle-flash lights are clustered: one
+            // cluster for them all (the default froxel grid cost the render
+            // thread over a millisecond a frame).
+            bevy::light::cluster::ClusterConfig::Single,
             DistanceFog {
                 color: Color::srgba(0.6, 0.68, 0.78, 1.0),
                 falloff: FogFalloff::Linear { start: 120.0, end: 600.0 },
@@ -171,15 +180,24 @@ fn spawn_view(commands: &mut Commands, slot: usize, count: usize, compensation_c
             SlotViewModelCamera(slot),
             Camera3d::default(),
             Camera { order: 2 * slot as isize + 1, clear_color: ClearColorConfig::None, ..default() },
-            Projection::from(PerspectiveProjection { fov: HIP_FOV.to_radians(), near: 0.01, far: 10.0, ..default() }),
+            Projection::from(PerspectiveProjection { fov: hip_fov().to_radians(), near: 0.01, far: 10.0, ..default() }),
             RenderLayers::layer(viewmodel_layer(slot)),
             // Both cameras draw into one image, so their MSAA and HDR
             // must match. This camera renders last, so its post-processing
             // (exposure, bloom, tonemapping, SMAA) covers the whole frame.
             Hdr,
             Msaa::Off,
+            // Only the effects' few muzzle-flash lights are clustered: one
+            // cluster for them all (the default froxel grid cost the render
+            // thread over a millisecond a frame).
+            bevy::light::cluster::ClusterConfig::Single,
             AutoExposure {
                 range: -EXPOSURE_RANGE_EV..=EXPOSURE_RANGE_EV,
+                // The brightest 15% left out: snow and overcast skies set it
+                // otherwise, leaving shade black (Bloc); leaving out more
+                // lifted the whole frame and flattened Crash's depth
+                // against CoD4's.
+                filter: 0.05..=0.85,
                 compensation_curve,
                 ..default()
             },
@@ -247,11 +265,12 @@ pub fn view_fov(gunplay: Gunplay, weapon: &WeaponState) -> f32 {
 pub fn look_scale(gunplay: Gunplay, weapon: &WeaponState) -> f32 {
     // Through a lens scope, by the lens's zoom rather than the view's.
     let fov = if weapon.def.ads_overlay.is_some() && crate::ui::lens_scopes() && !gunplay.is_bodycam() {
-        HIP_FOV + (weapon.def.ads_fov - HIP_FOV) * weapon.ads
+        hip_fov() + (weapon.def.ads_fov - hip_fov()) * weapon.ads
     } else {
         view_fov(gunplay, weapon)
     };
-    SENSITIVITY * fov / gunplay.fovs(weapon.def).0
+    // The settings' sensitivity (and aiming sensitivity) on top.
+    SENSITIVITY * fov / gunplay.fovs(weapon.def).0 * crate::settings_apply::mouse_scale(weapon.ads)
 }
 
 fn mouse_look(
@@ -263,8 +282,9 @@ fn mouse_look(
             continue;
         }
         let scale = look_scale(*gunplay, weapon);
+        let invert = if crate::settings_apply::invert_mouse() { -1.0 } else { 1.0 };
         view.yaw -= input.look.x * scale;
-        view.pitch = (view.pitch - input.look.y * scale).clamp(-85f32.to_radians(), 85f32.to_radians());
+        view.pitch = (view.pitch - input.look.y * scale * invert).clamp(-85f32.to_radians(), 85f32.to_radians());
     }
 }
 

@@ -1,0 +1,33 @@
+# Builds the game and the launcher on GitHub's Windows machines and attaches
+# them to a release. Push a version tag to publish one:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Launcher.exe (in the repo and on the release) downloads cod4rw.exe from the
+# latest release, so players never need Rust.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p game -p launcher
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/cod4rw.exe
+            target/release/Launcher.exe
+          generate_release_notes: true

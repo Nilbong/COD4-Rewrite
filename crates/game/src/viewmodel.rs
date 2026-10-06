@@ -599,6 +599,9 @@ pub(crate) fn weapon_angles(
     let side = mover.horizontal_bob(std::f32::consts::FRAC_PI_2, bob_speed * 1.5, 10.0) * (cycle - 0.471_238_9).sin();
     roll += side.min(0.0) * scale;
 
+    // The gun's own kick ([`WeaponState::gun_offset`]).
+    pitch += w.gun_offset.x;
+    yaw += w.gun_offset.y;
     // CoD angles: pitch down, yaw left, roll right side down.
     let euler = |a: Vec3| Quat::from_euler(EulerRot::YXZ, a.y.to_radians(), -a.x.to_radians(), -a.z.to_radians());
     // CoD's (forward, left, up) in inches, along the view's axes.

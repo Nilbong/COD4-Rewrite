@@ -146,7 +146,7 @@ fn look_one(
             match hb.location {
                 HitLocation::Torso => e.0 = Some(gt.translation()),
                 HitLocation::Head => e.1 = Some(gt.translation()),
-                HitLocation::Legs => {}
+                HitLocation::Neck | HitLocation::Legs => {}
             }
         }
         for (entity, pawn) in pawns {
@@ -191,7 +191,7 @@ fn look_one(
     let (hip_fov, _) = gunplay.fovs(weapon.def);
     let zoom = crate::player::view_fov(*gunplay, weapon) / hip_fov;
     let boost = 1.0 + (TURN_BOOST - 1.0) * ((frame.look_pinned - BOOST_DELAY) / BOOST_RAMP).clamp(0.0, 1.0) * (1.0 - ads);
-    let rate = settings.sensitivity * zoom * (1.0 + (ADS_RATE - 1.0) * ads) * slow;
+    let rate = settings.sensitivity * zoom * (1.0 + (ADS_RATE * settings.ads_sensitivity - 1.0) * ads) * slow;
     let invert = if settings.invert_pitch { -1.0 } else { 1.0 };
     view.yaw -= frame.look.x * (YAW_RATE * boost).to_radians() * rate * dt;
     view.pitch += frame.look.y * PITCH_RATE.to_radians() * rate * dt * invert;

@@ -1,11 +1,12 @@
 //! Domination (`_dom.gsc`): the map's flags A, B and C (`flag_primary`
 //! triggers). Standing in one the other team holds (or nobody does) takes it
-//! in 10 seconds while no enemy stands in it too; leaving starts it over.
-//! Every 5 seconds each team scores a point per flag it holds, 200 to win.
-//! The flags fly their holder's colours, and the announcer calls captures.
-//! Taking a flag is worth XP to everyone who took it, and so is killing an
-//! enemy on or by a flag your team holds (`giveRankXP( "capture" )`,
-//! `"defend"`).
+//! in 10 seconds, less with more of the team on it (`updateUseRate`), while
+//! no enemy stands in it too; leaving for more than a second starts it over
+//! (`setClaimTeam`). Every 5 seconds each team scores a point per flag it
+//! holds. The flags fly their holder's colours, and the announcer calls
+//! captures. Taking a flag is worth XP to everyone who took it, and so is
+//! killing an enemy standing in one: an assault if they held it, else a
+//! defence (`giveRankXP( "capture" )`, `"assault"`, `"defend"`).
 
 use super::{Flag, GameMode, Objectives, current};
 use crate::audio::{Sfx, Sides};
@@ -38,6 +39,9 @@ fn playing() -> bool {
 
 /// `setUseTime( 10.0 )`.
 const CAPTURE_TIME: f32 = 10.0;
+/// `setClaimTeam`: the takers can step out this long and keep their
+/// progress.
+const CLAIM_GRACE: f32 = 1.0;
 /// `updateDomScores`: a point per flag every 5 seconds.
 const SCORE_EVERY: f32 = 5.0;
 
@@ -113,17 +117,20 @@ fn capture(
     sides: Option<Res<Sides>>,
     mut sfx: ResMut<Sfx>,
     mut awards: MessageWriter<Award>,
+    mut left_at: Local<Vec<Option<f32>>>,
 ) {
     let Some(state) = state else { return };
     if state.ended.is_some() {
         return;
     }
     let dt = time.delta_secs();
+    let now = time.elapsed_secs();
+    left_at.resize(objectives.flags.len(), None);
     let mine = me.single().ok().map(|p| p.team);
     // For each team: announcer lines (`<voice>_1mc_<line>`) and sounds.
     let mut heard: Vec<(Team, String)> = Vec::new();
     let mut say = |team: Team, line: String| heard.push((team, line));
-    for flag in &mut objectives.flags {
+    for (i, flag) in objectives.flags.iter_mut().enumerate() {
         let mut present = [0usize; 2];
         let mut inside: Vec<(Entity, Team)> = Vec::new();
         for (e, p, tf) in &pawns {
@@ -141,6 +148,7 @@ fn capture(
         let l = flag.letter();
         match claim.filter(|&t| Some(t) != flag.owner) {
             Some(team) => {
+                left_at[i] = None;
                 let progress = match flag.capture {
                     Some((t, p)) if t == team => p,
                     _ => {
@@ -151,7 +159,8 @@ fn capture(
                         0.0
                     }
                 };
-                let progress = progress + dt / CAPTURE_TIME;
+                // Each of them on it speeds it up.
+                let progress = progress + dt * present[(team == Team::Axis) as usize] as f32 / CAPTURE_TIME;
                 if progress < 1.0 {
                     flag.capture = Some((team, progress));
                     continue;
@@ -174,8 +183,16 @@ fn capture(
             }
             // Contested: the capture holds where it got to.
             None if flag.contested => {}
-            // Left (or the holders are back): it starts over.
-            None => flag.capture = None,
+            // Left (or the holders are back): after a second's grace, it
+            // starts over.
+            None => {
+                if flag.capture.is_some() && now - *left_at[i].get_or_insert(now) > CLAIM_GRACE {
+                    flag.capture = None;
+                }
+                if flag.capture.is_none() {
+                    left_at[i] = None;
+                }
+            }
         }
     }
     for (team, line) in heard.into_iter().filter(|(t, _)| mine == Some(*t)) {
@@ -187,10 +204,8 @@ fn capture(
     }
 }
 
-/// How far round a flag a kill still defends it.
-const DEFEND_REACH: f32 = 1.5;
-
-/// Killing an enemy on (or by) a flag your team holds defends it.
+/// Killing an enemy standing in a flag: assaulting it if they held it,
+/// else defending it (`onPlayerKilled`).
 fn defends(
     mut killed: MessageReader<Killed>,
     objectives: Res<Objectives>,
@@ -200,12 +215,10 @@ fn defends(
     for k in killed.read() {
         let Some(attacker) = k.attacker.filter(|&a| a != k.victim) else { continue };
         let (Ok((a, _)), Ok((v, at))) = (pawns.get(attacker), pawns.get(k.victim)) else { continue };
-        let near = |f: &&super::Flag| {
-            let d = at.translation - f.pos;
-            Vec2::new(d.x, d.z).length() <= f.radius * DEFEND_REACH && d.y.abs() <= f.height
-        };
-        if hostile(a, v) && objectives.flags.iter().filter(near).any(|f| f.owner == Some(a.team)) {
-            awards.write(Award { pawn: attacker, kind: AwardKind::Defend });
+        let Some(flag) = objectives.flags.iter().find(|f| f.contains(at.translation)) else { continue };
+        if hostile(a, v) {
+            let kind = if flag.owner == Some(v.team) { AwardKind::Assault } else { AwardKind::Defend };
+            awards.write(Award { pawn: attacker, kind });
         }
     }
 }

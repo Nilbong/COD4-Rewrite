@@ -18,7 +18,7 @@
 
 use crate::combat::Dead;
 use crate::movement::{Landed, MoveTuning, MovementSet, Mover, RUN_SPEED, Stance, ViewAngles};
-use crate::player::{HIP_FOV, LocalPlayer, MainCamera, ViewModelCamera, look_scale};
+use crate::player::{LocalPlayer, MainCamera, ViewModelCamera, hip_fov, look_scale};
 use crate::units::u;
 use crate::viewmodel::ViewModelRoot;
 use crate::weapons::{FreeAim, ShotFired, WeaponDef, WeaponSet, WeaponState};
@@ -78,8 +78,8 @@ impl Gunplay {
         match self {
             // A lens scope keeps the view around it a rifle's aimed view
             // (`ui::scope`); the lens shows the gun's own zoom.
-            Gunplay::Cod4 if def.ads_overlay.is_some() && crate::ui::lens_scopes() => (HIP_FOV, crate::ui::LENS_OUTER_FOV),
-            Gunplay::Cod4 => (HIP_FOV, def.ads_fov),
+            Gunplay::Cod4 if def.ads_overlay.is_some() && crate::ui::lens_scopes() => (hip_fov(), crate::ui::LENS_OUTER_FOV),
+            Gunplay::Cod4 => (hip_fov(), def.ads_fov),
             // A wide body-worn lens that barely zooms when aiming.
             Gunplay::Bodycam => (BODYCAM_FOV, BODYCAM_FOV - 12.0),
         }

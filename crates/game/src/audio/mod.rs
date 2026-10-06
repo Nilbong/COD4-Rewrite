@@ -32,14 +32,29 @@ impl Plugin for AudioPlugin {
         app.init_resource::<Sfx>()
             .add_systems(OnEnter(crate::state::GameState::InGame), load_bank.after(crate::world::load_map).in_set(crate::state::Setup::Content))
             .add_systems(Update, add_listener.run_if(crate::state::in_game))
-            .add_systems(PostUpdate, (play_queued, follow_falloff).chain().run_if(crate::state::in_game));
+            .init_resource::<Ducking>()
+            .add_systems(PostUpdate, (play_queued, duck, follow_falloff).chain().run_if(crate::state::in_game));
         events::build(app);
         matchflow::build(app);
     }
 }
 
 /// Overall volume, under the aliases' own.
-const MASTER: f32 = 0.9;
+/// What a sound is, for the settings' volumes: the announcer and battle
+/// chatter (`US_1mc_*`, `UK_mp_rsp_*`, ...) are voices, the match's music
+/// music, the rest effects.
+fn category(alias: &str) -> crate::settings_apply::Sound {
+    use crate::settings_apply::Sound;
+    let a = alias.to_ascii_lowercase();
+    let voice_prefix = ["us_", "uk_", "ab_", "ru_", "sas_", "spetsnaz_", "opfor_", "marines_"].iter().any(|p| a.starts_with(p));
+    if voice_prefix || a.contains("_1mc_") || a.contains("_mp_rsp_") || a.contains("_mp_cmd_") || a.contains("_mp_stm_") || a.contains("_mp_inform_") {
+        Sound::Voice
+    } else if a.starts_with("mus_") || a.contains("music") || a.starts_with("mp_victory") || a.starts_with("mp_defeat") || a.starts_with("mp_suspense") || a.starts_with("mp_spawn_") || a.starts_with("mp_time_running_out") {
+        Sound::Music
+    } else {
+        Sound::Effects
+    }
+}
 /// Bevy's spatial audio fades with the inverse square of the distance;
 /// shrunk this far, nothing in a map is more than a unit away, so it only
 /// pans, and the aliases' own falloff does the fading.
@@ -252,7 +267,7 @@ fn play_queued(
         let vfs = bank.vfs.clone();
         let Some(source) = bank.sources.handle(&v.file, &vfs, &mut audio) else { continue };
         let range = |(a, b): (f32, f32)| if b > a { rand::random_range(a..b) } else { a };
-        let volume = range(v.volume) * req.gain * MASTER * hearing;
+        let volume = range(v.volume) * req.gain * crate::settings_apply::volume(category(&req.alias)) * hearing;
         let settings = PlaybackSettings {
             volume: Volume::Linear(volume * falloff),
             speed: range(v.pitch).clamp(0.25, 4.0),
@@ -268,6 +283,12 @@ fn play_queued(
         if v.looping && !two_d {
             e.insert(Falloff { variant: v.clone(), gain: volume });
         }
+        if v.master {
+            e.insert(Master);
+        }
+        if let Some(percentage) = v.slave {
+            e.insert(Slave { volume: volume * falloff, percentage });
+        }
         if let Some(layer) = v.secondary.as_ref().filter(|_| depth < 2) {
             queue.push((Request { alias: layer.clone(), ..req.clone() }, depth + 1));
         }
@@ -276,10 +297,64 @@ fn play_queued(
 
 fn follow_falloff(
     listener: Query<&GlobalTransform, With<SpatialListener>>,
-    mut loops: Query<(&GlobalTransform, &Falloff, &mut bevy::audio::SpatialAudioSink)>,
+    ducking: Res<Ducking>,
+    mut loops: Query<(&GlobalTransform, &Falloff, Option<&Slave>, &mut bevy::audio::SpatialAudioSink)>,
 ) {
     let Some(ear) = listener.iter().next().map(|g| g.translation()) else { return };
-    for (tf, f, mut sink) in &mut loops {
-        sink.set_volume(Volume::Linear(f.gain * f.variant.falloff(ear.distance(tf.translation()) / INCH)));
+    for (tf, f, slave, mut sink) in &mut loops {
+        let duck = slave.map_or(1.0, |s| ducking.scale(s.percentage));
+        sink.set_volume(Volume::Linear(f.gain * f.variant.falloff(ear.distance(tf.translation()) / INCH) * duck));
+    }
+}
+
+/// A master sound playing (CoD4 ducks slave sounds meanwhile).
+#[derive(Component)]
+struct Master;
+
+/// A slave sound: its volume undimmed, and how far ducking takes it.
+#[derive(Component)]
+struct Slave {
+    volume: f32,
+    percentage: f32,
+}
+
+/// CoD4's `slaveLerp`: 0 to 1 over `snd_slaveFadeTime` (0.5 s) while any
+/// master sound plays, back down after.
+#[derive(Resource, Default)]
+struct Ducking {
+    lerp: f32,
+}
+
+/// `snd_slaveFadeTime`.
+const SLAVE_FADE: f32 = 0.5;
+
+impl Ducking {
+    /// A slave sound's volume scale (`SND_GetLerpedSlavePercentage`).
+    fn scale(&self, percentage: f32) -> f32 {
+        1.0 - (1.0 - percentage) * self.lerp
+    }
+}
+
+fn duck(
+    time: Res<Time>,
+    mut ducking: ResMut<Ducking>,
+    masters: Query<(), With<Master>>,
+    mut slaves: Query<(&Slave, Option<&mut AudioSink>, Option<&mut bevy::audio::SpatialAudioSink>), Without<Falloff>>,
+) {
+    let step = time.delta_secs() / SLAVE_FADE;
+    let lerp = if masters.is_empty() { ducking.lerp - step } else { ducking.lerp + step };
+    let lerp = lerp.clamp(0.0, 1.0);
+    if lerp == ducking.lerp && lerp == 0.0 {
+        return;
+    }
+    ducking.lerp = lerp;
+    for (s, flat, spatial) in &mut slaves {
+        let v = Volume::Linear(s.volume * ducking.scale(s.percentage));
+        if let Some(mut sink) = flat {
+            sink.set_volume(v);
+        }
+        if let Some(mut sink) = spatial {
+            sink.set_volume(v);
+        }
     }
 }

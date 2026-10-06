@@ -37,9 +37,7 @@ fn setup_hud(mut commands: Commands) {
         .id();
     commands.spawn((
         HintText,
-        text("Click to play  |  WASD move, Shift sprint, Space jump, C crouch, Ctrl prone
-LMB fire, RMB aim, R reload, Tab scores, Esc release mouse
-B switch Bodycam / CoD4 gunplay, Q/E lean (Bodycam)", 16.0),
+        text(MATCH_HINT, 16.0),
         TextLayout::justify(Justify::Center),
         Node { position_type: PositionType::Absolute, bottom: px(60), width: percent(100), justify_content: JustifyContent::Center, ..default() },
         ChildOf(root),
@@ -73,7 +71,7 @@ fn update_hint(
     pad: Res<crate::gamepad::ActiveDevice>,
     player: Query<(), With<LocalPlayer>>,
     selecting: Option<Res<crate::killstreaks::airstrike::Selecting>>,
-    mut hint: Single<&mut Visibility, With<HintText>>,
+    mut hint: Single<(&mut Visibility, &mut Text), With<HintText>>,
 ) {
     if player.is_empty() {
         return;
@@ -83,5 +81,16 @@ fn update_hint(
         && pad.pad.is_none()
         && selecting.is_none()
         && !crate::splitscreen::active();
-    hint.set_if_neq(if free { Visibility::Inherited } else { Visibility::Hidden });
+    let (visibility, text) = &mut *hint;
+    visibility.set_if_neq(if free { Visibility::Inherited } else { Visibility::Hidden });
+    // Headquarters has nothing to fight with.
+    let wanted = if crate::hq::active() { HQ_HINT } else { MATCH_HINT };
+    if text.0 != wanted {
+        text.0 = wanted.to_owned();
+    }
 }
+
+const MATCH_HINT: &str = "Click to play  |  WASD move, Shift sprint, Space jump, C crouch, Ctrl prone
+LMB fire, RMB aim, R reload, Tab scores, Esc release mouse
+B switch Bodycam / CoD4 gunplay, Q/E lean (Bodycam)";
+const HQ_HINT: &str = "Click to play  |  WASD move, Shift sprint, Space jump, C crouch, Ctrl prone  |  Esc menu";

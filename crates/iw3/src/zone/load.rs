@@ -611,9 +611,19 @@ impl<'a> Loader<'a> {
     fn phys_preset(&mut self) -> Result<PhysPreset> {
         let s = self.begin(44)?;
         let name = self.r.xstring_or_empty(s.ptr(0))?;
-        self.r.xstring(s.ptr(28))?;
+        let sound_prefix = self.r.xstring(s.ptr(28))?.unwrap_or_default();
         self.end();
-        Ok(PhysPreset { name, mass: s.f32(8), bounce: s.f32(12), friction: s.f32(16) })
+        Ok(PhysPreset {
+            name,
+            sound_prefix,
+            mass: s.f32(8),
+            bounce: s.f32(12),
+            friction: s.f32(16),
+            bullet_force_scale: s.f32(20),
+            explosive_force_scale: s.f32(24),
+            pieces_spread_fraction: s.f32(32),
+            pieces_upward_velocity: s.f32(36),
+        })
     }
 
     fn light_def(&mut self) -> Result<LightDef> {
@@ -1252,17 +1262,36 @@ impl<'a> Loader<'a> {
         }
 
         let dyn_ent_counts = [s.u16(244), s.u16(246)];
+        let mut dyn_ents = Vec::new();
         for (k, &count) in dyn_ent_counts.iter().enumerate() {
             if s.ptr(248 + k * 4).is_inline() {
                 let (loc, defs) = self.r.array(4, 96, count as usize)?;
                 for i in 0..count as usize {
+                    // `DynEntityDef` (0x60): type, pose (quat, origin), xModel,
+                    // brushModel, physicsBrushModel, destroyFx, destroyPieces,
+                    // physPreset, health, mass (36 bytes), contents.
                     let d = defs.elem(i, 96);
-                    self.handle(d.ptr(32), AssetType::XModel, slot(loc, i * 96 + 32))?;
-                    if d.ptr(40) != Ptr::Null {
-                        self.handle(d.ptr(40), AssetType::Fx, slot(loc, i * 96 + 40))?;
-                    }
-                    self.handle(d.ptr(44), AssetType::XModelPieces, slot(loc, i * 96 + 44))?;
-                    self.handle(d.ptr(48), AssetType::PhysPreset, slot(loc, i * 96 + 48))?;
+                    let model = self.handle(d.ptr(32), AssetType::XModel, slot(loc, i * 96 + 32))?;
+                    let destroy_fx = if d.ptr(40) != Ptr::Null {
+                        self.handle(d.ptr(40), AssetType::Fx, slot(loc, i * 96 + 40))?
+                    } else {
+                        None
+                    };
+                    let destroy_pieces = self.handle(d.ptr(44), AssetType::XModelPieces, slot(loc, i * 96 + 44))?;
+                    let phys_preset = self.handle(d.ptr(48), AssetType::PhysPreset, slot(loc, i * 96 + 48))?;
+                    dyn_ents.push(DynEntDef {
+                        kind: d.i32(0),
+                        quat: d.vec4(4),
+                        origin: d.vec3(20),
+                        model,
+                        brush_model: d.u16(36),
+                        physics_brush_model: d.u16(38),
+                        destroy_fx,
+                        destroy_pieces,
+                        phys_preset,
+                        health: d.i32(52),
+                        contents: d.i32(92),
+                    });
                 }
             }
         }
@@ -1283,6 +1312,7 @@ impl<'a> Loader<'a> {
             cmodels,
             map_ents,
             dyn_ent_counts,
+            dyn_ents,
             leaf_brush_nodes,
         })
     }

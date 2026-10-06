@@ -125,7 +125,7 @@ fn drive(
                 let enemies: Vec<Entity> = pawns.iter().filter(|(_, p)| p.team != mine.team).map(|(e, _)| e).collect();
                 for k in 0..*n as usize {
                     if let Some(&victim) = enemies.get(k % enemies.len().max(1)) {
-                        killed.write(Killed { victim, attacker: Some(me) });
+                        killed.write(Killed { victim, attacker: Some(me), weapon: "", location: HitLocation::Torso });
                     }
                 }
             }

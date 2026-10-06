@@ -13,6 +13,7 @@
 //! A match started with `--map` has no menus loaded; their fonts and
 //! materials then load in the background as it starts.
 
+use crate::settings_apply::Hud;
 use super::assets::UiAssets;
 use super::draw::{self, MINIMAP_Z, Placement};
 use super::expr::{Env, Val};
@@ -144,7 +145,7 @@ fn hud_test(
             }
             let at = pawns.get(shooter).map_or(Vec3::ZERO, |p| p.2.translation);
             damage.write(Damage { target: me, attacker: Some(shooter), amount: 65.0, location: HitLocation::Torso, weapon: "ak47_mp" });
-            shots.write(ShotFired { shooter, from: at, to: at, hit_pawn: true, normal: Vec3::Y, hit_world: false });
+            shots.write(ShotFired { shooter, weapon: None, from: at, to: at, hit_pawn: true, normal: Vec3::Y, hit_world: false });
             damage.write(Damage { target, attacker: Some(me), amount: 500.0, location: HitLocation::Head, weapon: "ak47_mp" });
             hits.write(HitConfirmed { shooter: me, headshot: true });
             let ahead = view.forward().with_y(0.0).normalize_or_zero();
@@ -302,6 +303,11 @@ fn setup_minimap(mut commands: Commands, content: Option<Res<Content>>, map: Res
 /// What happened lately that the HUD shows, and what it draws this frame.
 #[derive(Resource)]
 pub(super) struct HudState {
+    /// The frame time's running average (ms), for the performance overlay.
+    frame_ms: f32,
+    /// A dropped weapon a Use would swap for: its name's string key
+    /// ([`crate::pickups`]).
+    pickup: Option<String>,
     /// When the player last hurt someone.
     hit: f32,
     /// The crosshair is on a live enemy.
@@ -487,6 +493,8 @@ pub(super) fn end_game(mut fe: Option<ResMut<Frontend>>) {
 impl Default for HudState {
     fn default() -> Self {
         HudState {
+            frame_ms: 0.0,
+            pickup: None,
             hit: f32::NEG_INFINITY,
             aim_enemy: false,
             hurt: Vec::new(),
@@ -577,6 +585,8 @@ fn collect(
         match n {
             StreakNotice::Earned { streak, item } => hud.streak_notify = Some((*streak, *item, now)),
             StreakNotice::Unavailable(item) => hud.unavailable = Some((*item, now)),
+            // `MP_WAR_AIRSTRIKE_INBOUND_NEAR_YOUR_POSITION`.
+            StreakNotice::AirstrikeNear => hud.message("Airstrike inbound near your position!".into(), now),
             // `MP_WAR_RADAR_ACQUIRED` and so on: to the caller's team, and
             // the enemy's UAV to everyone else.
             StreakNotice::CalledIn { item, by, team } => {
@@ -847,16 +857,19 @@ pub(super) fn paint(
     pawns: Query<(Entity, &Pawn, &Transform, &ViewAngles, Has<Dead>, Option<&crate::bots::Bot>)>,
     live: Query<(&crate::grenades::LiveGrenade, &Transform)>,
     selecting: Option<Res<crate::killstreaks::airstrike::Selecting>>,
-    (cameras, explosives, killcam, night_vision, objectives, radar): (
+    (cameras, explosives, killcam, night_vision, objectives, radar, pickup_hints): (
         Query<(&SlotCamera, &Camera, &GlobalTransform, &Projection)>,
         Query<(&crate::explosives::Explosive, &GlobalTransform)>,
         Option<Res<crate::killcam::Killcam>>,
         Res<crate::vision::NightVisions>,
         Option<Res<crate::modes::Objectives>>,
         Option<Res<crate::killstreaks::uav::Radar>>,
+        Query<(&LocalSlot, &crate::pickups::PickupHint)>,
     ),
 ) {
     let now = time.elapsed_secs();
+    let ms = time.delta_secs() * 1000.0;
+    hud.frame_ms = if hud.frame_ms <= 0.0 { ms } else { hud.frame_ms + (ms - hud.frame_ms) * 0.05 };
     // Hardcore (`ui_hud_hardcore`, `cg_drawCrosshair 0`): no compass but
     // while the team's UAV is up, crosshair, ammo, equipment, XP or
     // hardpoint icons; the HUD menus hide their own parts by the dvar.
@@ -866,7 +879,8 @@ pub(super) fn paint(
         h.compass = None;
     }
     // CoD4 hides the HUD under its menus (`ui_active`).
-    if !fe.stack.is_empty() {
+    // Headquarters has no combat HUD.
+    if !fe.stack.is_empty() || crate::hq::active() {
         hud.ops.clear();
         return;
     }
@@ -887,6 +901,10 @@ pub(super) fn paint(
             continue;
         }
         let me = players.iter().find(|(_, (s, ..), _)| s.0 == slot);
+        {
+            let own = if slot == 0 { &mut *hud } else { extra.slot(slot) };
+            own.pickup = pickup_hints.iter().find(|h| h.0.0 == slot).and_then(|h| h.1.0.clone());
+        }
         // This player's weapon name, shown a while after it changes.
         if let Some(((_, _, _, weapon, _, _, _, _, loadout, _), ..)) = me {
             let name = match loadout {
@@ -1021,18 +1039,20 @@ fn paint_player(
             }
             if !gunplay.is_bodycam() {
                 if let Some((_, _, Projection::Perspective(proj))) = camera {
-                    if !mover.sprinting && !hardcore {
+                    if !mover.sprinting && !hardcore && show(Hud::Crosshair) {
                         let color = if hud.aim_enemy { [1.0, 0.0, 0.0] } else { [1.0; 3] };
                         crosshair(p, weapon, mover, proj.fov, color);
                     }
                 }
                 // `_damagefeedback.gsc`: shown, then faded over a second.
                 let t = now - hud.hit;
-                if t < 1.0 {
+                if t < 1.0 && show(Hud::HitMarkers) {
                     p.image("damage_feedback", vr(-12.0, -12.0, 24.0, 48.0, 2, 2), [1.0, 1.0, 1.0, 1.0 - t], 1);
                 }
             }
-            damage_direction(p, hud, tf.translation, view.yaw, now);
+            if show(Hud::DamageDirection) {
+                damage_direction(p, hud, tf.translation, view.yaw, now);
+            }
             // Objectives in the world, unless the killcam has the camera.
             if let (Some(o), Some((cam, cam_tf, _))) = (objectives.filter(|_| !killcam_on), camera) {
                 objectives::waypoints(p, o, my_team, size, (cam, cam_tf));
@@ -1057,10 +1077,22 @@ fn paint_player(
         }
         // The player's part in the objectives, and a round's result.
         if let Some(o) = objectives.filter(|_| !killcam_on) {
-            objectives::status(p, o, e, my_team, tf.translation, alive, input.use_key(), now);
+            objectives::status(p, o, e, my_team, tf.translation, alive, &input.use_key(), now);
+        }
+        // A dropped weapon to swap for (`PLATFORM_SWAPWEAPONS` and its name;
+        // hardcore hides the hints).
+        if let Some(key) = hud.pickup.as_ref().filter(|_| alive && !killcam_on && !hardcore) {
+            let text = loc(fe, "PLATFORM_SWAPWEAPONS", "Press [{+activate}] to swap for")
+                .replace("[{+activate}]", &input.use_key())
+                .replace("&&1", &input.use_key());
+            let name = fe.assets.localize(&format!("@{key}"));
+            p.text(&format!("{text} {name}"), 0.0, 100.0, 2, 2, 0.4 * 48.0, 0, WHITE, 0.5, true);
         }
     }
-    obituaries(p, shared, now);
+    if show(Hud::KillFeed) {
+        obituaries(p, shared, now);
+    }
+    performance(p, shared);
     // The scoreboard waits for the final killcam.
     for om in shared.menus.iter().filter(|m| m.name != "scoreboard" || (fe.game.scoreboard && !killcam_on)) {
         fe.paint_menu(om, &p.pl, None, &mut p.ops);
@@ -1076,8 +1108,8 @@ fn paint_player(
         p.text(&line, 0.0, -112.0, 2, 3, height, 0, WHITE, 0.5, true);
         if b.skippable {
             // [Use]: F, or the pad's X / Square (CoD4's console layout).
-            let key = me.map_or("F", |m| m.1.1.use_key());
-            let prompt = loc(fe, "PLATFORM_PRESS_TO_SKIP", "Press [{+activate}] to skip").replace("[{+activate}]", key);
+            let key = me.map_or_else(|| "F".to_owned(), |m| m.1.1.use_key());
+            let prompt = loc(fe, "PLATFORM_PRESS_TO_SKIP", "Press [{+activate}] to skip").replace("[{+activate}]", &key);
             p.text(&prompt, 0.0, -90.0, 2, 3, height * 0.75, 0, WHITE, 0.5, true);
         }
     }
@@ -1253,8 +1285,10 @@ fn compass(
     now: f32,
 ) -> Option<CompassView> {
     let pos = flat(at);
-    // The player's facing in the image; screen up on the compass.
-    let d = m.image_dir(facing(yaw));
+    // The player's facing in the image, screen up on the compass; or
+    // north, with the player's arrow turning (the settings' North Up).
+    let rotating = show(Hud::MinimapRotates);
+    let d = if rotating { m.image_dir(facing(yaw)) } else { m.image_dir(m.north) };
     let r = Vec2::new(-d.y, d.x);
     let to_compass = |world: Vec3| {
         let o = m.image_dir(flat(world) - pos) / COMPASS_RANGE;
@@ -1302,7 +1336,7 @@ fn compass(
     if let Some(o) = goals {
         objectives::compass_icons(p, o, team, &to_compass, &icon);
     }
-    icon(p, "compassping_player", Vec2::ZERO, COMPASS_ICON, 0.0, 1.0);
+    icon(p, "compassping_player", Vec2::ZERO, COMPASS_ICON, if rotating { 0.0 } else { turn(yaw) }, 1.0);
 
     let (map_pos, map_size) = p.pl.rect(&vr(mx, my, mw, mh, 1, 1));
     Some(CompassView {
@@ -1468,8 +1502,10 @@ fn grenade_danger(p: &mut Painter, at: Vec3, yaw: f32, live: &Query<(&crate::gre
     }
 }
 
-/// Bomb Squad (`specialty_detectexplosive`): enemy C4 and claymores nearby
-/// marked where they are, through walls.
+/// Bomb Squad (`specialty_detectexplosive`, `_weapons.gsc`'s
+/// `claymoreDetectionTrigger`): within 512 units across and 128 up or down
+/// of an enemy's C4 or claymore, its `waypoint_bombsquad` icon 24 units over
+/// it, through walls; the nearest four.
 fn bomb_squad(
     p: &mut Painter,
     (w, h): (f32, f32),
@@ -1479,22 +1515,47 @@ fn bomb_squad(
     explosives: &Query<(&crate::explosives::Explosive, &GlobalTransform)>,
     pawns: &Query<(Entity, &Pawn, &Transform, &ViewAngles, Has<Dead>, Option<&crate::bots::Bot>)>,
 ) {
-    /// How far they're seen, CoD units.
-    const RANGE: f32 = 1500.0;
+    const ACROSS: f32 = 512.0;
+    const UP_DOWN: f32 = 128.0;
+    const MOST: usize = 4;
     let (w, h) = (w.max(1.0), h.max(1.0));
-    for (x, tf) in explosives {
-        let mine = matches!(x.weapon.as_str(), "c4_mp" | "claymore_mp");
-        let enemy = x.owner != me && pawns.get(x.owner).is_ok_and(|(_, owner, ..)| owner.team != my_team || crate::combat::free_for_all());
-        if !mine || !enemy || (tf.translation() - at).length() / crate::units::INCH > RANGE {
-            continue;
-        }
-        let Ok(px) = cam.world_to_viewport(cam_tf, tf.translation() + Vec3::Y * crate::units::u(6.0)) else { continue };
-        let icon = if x.weapon == "c4_mp" { "hud_icon_c4" } else { "hud_icon_claymore" };
-        // Stretched virtual coordinates, sized to stay square on screen.
-        let (sw, sh) = (24.0 / w * 640.0 * (h / 480.0), 24.0);
+    let mut near: Vec<(f32, Vec3)> = explosives
+        .iter()
+        .filter(|(x, _)| matches!(x.weapon.as_str(), "c4_mp" | "claymore_mp"))
+        .filter(|(x, _)| x.owner != me && pawns.get(x.owner).is_ok_and(|(_, owner, ..)| owner.team != my_team || crate::combat::free_for_all()))
+        .filter_map(|(_, tf)| {
+            let d = (tf.translation() - at) / crate::units::INCH;
+            let across = Vec2::new(d.x, d.z).length();
+            (across <= ACROSS && d.y.abs() <= UP_DOWN).then_some((across, tf.translation()))
+        })
+        .collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, x) in near.into_iter().take(MOST) {
+        let Ok(px) = cam.world_to_viewport(cam_tf, x + Vec3::Y * crate::units::u(24.0)) else { continue };
+        // 14 by 14, kept square on screen.
+        let (sw, sh) = (14.0 / w * 640.0 * (h / 480.0), 14.0);
         let (vx, vy) = (px.x / w * 640.0, px.y / h * 480.0);
-        p.image(icon, vr(vx - sw * 0.5, vy - sh * 0.5, sw, sh, 4, 4), [1.0, 0.25, 0.2, 0.9], 1);
+        p.image("waypoint_bombsquad", vr(vx - sw * 0.5, vy - sh * 0.5, sw, sh, 4, 4), WHITE, 1);
     }
+}
+
+/// A HUD switch from the settings.
+fn show(which: Hud) -> bool {
+    crate::settings_apply::hud(which)
+}
+
+/// The settings' performance overlay: frames a second (and the frame
+/// time), top right, from a running average.
+fn performance(p: &mut Painter, hud: &HudState) {
+    let mode = crate::settings_apply::overlay();
+    if mode == 0 || hud.frame_ms <= 0.0 {
+        return;
+    }
+    let text = match mode {
+        1 => format!("{:.0} FPS", 1000.0 / hud.frame_ms),
+        _ => format!("{:.0} FPS  {:.1} ms", 1000.0 / hud.frame_ms, hud.frame_ms),
+    };
+    p.text(&text, -6.0, 16.0, 3, 1, 12.0, 0, [1.0, 1.0, 0.6, 0.9], 1.0, true);
 }
 
 /// The game message window: obituaries, newest at the bottom.
@@ -1778,7 +1839,7 @@ const NOTIFY_TIME: f32 = 4.0;
 /// frames and back over five, then fading.
 fn xp(p: &mut Painter, hud: &HudState, now: f32) {
     let t = now - hud.xp.1;
-    if hud.xp.0 == 0 || t > XP_SHOW + XP_FADE {
+    if hud.xp.0 == 0 || t > XP_SHOW + XP_FADE || !show(Hud::ScorePopups) {
         return;
     }
     let alpha = 0.85 * if t < XP_SHOW { 1.0 } else { 1.0 - (t - XP_SHOW) / XP_FADE };

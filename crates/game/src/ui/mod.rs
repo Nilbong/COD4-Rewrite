@@ -10,17 +10,22 @@ mod assets;
 mod attachments;
 mod bo1;
 mod browser;
+mod camos;
+mod combat_record;
 mod draw;
 mod expr;
 mod figures;
 mod hud;
 mod ingame;
+mod hq;
 mod lobby;
+mod mastery;
 mod pad;
 mod preview;
 pub(crate) mod challenges;
 pub(crate) mod progression;
 mod options;
+mod settings_menu;
 pub use options::{film_tint, lighting};
 mod split;
 mod scope;
@@ -78,7 +83,7 @@ impl Plugin for UiPlugin {
                     ingame::paint,
                 )
                     .chain()
-                    .run_if(in_game.and_then(resource_exists::<Frontend>)),
+                    .run_if(in_game.and_then(resource_exists::<Frontend>).and_then(|| !crate::perf::no_hud())),
             )
             .add_systems(PostUpdate, draw::sync_nodes.run_if(in_game))
             // The match's UI nodes go with it (`crate::session`).
@@ -87,6 +92,8 @@ impl Plugin for UiPlugin {
         // XP, ranks and promotions.
         progression::setup(app);
         challenges::setup(app);
+        combat_record::setup(app);
+        mastery::setup(app);
         hud::build(app);
         pad::build(app);
         scope::build(app);
@@ -151,6 +158,7 @@ struct OpenMenu {
 /// The menu system's state: open menus, dvars, local vars and stats.
 #[derive(Resource)]
 pub struct Frontend {
+    combat_record: combat_record::Editor,
     assets: UiAssets,
     dvars: HashMap<String, String>,
     locals: HashMap<String, String>,
@@ -165,6 +173,8 @@ pub struct Frontend {
     clock: std::time::Instant,
     /// Set by `uiScript StartServer`: the map to load.
     start: Option<String>,
+    /// Set by `uiScript startHeadquarters`: that map is Headquarters.
+    start_hq: bool,
     quit: bool,
     /// `disconnect` ran (Leave Game): back to the main menu.
     pub(super) leave: bool,
@@ -202,10 +212,28 @@ pub struct Frontend {
     servers: browser::ServerList,
     /// Where the mouse is (window pixels), for clicks inside list boxes.
     cursor: Option<Vec2>,
+    /// A bind row listening for a key ([`settings_menu`]), and whether
+    /// what started it has been let go.
+    capturing: Option<crate::bindings::Action>,
+    capture_armed: bool,
+    /// The window's size (for sliders' bars), and where a click landed this
+    /// frame (screen x), for the row it activates.
+    screen: Vec2,
+    click: Option<f32>,
+}
+
+impl Frontend {
+    /// The player's profile name (`com_playerProfile`).
+    pub fn profile_name(&self) -> String {
+        Some(self.dvar("com_playerProfile")).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Player".into())
+    }
 }
 
 impl Env for Frontend {
     fn dvar(&self, name: &str) -> String {
+        if name.eq_ignore_ascii_case(camos::DESCRIPTION_DVAR) {
+            return self.camo_description();
+        }
         self.dvars.get(&name.to_ascii_lowercase()).cloned().unwrap_or_default()
     }
 
@@ -305,9 +333,12 @@ fn weapon_picture_stat(exp: &Statement) -> Option<i32> {
     if !from_stats_table || !image_column {
         return None;
     }
+    let class_weapon_lookup = exp.windows(4).any(|w| matches!(w,
+        [Token::Op(op::TABLELOOKUP), Token::Str(table), Token::Op(op::COMMA), Token::Int(0)]
+            if table.eq_ignore_ascii_case("mp/statstable.csv")));
     exp.windows(2).find_map(|w| match w {
         // Class weapon stats: 200 + 10 * class + 1 (primary) or 3 (secondary).
-        [Token::Op(op::STAT), Token::Int(n)] if (201..250).contains(n) && matches!(n % 10, 1 | 3) => Some(*n),
+        [Token::Op(op::STAT), Token::Int(n)] if class_weapon_lookup && (201..250).contains(n) && matches!(n % 10, 1 | 3 | 5) => Some(*n),
         [Token::Op(op::DVARSTRING), Token::Str(d)] if d.eq_ignore_ascii_case("ui_primary_highlighted") => {
             Some(HIGHLIGHTED_WEAPON)
         }
@@ -373,9 +404,11 @@ impl Frontend {
         let debug = std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && k != "COD4RW_UNLOCKS" && !crate::net::setting(&k));
         let stats = Stats::load(&assets, !debug);
         let fe = Frontend {
+            combat_record: combat_record::Editor::default(),
             dvars: DEFAULT_DVARS
                 .iter()
                 .map(|(k, v)| (k.to_ascii_lowercase(), (*v).to_owned()))
+                .chain(settings_menu::default_dvars())
                 .chain(stats.dvars.clone())
                 .collect(),
             locals: HashMap::new(),
@@ -388,6 +421,7 @@ impl Frontend {
             clock: std::time::Instant::now(),
             start: None,
             quit: false,
+            start_hq: false,
             leave: false,
             lobby: lobby::Lobby::default(),
             player_team: crate::combat::Team::Allies,
@@ -405,6 +439,10 @@ impl Frontend {
             pad: false,
             servers: browser::ServerList::default(),
             cursor: None,
+            capturing: None,
+            capture_armed: false,
+            screen: Vec2::new(1280.0, 720.0),
+            click: None,
         };
         fe
     }
@@ -434,7 +472,7 @@ impl Frontend {
             if lower == "statsetusingtable" {
                 let args = self.call_args(&toks, &mut i);
                 if let [stat, value, ..] = &args[..] {
-                    self.stats.set(num(stat), num(value));
+                    self.set_class_stat(num(stat), num(value));
                 }
                 continue;
             }
@@ -497,6 +535,7 @@ impl Frontend {
                 self.locals.insert(a(1).to_ascii_lowercase(), a(2).to_owned());
             }
             "setdvar" => self.set_dvar(a(1), a(2)),
+            "settingsreset" => self.reset_settings(a(1)),
             "exec" | "execnow" => self.exec(a(1)),
             "execondvarstringvalue" | "execnowondvarstringvalue" => {
                 if self.dvar(a(1)).eq_ignore_ascii_case(a(2)) {
@@ -546,7 +585,7 @@ impl Frontend {
                 let on = Val::Str(self.dvar(a(1))).truthy();
                 self.set_dvar(a(1), if on { "0" } else { "1" });
             }
-            "statset" => self.stats.set(num(a(1)), num(a(2))),
+            "statset" => self.set_class_stat(num(a(1)), num(a(2))),
             "statgetindvar" => {
                 let v = self.stats.get(num(a(1)));
                 self.set_dvar(a(2), &v.to_string());
@@ -584,8 +623,14 @@ impl Frontend {
                 }
             }
             "startserver" => self.start = Some(self.dvar("ui_mapname")),
+            "startheadquarters" => {
+                self.start = Some(crate::hq::MAP.into());
+                self.start_hq = true;
+            }
             "quit" => self.quit = true,
             s if s.starts_with("supply") => self.supply_script(args),
+            s if s.starts_with("combat") => self.combat_record_script(args),
+            s if s.starts_with("camo") => self.camo_script(args),
             s if s.starts_with("t5") => self.bo1_script(args),
             s if s.starts_with("t4") => self.waw_script(args),
             s if s.starts_with("lobby") => self.lobby_script(args),
@@ -611,6 +656,8 @@ impl Frontend {
             return self.open(&choice);
         }
         let base = self.supply_menu(&key, self.assets.menu(&key).or_else(|| self.bo1_menu(&key)).or_else(|| self.waw_menu(&key)));
+        let base = self.combat_record_menu(&key, base);
+        let base = if key == hq::PAUSE_MENU { self.assets.menu("class").and_then(|m| hq::pause_menu(&m)).map(Arc::new) } else { base };
         let Some(mut menu) = self.lobby_menu(&key, base) else {
             warn!("ui: no menu {name}");
             return;
@@ -696,6 +743,9 @@ impl Frontend {
 
     /// The dvar-backed value shown by settings items.
     fn item_value(&self, item: &Item) -> Option<String> {
+        if let Some(v) = self.setting_value(item) {
+            return Some(v);
+        }
         let current = || self.dvar(&item.dvar);
         match item.ty {
             item_type::YESNO => {
@@ -763,6 +813,13 @@ impl Frontend {
         }
         if item.ty == item_type::OWNERDRAW {
             self.browser_owner_draw_click(item.window.owner_draw);
+        }
+        // Settings' rows: binds listen, sliders follow the click, choices
+        // step (through the preset's bookkeeping).
+        let click = self.click.take();
+        if self.setting_activate(item, click) || self.setting_step(item, 1) {
+            self.run(&item.action, menu);
+            return;
         }
         match (&item.data, item.ty) {
             (_, item_type::YESNO) => {
@@ -933,6 +990,7 @@ impl Frontend {
             }
             self.paint_supply(om, pl, ops);
             self.paint_lobby(om, pl, ops);
+            self.paint_combat_record(om, pl, ops);
         }
     }
 
@@ -966,6 +1024,9 @@ impl Frontend {
             paint_window(&item.window, pos, size, pl.scale, material, fore, ops);
             let focused = self.focus.as_ref().is_some_and(|(m, f)| *m == om.name && *f == i);
             self.paint_text(menu, item, &r, pl, fore, focused, ops);
+            if item.ty == item_type::SLIDER {
+                self.paint_slider(item, pl, fore, ops);
+            }
             if item.ty == item_type::LISTBOX && item.special == browser::FEEDER_SERVERS {
                 self.paint_servers(item, pl, ops);
             }
@@ -1016,6 +1077,7 @@ impl Frontend {
                 n > 1 || (n == 1 && self.stat(*w) >= crate::bo1::FIRST_INDEX)
             });
         let raw = match several {
+            _ if Self::is_desc(item) => self.setting_desc(),
             Some(w) => self.attachment_list(w),
             None if item.text_exp.is_empty() => item.text.clone(),
             None => eval(&item.text_exp, self).text(),
@@ -1082,18 +1144,18 @@ impl Frontend {
             return (!w.is_empty() && w != "0").then(|| (format!("{w}:"), 0));
         }
         let primary = key % 10 == 1;
-        let weapon = self.table_lookup("mp/statstable.csv", 0, &self.stat(key).to_string(), 4);
-        let mut set = attachments::set_of(self, key);
-        let mut camo = if primary { self.stat(key - key % 10 + 9) } else { 0 };
+        let weapon = self.class_weapon(key);
+        let mut set = if key % 10 == 5 { 0 } else { attachments::set_of(self, key) };
+        let mut camo = self.class_camo(key);
         let valid = |v: &String| !v.is_empty() && v != "0";
         if let Some(top) = self.stack.last().map(|m| m.name.as_str()) {
             // `...2` popups are for the second weapon (Overkill), `pistol` and
             // `secondary` for the sidearm; Black Ops' popups name their stat.
-            let for_secondary = match bo1::key_stat(top).or_else(|| waw::key_stat(top)) {
+            let for_secondary = match camos::key_stat(top).or_else(|| bo1::key_stat(top)).or_else(|| waw::key_stat(top)) {
                 Some(stat) => stat % 10 == 3,
                 None => top.ends_with('2') || top.ends_with("secondary") || top.ends_with("pistol"),
             };
-            if for_secondary != primary {
+            if camos::key_stat(top).map_or(for_secondary != primary, |stat| stat == key) {
                 if top.contains("attachment_popup") {
                     // Show what clicking the hovered row would add.
                     let a = self.dvar("ui_attachment_highlighted");
@@ -1262,11 +1324,40 @@ fn menu_input(
     window: Single<&Window, With<PrimaryWindow>>,
     mut next: ResMut<NextState<GameState>>,
     mut exit: MessageWriter<AppExit>,
+    injected: Res<crate::gamepad::PadInjected>,
 ) {
     fe.esc_used = false;
     let pl = Placement::new(window.width(), window.height());
     let cursor = window.cursor_position();
     fe.cursor = cursor;
+    fe.screen = Vec2::new(window.width(), window.height());
+    // A bind listening takes the next key or button, and nothing else does.
+    if fe.capture(&keys, &mouse, &injected.keys) {
+        fe.stats.save_if_changed();
+        return;
+    }
+    // The focused setting: the arrow keys step it, a right click steps it
+    // back, holding the mouse on a slider drags it.
+    if let Some(item) = fe.focus.clone().and_then(|(m, i)| fe.menu_item(&m).map(|menu| menu.items[i].clone())) {
+        if Frontend::setting_of(&item).is_some() && fe.editing.is_none() {
+            let step = keys.just_pressed(KeyCode::ArrowRight) as i32 - keys.just_pressed(KeyCode::ArrowLeft) as i32 - mouse.just_pressed(MouseButton::Right) as i32;
+            if step != 0 {
+                fe.setting_step(&item, step.signum());
+                fe.run("\"play\" \"mouse_click\"", "");
+            }
+            if item.ty == item_type::SLIDER && mouse.pressed(MouseButton::Left) && !mouse.just_pressed(MouseButton::Left) {
+                if let (Some(p), Some(crate::settings::Kind::Slider { min, max, step, .. })) = (cursor, Frontend::setting_of(&item).map(|s| s.kind)) {
+                    if let Some(f) = fe.slider_fraction(&item, p.x) {
+                        let v = ((min + f * (max - min)) / step).round() * step;
+                        let text = format!("{}", (v * 1000.0).round() / 1000.0);
+                        if fe.dvar(&item.dvar) != text {
+                            fe.set_setting(&item.dvar, &text);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // The mouse wheel scrolls the server list it's over.
     if scroll.delta.y != 0.0 {
         let list = fe.focus.clone().and_then(|(m, i)| fe.menu_item(&m).map(|menu| menu.items[i].clone()));
@@ -1287,6 +1378,7 @@ fn menu_input(
         }
     }
     if (mouse.just_pressed(MouseButton::Left) && !dragging) || keys.just_pressed(KeyCode::Enter) {
+        fe.click = cursor.filter(|_| mouse.just_pressed(MouseButton::Left)).map(|p| p.x);
         if let Some((menu, i)) = fe.focus.clone() {
             fe.activate(&menu, i);
         }
@@ -1314,6 +1406,11 @@ fn menu_input(
     if let Some((config, players)) = fe.lobby.take_start() {
         commands.insert_resource(config);
         commands.insert_resource(players);
+    }
+    // Headquarters: a match of its own kind ([`crate::hq`]).
+    if std::mem::take(&mut fe.start_hq) {
+        commands.insert_resource(crate::hq::config());
+        commands.insert_resource(crate::hq::Headquarters);
     }
     if let Some(map) = fe.start.take() {
         info!("ui: starting {map}");
@@ -1528,6 +1625,8 @@ fn ui_shots(
                 "Enter" => Some(KeyCode::Enter),
                 "KeyR" => Some(KeyCode::KeyR),
                 "Tab" => Some(KeyCode::Tab),
+                "KeyW" => Some(KeyCode::KeyW),
+                "ShiftLeft" => Some(KeyCode::ShiftLeft),
                 _ => None,
             };
             if k % 2 == 0 && k > 0 {

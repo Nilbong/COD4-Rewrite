@@ -220,7 +220,7 @@ pub(super) fn str_exp(s: &str) -> Vec<Token> {
 }
 
 /// Point `"setLocalVarInt" "ui_highlight" N` in a script at another row.
-fn retarget_focus(script: &str, row: i32) -> String {
+pub(super) fn retarget_focus(script: &str, row: i32) -> String {
     let key = "\"ui_highlight\" ";
     let Some(at) = script.find(key) else { return script.into() };
     let start = at + key.len();

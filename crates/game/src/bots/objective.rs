@@ -30,6 +30,8 @@ pub(super) enum Goal {
     Guard(Vec3),
     /// Defuse the planted bomb.
     Defuse(Vec3),
+    /// Headquarters: stand in the HQ to take it.
+    Hq,
 }
 
 impl Goal {
@@ -42,6 +44,7 @@ impl Goal {
             Goal::Plant(_) => 1.6,
             Goal::Guard(_) => 0.9,
             Goal::Defuse(_) => 1.8,
+            Goal::Hq => 1.2,
         }
     }
 
@@ -49,7 +52,7 @@ impl Goal {
     fn same(self, other: Goal) -> bool {
         match (self, other) {
             (Goal::Flag(a, _), Goal::Flag(b, _)) | (Goal::Plant(a), Goal::Plant(b)) => a == b,
-            (Goal::Pickup(_), Goal::Pickup(_)) | (Goal::Defuse(_), Goal::Defuse(_)) => true,
+            (Goal::Pickup(_), Goal::Pickup(_)) | (Goal::Defuse(_), Goal::Defuse(_)) | (Goal::Hq, Goal::Hq) => true,
             (Goal::Guard(a), Goal::Guard(b)) => a.distance(b) < u(400.0),
             _ => false,
         }
@@ -102,9 +105,13 @@ fn goal_of(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx) -> Option<Goal> {
     if !o.flags.is_empty() {
         return flag(bot, feet, tc, o);
     }
-    // Search and Destroy only (Sabotage's sites belong to a team; bots don't
-    // play it yet).
-    if o.sites.is_empty() || o.sites.iter().any(|s| s.team.is_some()) || o.round_over.is_some() {
+    if let Some(h) = &o.hq {
+        return hq(bot, feet, tc, h);
+    }
+    if o.sites.iter().any(|s| s.team.is_some()) {
+        return sabotage(me, feet, tc, o);
+    }
+    if o.sites.is_empty() || o.round_over.is_some() {
         return None;
     }
     let bomb = o.bomb.as_ref();
@@ -133,6 +140,52 @@ fn goal_of(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx) -> Option<Goal> {
     }
 }
 
+/// Headquarters: take an HQ that isn't ours, a few at a time (more inside
+/// take it faster, `koth.gsc`); keep one that is (holders don't respawn).
+/// Between HQs there's nothing to go for.
+fn hq(bot: &Bot, feet: Vec3, tc: &TacCtx, h: &crate::modes::Hq) -> Option<Goal> {
+    if h.owner == Some(tc.team) {
+        return Some(Goal::Guard(h.pos));
+    }
+    if blocked(bot, Goal::Hq) {
+        return None;
+    }
+    let mine = matches!(bot.goal, Some(Goal::Hq)) && bot.mode == super::Mode::Objective;
+    let going = tc
+        .mates
+        .iter()
+        .filter(|m| h.contains(m.feet) || (m.mode == super::Mode::Objective && m.dest.is_some_and(|d| h.contains(d))))
+        .count();
+    let _ = feet;
+    (mine || going < 3).then_some(Goal::Hq)
+}
+
+/// Sabotage (`sab.gsc`): one bomb for both sides, each side's own site to
+/// keep. A loose bomb: the two nearest go for it, the rest close in. Ours:
+/// the carrier plants it at their site, the rest go ahead to clear it.
+/// Theirs: back to our site. Planted at ours: the nearest defuses, the rest
+/// guard; at theirs: guard it.
+fn sabotage(me: Entity, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Option<Goal> {
+    if o.round_over.is_some() {
+        return None;
+    }
+    let ours = o.sites.iter().position(|s| s.team == Some(tc.team))?;
+    let theirs = o.sites.iter().position(|s| s.team == Some(tc.team.other()))?;
+    let bomb = o.bomb.as_ref()?;
+    let closer = |p: Vec3| tc.mates.iter().filter(|m| m.feet.distance(p) < feet.distance(p)).count();
+    if let Some(label) = bomb.planted {
+        let at_ours = o.sites[ours].label == label;
+        return Some(if at_ours && closer(bomb.pos) == 0 { Goal::Defuse(bomb.pos) } else { Goal::Guard(bomb.pos) });
+    }
+    Some(match bomb.carrier {
+        Some(c) if c == me => Goal::Plant(theirs),
+        Some(c) if tc.mates.iter().any(|m| m.entity == c) => Goal::Guard(o.sites[theirs].pos),
+        Some(_) => Goal::Guard(o.sites[ours].pos),
+        None if closer(bomb.pos) < 2 => Goal::Pickup(bomb.pos),
+        None => Goal::Guard(bomb.pos),
+    })
+}
+
 /// The site attackers go for this round: one still standing, the same for
 /// the whole team (picked from the round's end time, fixed for the round).
 fn round_target(o: &Objectives, live: &[usize]) -> Option<usize> {
@@ -142,7 +195,8 @@ fn round_target(o: &Objectives, live: &[usize]) -> Option<usize> {
 
 /// Domination: flags we don't hold, or ours being taken, nearest first;
 /// not one enough teammates are already on or heading for (one to take it,
-/// two to keep it: real players were mostly alone on a flag).
+/// two to keep it: real players were mostly alone on a flag; one more for
+/// every six on the team).
 fn flag(bot: &Bot, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Option<Goal> {
     let current = match bot.goal {
         Some(Goal::Flag(i, _)) if bot.mode == super::Mode::Objective => Some(i),
@@ -166,7 +220,13 @@ fn flag(bot: &Bot, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Option<Goal> {
                 })
                 .count();
             let mine = current == Some(i);
-            if !mine && on_it >= if attacked { 2 } else { 1 } {
+            // Big teams send more: alone, the one on its way to a flag in
+            // the thick of it (Wet Work's B with ten a side) keeps dying
+            // there and it never falls, where real players kept taking it.
+            // Bot lab experiment `crew`: one more (more inside take a flag
+            // faster, `dom.gsc`).
+            let crew = if attacked { 2 } else { 1 } + (tc.mates.len() + 1) / 6 + usize::from(super::lab::on("crew"));
+            if !mine && on_it >= crew {
                 return None;
             }
             let cost = feet.distance(f.pos) + on_it as f32 * u(600.0)
@@ -193,6 +253,7 @@ pub(super) fn pursue(bot: &mut Bot, goal: Goal, tc: &TacCtx, nav: Option<&NavGra
             Goal::Defuse(p) => feet.distance(p) > u(48.0),
             // (Respawned for a new round with the same goal, say.)
             Goal::Guard(p) => feet.distance(p) > u(700.0),
+            Goal::Hq => !o.hq.as_ref().is_some_and(|h| h.contains(feet)),
         };
     bot.blocked.retain(|b| b.1 > now);
     let changed = bot.mode != super::Mode::Objective || !bot.goal.is_some_and(|g| g.same(goal));
@@ -222,6 +283,20 @@ pub(super) fn pursue(bot: &mut Bot, goal: Goal, tc: &TacCtx, nav: Option<&NavGra
             within(s.pos, u(80.0), &|p| s.contains(p))
         }
         Goal::Pickup(p) | Goal::Defuse(p) => p,
+        // A walkable point inside the HQ's box, at whatever height (random
+        // spots near the radio snapped to the ground floor below one
+        // upstairs: Crash), spread from teammates; else the radio.
+        Goal::Hq => match &o.hq {
+            Some(h) => {
+                let inside: Vec<Vec3> = nav
+                    .map(|n| n.nodes.iter().map(|n| n.pos).filter(|p| h.contains(*p)).collect())
+                    .unwrap_or_default();
+                let free: Vec<Vec3> = inside.iter().copied().filter(|p| avoid.iter().all(|m| m.distance(*p) > u(60.0))).collect();
+                let pick = if free.is_empty() { &inside } else { &free };
+                if pick.is_empty() { h.pos } else { pick[rng.random_range(0..pick.len())] }
+            }
+            None => feet,
+        },
         // One of the map's holding spots near it (open ground or a corner
         // picked at random gets players stuck), else somewhere around it.
         Goal::Guard(p) => {
@@ -250,13 +325,14 @@ pub(super) fn pursue(bot: &mut Bot, goal: Goal, tc: &TacCtx, nav: Option<&NavGra
 /// while nobody's in sight.
 pub(super) fn use_objectives(
     objectives: Option<Res<Objectives>>,
-    mut bots: Query<(Entity, &Bot, &Transform, Option<&mut UseObjective>), Without<Dead>>,
+    mut bots: Query<(Entity, &Bot, &Transform, Option<&mut UseObjective>, Has<crate::perks::Downed>), Without<Dead>>,
 ) {
     let Some(o) = objectives else { return };
-    for (me, bot, tf, using) in &mut bots {
+    for (me, bot, tf, using, downed) in &mut bots {
         let Some(mut using) = using else { continue };
         let feet = tf.translation;
-        let calm = !bot.know.contacts.values().any(|c| c.noticed());
+        // Downed (Last Stand) can't touch the bomb.
+        let calm = !bot.know.contacts.values().any(|c| c.noticed()) && !downed;
         let carrying = o.bomb.as_ref().is_some_and(|b| b.carrier == Some(me));
         let want = calm
             && bot.mode == super::Mode::Objective

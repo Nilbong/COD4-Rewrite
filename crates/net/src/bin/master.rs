@@ -7,7 +7,7 @@
 //! default). Point the game at it with `COD4RW_MASTER=host:port`; without
 //! that, the game uses one on this machine.
 
-use cod4rw_net::{GAME, MASTER_PORT, challenge, packet, parse, parse_info, servers_response};
+use cod4rw_net::{GAME, MASTER_PORT, MIN_QUERY, RateLimit, challenge, packet, padded, parse, parse_info, servers_response, unpad};
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
@@ -35,12 +35,19 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-#[derive(Default)]
 struct Master {
     /// Listed games and their last heartbeat.
     servers: HashMap<SocketAddrV4, Instant>,
     /// Games being checked: the challenge sent and when.
     checking: HashMap<SocketAddrV4, (String, Instant)>,
+    /// Replies are rationed ([`RateLimit`]): a list can be several packets.
+    limit: RateLimit,
+}
+
+impl Default for Master {
+    fn default() -> Master {
+        Master { servers: HashMap::new(), checking: HashMap::new(), limit: RateLimit::new(4.0, 0.5, 200.0) }
+    }
 }
 
 impl Master {
@@ -48,12 +55,15 @@ impl Master {
     fn handle(&mut self, data: &[u8], from: SocketAddr, now: Instant) -> Vec<(Vec<u8>, SocketAddr)> {
         let SocketAddr::V4(from4) = from else { return Vec::new() };
         let Some((command, rest)) = parse(data) else { return Vec::new() };
-        let text = String::from_utf8_lossy(rest);
+        let text = String::from_utf8_lossy(unpad(rest));
+        // Anything answered must have been padded (no amplification) and
+        // be within the sender's ration.
+        let answerable = |m: &mut Master| data.len() >= MIN_QUERY && m.limit.allow(from.ip(), now);
         match command {
-            "heartbeat" if text.trim() == GAME => {
+            "heartbeat" if text.trim() == GAME && answerable(self) => {
                 // Check it's a game answering there before listing it.
                 let c = challenge();
-                let ask = packet(&format!("getinfo {c}"));
+                let ask = padded(packet(&format!("getinfo {c}")));
                 self.checking.insert(from4, (c, now));
                 vec![(ask, from)]
             }
@@ -69,7 +79,7 @@ impl Master {
                 }
                 Vec::new()
             }
-            "getservers" if text.split_whitespace().next() == Some(GAME) => {
+            "getservers" if text.split_whitespace().next() == Some(GAME) && answerable(self) => {
                 let list: Vec<SocketAddrV4> = self.servers.keys().copied().collect();
                 servers_response(&list).into_iter().map(|p| (p, from)).collect()
             }
@@ -101,8 +111,10 @@ mod tests {
         let browser: SocketAddr = "10.0.0.9:50000".parse().unwrap();
         let t0 = Instant::now();
         // A heartbeat gets a challenge back, not a listing.
-        let replies = m.handle(&packet("heartbeat cod4rw\n"), game, t0);
+        assert!(m.handle(&packet("heartbeat cod4rw\n"), game, t0).is_empty(), "unpadded: ignored");
+        let replies = m.handle(&padded(packet("heartbeat cod4rw\n")), game, t0);
         let (command, rest) = parse(&replies[0].0).unwrap();
+        let rest = unpad(rest);
         assert_eq!(command, "getinfo");
         assert!(m.servers.is_empty());
         // The wrong challenge doesn't list it; the right one does.
@@ -117,10 +129,13 @@ mod tests {
         m.handle(&answer(std::str::from_utf8(rest).unwrap()), game, t0);
         assert_eq!(m.servers.len(), 1);
         // Browsers get it.
-        let list = m.handle(&packet("getservers cod4rw 1 full empty"), browser, t0);
+        let list = m.handle(&padded(packet("getservers cod4rw 1 full empty")), browser, t0);
         assert_eq!(parse_servers(parse(&list[0].0).unwrap().1), vec![game]);
         // Other games' browsers don't.
-        assert!(m.handle(&packet("getservers QuakeArena-1 68 full empty"), browser, t0).is_empty());
+        assert!(m.handle(&padded(packet("getservers QuakeArena-1 68 full empty")), browser, t0).is_empty());
+        // A flood from one address gets a few answers, then none.
+        let flood = (0..50).filter(|_| !m.handle(&padded(packet("getservers cod4rw 1 full empty")), browser, t0).is_empty()).count();
+        assert!(flood < 5, "{flood}");
         // Silent for long enough, it drops off.
         m.expire(t0 + EXPIRE + Duration::from_secs(1));
         assert!(m.servers.is_empty());

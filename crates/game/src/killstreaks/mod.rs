@@ -138,6 +138,8 @@ pub enum StreakNotice {
     CalledIn { item: Hardpoint, by: String, team: Team },
     /// The player's can't be used now (another airstrike or helicopter is up).
     Unavailable(Hardpoint),
+    /// The player's team called an airstrike on them.
+    AirstrikeNear,
 }
 
 fn reset(
@@ -208,12 +210,19 @@ fn equip(mut commands: Commands, pawns: Query<Entity, (With<Pawn>, Without<Kills
 fn count_streaks(
     time: Res<Time>,
     mut killed: MessageReader<Killed>,
-    mut pawns: Query<(&Pawn, &mut Killstreak, Has<LocalPlayer>, Has<Dead>)>,
+    mut pawns: Query<(&Pawn, &mut Killstreak, Has<LocalPlayer>, Option<Ref<Dead>>)>,
     mut notices: MessageWriter<StreakNotice>,
     mut sfx: ResMut<Sfx>,
     sides: Option<Res<Sides>>,
     heli_paths: Res<helicopter::HeliPaths>,
 ) {
+    // Dying, or a new round's respawn (the script's `map_restart` keeps
+    // only the held hardpoint), ends a streak.
+    for (_, mut s, _, dead) in &mut pawns {
+        if dead.is_some_and(|d| d.is_added()) {
+            s.kills = 0;
+        }
+    }
     for k in killed.read() {
         let victim_team = pawns.get(k.victim).ok().map(|(p, ..)| p.team);
         if let Ok((_, mut s, ..)) = pawns.get_mut(k.victim) {
@@ -221,7 +230,7 @@ fn count_streaks(
         }
         let Some(attacker) = k.attacker.filter(|&a| a != k.victim) else { continue };
         let Ok((pawn, mut streak, local, dead)) = pawns.get_mut(attacker) else { continue };
-        if victim_team.is_none_or(|t| t == pawn.team) || dead {
+        if victim_team.is_none_or(|t| t == pawn.team) || dead.is_some() {
             continue;
         }
         streak.kills += 1;
@@ -281,6 +290,8 @@ fn use_hardpoints(
     sides: Option<Res<Sides>>,
     mut heli_calls: ResMut<helicopter::Calls>,
     helis: Query<(), With<helicopter::Helicopter>>,
+    mut awards: MessageWriter<crate::ui::progression::Award>,
+    locals: Query<(&Transform, &Pawn), (With<LocalPlayer>, Without<Dead>)>,
 ) {
     let now = time.elapsed_secs();
     let me = local.single().ok().cloned();
@@ -309,6 +320,16 @@ fn use_hardpoints(
             Hardpoint::Airstrike => match target {
                 Some(at) => {
                     strikes.call(entity, at, now);
+                    // `doArtillery`: the caller's team within 562.5 units
+                    // of the spot are told (not in hardcore).
+                    if !crate::tdm::hardcore() {
+                        for (tf, p) in &locals {
+                            let d = (tf.translation - at).with_y(0.0).length();
+                            if !hostile(p, pawn) && d <= crate::units::u(450.0 * 1.25) {
+                                notices.write(StreakNotice::AirstrikeNear);
+                            }
+                        }
+                    }
                     // `leaderDialog( "airstrike_inbound", team )`.
                     if let (Some(sides), Some(me)) = (&sides, me.filter(|me| !hostile(me, pawn))) {
                         sfx.play(format!("{}_1mc_friendlyair", sides.of(me.team).voice), None);
@@ -346,6 +367,7 @@ fn use_hardpoints(
         };
         if used {
             streak.held = None;
+            awards.write(crate::ui::progression::Award { pawn: entity, kind: crate::ui::progression::AwardKind::Hardpoint });
             notices.write(StreakNotice::CalledIn { item, by: pawn.name.clone(), team: pawn.team });
         }
     }

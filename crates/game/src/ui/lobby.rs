@@ -313,8 +313,16 @@ fn with_private_match(menu: &Menu) -> Option<Menu> {
     let it = &mut out.items[i];
     it.text_exp = str_exp("Private Match");
     it.action = format!("\"play\" \"mouse_click\" ; \"open\" \"{LOBBY_MENU}\" ; ");
+    // Headquarters ([`crate::hq`]) above Join Game, a copy of this row.
+    let y = it.window.rect.y;
+    let template: Vec<Item> = out.items.iter().filter(|it| left_column(it) && (it.window.rect.y - y).abs() < 0.5).cloned().collect();
+    let row = out.items.iter().flat_map(|it| highlight_rows(&it.visible_exp)).max().unwrap_or(0) + 1;
+    out.items.extend(place_row(&template, y - 2.0 * HQ_PITCH, row, str_exp("Headquarters"), &script(&[&ui_script("startHeadquarters")])));
     Some(out)
 }
+
+/// The main menu's rows' spacing.
+const HQ_PITCH: f32 = 24.0;
 
 impl Frontend {
     /// The lobby's menus, and the main menu pointing at it.

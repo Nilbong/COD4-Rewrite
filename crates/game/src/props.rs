@@ -8,6 +8,8 @@
 //! (`script_gameobjectname`: bomb sites, flags, HQ radios, Domination's
 //! barriers; the modes draw their own), Old School's perk pickups and
 //! `exploder` models (what a bomb site looks like once blown).
+//!
+//! The map's clutter (its dynamic entities) is [`crate::clutter`]'s.
 
 use crate::content::Content;
 use crate::models::{Skeleton, SpawnModel, spawn_model};
@@ -19,7 +21,7 @@ pub struct PropsPlugin;
 
 impl Plugin for PropsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(GameState::InGame), spawn_props.in_set(Setup::Spawn));
+        app.add_systems(OnEnter(GameState::InGame), spawn_props.in_set(Setup::Spawn)).add_plugins((crate::clutter::ClutterPlugin, crate::terrain::TerrainPlugin, crate::mapfx::MapFxPlugin));
     }
 }
 

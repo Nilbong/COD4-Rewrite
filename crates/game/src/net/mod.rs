@@ -19,7 +19,7 @@
 
 pub use cod4rw_net as protocol;
 
-use protocol::{Info, PORTS, packet, parse, parse_info, parse_servers};
+use protocol::{Info, MIN_QUERY, PORTS, RateLimit, packet, padded, parse, parse_info, parse_servers, unpad};
 use bevy::prelude::*;
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -208,7 +208,7 @@ impl Browser {
                 let master = master();
                 match master.to_socket_addrs().ok().and_then(|mut a| a.find(SocketAddr::is_ipv4)) {
                     Some(addr) => {
-                        let ask = packet(&format!("getservers {} {} full empty", protocol::GAME, protocol::PROTOCOL));
+                        let ask = padded(packet(&format!("getservers {} {} full empty", protocol::GAME, protocol::PROTOCOL)));
                         if let Some(s) = self.socket() {
                             let _ = s.send_to(&ask, addr);
                         }
@@ -243,7 +243,7 @@ impl Browser {
 
     fn query(&mut self, addr: SocketAddr) {
         let challenge = protocol::challenge();
-        let ask = packet(&format!("getinfo {challenge}"));
+        let ask = padded(packet(&format!("getinfo {challenge}")));
         if let Some(s) = self.socket() {
             if s.send_to(&ask, addr).is_ok() {
                 // A broadcast's answers come from each game's own address.
@@ -419,6 +419,8 @@ pub struct Host {
     next_heartbeat: f32,
     /// The master's challenge-checking `getinfo` is answered like anyone's.
     master: Option<SocketAddr>,
+    /// Queries answered are rationed ([`RateLimit`]).
+    limit: Option<RateLimit>,
 }
 
 impl Host {
@@ -439,6 +441,7 @@ fn host(
     config: Option<Res<crate::tdm::MatchConfig>>,
     map: Option<Res<crate::world::MapName>>,
     pawns: Query<(&crate::combat::Pawn, Has<crate::player::LocalPlayer>)>,
+    fe: Option<Res<crate::ui::Frontend>>,
 ) {
     if !host.tried {
         host.tried = true;
@@ -461,17 +464,23 @@ fn host(
     let now = time.elapsed_secs();
     if now >= host.next_heartbeat {
         if let Some(m) = host.master {
-            let _ = socket.send_to(&packet(&format!("heartbeat {}\n", protocol::GAME)), m);
+            let _ = socket.send_to(&padded(packet(&format!("heartbeat {}\n", protocol::GAME))), m);
         }
         host.next_heartbeat = now + HEARTBEAT;
     }
+    let limit = host.limit.get_or_insert_with(|| RateLimit::new(5.0, 2.0, 100.0));
     let mut buf = [0u8; 1024];
     while let Ok((n, from)) = socket.recv_from(&mut buf) {
+        // Padded queries only (a reply no bigger than the ask), and only so
+        // many a second, per address and in all.
+        if n < MIN_QUERY || !limit.allow(from.ip(), std::time::Instant::now()) {
+            continue;
+        }
         let Some(("getinfo", rest)) = parse(&buf[..n]) else { continue };
-        let challenge = String::from_utf8_lossy(rest).trim().to_owned();
-        // The player's name in the game is "You"; the computer's user name reads
-        // better in a list.
-        let me = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).unwrap_or_else(|_| "Player".into());
+        let challenge: String = String::from_utf8_lossy(unpad(rest)).trim().chars().take(32).collect();
+        // The player's profile name, never the computer's user name: anyone
+        // can ask for this.
+        let me = fe.as_deref().map_or_else(|| "Player".to_owned(), crate::ui::Frontend::profile_name);
         let mut info = Info::new();
         let mut put = |k: &str, v: String| {
             info.insert(k.to_owned(), v);
@@ -509,10 +518,11 @@ mod tests {
         let mut answered = false;
         for _ in 0..200 {
             if let Ok((n, from)) = server.recv_from(&mut buf) {
+                assert!(n >= MIN_QUERY, "queries are padded");
                 let (command, rest) = parse(&buf[..n]).unwrap();
                 assert_eq!(command, "getinfo");
                 let mut info = Info::new();
-                info.insert("challenge".into(), String::from_utf8_lossy(rest).trim().to_owned());
+                info.insert("challenge".into(), String::from_utf8_lossy(unpad(rest)).trim().to_owned());
                 info.insert("gamename".into(), protocol::GAME.into());
                 info.insert("hostname".into(), "Test".into());
                 info.insert("mapname".into(), "mp_crash".into());

@@ -2,9 +2,9 @@
 //! (10 in team games, 5 in free-for-all), headshots (as much again),
 //! assists (2: damage on someone a teammate then kills), objectives
 //! ([`Award`]), challenges (their own XP), and the match bonus at the end
-//! (`updateMatchBonusScores`: the win, loss or tie scale × the match's
-//! minutes × the score per minute of the rank, `3 + level / 2`, × the share
-//! of it played). XP climbs the ranks of `mp/rankTable.csv`, with "Promoted!"
+//! (`updateMatchBonusScores`: the win, loss or tie scale, 1/0.5/0.75 or
+//! Search and Destroy's 2/1/1.5, × the score per minute of the rank,
+//! `3 + level / 2`, × the minutes played). XP climbs the ranks of `mp/rankTable.csv`, with "Promoted!"
 //! and its sound at each. Everything goes in CoD4's own stats
 //! (`mp/playerStatsTable.csv`: 2301 RANKXP, 2303 KILLS, 2350 RANK, ...),
 //! kept with the rest ([`super::stats`]).
@@ -46,15 +46,50 @@ pub struct Award {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AwardKind {
     Capture,
+    /// A kill near what your team holds, or (Headquarters) holding it.
     Defend,
+    /// A kill near what the enemy holds.
+    Assault,
+    Plant,
+    Defuse,
+    /// Calling in a hardpoint (`_hardpoints.gsc`'s `"hardpoint"`).
+    Hardpoint,
 }
 
 impl AwardKind {
+    /// Each mode's `registerScoreInfo`: Domination and Headquarters capture
+    /// 15, defend and assault 5; Search and Destroy plant and defuse 10;
+    /// Sabotage plant 20, defuse 15.
     fn xp(self) -> i32 {
-        match self {
-            AwardKind::Capture | AwardKind::Defend => 30,
+        use crate::modes::GameMode as M;
+        match (self, crate::modes::current()) {
+            (AwardKind::Capture, _) => 15,
+            (AwardKind::Defend | AwardKind::Assault, _) => 5,
+            (AwardKind::Plant, M::Sab) => 20,
+            (AwardKind::Defuse, M::Sab) => 15,
+            (AwardKind::Plant | AwardKind::Defuse | AwardKind::Hardpoint, _) => 10,
         }
     }
+}
+
+/// Each mode's kill, headshot and assist XP (`_rank.gsc` and the modes'
+/// `registerScoreInfo`): 10/10/2 in team play, 5/5/1 in Domination and
+/// Headquarters, 5/5/2 in Search and Destroy, 5/5/0 free for all. A
+/// headshot is paid instead of the kill, not on top.
+fn kill_values() -> (i32, i32, i32) {
+    use crate::modes::GameMode as M;
+    match crate::modes::current() {
+        M::Ffa => (5, 5, 0),
+        M::Dom | M::Koth => (5, 5, 1),
+        M::Sd => (5, 5, 2),
+        M::Tdm | M::Sab => (10, 10, 2),
+    }
+}
+
+/// `giveRankXP`'s `max(1, int(10 / numLives))`: one-life Search and
+/// Destroy pays ten times over.
+fn lives_scale() -> i32 {
+    if crate::modes::current() == crate::modes::GameMode::Sd { 10 } else { 1 }
 }
 
 /// CoD4's player stats (`mp/playerStatsTable.csv`).
@@ -98,7 +133,12 @@ fn assists(
     mut damage: MessageReader<Damage>,
     mut killed: MessageReader<Killed>,
     mut pawns: Query<&mut Pawn>,
+    health: Query<&crate::combat::Health>,
 ) {
+    // `Callback_PlayerDamage` forgets who hurt someone once they're hurt
+    // again at full health: those back to full have no one to credit.
+    let full = crate::combat::max_health();
+    progress.damaged.retain(|e, _| health.get(*e).is_ok_and(|h| h.current < full));
     for d in damage.read() {
         progress.last_hit.insert(d.target, d.location);
         if let Some(a) = d.attacker.filter(|&a| a != d.target) {
@@ -110,6 +150,10 @@ fn assists(
     }
     for k in killed.read() {
         let helpers = progress.damaged.remove(&k.victim).unwrap_or_default();
+        // No assists free for all.
+        if free_for_all() {
+            continue;
+        }
         let Ok(victim) = pawns.get(k.victim).cloned() else { continue };
         for h in helpers.into_iter().filter(|&h| Some(h) != k.attacker) {
             if let Ok(mut p) = pawns.get_mut(h) {
@@ -131,17 +175,19 @@ fn award(
     mut killed: MessageReader<Killed>,
     mut awards: MessageReader<Award>,
     pawns: Query<(Entity, &Pawn, Has<LocalPlayer>)>,
-    player: Query<(Has<crate::combat::Dead>, Has<crate::loadout::AwaitingClass>), With<LocalPlayer>>,
+    player: Query<(Has<crate::combat::Dead>, Has<crate::loadout::AwaitingClass>, Has<crate::perks::Downed>), With<LocalPlayer>>,
 ) {
     let now = time.elapsed_secs();
     let Some(fe) = fe.as_deref_mut() else { return };
     let Some((me, me_pawn, _)) = pawns.iter().find(|p| p.2) else { return };
-    if let Ok((_, waiting)) = player.single() {
+    let mut downed = false;
+    if let Ok((_, waiting, last_stand)) = player.single() {
+        downed = last_stand;
         if !waiting {
             progress.played += time.delta_secs();
         }
     }
-    let (kill_xp, assist_xp) = if free_for_all() { (5, 0) } else { (10, 2) };
+    let (kill_xp, headshot_xp, assist_xp) = kill_values();
     let mut xp = 0;
     for k in killed.read() {
         let victim = pawns.get(k.victim).ok().map(|p| p.1.clone());
@@ -154,7 +200,8 @@ fn award(
         }
         if k.attacker == Some(me) && k.victim != me {
             let head = progress.last_hit.get(&k.victim) == Some(&crate::combat::HitLocation::Head);
-            xp += kill_xp * if head { 2 } else { 1 };
+            // In Last Stand, kills pay double.
+            xp += if head { headshot_xp } else { kill_xp } * if downed { 2 } else { 1 };
             fe.stats.add(stat::KILLS, 1);
             if head {
                 fe.stats.add(stat::HEADSHOTS, 1);
@@ -177,6 +224,7 @@ fn award(
             xp += a.kind.xp();
         }
     }
+    xp *= lives_scale();
     if xp > 0 {
         debug!("progression: +{xp} XP");
         give_xp(fe, &mut hud, xp, now);
@@ -210,20 +258,23 @@ fn match_bonus(
     }
     progress.bonus_given = true;
     let outcome = state.outcome(me);
+    let sd = state.mode == crate::modes::GameMode::Sd;
     let scale = match outcome {
         Some(true) => 1.0,
         Some(false) => 0.5,
         None => 0.75,
-    };
+    } * if sd { 2.0 } else { 1.0 };
     match outcome {
         Some(true) => fe.stats.add(stat::WINS, 1),
         Some(false) => fe.stats.add(stat::LOSSES, 1),
         None => {}
     }
-    let length = state.time_limit.max(60.0);
+    // The script's match length cancels out (`length / 60 × played /
+    // length`): rounds and overtime count as played.
     let spm = 3.0 + (fe.stats.get(stat::RANK) % 61 + 1) as f32 * 0.5;
-    let bonus = (scale * (length / 60.0) * spm * (progress.played / length).min(1.0)) as i32;
-    fe.stats.add(stat::TIME_PLAYED_TOTAL, progress.played as i32);
+    let bonus = (scale * spm * progress.played / 60.0) as i32;
+    // Combat Record accounts for match time as it is played, including
+    // matches left early. Do not count the whole match a second time here.
     info!("progression: match bonus {bonus} ({outcome:?}, {:.0}s played)", progress.played);
     if bonus > 0 {
         give_xp(fe, &mut hud, bonus, time.elapsed_secs());
@@ -394,6 +445,7 @@ pub(super) fn refresh_unlocks(stats: &mut Stats, assets: &UiAssets) {
         apply_unlocks(stats, assets);
     }
     unlock_challenges(stats, assets, !cod4);
+    super::mastery::refresh(stats, assets);
 }
 
 /// What each rank unlocks (`mp/rankTable.csv`): weapons (column 8), perks

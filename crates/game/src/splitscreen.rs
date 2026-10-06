@@ -200,15 +200,19 @@ pub struct PlayerInput {
 }
 
 impl PlayerInput {
-    /// The [Use] key as the player's device names it.
-    pub fn use_key(&self) -> &'static str {
+    /// The [Use] key as the player's device names it (the key it's bound
+    /// to on the keyboard).
+    pub fn use_key(&self) -> String {
         match self.pad_kind {
-            Some(PadKind::PlayStation) => "Square",
-            Some(PadKind::Xbox) => "X",
-            None => "F",
+            Some(PadKind::PlayStation) => "Square".into(),
+            Some(PadKind::Xbox) => "X".into(),
+            None => USE_KEY.lock().map_or_else(|_| "F".into(), |k| k.clone()),
         }
     }
 }
+
+/// The keyboard's Use key's name, for the hints (`crate::settings_apply`).
+pub static USE_KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// The match's local players, known before anything spawns for them
 /// (none but Player 1 while spectating).
@@ -293,16 +297,36 @@ fn gather_input(
     cursor: Single<&CursorOptions, With<PrimaryWindow>>,
     fe: Option<Res<crate::ui::Frontend>>,
     mut pawns: Query<(&LocalSlot, &mut PlayerInput, Has<LocalPlayer>)>,
+    settings: Res<crate::settings::Settings>,
+    injected: Res<crate::gamepad::PadInjected>,
+    mut translated: Local<std::collections::HashMap<usize, crate::bindings::Translated>>,
+    mut bindings: Local<Option<crate::bindings::Bindings>>,
 ) {
     let grabbed = cursor.grab_mode != CursorGrabMode::None;
+    // The keyboard and mouse as the game reads them: rebound keys pressing
+    // their actions' default keys ([`crate::bindings`]).
+    if settings.is_changed() || bindings.is_none() {
+        *bindings = Some(settings.bindings());
+    }
+    let b = bindings.as_ref().expect("set above");
+    let forward = b.of(crate::bindings::Action::Forward).iter().any(|i| match i {
+        crate::bindings::Input::Key(k) => keys.pressed(*k),
+        crate::bindings::Input::Mouse(m) => mouse.pressed(*m),
+    });
+    let mut translate = |slot: usize| {
+        let t = translated.entry(slot).or_default();
+        crate::bindings::translate(&keys, &mouse, (&injected.keys, &injected.mouse), b, forward, t);
+        (t.keys.clone(), t.mouse.clone())
+    };
     let global_menu = crate::ui::menu_open(fe.as_deref());
     for (slot, mut input, _) in &mut pawns {
         // A player's own menu (splitscreen) stops their play alone.
         let menu = global_menu || fe.as_deref().is_some_and(|fe| fe.slot_menu_open(slot.0));
         if !active() {
+            let (keys, mouse) = translate(slot.0);
             *input = PlayerInput {
-                keys: keys.clone(),
-                mouse: mouse.clone(),
+                keys,
+                mouse,
                 look: motion.delta,
                 scroll: scroll.delta.y,
                 pad: pad.clone(),
@@ -310,17 +334,22 @@ fn gather_input(
                 pad_entity: active_device.entity.filter(|_| active_device.pad.is_some()),
                 live: grabbed,
             };
+            // Headquarters has no fighting.
+            crate::hq::strip(&mut input);
             continue;
         }
         *input = match players.devices.get(slot.0).copied().unwrap_or(Device::NextPad) {
-            Device::KeyboardMouse => PlayerInput {
-                keys: keys.clone(),
-                mouse: mouse.clone(),
+            Device::KeyboardMouse => {
+                let (keys, mouse) = translate(slot.0);
+                PlayerInput {
+                keys,
+                mouse,
                 look: motion.delta,
                 scroll: scroll.delta.y,
                 live: grabbed && !menu,
                 ..default()
-            },
+            }
+            }
             Device::Pad(e) => match slot_pads.0.get(&e) {
                 Some(p) => PlayerInput {
                     keys: p.keys.clone(),

@@ -49,12 +49,24 @@ impl Plugin for KillcamPlugin {
     }
 }
 
-/// Bodies being replayed, by their body entity: the view's yaw and pitch,
-/// the body's twist and whether it was dead, as they were, for
+/// Bodies being replayed, by their body entity, as they were, for
 /// [`crate::thirdperson`] to turn the spine by (rather than by the live
 /// game's view). Empty outside a killcam.
 #[derive(Resource, Default)]
-pub struct ReplayPoses(pub std::collections::HashMap<Entity, (f32, f32, f32, bool)>);
+pub struct ReplayPoses(pub std::collections::HashMap<Entity, ReplayPose>);
+
+/// A replayed body: the view's yaw and pitch, the body's twist from it,
+/// whether it was dead, its lean, and the body's whole turn (with a prone
+/// body's tilt to the ground).
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayPose {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub twist: f32,
+    pub dead: bool,
+    pub lean: f32,
+    pub body_turn: Quat,
+}
 
 /// The killcam playing (or about to).
 #[derive(Resource, Default)]
@@ -171,9 +183,11 @@ fn flow(
         let name = |e: Entity| pawns.get(e).map_or_else(|_| "?".to_owned(), |p| p.1.name.clone());
         let (killer, victim) = (name(kill.attacker), name(kill.victim));
         let team = pawns.get(kill.attacker).map_or(Team::Allies, |p| p.1.team);
-        let before = if skippable { replay::BEFORE } else { replay::FINAL_BEFORE };
+        let before = if skippable { replay::before(kill.weapon) } else { replay::FINAL_BEFORE };
         let start = history.frames.front().map_or(kill.time, |f| f.time).max(kill.time - before);
-        let end = (kill.time + replay::AFTER).min(now);
+        // To two seconds after the kill: recorded by the time playback
+        // gets there (it starts at least 1.3 s before the kill).
+        let end = kill.time + replay::AFTER;
         let mut r = Replay::new(title, kill.clone(), (killer, victim), team, (start, end), now, skippable);
         // An explosive kill rides the explosive.
         r.projectile = explosive(&history, &kill);

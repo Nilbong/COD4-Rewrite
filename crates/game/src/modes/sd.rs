@@ -234,12 +234,17 @@ fn bomb(
     round: Option<ResMut<SdRound>>,
     mut objectives: ResMut<Objectives>,
     pawns: Query<(Entity, &Pawn, &Transform, &UseObjective, Has<Dead>)>,
+    // In Last Stand the bomb is dropped and can't be taken, planted or
+    // defused (`_gameobjects::onPlayerLastStand`).
+    downed: Query<(), With<crate::perks::Downed>>,
     me: Query<(Entity, &Pawn), With<LocalPlayer>>,
     sides: Option<Res<Sides>>,
     mut sfx: ResMut<Sfx>,
     mut effects: ResMut<Effects>,
     mut damage: MessageWriter<Damage>,
+    mut awards: MessageWriter<crate::ui::progression::Award>,
 ) {
+    use crate::ui::progression::{Award, AwardKind};
     let Some(mut round) = round else { return };
     if round.over.is_some() {
         objectives.using.clear();
@@ -261,7 +266,7 @@ fn bomb(
     // Carried: it goes where the carrier goes, and falls where they die.
     if let Some(c) = b.carrier {
         match pawns.get(c) {
-            Ok((_, _, tf, _, false)) => round.carrier_at = tf.translation,
+            Ok((_, _, tf, _, false)) if !downed.contains(c) => round.carrier_at = tf.translation,
             _ => {
                 b.carrier = None;
                 b.pos = round.carrier_at;
@@ -271,7 +276,7 @@ fn bomb(
     }
     // Lying about: the first live attacker to it picks it up.
     if b.carrier.is_none() && b.planted.is_none() {
-        if let Some((e, ..)) = pawns.iter().find(|(_, p, tf, _, dead)| !dead && p.team == attackers && in_pickup_reach(tf.translation, b.pos)) {
+        if let Some((e, ..)) = pawns.iter().find(|(e, p, tf, _, dead)| !dead && !downed.contains(*e) && p.team == attackers && in_pickup_reach(tf.translation, b.pos)) {
             b.carrier = Some(e);
             lines.push((attackers, "bomb_taken"));
         }
@@ -281,7 +286,7 @@ fn bomb(
     let previous = std::mem::take(&mut objectives.using);
     let progress_of = |e: Entity| previous.iter().find(|u| u.0 == e).map(|u| u.1);
     for (e, p, tf, use_input, dead) in &pawns {
-        if dead || !use_input.0 {
+        if dead || downed.contains(e) || !use_input.0 {
             continue;
         }
         let at = tf.translation;
@@ -305,6 +310,7 @@ fn bomb(
         }
         if defusing {
             info!("sd: {} defused the bomb", p.name);
+            awards.write(Award { pawn: e, kind: AwardKind::Defuse });
             b.explodes_at = None;
             sfx.play("MP_bomb_defuse", Some(b.pos));
             lines.push((attackers, "bomb_defused"));
@@ -317,6 +323,7 @@ fn bomb(
         let site = objectives.sites.iter().find(|s| s.contains(at)).map(|s| (s.label, s.pos));
         if let Some((label, pos)) = site {
             info!("sd: {} planted the bomb at {label}", p.name);
+            awards.write(Award { pawn: e, kind: AwardKind::Plant });
             b = Bomb { pos, carrier: None, planted: Some(label), explodes_at: Some(now + BOMB_TIMER) };
             round.planter = Some(e);
             objectives.timer = Some((now + BOMB_TIMER, true));
@@ -374,6 +381,7 @@ fn rounds(
     me: Query<(Entity, &Pawn), With<LocalPlayer>>,
     sides: Option<Res<Sides>>,
     mut sfx: ResMut<Sfx>,
+    config: Option<Res<crate::tdm::MatchConfig>>,
 ) {
     let (Some(mut round), Some(mut state)) = (round, state) else { return };
     let now = time.elapsed_secs();
@@ -397,6 +405,9 @@ fn rounds(
             let settled = now - round.started > 1.0;
             let result = objectives.round_over.or_else(|| match (wiped(attackers), wiped(attackers.other())) {
                 _ if !settled => None,
+                // `onDeadEvent("all")`: everyone down goes to the defenders
+                // unless the bomb is planted.
+                (true, true) if !planted => Some((attackers.other(), "MP_ENEMIES_ELIMINATED", "Enemies Eliminated")),
                 (_, true) => Some((attackers, "MP_ENEMIES_ELIMINATED", "Enemies Eliminated")),
                 (true, _) if !planted => Some((attackers.other(), "MP_ENEMIES_ELIMINATED", "Enemies Eliminated")),
                 _ if !planted && objectives.timer.is_some_and(|(at, _)| now >= at) => {
@@ -428,9 +439,25 @@ fn rounds(
         }
         Some(at) if now - at >= ROUND_DELAY => {
             let number = round.number + 1;
-            // Sides swap every `ROUND_SWITCH` rounds.
+            // Sides swap every `ROUND_SWITCH` rounds (`onRoundSwitch`),
+            // except at one round each from winning: then the team ahead
+            // in kills (fewer deaths if level) defends.
             let swap = (number - 1) % ROUND_SWITCH == 0;
-            let next = if swap { attackers.other() } else { attackers };
+            let limit = config.as_ref().map_or(0, |c| c.score_limit);
+            let overtime = limit > 0 && state.allies + 1 == limit && state.axis + 1 == limit;
+            let next = if swap && overtime {
+                let tally = |team: Team| {
+                    pawns.iter().filter(|(_, p, _)| p.team == team).fold((0i64, 0i64), |(k, d), (_, p, _)| (k + p.kills as i64, d + p.deaths as i64))
+                };
+                let ((ak, ad), (xk, xd)) = (tally(Team::Allies), tally(Team::Axis));
+                let allies_better = ak > xk || (ak == xk && ad < xd);
+                // The better team defends.
+                if allies_better { Team::Axis } else { Team::Allies }
+            } else if swap {
+                attackers.other()
+            } else {
+                attackers
+            };
             start_round(&mut commands, &mut round, &mut objectives, now, number, next, &pawns, true);
         }
         Some(_) => {}

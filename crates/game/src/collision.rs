@@ -9,7 +9,7 @@ use bevy::prelude::*;
 use iw3::zone::ClipMap;
 
 /// Physics layers. Movement collides with `World | PlayerClip`, bullets with
-/// `World | Hitbox`.
+/// `World | ShotClip | Hitbox`, bots' sight with `World | ShotClip | NoSight`.
 #[derive(PhysicsLayer, Default, Clone, Copy, Debug)]
 pub enum Layer {
     #[default]
@@ -19,10 +19,19 @@ pub enum Layer {
     Hitbox,
     /// Mantle volumes: only mantle checks see them.
     Mantle,
+    /// `CONTENTS_CLIPSHOT` brushes that aren't solid: they stop bullets (and
+    /// sight), not players.
+    ShotClip,
+    /// Non-solid `CONTENTS_FOLIAGE` / `CONTENTS_AI_NOSIGHT` brushes: they
+    /// only block sight (the level's hedges and bushes).
+    NoSight,
 }
 
 pub mod contents {
     pub const SOLID: i32 = 0x1;
+    pub const FOLIAGE: i32 = 0x2;
+    pub const AI_NOSIGHT: i32 = 0x1000;
+    pub const CLIPSHOT: i32 = 0x2000;
     pub const GLASS: i32 = 0x10;
     pub const PLAYERCLIP: i32 = 0x10000;
     pub const MANTLE: i32 = 0x1000000;
@@ -70,16 +79,74 @@ pub fn movement_filter() -> SpatialQueryFilter {
 }
 
 pub fn bullet_filter() -> SpatialQueryFilter {
-    SpatialQueryFilter::from_mask([Layer::World, Layer::Hitbox])
+    SpatialQueryFilter::from_mask([Layer::World, Layer::ShotClip, Layer::Hitbox])
+}
+
+/// What blocks seeing someone, as CoD4's `MASK_AIMTARGET_VISIBILITY`: the
+/// world, shot clip, foliage and the "no sight" brushes over hedges and
+/// bushes (for bots' eyes).
+pub fn ai_sight_filter() -> SpatialQueryFilter {
+    SpatialQueryFilter::from_mask([Layer::World, Layer::ShotClip, Layer::NoSight])
 }
 
 pub fn sight_filter() -> SpatialQueryFilter {
     SpatialQueryFilter::from_mask([Layer::World])
 }
 
+/// Each brush collider's face planes (Bevy space: normal, distance), for
+/// traces that want the face they hit rather than a rounded edge
+/// (`movement`'s, as CoD4's brush traces).
+#[derive(Resource, Default)]
+pub struct BrushFaces(pub std::collections::HashMap<Entity, Vec<(Vec3, f32)>>);
+
+impl BrushFaces {
+    /// The face of `entity` through `point`, facing a trace along `dir`,
+    /// that best matches `normal` (at an edge: a stair's top for a trace
+    /// down, its riser for one forward).
+    pub fn face(&self, entity: Entity, point: Vec3, normal: Vec3, dir: Vec3) -> Option<Vec3> {
+        self.0
+            .get(&entity)?
+            .iter()
+            .filter(|(n, d)| (n.dot(point) - d).abs() < units::u(0.25) && n.dot(dir) < -0.05)
+            .max_by(|a, b| a.0.dot(normal).total_cmp(&b.0.dot(normal)))
+            .map(|f| f.0)
+    }
+}
+
+/// The world's colliders never move: static bodies, each its own entity
+/// (no parent), so avian keeps them in its static tree and never refits,
+/// re-optimises or re-syncs them (with the moving hitboxes in the same tree
+/// that cost several ms a frame). Moving colliders are synced by
+/// [`sync_moved_colliders`].
+fn static_body() -> RigidBody {
+    RigidBody::Static
+}
+
+/// Avian's own transform-to-position sync walks every collider every frame;
+/// this one only those whose transform changed (hitboxes, the helicopter):
+/// see [`physics_transform_config`].
+pub fn sync_moved_colliders(mut moved: Query<(&GlobalTransform, &mut Position, &mut Rotation), Changed<GlobalTransform>>) {
+    for (gt, mut pos, mut rot) in &mut moved {
+        let (_, r, t) = gt.to_scale_rotation_translation();
+        if pos.0 != t {
+            pos.0 = t;
+        }
+        let r = Rotation::from(r);
+        if *rot != r {
+            *rot = r;
+        }
+    }
+}
+
+/// Avian's transform syncing, minus the per-frame walks over every collider
+/// ([`sync_moved_colliders`] stands in).
+pub fn physics_transform_config() -> avian3d::physics_transform::PhysicsTransformConfig {
+    avian3d::physics_transform::PhysicsTransformConfig { transform_to_position: false, transform_to_collider_scale: false, ..default() }
+}
+
 pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
-    let root = commands.spawn((Name::new("collision"), Transform::default(), Visibility::Hidden)).id();
-    let (mut solid, mut player_clip, mut skipped) = (0, 0, 0);
+    let mut faces = BrushFaces::default();
+    let (mut solid, mut player_clip, mut shot_clip, mut no_sight, mut skipped) = (0, 0, 0, 0, 0);
     let entity = clip.entity_brushes();
     for (i, brush) in clip.brushes.iter().enumerate() {
         if entity.contains(&(i as u32)) {
@@ -96,7 +163,7 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
                     MantleSurface { over },
                     CollisionLayers::new(Layer::Mantle, LayerMask::NONE),
                     Transform::default(),
-                    ChildOf(root),
+                    static_body(),
                 ));
             }
             continue;
@@ -107,6 +174,12 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
         } else if brush.contents & contents::PLAYERCLIP != 0 {
             player_clip += 1;
             Layer::PlayerClip
+        } else if brush.contents & contents::CLIPSHOT != 0 {
+            shot_clip += 1;
+            Layer::ShotClip
+        } else if brush.contents & (contents::FOLIAGE | contents::AI_NOSIGHT) != 0 {
+            no_sight += 1;
+            Layer::NoSight
         } else {
             skipped += 1;
             continue;
@@ -123,14 +196,13 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
             let m = brush.axial_materials[f / 3][f % 3];
             if m < 0 { fallback } else { surface_type(clip, m as i64) }
         });
-        commands.spawn((
-            collider,
-            Surfaces(surfaces),
-            CollisionLayers::new(layer, LayerMask::NONE),
-            Transform::default(),
-            ChildOf(root),
-        ));
+        let e = commands
+            .spawn((collider, Surfaces(surfaces), CollisionLayers::new(layer, LayerMask::NONE), Transform::default(), static_body()))
+            .id();
+        let planes = brush_planes(clip, brush).into_iter().map(|(n, d)| (units::dir(n.to_array()), units::u(d))).collect();
+        faces.0.insert(e, planes);
     }
+    commands.insert_resource(faces);
 
     // Terrain / curve patches: an indexed triangle soup.
     if !clip.tri_indices.is_empty() {
@@ -145,15 +217,58 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
             Collider::trimesh(verts, tris),
             CollisionLayers::new(Layer::World, LayerMask::NONE),
             Transform::default(),
-            ChildOf(root),
+            static_body(),
         ));
     }
-    info!("collision: {solid} solid brushes, {player_clip} player clip, {skipped} other skipped");
+    info!("collision: {solid} solid brushes, {player_clip} player clip, {shot_clip} shot clip, {no_sight} sight-blocking, {skipped} other skipped");
+}
+
+/// The clip map's static models (props with collision: rocks, air
+/// conditioners, grass and shrub clumps). CoD4 traces them only for lines
+/// (bullets, sight: `CM_PointTraceStaticModels`), never for players moving,
+/// by the model's contents: solid ones stop bullets and sight
+/// ([`Layer::ShotClip`]), foliage only sight ([`Layer::NoSight`]). Each is
+/// its placed bounds, a box (CoD4 traces the model's collision triangles,
+/// which this doesn't read yet).
+pub fn spawn_static_model_collision(commands: &mut Commands, zone: &iw3::zone::Zone, clip: &ClipMap) {
+    let (mut solid, mut foliage) = (0, 0);
+    for sm in &clip.static_models {
+        let Some(model) = sm.model.and_then(|id| zone.xmodel(id)) else { continue };
+        let (layer, surface) = if model.contents & contents::SOLID != 0 {
+            solid += 1;
+            (Layer::ShotClip, "default")
+        } else if model.contents & contents::FOLIAGE != 0 {
+            foliage += 1;
+            (Layer::NoSight, "foliage")
+        } else {
+            continue;
+        };
+        let (a, b) = (units::pos(sm.absmin), units::pos(sm.absmax));
+        let (min, max) = (a.min(b), a.max(b));
+        let size = max - min;
+        if size.min_element() <= 0.0 {
+            continue;
+        }
+        commands.spawn((
+            Collider::cuboid(size.x, size.y, size.z),
+            Surfaces([surface_index(surface); 6]),
+            CollisionLayers::new(layer, LayerMask::NONE),
+            Transform::from_translation((min + max) * 0.5),
+            Position((min + max) * 0.5),
+            static_body(),
+        ));
+    }
+    info!("collision: {solid} solid and {foliage} foliage static models (bullets and sight only)");
+}
+
+fn surface_index(name: &str) -> u8 {
+    SURFACE_NAMES.iter().position(|n| *n == name).unwrap_or(0) as u8
 }
 
 /// Vertices of a brush: intersections of every three bounding planes that
 /// lie inside all of them. Works in CoD space.
-fn brush_points(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<Vec3> {
+/// A brush's planes (CoD space): its box's six, then its other sides.
+fn brush_planes(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<(Vec3, f32)> {
     let mut planes: Vec<(Vec3, f32)> = vec![
         (Vec3::X, brush.maxs[0]),
         (Vec3::NEG_X, -brush.mins[0]),
@@ -167,6 +282,11 @@ fn brush_points(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<Vec3> {
             planes.push((Vec3::from(pl.normal), pl.dist));
         }
     }
+    planes
+}
+
+fn brush_points(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<Vec3> {
+    let planes = brush_planes(clip, brush);
     let mut out: Vec<Vec3> = Vec::new();
     let n = planes.len();
     for i in 0..n {

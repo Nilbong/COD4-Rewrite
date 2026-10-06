@@ -48,16 +48,19 @@ pub fn has(loadout: Option<&Loadout>, perk: &str) -> bool {
     loadout.is_some_and(|l| l.class.perks.iter().any(|p| p.eq_ignore_ascii_case(perk)))
 }
 
-/// `mayDoLastStand`: bullets (not to the head) and falls down a Last Stand
-/// pawn; explosives, grenades and kill streaks kill outright.
+/// `mayDoLastStand`: only bullets (`MOD_PISTOL_BULLET`, `MOD_RIFLE_BULLET`;
+/// not to the head) and falls down a Last Stand pawn; explosives, grenades,
+/// kill streaks, the knife and the bomb kill outright.
 pub fn may_go_down(loadout: Option<&Loadout>, weapon: &str, location: HitLocation) -> bool {
     if !has(loadout, "specialty_pistoldeath") || location == HitLocation::Head {
         return false;
     }
-    let blast = crate::grenades::kill_icon(weapon).is_some()
+    let not_a_bullet = crate::grenades::kill_icon(weapon).is_some()
         || crate::killstreaks::kill_icon(weapon).is_some()
-        || crate::explosives::is_explosive(weapon);
-    weapon == "falling" || !blast
+        || crate::explosives::is_explosive(weapon)
+        || weapon == crate::melee::WEAPON
+        || weapon == "briefcase_bomb_mp";
+    weapon == "falling" || !not_a_bullet
 }
 
 /// Downed in Last Stand.
@@ -78,6 +81,11 @@ const COWARDS_WAY_OUT: f32 = 0.7;
 impl Downed {
     pub fn new(now: f32, attacker: Option<Entity>, weapon: &'static str) -> Downed {
         Downed { until: now + LAST_STAND_TIME, attacker, weapon, held_use: None }
+    }
+
+    /// Seconds since going down, at `now`.
+    pub fn since(&self, now: f32) -> f32 {
+        now - (self.until - LAST_STAND_TIME)
     }
 }
 
@@ -136,10 +144,12 @@ fn bleed_out(
     }
 }
 
-/// Downed, the player lies prone and can only crawl.
-fn downed_controls(mut player: Query<&mut MoveInput, (With<crate::splitscreen::LocalSlot>, With<Downed>)>) {
-    for mut mv in &mut player {
+/// Downed, a pawn lies where it fell: it can't move at all
+/// (`PM_DeadMove` zeroes the moves), only turn and shoot.
+fn downed_controls(mut pawns: Query<&mut MoveInput, With<Downed>>) {
+    for mut mv in &mut pawns {
         mv.stance = Stance::Prone;
+        (mv.forward, mv.right) = (0.0, 0.0);
         mv.jump = false;
         mv.sprint = false;
     }

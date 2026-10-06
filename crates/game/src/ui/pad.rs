@@ -114,6 +114,18 @@ fn navigate(
         left_from.insert(top.clone(), cur.item);
     }
     let remembered = left_from.get(&top).and_then(|i| spots.iter().find(|s| s.item == *i).copied());
+    // Left and right on a setting change it, as on CoD4's consoles.
+    if let (Some(cur), Some(dir)) = (current, frame.menu_dir) {
+        if dir.y == 0 && dir.x != 0 {
+            let item = fe.stack.last().map(|om| om.menu.items[cur.item].clone());
+            if let Some(item) = item.filter(|it| Frontend::setting_of(it).is_some()) {
+                if fe.setting_step(&item, dir.x.signum()) {
+                    fe.run("\"play\" \"mouse_click\"", "");
+                }
+                return;
+            }
+        }
+    }
     let target = match (current, frame.menu_dir) {
         (None, _) if opened => remembered.or_else(|| first(&spots)),
         (None, Some(_)) => first(&spots),

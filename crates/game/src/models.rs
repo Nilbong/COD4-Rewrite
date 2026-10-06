@@ -215,11 +215,14 @@ pub struct AnimPlayer {
     /// base animation for the bones it animates. CoD4's viewmodel ADS anims
     /// work this way: they only move `tag_ads`, driven by the ADS fraction.
     pub overlay: Option<(Arc<XAnim>, f32)>,
+    /// How much of the overlay shows (0..1): a third-person torso
+    /// animation blending in and out over the legs'.
+    pub overlay_weight: f32,
 }
 
 impl Default for AnimPlayer {
     fn default() -> Self {
-        AnimPlayer { anim: None, time: 0.0, speed: 1.0, prev: None, fade: 1.0, fade_len: 0.0, map: Vec::new(), prev_map: Vec::new(), overlay: None }
+        AnimPlayer { anim: None, time: 0.0, speed: 1.0, prev: None, fade: 1.0, fade_len: 0.0, map: Vec::new(), prev_map: Vec::new(), overlay: None, overlay_weight: 1.0 }
     }
 }
 
@@ -288,6 +291,32 @@ fn sample(anim: &XAnim, track: Option<usize>, frame: f32, joint: &Joint) -> Tran
     t
 }
 
+/// Campaign (single-player) anims turn the spine relative to `j_mainroot`;
+/// the multiplayer rig hangs it from `torso_stabilizer` (turned against
+/// the root, [`mp_torso`]), which they leave alone. For such an anim (it
+/// moves the root, not the stabilizer): the spine's joint, and the turn
+/// that takes its pose into the stabilizer's frame.
+fn spine_fix(skel: &Skeleton, anim: &XAnim) -> Option<(usize, Quat)> {
+    let has = |name: &str| anim.bones.iter().any(|b| b.name == name);
+    // Player anims (CoD4's or Black Ops') are made for the rig as it is.
+    let player = anim.name.starts_with("pb_") || anim.name.starts_with("pt_");
+    if player || !has("j_mainroot") || has("torso_stabilizer") {
+        return None;
+    }
+    let joint = |name: &str| skel.by_name.get(name).copied();
+    let (pelvis, torso, spine) = (joint("pelvis")?, joint("torso_stabilizer")?, joint("j_spinelower")?);
+    let r = skel.joints[pelvis].bind.rotation * skel.joints[torso].bind.rotation;
+    Some((spine, r.inverse()))
+}
+
+/// [`spine_fix`] on a sampled pose.
+fn fix_spine(pose: &mut Transform, joint: &Joint, i: usize, fix: Option<(usize, Quat)>) {
+    if let Some((_, inv)) = fix.filter(|f| f.0 == i) {
+        pose.rotation = inv * pose.rotation;
+        pose.translation = joint.anim_base + inv * (pose.translation - joint.anim_base);
+    }
+}
+
 pub(crate) fn animate_skeletons(time: Res<Time>, mut q: Query<(&Skeleton, &mut AnimPlayer)>, mut joints: Query<&mut Transform>) {
     let dt = time.delta_secs();
     for (skel, mut player) in &mut q {
@@ -307,18 +336,29 @@ pub(crate) fn animate_skeletons(time: Res<Time>, mut q: Query<(&Skeleton, &mut A
             }
         }
         let w = player.fade;
+        let fix = spine_fix(skel, &anim);
+        let prev_fix = prev.as_ref().and_then(|(p, _)| spine_fix(skel, p));
         let overlay = player.overlay.as_ref().map(|(a, progress)| (a, track_map(skel, a), progress * a.num_frames as f32));
+        let ow = player.overlay_weight.clamp(0.0, 1.0);
         for (i, j) in skel.joints.iter().enumerate() {
             let Ok(mut tf) = joints.get_mut(j.entity) else { continue };
             let mut pose = sample(&anim, player.map[i], frame, j);
+            fix_spine(&mut pose, j, i, fix);
             if let Some((p, pt)) = &prev {
-                let from = sample(p, player.prev_map[i], p.frame_at(*pt), j);
+                let mut from = sample(p, player.prev_map[i], p.frame_at(*pt), j);
+                fix_spine(&mut from, j, i, prev_fix);
                 pose.translation = from.translation.lerp(pose.translation, w);
                 pose.rotation = from.rotation.slerp(pose.rotation, w);
             }
             if let Some((a, map, frame)) = &overlay {
                 if map[i].is_some() {
-                    pose = sample(a, map[i], *frame, j);
+                    let over = sample(a, map[i], *frame, j);
+                    if ow >= 1.0 {
+                        pose = over;
+                    } else {
+                        pose.translation = pose.translation.lerp(over.translation, ow);
+                        pose.rotation = pose.rotation.slerp(over.rotation, ow);
+                    }
                 }
             }
             if skel.hidden.get(i).copied().unwrap_or(false) {
