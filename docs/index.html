@@ -187,7 +187,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: 
     <a class="l" href="#requirements">Requirements</a>
     <a class="l" href="#modes">Modes</a>
     <a class="l" href="#screenshots" id="nav-shots" hidden>Screenshots</a>
-    <a class="l keep" href="#run">Run it</a>
+    <a class="l keep" href="#run">Download</a>
     <a class="l keep" href="https://github.com/Nilbong/COD4-Rewrite">GitHub</a>
   </div>
 </nav>
@@ -199,7 +199,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: 
       <h1>Call of Duty 4 multiplayer, <em>rebuilt.</em></h1>
       <p>A from-scratch reimplementation on the Bevy engine. It reads maps, models and textures from your own game installs at runtime, the way OpenMW does for Morrowind. The repository ships no game data.</p>
       <div class="btns">
-        <a class="btn primary" href="#run">Get started
+        <a class="btn primary" href="#run">Download &amp; play
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 8h10M9 4l4 4-4 4"/></svg></a>
         <a class="btn" href="https://github.com/Nilbong/COD4-Rewrite">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 00-2.53 15.59c.4.07.55-.17.55-.38v-1.33c-2.23.48-2.7-1.07-2.7-1.07-.36-.93-.89-1.17-.89-1.17-.73-.5.05-.49.05-.49.8.06 1.23.83 1.23.83.72 1.23 1.88.87 2.34.67.07-.52.28-.87.5-1.07-1.78-.2-3.65-.89-3.65-3.95 0-.87.31-1.59.83-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.6 7.6 0 014 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.52.56.83 1.28.83 2.15 0 3.07-1.87 3.75-3.66 3.95.29.25.54.73.54 1.48v2.2c0 .21.15.46.55.38A8 8 0 008 0z"/></svg>
@@ -316,7 +316,7 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: 
         <span class="env">WAW_PATH → folder with CoDWaWmp.exe</span>
       </div>
     </div>
-    <p style="color:var(--muted);margin-top:22px">Installs in common Steam library locations are found automatically. Set the variable only if yours isn't. You also need a <a href="https://rustup.rs">Rust toolchain</a>.</p>
+    <p style="color:var(--muted);margin-top:22px">Installs in common Steam library locations are found automatically. Set the variable only if yours isn't. A Rust toolchain is only needed if you <a href="#run">build from source</a>.</p>
   </div>
 </section>
 
@@ -353,13 +353,24 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 28px; justify-content: 
 
 <section id="run">
   <div class="wrap">
-    <div class="eyebrow">Run it</div>
-    <h2>Up and running</h2>
-    <p class="lead">Needs the Rust toolchain and the games from the requirements above.</p>
+    <div class="eyebrow">Download and play</div>
+    <h2>Download, open, play</h2>
+    <p class="lead">No Rust or other tools needed. The launcher fetches the latest build of the game for you and keeps it up to date.</p>
     <ol class="steps">
-      <li><strong>Install your games.</strong> CoD4 is required. Add Black Ops and World at War for their weapons and characters.</li>
-      <li><strong>Clone and run.</strong> Game folders are found automatically in common Steam locations.</li>
+      <li><strong>Own the original Call of Duty 4: Modern Warfare</strong> (Steam or retail, patch 1.7). It is required, because the game reads its maps, models and sounds from your install. Black Ops and World at War are optional and add their weapons and characters if you have them installed.</li>
+      <li><strong>Download the ZIP</strong> and unzip it anywhere.
+        <div class="btns" style="margin-top:12px">
+          <a class="btn primary" href="https://github.com/Nilbong/COD4-Rewrite/archive/refs/heads/main.zip">Download ZIP
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v9M4 7l4 4 4-4M3 14h10"/></svg></a>
+        </div></li>
+      <li><strong>Open <code>Launcher.exe</code>.</strong> It downloads the latest release of the game from GitHub into a <code>game</code> folder beside it, then starts the game. Each time you open it, it checks for a newer release and updates first.</li>
     </ol>
+    <div class="notice" style="margin-top:24px">
+      <p>You need <strong>Windows</strong>, a graphics card with <strong>Vulkan</strong>, and your own copy of CoD4. The game files are never downloaded or included: everything is read from your installs. The launcher finds them automatically in common Steam locations. If it can't, set <code>COD4_PATH</code> to the folder containing <code>iw3mp.exe</code> (see Requirements above).</p>
+    </div>
+
+    <h4 style="margin-top:44px">Build from source (optional)</h4>
+    <p>Only needed if you want to modify the game. Install a <a href="https://rustup.rs">Rust toolchain</a>, then:</p>
 <pre><code>git clone https://github.com/Nilbong/COD4-Rewrite.git
 cd COD4-Rewrite
 cargo run --release -p game</code></pre>
