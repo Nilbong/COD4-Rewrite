@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
     for sm in &zone.gfx_world().expect("world").static_models {
         let name = sm.model.and_then(|m| zone.xmodel(m)).map_or("", |x| x.name.as_str());
         if name.to_ascii_lowercase().contains(&filter) {
-            println!("{name} at [{:.0}, {:.0}, {:.0}]", sm.origin[0], sm.origin[1], sm.origin[2]);
+            println!("{name} at [{:.0}, {:.0}, {:.0}] cull {:.0} scale {:.2}", sm.origin[0], sm.origin[1], sm.origin[2], sm.cull_dist, sm.scale);
         }
     }
     Ok(())

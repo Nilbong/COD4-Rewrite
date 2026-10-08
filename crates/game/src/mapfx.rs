@@ -5,7 +5,8 @@
 //! (`createOneshotEffect`: origin, angles, effect, delay). Each is started
 //! once a match, its looping elements going on for good; negative delays
 //! start them in the past, so smoke is already up. Their sound emitters are
-//! [`crate::audio`]'s. `COD4RW_NOMAPFX=1` leaves them out.
+//! [`crate::audio`]'s. `COD4RW_NOMAPFX=1` leaves them out; `COD4RW_MAPFXONLY=<part>`
+//! places only those whose name has it, `COD4RW_MAPFXLOG` lists them.
 
 use crate::content::Content;
 use crate::fx::{Effects, Frame};
@@ -51,7 +52,24 @@ fn start(content: Res<Content>, map: Res<crate::world::MapName>, effects: Option
     };
     let names = script(&format!("maps/mp/{}_fx.gsc", map.0)).map(|s| effect_names(&s)).unwrap_or_default();
     let placed = script(&format!("maps/createfx/{}_fx.gsc", map.0)).map(|s| placements(&s, &names)).unwrap_or_default();
+    // Debug aids: `COD4RW_MAPFXONLY=<part>` places only effects whose name
+    // contains it; `COD4RW_MAPFXLOG` lists what's placed.
+    let only = std::env::var("COD4RW_MAPFXONLY").ok().filter(|v| !v.is_empty());
+    if std::env::var_os("COD4RW_MAPFXLOG").is_some() {
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for p in &placed {
+            *counts.entry(p.effect.as_str()).or_default() += 1;
+        }
+        info!("map fx placed: {counts:?}");
+    }
     for p in &placed {
+        // The showcase's storm brings its own rain (`crate::weather`).
+        if crate::weather::showcase() && p.effect.to_ascii_lowercase().contains("rain") {
+            continue;
+        }
+        if only.as_ref().is_some_and(|o| !p.effect.contains(o.as_str())) {
+            continue;
+        }
         effects.play_ambient(&p.effect, frame(p.origin, p.angles), p.delay as f64 * 1000.0);
     }
     if !placed.is_empty() {

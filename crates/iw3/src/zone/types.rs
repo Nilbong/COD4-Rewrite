@@ -300,6 +300,53 @@ pub struct XModel {
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
     pub contents: i32,
+    /// The collision surfaces' bounds in model space, with their contents
+    /// (`XModelCollSurf_s`: what bullets and sight trace against; CoD4
+    /// traces their triangles, these are each one's box).
+    pub coll_boxes: Vec<CollBox>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollBox {
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    pub contents: i32,
+    /// Its triangles' corners (model space). Each is stored as a plane and
+    /// two barycentric vectors (`XModelCollTri_s`); the corners are where
+    /// (s, t) is (0, 0), (1, 0) and (0, 1) on the plane. Facing out: CoD4
+    /// stops traces entering their front.
+    pub tris: Vec<[[f32; 3]; 3]>,
+}
+
+/// The corners of a collision triangle from its plane and barycentric
+/// vectors (each `[x, y, z, w]`: `dot(xyz, p) - w`), or `None` if they're
+/// degenerate.
+pub fn coll_tri_corners(plane: [f32; 4], svec: [f32; 4], tvec: [f32; 4]) -> Option<[[f32; 3]; 3]> {
+    // Rows: the plane, s and t; solve rows · p = (d, s + sw, t + tw).
+    let m = [[plane[0], plane[1], plane[2]], [svec[0], svec[1], svec[2]], [tvec[0], tvec[1], tvec[2]]];
+    let det = |m: &[[f32; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d = det(&m);
+    if !(d.abs() > 1e-12) {
+        return None;
+    }
+    let solve = |s: f32, t: f32| {
+        let rhs = [plane[3], s + svec[3], t + tvec[3]];
+        let mut p = [0.0f32; 3];
+        for (c, out) in p.iter_mut().enumerate() {
+            // Cramer: column c replaced by the right-hand side.
+            let mut mc = m;
+            for r in 0..3 {
+                mc[r][c] = rhs[r];
+            }
+            *out = det(&mc) / d;
+        }
+        p
+    };
+    let corners = [solve(0.0, 0.0), solve(1.0, 0.0), solve(0.0, 1.0)];
+    corners.iter().flatten().all(|v| v.is_finite()).then_some(corners)
 }
 
 #[derive(Debug)]

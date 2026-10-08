@@ -465,7 +465,7 @@ fn match_end(
                 counts.add("ch_victor_dm", 1);
             }
         }
-        GameMode::Tdm => {
+        GameMode::Tdm | GameMode::Tdm3 => {
             if win {
                 counts.add(if hardcore { "ch_teamplayer_hc" } else { "ch_teamplayer" }, 1);
             }

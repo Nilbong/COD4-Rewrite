@@ -141,9 +141,9 @@ pub struct WeaponDef {
 /// change the hip spread.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gunplay {
-    /// `locationDamageMultipliers` for the head, neck, upper torso and
-    /// upper legs (the hitboxes there are).
-    pub location_mult: [f32; 4],
+    /// `locationDamageMultipliers` for the head, neck, upper torso, lower
+    /// torso and upper legs (the hitboxes there are).
+    pub location_mult: [f32; 5],
     /// `hipViewKickCenterSpeed`, `adsViewKickCenterSpeed`: how fast the
     /// view kick is pulled back (degrees/s²).
     pub kick_center: (f32, f32),
@@ -207,7 +207,7 @@ impl GunKick {
 impl Default for Gunplay {
     fn default() -> Self {
         Gunplay {
-            location_mult: [1.4, 1.0, 1.0, 1.0],
+            location_mult: [1.4, 1.0, 1.0, 1.0, 1.0],
             kick_center: (1500.0, 1500.0),
             reduced_kick: [(0.0, 0.0), (0.0, 0.0)],
             spread_decay_stance: (1.0, 1.0),
@@ -447,9 +447,9 @@ impl WeaponDef {
                 .filter(|m| !m.is_empty())
                 .map(|material| AdsOverlay { material, width: w.float("overlayWidth"), height: w.float("overlayHeight") }),
             gunplay: Gunplay {
-                // `hitLocation_t`: 2 head, 3 neck, 4 upper torso, 12 upper
-                // right leg.
-                location_mult: [2, 3, 4, 12].map(|i| w.float(&format!("locationDamageMultipliers[{i}]"))),
+                // `hitLocation_t`: 2 head, 3 neck, 4 upper torso, 5 lower
+                // torso, 12 upper right leg.
+                location_mult: [2, 3, 4, 5, 12].map(|i| w.float(&format!("locationDamageMultipliers[{i}]"))),
                 kick_center: (w.float("fHipViewKickCenterSpeed"), w.float("fAdsViewKickCenterSpeed")),
                 reduced_kick: [
                     (w.float("hipGunKickReducedKickBullets"), w.float("hipGunKickReducedKickPercent")),
@@ -915,7 +915,8 @@ pub fn bullet_damage(def: &WeaponDef, dist_units: f32, strength: f32, location: 
         HitLocation::Head => 0,
         HitLocation::Neck => 1,
         HitLocation::Torso => 2,
-        HitLocation::Legs => 3,
+        HitLocation::TorsoLower => 3,
+        HitLocation::Legs => 4,
     };
     after_walls * def.gunplay.location_mult[i]
 }
@@ -1282,7 +1283,7 @@ mod tests {
             min_damage: 20.0,
             max_damage_range: 1500.0,
             min_damage_range: 2000.0,
-            gunplay: Gunplay { location_mult: [1.4, 1.0, 1.0, 1.0], ..Gunplay::default() },
+            gunplay: Gunplay { location_mult: [1.4, 1.0, 1.0, 1.0, 1.0], ..Gunplay::default() },
             ..WeaponDef::fallback()
         };
         assert_eq!(bullet_damage(&m4, 1000.0, 1.0, HitLocation::Torso), 30.0);

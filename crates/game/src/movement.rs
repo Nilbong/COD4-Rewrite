@@ -23,7 +23,7 @@ impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<Landed>()
             .init_resource::<MoveTuning>()
-            .add_systems(Update, (mantle::load_anims, move_pawns.in_set(MovementSet)).chain().run_if(crate::state::in_game));
+            .add_systems(Update, (mantle::load_anims, (move_pawns, settle_frozen).in_set(MovementSet)).chain().run_if(crate::state::in_game));
     }
 }
 
@@ -500,6 +500,22 @@ pub fn mantle_landing(spatial: &SpatialQuery, feet: Vec3, yaw: f32, over: &[Enti
     let filter = collision::movement_filter();
     let ctx = Ctx { mantle: None, mantle_over: over, spatial, filter: &filter, tuning: MoveTuning::COD4, faces: None };
     mantle::landing(&ctx, feet, yaw, over)
+}
+
+/// Frozen pawns (a round or match over, the class menu, a supply drop
+/// opening) stand still: no speed across the ground, and no sprint, which
+/// otherwise stayed as they were when frozen, leaving the body and the
+/// viewmodel running on the spot until the next round. (Network puppets
+/// take theirs from the network; the dead keep theirs.)
+#[allow(clippy::type_complexity)]
+fn settle_frozen(mut pawns: Query<&mut Mover, (With<Frozen>, Without<crate::combat::Dead>, Without<crate::netplay::Puppet>)>) {
+    for mut m in &mut pawns {
+        if m.sprinting || m.velocity.x != 0.0 || m.velocity.z != 0.0 {
+            m.sprinting = false;
+            m.velocity.x = 0.0;
+            m.velocity.z = 0.0;
+        }
+    }
 }
 
 fn move_pawns(

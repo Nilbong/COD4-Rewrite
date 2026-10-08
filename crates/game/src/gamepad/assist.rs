@@ -146,7 +146,7 @@ fn look_one(
             match hb.location {
                 HitLocation::Torso => e.0 = Some(gt.translation()),
                 HitLocation::Head => e.1 = Some(gt.translation()),
-                HitLocation::Neck | HitLocation::Legs => {}
+                HitLocation::Neck | HitLocation::TorsoLower | HitLocation::Legs => {}
             }
         }
         for (entity, pawn) in pawns {

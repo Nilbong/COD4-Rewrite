@@ -313,15 +313,15 @@ fn overlay(
     let mut lines = Vec::new();
     if let Some(state) = &state {
         let left = state.time_left(now);
+        // Round modes (S&D, Sabotage) have no match clock: none shown.
+        let clock = if left.is_finite() { format!("    {}:{:02}", (left / 60.0) as u32, (left % 60.0) as u32) } else { String::new() };
         lines.push(format!(
-            "{} {}   {} {}   (to {})    {}:{:02}",
+            "{} {}   {} {}   (to {}){clock}",
             Team::Allies.name(),
             state.score(Team::Allies),
             Team::Axis.name(),
             state.score(Team::Axis),
             state.score_limit,
-            (left / 60.0) as u32,
-            (left % 60.0) as u32,
         ));
     }
     lines.extend(feed.entries.iter().rev().filter(|e| now - e.time < 6.0).take(5).map(|e| e.text.clone()));

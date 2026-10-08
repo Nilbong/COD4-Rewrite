@@ -7,6 +7,7 @@
 //! and runs them; the cards and details are drawn here.
 
 use super::attachments::{highlight_rows, retarget_highlight};
+use bevy::math::Vec2;
 use super::draw::{self, Placement};
 use super::expr::Env;
 use super::{Frontend, Op, OpenMenu};
@@ -216,11 +217,13 @@ struct Painter<'a> {
     pl: &'a Placement,
     ops: &'a mut Vec<Op>,
     horz_align: u8,
+    /// Everything moved down this far (a card being dealt up).
+    dy: f32,
 }
 
 impl Painter<'_> {
     fn r(&self, x: f32, y: f32, w: f32, h: f32) -> (bevy::math::Vec2, bevy::math::Vec2) {
-        self.pl.rect(&VRect { x, y, w, h, horz_align: self.horz_align, vert_align: 1 })
+        self.pl.rect(&VRect { x, y: y + self.dy, w, h, horz_align: self.horz_align, vert_align: 1 })
     }
 
     fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
@@ -271,6 +274,41 @@ impl Painter<'_> {
         self.fill(x, y + h - 1.0, w, 1.0, color);
         self.fill(x, y, 1.0, h, color);
         self.fill(x + w - 1.0, y, 1.0, h, color);
+    }
+}
+
+/// Ops grown about `centre` by `k` (window pixels).
+fn scale_ops(ops: &mut [Op], centre: Vec2, k: f32, to: Vec2) {
+    let at = |p: Vec2| to + (p - centre) * k;
+    for op in ops {
+        match op {
+            Op::Fill { pos, size, .. } | Op::Pic { pos, size, .. } | Op::Image { pos, size, .. } | Op::Gun { pos, size, .. } => {
+                *pos = at(*pos);
+                *size *= k;
+            }
+            Op::Text { x, y, k: tk, shadow, .. } => {
+                let p = at(Vec2::new(*x, *y));
+                (*x, *y) = (p.x, p.y);
+                *tk *= k;
+                *shadow *= k;
+            }
+        }
+    }
+}
+
+/// Ops squeezed sideways about `cx` to `w` of their width (a card turning).
+fn squash(ops: &mut [Op], cx: f32, w: f32) {
+    for op in ops {
+        match op {
+            Op::Fill { pos, size, .. } | Op::Pic { pos, size, .. } | Op::Image { pos, size, .. } | Op::Gun { pos, size, .. } => {
+                pos.x = cx + (pos.x - cx) * w;
+                size.x *= w;
+            }
+            Op::Text { x, k, .. } => {
+                *x = cx + (*x - cx) * w;
+                *k *= w.max(0.3);
+            }
+        }
     }
 }
 
@@ -570,9 +608,81 @@ impl Frontend {
         }
     }
 
+    /// Headquarters' supply drop ([`crate::hq`]): the drop's cards in a row
+    /// across the middle, each dealt up from below as its time comes (`age`:
+    /// seconds since; `None`, not yet), face down until it lands, then
+    /// turned over.
+    pub(super) fn paint_reveal_cards(&self, pl: &Placement, ops: &mut Vec<Op>, cards: &[(DropItem, bool, Option<f32>)], since: f32) {
+        /// Bigger than the menu's, centred.
+        const SCALE: f32 = 1.15;
+        const RISE_FROM: f32 = 260.0;
+        // Dealt face down, then a beat, then turned.
+        let deal = crate::hq::DEAL;
+        let hold = crate::hq::FACE_DOWN;
+        // The stage: the world dimmed behind, darker at the edges.
+        let dim = (since / 0.5).clamp(0.0, 1.0);
+        let start = ops.len();
+        let mut p = Painter { fe: self, pl, ops, horz_align: 4, dy: 0.0 };
+        p.fill(0.0, 0.0, 640.0, 480.0, [0.0, 0.0, 0.0, 0.5 * dim]);
+        p.fill(0.0, 0.0, 640.0, 60.0, [0.0, 0.0, 0.0, 0.35 * dim]);
+        p.fill(0.0, 420.0, 640.0, 60.0, [0.0, 0.0, 0.0, 0.35 * dim]);
+        // Each card's turn: a flash of its rarity's colour over the stage.
+        for &(item, _, age) in cards {
+            if let Some(t) = age.map(|a| a - deal - hold).filter(|t| (0.0..0.6).contains(t)) {
+                let strength = match item.rarity() {
+                    Rarity::Elite => 0.4,
+                    Rarity::Professional => 0.28,
+                    Rarity::Veteran => 0.2,
+                    _ => 0.12,
+                };
+                p.fill(0.0, 0.0, 640.0, 480.0, with_alpha(item.rarity().color(), strength * (1.0 - t / 0.6).powi(2)));
+            }
+        }
+        let back = p.ops.len();
+        p.horz_align = 2;
+        p.text(0.0, CARD_Y - 16.0, 1, 0.55, "SUPPLY DROP", [1.0, 0.85, 0.45, dim]);
+        let total = 3.0 * CARD_W + 2.0 * CARD_GAP;
+        let now = self.millis();
+        let mut out = 0;
+        for (i, &(item, new, age)) in cards.iter().enumerate() {
+            let Some(age) = age else { continue };
+            let x = -total * 0.5 + i as f32 * (CARD_W + CARD_GAP);
+            let k = (age / deal).min(1.0);
+            p.dy = RISE_FROM * (1.0 - k).powi(3);
+            // Solid cards: nothing of the world shows through.
+            p.fill(x, CARD_Y, CARD_W, CARD_H, [0.045, 0.045, 0.05, 1.0]);
+            if age < deal + hold {
+                p.sealed(x, now, age >= deal);
+            } else {
+                let turned = age - deal - hold;
+                // Turning over: narrow to an edge and open out again.
+                let w = (turned / 0.18).clamp(0.0, 1.0);
+                let before = p.ops.len();
+                p.card(x, item, new, i, (turned * 1000.0) as i64);
+                if w < 1.0 {
+                    let c = p.r(x + CARD_W * 0.5, CARD_Y, 0.0, 0.0).0.x;
+                    squash(&mut p.ops[before..], c, w.max(0.05));
+                }
+                out += 1;
+            }
+        }
+        // What came out, once it all has.
+        if out == cards.len() && out > 0 {
+            let new = cards.iter().filter(|c| c.1).count();
+            let best = cards.iter().map(|c| c.0.rarity()).max_by_key(|r| *r as u8).unwrap_or(Rarity::Enlisted);
+            let line = if new > 0 { format!("{new} new for your collection  ·  best: {}", best.name()) } else { format!("All duplicates  ·  best: {}", best.name()) };
+            p.dy = 0.0;
+            p.text(0.0, CARD_Y + CARD_H + 26.0, 1, 0.34, &line, with_alpha(GREY, 0.95));
+        }
+        // Bigger, in the screen's middle (the stage itself stays put).
+        let _ = start;
+        let middle = (CARD_Y + CARD_H * 0.5) / 480.0 * pl.h;
+        scale_ops(&mut ops[back..], Vec2::new(pl.w * 0.5, middle), SCALE, Vec2::new(pl.w * 0.5, pl.h * 0.5));
+    }
+
     fn paint_drops(&self, pl: &Placement, ops: &mut Vec<Op>) {
         let inv = supply::inventory();
-        let mut p = Painter { fe: self, pl, ops, horz_align: 1 };
+        let mut p = Painter { fe: self, pl, ops, horz_align: 1, dy: 0.0 };
         // What's waiting and what's next, under the row.
         let (x, mut y) = (14.0, 92.0);
         p.fill(0.0, 64.0, 222.0, 182.0, [0.0, 0.0, 0.0, 0.35]);
@@ -622,7 +732,7 @@ impl Frontend {
     fn paint_characters(&self, om: &OpenMenu, pl: &Placement, ops: &mut Vec<Op>) {
         let inv = supply::inventory();
         let worn = inv.wearing();
-        let mut p = Painter { fe: self, pl, ops, horz_align: 1 };
+        let mut p = Painter { fe: self, pl, ops, horz_align: 1, dy: 0.0 };
         // On the rows: a tick on the one worn, and each one's game where
         // its name leaves room.
         for (i, it) in om.menu.items.iter().enumerate() {
@@ -663,7 +773,7 @@ impl Frontend {
         let weapon = self.table_lookup("mp/statstable.csv", 0, &self.stat(stat).to_string(), 4);
         let inv = supply::inventory();
         let equipped = inv.equipped(stat, &weapon).map_or("none", |v| v.id.as_str());
-        let mut p = Painter { fe: self, pl, ops, horz_align: 1 };
+        let mut p = Painter { fe: self, pl, ops, horz_align: 1, dy: 0.0 };
         // Ticks on the rows, like the attachment popups'.
         for (i, it) in om.menu.items.iter().enumerate() {
             let Some(id) = it.action.split("\"supplyEquip\"").nth(1).and_then(|r| r.split('"').nth(3)) else { continue };
@@ -712,7 +822,7 @@ impl Frontend {
     /// its rarity's colour.
     fn paint_cac_variants(&self, base: i32, pl: &Placement, ops: &mut Vec<Op>) {
         let inv = supply::inventory();
-        let mut p = Painter { fe: self, pl, ops, horz_align: 3 };
+        let mut p = Painter { fe: self, pl, ops, horz_align: 3, dy: 0.0 };
         for (slot, y) in [(1, 92.0), (3, 180.0)] {
             let weapon = self.table_lookup("mp/statstable.csv", 0, &self.stat(base + slot).to_string(), 4);
             if let Some(v) = inv.equipped(base + slot, &weapon) {
@@ -765,7 +875,18 @@ impl Painter<'_> {
     fn character_card(&mut self, x: f32, c: &Character, index: usize) {
         let (mid, y) = (x + CARD_W * 0.5, CARD_Y);
         let (pos, size) = self.r(x + 6.0, y + 26.0, CARD_W - 12.0, 168.0);
-        self.ops.push(Op::Gun { pos, size, key: CARD_KEY + index as i32, weapon: format!("char:{}", c.id), camo: 0, picture: String::new() });
+        let weapon = format!("char:{}", c.id);
+        let key = CARD_KEY + index as i32;
+        // Still loading (another game's zone, say): a shimmer, not an empty card.
+        if !self.fe.previews.shown(key, &weapon) {
+            let t = self.fe.millis() as f32 * 0.003;
+            for k in 0..6 {
+                let band = 0.5 + 0.5 * (t - k as f32 * 0.6).sin();
+                self.fill(x + 16.0, y + 40.0 + k as f32 * 26.0, CARD_W - 32.0, 18.0, with_alpha(c.rarity.color(), 0.06 + 0.12 * band));
+            }
+            self.text(mid, y + 120.0, 1, 0.26, "Loading...", with_alpha(GREY, 0.8));
+        }
+        self.ops.push(Op::Gun { pos, size, key, weapon, camo: 0, picture: String::new() });
         self.fill(x + 12.0, y + 200.0, CARD_W - 24.0, 1.0, with_alpha(c.rarity.color(), 0.5));
         let lines = self.wrapped(mid, y + 222.0, 0.42, CARD_W - 10.0, c.name, c.rarity.color());
         self.text(mid, y + 228.0 + 20.0 * lines as f32, 1, 0.28, c.game.name(), GREY);

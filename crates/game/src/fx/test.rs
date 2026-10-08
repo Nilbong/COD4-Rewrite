@@ -208,6 +208,13 @@ fn stats(
     let t = time.elapsed_secs();
     let Some(mut fx) = fx.filter(|_| t >= *next) else { return };
     let (busy, frames) = std::mem::take(&mut fx.busy);
+    let parts = std::mem::take(&mut fx.busy_parts);
+    info!(
+        "fx: of that, lighting {:.2} ms, meshes {:.2} ms, cloud specks {:.2} ms a frame",
+        parts[0].as_secs_f64() * 1000.0 / frames.max(1) as f64,
+        parts[1].as_secs_f64() * 1000.0 / frames.max(1) as f64,
+        parts[2].as_secs_f64() * 1000.0 / frames.max(1) as f64
+    );
     let per_frame = busy.as_secs_f64() * 1000.0 / frames.max(1) as f64;
     *next = t + 2.0;
     let fps =

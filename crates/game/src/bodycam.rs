@@ -24,7 +24,6 @@ use crate::viewmodel::ViewModelRoot;
 use crate::weapons::{FreeAim, ShotFired, WeaponDef, WeaponSet, WeaponState};
 use avian3d::prelude::*;
 use bevy::asset::RenderAssetUsages;
-use bevy::core_pipeline::prepass::MotionVectorPrepass;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::post_process::effect_stack::{ChromaticAberration, LensDistortion, Vignette};
 use bevy::post_process::motion_blur::MotionBlur;
@@ -79,6 +78,8 @@ impl Gunplay {
             // A lens scope keeps the view around it a rifle's aimed view
             // (`ui::scope`); the lens shows the gun's own zoom.
             Gunplay::Cod4 if def.ads_overlay.is_some() && crate::ui::lens_scopes() => (hip_fov(), crate::ui::LENS_OUTER_FOV),
+            // A 3D scope (an ACOG too): likewise, the eyepiece magnifying.
+            Gunplay::Cod4 if crate::ui::scope_3d() && crate::ui::scope_magnifies(def) => (hip_fov(), crate::ui::LENS_OUTER_FOV.max(def.ads_fov)),
             Gunplay::Cod4 => (hip_fov(), def.ads_fov),
             // A wide body-worn lens that barely zooms when aiming.
             Gunplay::Bodycam => (BODYCAM_FOV, BODYCAM_FOV - 12.0),
@@ -185,7 +186,13 @@ fn toggle_gunplay(keys: Res<ButtonInput<KeyCode>>, mut gunplay: ResMut<Gunplay>,
         }
         return;
     }
-    if keys.just_pressed(KeyCode::KeyB) {
+    // Debug: `COD4RW_BODYCAM_FLIP=<seconds>` presses B at that many seconds
+    // in, and again twice that, for testing the switch both ways.
+    let flip = std::env::var("COD4RW_BODYCAM_FLIP").ok().and_then(|v| v.parse::<f32>().ok()).is_some_and(|at| {
+        let (t, dt) = (time.elapsed_secs(), time.delta_secs());
+        [at, at * 2.0].iter().any(|&m| t >= m && t - dt < m)
+    });
+    if keys.just_pressed(KeyCode::KeyB) || flip {
         *gunplay = if gunplay.is_bodycam() { Gunplay::Cod4 } else { Gunplay::Bodycam };
         overlay.toast_until = time.elapsed_secs() + 2.0;
     }
@@ -202,7 +209,11 @@ fn apply_gunplay(
     info!("gunplay: {:?}", *gunplay);
     if !gunplay.is_bodycam() {
         *tuning = MoveTuning::COD4;
-        commands.entity(*main).remove::<(MotionBlur, MotionVectorPrepass)>().insert(ColorGrading::default());
+        // The motion-vector prepass stays once added: removing it mid-game
+        // left Bevy's background motion-vector pipeline cached for the old
+        // attachments, and the next frame failed validation (a crash on
+        // leaving bodycam).
+        commands.entity(*main).remove::<MotionBlur>().insert(ColorGrading::default());
         commands
             .entity(*vm)
             .remove::<(LensDistortion, Vignette, ChromaticAberration)>()

@@ -160,6 +160,18 @@ fn reset(
 
 /// A hardpoint weapon's kill icon and its width over height, for the kill
 /// feed.
+/// A kill streak's weapon as the kill feed names it ("Airstrike",
+/// "Helicopter"); other weapons as they are.
+pub fn feed_name(weapon: &str) -> &str {
+    if weapon == airstrike::WEAPON {
+        "Airstrike"
+    } else if weapon == helicopter::WEAPON || helicopter::ROCKETS.contains(&weapon) {
+        "Helicopter"
+    } else {
+        weapon
+    }
+}
+
 pub fn kill_icon(weapon: &str) -> Option<(&'static str, f32)> {
     match weapon {
         airstrike::WEAPON => Some(("death_airstrike", 4.0)),

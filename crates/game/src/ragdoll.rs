@@ -268,7 +268,8 @@ fn schedule(
             let parts: &[usize] = match location {
                 HitLocation::Head => &[HEAD],
                 HitLocation::Neck => &[HEAD, SPINE],
-                HitLocation::Torso => &[SPINE, ROOT],
+                HitLocation::Torso => &[SPINE],
+                HitLocation::TorsoLower => &[SPINE, ROOT],
                 HitLocation::Legs => &[10, 13],
             };
             for &i in parts {

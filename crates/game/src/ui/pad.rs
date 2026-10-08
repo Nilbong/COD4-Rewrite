@@ -86,6 +86,7 @@ fn navigate(
     mut window: Single<&mut Window, With<PrimaryWindow>>,
     mut last_top: Local<Option<String>>,
     mut left_from: Local<std::collections::HashMap<String, usize>>,
+    mut pending: Local<std::collections::HashSet<String>>,
 ) {
     let pad = active.pad.is_some();
     if fe.pad != pad {
@@ -98,9 +99,10 @@ fn navigate(
     let opened = last_top.as_deref() != Some(top.as_str());
     *last_top = Some(top.clone());
     if fe.editing.is_some() {
-        // A pad can't type: A or B leaves the field, as a click elsewhere does.
-        if frame.menu_done {
-            fe.editing = None;
+        // Typing on a pad: the D-pad picks letters (`Frontend::pad_edit`); A
+        // accepts and B cancels, arriving as Enter and Escape.
+        if let (true, Some(dir)) = (pad, frame.menu_dir) {
+            fe.pad_edit(dir);
         }
         return;
     }
@@ -118,16 +120,38 @@ fn navigate(
     if let (Some(cur), Some(dir)) = (current, frame.menu_dir) {
         if dir.y == 0 && dir.x != 0 {
             let item = fe.stack.last().map(|om| om.menu.items[cur.item].clone());
-            if let Some(item) = item.filter(|it| Frontend::setting_of(it).is_some()) {
-                if fe.setting_step(&item, dir.x.signum()) {
+            if let Some(item) = item.filter(|it| Frontend::setting_of(it).is_some() || super::custom_camo::is_row(it)) {
+                if fe.setting_step(&item, dir.x.signum()) || fe.camo_row_step(&item, dir.x.signum()) {
                     fe.run("\"play\" \"mouse_click\"", "");
                 }
                 return;
             }
         }
     }
+    // A menu just opened (or not yet laid out the frame it opened: a popup
+    // over another isn't on top of the hit test at once) gets its focus as
+    // soon as it has items to focus: where it was left, else a popup's "No"
+    // (the safe answer), else the first.
+    if opened {
+        pending.insert(top.clone());
+    }
+    let wants = current.is_none() && pending.contains(&top);
+    let safe = || {
+        let om = fe.stack.last()?;
+        spots.iter().copied().find(|s| {
+            let it = &om.menu.items[s.item];
+            let label = match it.text_exp.as_slice() {
+                [_, iw3::menu::Token::Str(t)] => t.clone(),
+                _ => it.text.clone(),
+            };
+            label.eq_ignore_ascii_case("@MENU_NO")
+        })
+    };
+    if current.is_some() || !spots.is_empty() {
+        pending.remove(&top);
+    }
     let target = match (current, frame.menu_dir) {
-        (None, _) if opened => remembered.or_else(|| first(&spots)),
+        (None, _) if wants => remembered.or_else(safe).or_else(|| first(&spots)),
         (None, Some(_)) => first(&spots),
         (Some(from), Some(dir)) => step(&spots, from, dir),
         _ => None,
@@ -160,6 +184,10 @@ struct MenuFooter;
 #[derive(Component)]
 struct RotatePrompt;
 
+/// "Change" (left and right step a setting): the Camo Editor's rows.
+#[derive(Component)]
+struct ChangePrompt;
+
 /// Spawned once and kept: the menus come and go around it.
 fn spawn_footer(mut commands: Commands) {
     let footer = commands
@@ -178,6 +206,7 @@ fn spawn_footer(mut commands: Commands) {
             Visibility::Hidden,
         ))
         .id();
+    commands.spawn((ChangePrompt, PadPrompt::row(vec![glyph(Glyph::DPadLeft), glyph(Glyph::DPadRight), text("Change")], 30.0), ChildOf(footer)));
     commands.spawn((RotatePrompt, PadPrompt::row(vec![glyph(Glyph::RightStick), text("Rotate")], 30.0), ChildOf(footer)));
     commands.spawn((PadPrompt::row(vec![glyph(Glyph::South), text("Select")], 30.0), ChildOf(footer)));
     commands.spawn((PadPrompt::row(vec![glyph(Glyph::East), text("Back")], 30.0), ChildOf(footer)));
@@ -189,8 +218,9 @@ fn show_footer(
     fe: Option<Res<Frontend>>,
     active: Res<ActiveDevice>,
     state: Res<State<GameState>>,
-    mut footer: Query<&mut Visibility, (With<MenuFooter>, Without<RotatePrompt>)>,
-    mut rotate: Query<&mut Visibility, (With<RotatePrompt>, Without<MenuFooter>)>,
+    mut footer: Query<&mut Visibility, (With<MenuFooter>, Without<RotatePrompt>, Without<ChangePrompt>)>,
+    mut rotate: Query<&mut Visibility, (With<RotatePrompt>, Without<MenuFooter>, Without<ChangePrompt>)>,
+    mut change: Query<&mut Visibility, (With<ChangePrompt>, Without<MenuFooter>, Without<RotatePrompt>)>,
 ) {
     let menus = fe.as_deref().is_some_and(|fe| !fe.stack.is_empty() && !fe.match_only) && *state.get() != GameState::Loading;
     let show = |on: bool| if on { Visibility::Inherited } else { Visibility::Hidden };
@@ -200,6 +230,10 @@ fn show_footer(
     let preview = fe.as_deref().is_some_and(|fe| fe.previews.first_rect().is_some());
     for mut v in &mut rotate {
         v.set_if_neq(show(preview));
+    }
+    let editor = fe.as_deref().is_some_and(|fe| fe.stack.last().is_some_and(|m| m.name == super::custom_camo::EDITOR));
+    for mut v in &mut change {
+        v.set_if_neq(show(editor));
     }
 }
 

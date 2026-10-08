@@ -2,7 +2,7 @@
 //! Native rows provide the fonts, highlights, locked artwork and swatches.
 //! Primary, sidearm/Overkill and RPG camos are saved independently.
 
-use super::{Frontend, attachments, bo1, expr::Env, mastery, script};
+use super::{Frontend, attachments, bo1, custom_camo, expr::Env, mastery, reticle_menu, script};
 use iw3::menu::{Item, Menu, Statement, StringTable, Token, item_type, op};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +28,11 @@ const MASTERY: [(&str, &str, &str, usize, i32, &str); 3] = [
 const MASTERY: [(&str, &str, &str, usize, i32, &str); 2] = [
     ("camo_gold", "COD4RW_CAMO_GOLD", "Gold", 6, 8192, "ui_camoskin_gold"),
     ("camo_platinum", "COD4RW_CAMO_PLATINUM", "Platinum", 200, 16384, PLATINUM_SWATCH),
+];
+/// Rows after the camos: (name, label key, label, swatch, script, description).
+const EXTRA_ROWS: [(&str, &str, &str, &str, &str, &str); 2] = [
+    (custom_camo::ROW_NAME, custom_camo::ROW_LABEL, "Custom Camos...", custom_camo::ICON, "ccamoOpen", "Design your own camos and equip them on any weapon."),
+    (reticle_menu::ROW_NAME, reticle_menu::ROW_LABEL, "Reticle...", "cod4rw_reticle_0", "creticleOpen", "The red dot sight's reticle: its shape, colour and size."),
 ];
 const CLASSES: [&str; 5] = ["assault", "specops", "heavygunner", "demolitions", "sniper"];
 
@@ -105,6 +110,33 @@ pub(super) fn add(
                 (11, id.to_string()),
             ] {
                 table.values[start + column] = value;
+            }
+        }
+    }
+    // The Camo Editor's and the reticles' rows: CoD4's "None" row's unlock
+    // bits, with their own labels, swatches and a camo number nothing has.
+    if let Some(table) = tables.get_mut(attachments::TABLE)
+        && table.columns >= 12
+        && let Some(none) = (0..table.rows).find(|&r| table.get(r, 4) == Some("camo_none"))
+    {
+        for (name, label, title, swatch, _, goal) in EXTRA_ROWS {
+            strings.insert(label.into(), title.into());
+            let description = format!("{label}_DESC");
+            strings.insert(description.clone(), goal.into());
+            let mut row: Vec<String> = table.values[none * table.columns..(none + 1) * table.columns].to_vec();
+            for (column, value) in [
+                (3, label.to_owned()),
+                (4, name.to_owned()),
+                (6, swatch.to_owned()),
+                (7, description.clone()),
+                (8, description),
+                (11, "999".to_owned()),
+            ] {
+                row[column] = value;
+            }
+            if !(0..table.rows).any(|r| table.get(r, 4) == Some(name)) {
+                table.values.extend(row);
+                table.rows += 1;
             }
         }
     }
@@ -349,9 +381,10 @@ fn with_mastery(
         if [126.0, 128.0, 130.0].iter().any(|y| (item.window.rect.y - y).abs() < 0.5)
             && (164.0..=168.0).contains(&item.window.rect.h)
         {
-            item.window.rect.h += 20.0;
+            // Room for the mastery rows and ours (in place of CoD4's two).
+            item.window.rect.h += 20.0 * (MASTERY.len() + EXTRA_ROWS.len() - 2) as f32;
         } else if (item.window.rect.y - 294.0).abs() < 0.5 && item.window.rect.x >= 220.0 {
-            item.window.rect.y += 20.0;
+            item.window.rect.y += 20.0 * (MASTERY.len() + EXTRA_ROWS.len() - 2) as f32;
         }
         retarget(item, primary, stat);
         if stat % 10 == 5 && (item.window.rect.y - 106.0).abs() < 0.5 && !item.text_exp.is_empty() {
@@ -416,6 +449,46 @@ fn with_mastery(
             item.visible_exp = guard(item.visible_exp, weapon_guard(stat, indices));
             if selection(&item.action).is_some() {
                 item.action = select_script(&item.action, stat, camo);
+            }
+            menu.items.push(item);
+        }
+    }
+    // The Camo Editor's and the reticles' rows, last: they open their
+    // screens.
+    for (n, (name, label, _, _, script, _)) in EXTRA_ROWS.into_iter().enumerate() {
+        let row = 7 + (MASTERY.len() + n) as i32;
+        for mut item in row_items.clone() {
+            item.window.rect.y = from + (6 + MASTERY.len() + n) as f32 * 20.0;
+            if stat % 10 == 5 {
+                item.window.rect.y -= 100.0;
+            } else {
+                let mut y = vec![
+                    Token::Float(item.window.rect.y),
+                    Token::Op(op::SUBTRACT),
+                    Token::Int(100),
+                    Token::Op(op::MULTIPLY),
+                    Token::Op(op::LEFTPAREN),
+                ];
+                y.extend(weapon_guard(stat, pistols));
+                y.push(Token::Op(op::RIGHTPAREN));
+                item.rect_y_exp = y;
+            }
+            item.window.name.clear();
+            item.on_focus = bo1::retarget_focus(&item.on_focus.replace("camo_none", name), row);
+            for token in item.visible_exp.iter_mut().chain(item.text_exp.iter_mut()).chain(item.material_exp.iter_mut()) {
+                if let Token::Str(s) = token {
+                    if s == "camo_none" {
+                        *s = name.into();
+                    } else if s == "@MPUI_NONE" {
+                        *s = format!("@{label}");
+                    }
+                }
+            }
+            attachments::retarget_highlight(&mut item.visible_exp, row);
+            retarget(&mut item, primary, stat);
+            item.visible_exp = guard(item.visible_exp, weapon_guard(stat, indices));
+            if item.ty == item_type::BUTTON {
+                item.action = format!("\"play\" \"mouse_click\" ; \"uiScript\" \"{script}\" \"{stat}\" ;");
             }
             menu.items.push(item);
         }
@@ -577,6 +650,14 @@ impl Frontend {
             if let Some(popup) = popup {
                 self.close(&popup);
             }
+        }
+    }
+
+    /// Equip camo `camo` (a custom one, or none) on class weapon `stat`.
+    pub(super) fn equip_custom_camo(&mut self, stat: i32, camo: i32) {
+        if (201..250).contains(&stat) && matches!(stat % 10, 1 | 3 | 5) {
+            self.stats.set(camo_stat(stat), camo);
+            self.stats.set(EXTRA_WEAPON + stat, self.stat(stat));
         }
     }
 

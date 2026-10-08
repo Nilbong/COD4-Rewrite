@@ -26,6 +26,13 @@ fn main() -> anyhow::Result<()> {
             e.2[1][i] = e.2[1][i].max(hi[i]);
         }
     }
+    for m in &world.static_models {
+        let d: f32 = (0..3).map(|i| (p[i] - m.origin[i]).powi(2)).sum::<f32>().sqrt();
+        if d <= r {
+            let name = m.model.and_then(|x| zone.xmodel(x)).map_or("?".into(), |x| x.name.clone());
+            println!("smodel {name} at {:?}", m.origin.map(f32::round));
+        }
+    }
     for (name, (n, tris, b)) in found {
         println!("{name}: {n} surfaces, {tris} tris, bounds {:?}..{:?}", b[0].map(f32::round), b[1].map(f32::round));
     }

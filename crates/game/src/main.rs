@@ -5,8 +5,10 @@
 //! The game data is read from your CoD4 install (set `COD4_PATH` if it isn't
 //! found automatically).
 
+mod atmos;
 mod audio;
 mod autoshot;
+mod bake;
 mod bipod;
 mod bo1;
 mod bodycam;
@@ -16,9 +18,14 @@ mod characters;
 mod collision;
 mod combat;
 mod content;
+mod cover;
+mod custom_camos;
 mod explosives;
 mod fog;
+mod first_person;
 mod fx;
+mod ocean;
+mod scatter;
 mod gallery;
 mod gamepad;
 mod grenades;
@@ -33,7 +40,10 @@ mod model_lighting;
 mod models;
 mod modes;
 mod melee;
+mod mesh_bounds;
 mod net;
+mod online;
+mod netplay;
 mod movement;
 mod perf;
 mod perks;
@@ -42,6 +52,8 @@ mod settings_apply;
 mod bindings;
 mod pickups;
 mod quake;
+mod render_scale;
+mod reticles;
 mod hq;
 mod ragdoll;
 mod player;
@@ -53,6 +65,7 @@ mod session;
 mod splitscreen;
 mod supply;
 mod tdm;
+mod tod_light;
 mod terrain;
 mod textures;
 mod thirdperson;
@@ -64,6 +77,11 @@ mod wardrobe;
 mod waw;
 mod weapons;
 mod walktest;
+mod weather;
+mod wet;
+mod ssr;
+mod pom;
+mod vm_lights;
 mod window_icon;
 mod world;
 
@@ -117,6 +135,10 @@ fn physics_plugins() -> bevy::app::PluginGroupBuilder {
 }
 
 fn main() -> AppExit {
+    // `COD4RW_BAKE=<map>`: re-bake the map's lighting (`bake`) and exit.
+    if let Ok(map) = std::env::var("COD4RW_BAKE") {
+        return if bake::cli(&map) == std::process::ExitCode::SUCCESS { AppExit::Success } else { AppExit::error() };
+    }
     if let Ok(dir) = std::env::var("COD4RW_GALLERY") {
         return gallery::run(dir.into());
     }
@@ -136,7 +158,7 @@ fn main() -> AppExit {
     // Splitscreen co-op for a run: `kbm,pad,pad` (`crate::splitscreen`).
     let mut splitscreen = std::env::var("COD4RW_SPLITSCREEN").ok();
     // Debug aids drive a match directly, skipping the menus.
-    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER" | "COD4RW_RAGDOLL")) {
+    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !k.starts_with("COD4RW_FP_") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER" | "COD4RW_RAGDOLL" | "COD4RW_NETLOOK" | "COD4RW_TIMELIMIT") && !net::setting(&k)) {
         state::GameState::InGame
     } else {
         state::GameState::Frontend
@@ -168,20 +190,22 @@ fn main() -> AppExit {
 
     // Background sim runs (`COD4RW_SIM`): a small window that stays out of
     // the way of whatever else is on screen.
+    // Debug aid: `COD4RW_RES=1920x1080` sizes the window (for timing).
+    let resolution = std::env::var("COD4RW_RES").ok().and_then(|r| {
+        let (w, h) = r.split_once('x')?;
+        Some(bevy::window::WindowResolution::new(w.parse().ok()?, h.parse().ok()?))
+    });
     let window = if std::env::var_os("COD4RW_SIM").is_some() {
         Window {
             title: "CoD4 Rewrite (sim)".into(),
-            resolution: (640, 360).into(),
+            resolution: resolution.clone().unwrap_or_else(|| (640, 360).into()),
             focused: false,
-            window_level: bevy::window::WindowLevel::AlwaysOnBottom,
+            // A timing run (`COD4RW_RES`) stays in view: a covered window is held
+            // to the compositor's rate.
+            window_level: if resolution.is_some() { bevy::window::WindowLevel::Normal } else { bevy::window::WindowLevel::AlwaysOnBottom },
             ..default()
         }
     } else {
-        // Debug aid: `COD4RW_RES=1920x1080` sizes the window (for timing).
-        let resolution = std::env::var("COD4RW_RES").ok().and_then(|r| {
-            let (w, h) = r.split_once('x')?;
-            Some(bevy::window::WindowResolution::new(w.parse().ok()?, h.parse().ok()?))
-        });
         Window { title: "CoD4 Rewrite".into(), resolution: resolution.unwrap_or_default(), ..default() }
     };
     App::new()
@@ -230,7 +254,10 @@ fn main() -> AppExit {
                 ..default()
             });
         })
-        .insert_resource(world::MapName(map))
+        .insert_resource(world::MapName({
+            atmos::climate::set_map(&map);
+            map
+        }))
         .insert_resource(tdm::MatchConfig {
             mode,
             score_limit: mode.default_score_limit(),
@@ -260,17 +287,24 @@ fn main() -> AppExit {
             model_lighting::ModelLightingPlugin,
             supply::SupplyPlugin,
         ))
-        .add_plugins((ragdoll::RagdollPlugin, pickups::PickupsPlugin, quake::QuakePlugin, hq::HqPlugin))
+        // The showcase's time-of-day baked lighting.
+        .add_plugins(tod_light::TodLightPlugin)
+        .add_plugins((ragdoll::RagdollPlugin, pickups::PickupsPlugin, quake::QuakePlugin, hq::HqPlugin, render_scale::RenderScalePlugin))
         .init_resource::<settings::Settings>()
         .add_plugins(settings_apply::SettingsApplyPlugin)
         // The characters worn: the player's (F5: third person) and the bots'.
         .add_plugins(wardrobe::WardrobePlugin)
+        .add_plugins(cover::CoverPlugin)
+        .add_plugins(first_person::FirstPersonPlugin)
+        .add_plugins((weather::WeatherPlugin, wet::WetPlugin, ssr::SsrPlugin, vm_lights::VmLightsPlugin))
         // G: grenades. 5: equipment and grenade launchers.
         .add_plugins((grenades::GrenadesPlugin, explosives::ExplosivesPlugin, perks::PerksPlugin, killcam::KillcamPlugin))
-        .add_plugins((melee::MeleePlugin, props::PropsPlugin, walktest::WalkTestPlugin, fog::FogPlugin, window_icon::WindowIconPlugin))
-        .add_plugins(net::NetPlugin)
+        .add_plugins((melee::MeleePlugin, props::PropsPlugin, walktest::WalkTestPlugin, fog::FogPlugin, atmos::AtmosPlugin, window_icon::WindowIconPlugin))
+        .add_plugins((net::NetPlugin, online::OnlinePlugin, netplay::NetplayPlugin, mesh_bounds::MeshBoundsPlugin))
+        .add_systems(Update, collision::ray_test.run_if(state::in_game.and_then(|| std::env::var_os("COD4RW_RAYTEST").is_some())))
         // Muzzle flashes, bullet impacts and blood.
         .add_plugins(fx::FxPlugin)
+        .add_plugins((ocean::OceanPlugin, scatter::ScatterPlugin))
         // Each map's film grading and its sun's flare, blind and glare.
         .add_plugins(vision::VisionPlugin)
         // Ray-traced lighting, when the Lighting setting asks for it.

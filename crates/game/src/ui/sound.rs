@@ -50,7 +50,7 @@ pub(super) fn play(
     for alias in std::mem::take(&mut fe.audio.queue) {
         if let Some((source, v)) = fe.sound(&alias, &mut audio) {
             let gain = crate::settings_apply::volume(crate::settings_apply::Sound::Menu);
-            commands.spawn((AudioPlayer(source), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(v.volume.1 * gain))));
+            commands.spawn((AudioPlayer(source), PlaybackSettings::DESPAWN.with_volume(Volume::Linear(v.volume.1 * gain * crate::audio::audible()))));
         }
     }
     let wanted = fe.audio.music.clone().filter(|_| *state.get() == GameState::Frontend);
@@ -65,7 +65,7 @@ pub(super) fn play(
             info!("ui: music {alias}");
             let mode = if v.looping { PlaybackSettings::LOOP } else { PlaybackSettings::ONCE };
             let gain = crate::settings_apply::volume(crate::settings_apply::Sound::Music);
-            commands.spawn((MenuMusic(alias), AudioPlayer(source), mode.with_volume(Volume::Linear(v.volume.1 * gain))));
+            commands.spawn((MenuMusic(alias), AudioPlayer(source), mode.with_volume(Volume::Linear(v.volume.1 * gain * crate::audio::audible()))));
         }
     }
 }

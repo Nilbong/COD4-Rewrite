@@ -10,7 +10,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(crate::state::GameState::InGame), setup_hud.in_set(crate::state::Setup::Spawn))
-            .add_systems(Update, (update_hint, update_mantle_hint).run_if(crate::state::in_game));
+            .add_systems(Update, (update_hint, update_mantle_hint, update_cover_hint).run_if(crate::state::in_game));
     }
 }
 
@@ -20,6 +20,10 @@ pub struct HintText;
 /// IW3's mantle hint, while there's something to climb.
 #[derive(Component)]
 struct MantleHint;
+
+/// 3rd Person TDM: cover within reach ([`crate::cover`]).
+#[derive(Component)]
+struct CoverHint;
 
 fn text(s: &str, size: f32) -> (Text, TextFont, TextColor, TextShadow) {
     (
@@ -50,6 +54,20 @@ fn setup_hud(mut commands: Commands) {
         Node { position_type: PositionType::Absolute, top: percent(58), width: percent(100), justify_content: JustifyContent::Center, ..default() },
         ChildOf(root),
     ));
+    commands.spawn((
+        CoverHint,
+        text("Press X to take cover", 20.0),
+        TextLayout::justify(Justify::Center),
+        Visibility::Hidden,
+        Node { position_type: PositionType::Absolute, top: percent(63), width: percent(100), justify_content: JustifyContent::Center, ..default() },
+        ChildOf(root),
+    ));
+}
+
+/// "Press X to take cover", like the mantle hint, with a keyboard.
+fn update_cover_hint(pad: Res<crate::gamepad::ActiveDevice>, mut hint: Single<&mut Visibility, With<CoverHint>>) {
+    let show = crate::cover::available() && pad.pad.is_none() && !crate::splitscreen::active();
+    hint.set_if_neq(if show { Visibility::Inherited } else { Visibility::Hidden });
 }
 
 fn update_mantle_hint(
@@ -82,6 +100,8 @@ fn update_hint(
         && selecting.is_none()
         && !crate::splitscreen::active();
     let (visibility, text) = &mut *hint;
+    // Headquarters says what to do where it matters (its prompts).
+    let free = free && !crate::hq::active();
     visibility.set_if_neq(if free { Visibility::Inherited } else { Visibility::Hidden });
     // Headquarters has nothing to fight with.
     let wanted = if crate::hq::active() { HQ_HINT } else { MATCH_HINT };

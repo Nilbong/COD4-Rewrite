@@ -24,14 +24,23 @@ struct Member {
 struct Room {
     map: String,
     invite: Invite,
+    code: LobbyCode,
     next_peer: PeerId,
     members: HashMap<PeerId, Member>,
 }
 #[derive(Default)]
 struct Registry {
     rooms: HashMap<u64, Room>,
+    codes: HashMap<LobbyCode, u64>,
     by_ip: HashMap<IpAddr, usize>,
+    /// Failed joins per address in the current window, so codes can't be
+    /// found by guessing.
+    failures: HashMap<IpAddr, (u32, Instant)>,
 }
+
+/// Failed joins allowed per address per [`FAILURE_WINDOW`].
+const MAX_FAILURES: u32 = 10;
+const FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Owns only local infrastructure state. QUIC remote addresses never enter
 /// protocol messages, room advertisements, or client event queues.
@@ -71,7 +80,7 @@ impl Relay {
                         let _permit = permit;
                         let lease = IpLease { relay: relay.clone(), ip };
                         if let Ok(Ok(connection)) = timeout(HANDSHAKE_TIMEOUT, incoming).await {
-                            let result = relay.handle(connection.clone()).await;
+                            let result = relay.handle(connection.clone(), ip).await;
                             if result.is_err() { connection.close(VarInt::from_u32(1), b"session rejected or closed"); }
                         }
                         drop(lease);
@@ -97,11 +106,11 @@ impl Relay {
         Ok(())
     }
 
-    async fn handle(&self, connection: Connection) -> Result<()> {
+    async fn handle(&self, connection: Connection, ip: IpAddr) -> Result<()> {
         let (mut send, mut recv) = timeout(HANDSHAKE_TIMEOUT, connection.accept_bi()).await??;
         let hello = Hello::decode(&timeout(HANDSHAKE_TIMEOUT, transport::read_frame(&mut recv)).await??)?;
         let (control_tx, mut control_rx) = mpsc::channel(CONTROL_QUEUE);
-        let welcome = self.admit(hello, Member { connection: connection.clone(), control: control_tx })?;
+        let welcome = self.admit(hello, Member { connection: connection.clone(), control: control_tx }, ip)?;
         let Control::Welcome { room, peer, .. } = &welcome else { unreachable!() };
         let (room, peer) = (*room, *peer);
         let lease = Membership { relay: self.clone(), room, peer };
@@ -116,7 +125,19 @@ impl Relay {
             RateLimit::new(if host { 512_000.0 } else { 12_000.0 }, if host { 1_024_000.0 } else { 24_000.0 }, now);
         let mut replay = ReplayWindow::default();
         let mut snapshot_ticks: HashMap<PeerId, u32> = HashMap::new();
-        let mut extra = [0; 1];
+        let mut message_count = RateLimit::new(20.0, 60.0, now);
+        let mut message_bytes = RateLimit::new(16_000.0, 32_000.0, now);
+        // One persistent frame reader (read_exact isn't cancellation safe in
+        // the select below); it ends on a malformed frame or a closed stream.
+        let (frames_tx, mut frames) = mpsc::channel::<Vec<u8>>(CONTROL_QUEUE);
+        let reader = tokio::spawn(async move {
+            while let Ok(frame) = transport::read_frame(&mut recv).await {
+                if frames_tx.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let _reader = AbortOnDrop(reader);
         loop {
             tokio::select! {
                 data = connection.read_datagram() => {
@@ -150,9 +171,18 @@ impl Relay {
                     let Some(control) = control else { break };
                     timeout(HANDSHAKE_TIMEOUT, transport::write_frame(&mut send, &control.encode()?)).await??;
                 }
-                // No post-join client control traffic is defined in v1. `read`
-                // is cancellation safe; read_exact would not be in this select.
-                _ = recv.read(&mut extra) => { break; }
+                frame = frames.recv() => {
+                    let Some(frame) = frame else { break };
+                    let now = Instant::now();
+                    ensure!(
+                        message_count.allow(1, now) && message_bytes.allow(frame.len(), now),
+                        "message rate limit exceeded"
+                    );
+                    let Control::Message { peer: to, data } = Control::decode(&frame)? else {
+                        bail!("only messages are accepted after joining")
+                    };
+                    self.message(room, peer, to, data)?;
+                }
                 _ = connection.closed() => { break; }
             }
         }
@@ -161,8 +191,38 @@ impl Relay {
         Ok(())
     }
 
-    fn admit(&self, hello: Hello, member: Member) -> Result<Control> {
+    fn admit(&self, hello: Hello, member: Member, ip: IpAddr) -> Result<Control> {
         let mut registry = self.registry.lock().unwrap();
+        let now = Instant::now();
+        if let Some(&(count, since)) = registry.failures.get(&ip) {
+            if now.duration_since(since) >= FAILURE_WINDOW {
+                registry.failures.remove(&ip);
+            } else {
+                ensure!(count < MAX_FAILURES, "join rejected");
+            }
+        }
+        let result = Self::admit_locked(&mut registry, hello, member);
+        if result.is_err() {
+            let entry = registry.failures.entry(ip).or_insert((0, now));
+            entry.0 += 1;
+            // Bounded: forget stale entries once it grows.
+            if registry.failures.len() > 4096 {
+                registry.failures.retain(|_, (_, since)| now.duration_since(*since) < FAILURE_WINDOW);
+            }
+        }
+        result
+    }
+
+    fn admit_locked(registry: &mut Registry, hello: Hello, member: Member) -> Result<Control> {
+        let hello = match hello {
+            Hello::JoinCode(code) => {
+                let Some(&room) = registry.codes.get(&code) else { bail!("join rejected") };
+                let invite = registry.rooms.get(&room).map(|r| r.invite.clone());
+                let Some(invite) = invite else { bail!("join rejected") };
+                Hello::Join { room, invite }
+            }
+            hello => hello,
+        };
         match hello {
             Hello::Create { map } => {
                 ensure!(registry.rooms.len() < MAX_ROOMS, "relay full");
@@ -171,8 +231,21 @@ impl Relay {
                     id = rand::random();
                 }
                 let invite = Invite::generate();
-                let welcome = Control::Welcome { room: id, peer: HOST, map: map.clone(), invite: Some(invite.clone()) };
-                registry.rooms.insert(id, Room { map, invite, next_peer: 1, members: HashMap::from([(HOST, member)]) });
+                let mut code = LobbyCode::generate();
+                while registry.codes.contains_key(&code) {
+                    code = LobbyCode::generate();
+                }
+                let welcome = Control::Welcome {
+                    room: id,
+                    peer: HOST,
+                    map: map.clone(),
+                    invite: Some(invite.clone()),
+                    code: Some(code),
+                };
+                registry.codes.insert(code, id);
+                registry
+                    .rooms
+                    .insert(id, Room { map, invite, code, next_peer: 1, members: HashMap::from([(HOST, member)]) });
                 Ok(welcome)
             }
             Hello::Join { room, invite } => {
@@ -185,9 +258,35 @@ impl Relay {
                 r.next_peer += 1;
                 let map = r.map.clone();
                 r.members.insert(peer, member);
-                Ok(Control::Welcome { room, peer, map, invite: None })
+                Ok(Control::Welcome { room, peer, map, invite: None, code: None })
+            }
+            Hello::JoinCode(_) => unreachable!(),
+        }
+    }
+
+    /// Pass a game message on, stamped with its sender. A recipient too slow
+    /// to keep up with its control queue is disconnected, not waited for.
+    fn message(&self, room: u64, from: PeerId, to: PeerId, data: Vec<u8>) -> Result<()> {
+        let registry = self.registry.lock().unwrap();
+        let room = registry.rooms.get(&room).ok_or_else(|| anyhow::anyhow!("room closed"))?;
+        let recipients: Vec<&Member> = if from == HOST {
+            ensure!(to != HOST, "host cannot message itself");
+            if to == EVERYONE {
+                room.members.iter().filter(|(id, _)| **id != HOST).map(|(_, m)| m).collect()
+            } else {
+                // A player may have just left; drop it like a late snapshot.
+                room.members.get(&to).into_iter().collect()
+            }
+        } else {
+            ensure!(to == HOST, "players may only message the host");
+            room.members.get(&HOST).into_iter().collect()
+        };
+        for member in recipients {
+            if member.control.try_send(Control::Message { peer: from, data: data.clone() }).is_err() {
+                member.connection.close(VarInt::from_u32(2), b"control consumer too slow");
             }
         }
+        Ok(())
     }
 
     fn has_member(&self, room: u64, peer: PeerId) -> bool {
@@ -229,6 +328,7 @@ impl Relay {
         let mut registry = self.registry.lock().unwrap();
         if peer == HOST {
             if let Some(room) = registry.rooms.remove(&room) {
+                registry.codes.remove(&room.code);
                 for m in room.members.values() {
                     m.connection.close(VarInt::from_u32(0), b"host left; room closed");
                 }
@@ -240,6 +340,13 @@ impl Relay {
         {
             host.connection.close(VarInt::from_u32(2), b"control consumer too slow");
         }
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

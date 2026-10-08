@@ -659,7 +659,7 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             height: fo("adsOverlayHeight", 480.0),
         }),
         gunplay: crate::weapons::Gunplay {
-            location_mult: [fo("locHead", 1.4), fo("locNeck", 1.0), fo("locTorsoUpper", 1.0), fo("locRightLegUpper", 1.0)],
+            location_mult: [fo("locHead", 1.4), fo("locNeck", 1.0), fo("locTorsoUpper", 1.0), fo("locTorsoLower", 1.0), fo("locRightLegUpper", 1.0)],
             kick_center: (fo("hipViewKickCenterSpeed", 1500.0), fo("adsViewKickCenterSpeed", 1500.0)),
             reduced_kick: [
                 (fo("hipGunKickReducedKickBullets", 0.0), fo("hipGunKickReducedKickPercent", 0.0)),

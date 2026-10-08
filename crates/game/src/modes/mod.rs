@@ -38,11 +38,15 @@ pub enum GameMode {
     Koth,
     /// Sabotage (`sab`): one bomb, each team's target.
     Sab,
+    /// 3rd Person Team Deathmatch (`war3p`): Team Deathmatch seen over the
+    /// shoulder, with cover ([`crate::cover`]). Last, so the others keep
+    /// their indices.
+    Tdm3,
 }
 
 impl GameMode {
     /// The game types the lobby offers, in its order.
-    pub const ALL: [GameMode; 6] = [GameMode::Tdm, GameMode::Ffa, GameMode::Dom, GameMode::Sd, GameMode::Koth, GameMode::Sab];
+    pub const ALL: [GameMode; 7] = [GameMode::Tdm, GameMode::Ffa, GameMode::Dom, GameMode::Sd, GameMode::Koth, GameMode::Sab, GameMode::Tdm3];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -52,6 +56,7 @@ impl GameMode {
             GameMode::Sd => "Search and Destroy",
             GameMode::Koth => "Headquarters",
             GameMode::Sab => "Sabotage",
+            GameMode::Tdm3 => "3rd Person TDM",
         }
     }
 
@@ -64,6 +69,7 @@ impl GameMode {
             GameMode::Sd => "sd",
             GameMode::Koth => "koth",
             GameMode::Sab => "sab",
+            GameMode::Tdm3 => "war3p",
         }
     }
 
@@ -76,7 +82,7 @@ impl GameMode {
     /// team's, or in free-for-all a player's), or Domination's points.
     pub fn score_limits(self) -> (&'static [u32], usize) {
         match self {
-            GameMode::Tdm => (&[25, 50, 75, 100, 150, 250], 2),
+            GameMode::Tdm | GameMode::Tdm3 => (&[25, 50, 75, 100, 150, 250], 2),
             GameMode::Ffa => (&[10, 20, 30, 40, 50, 75], 2),
             GameMode::Dom => (&[100, 150, 200, 250, 300, 400], 2),
             // Rounds won.
@@ -119,7 +125,7 @@ impl GameMode {
     /// The announcer's name for it as a match starts (`<voice>_1mc_<line>`).
     pub fn intro_line(self) -> &'static str {
         match self {
-            GameMode::Tdm => "team_deathmtch",
+            GameMode::Tdm | GameMode::Tdm3 => "team_deathmtch",
             GameMode::Ffa => "freeforall",
             GameMode::Dom => "domination",
             GameMode::Sd => "searchdestroy",
@@ -127,6 +133,12 @@ impl GameMode {
             GameMode::Sab => "sabotage",
         }
     }
+}
+
+/// Played over the shoulder, with cover: the local players' view is third
+/// person and [`crate::cover`] is live.
+pub fn third_person() -> bool {
+    current() == GameMode::Tdm3
 }
 
 /// The game type under way (set as a match starts, [`crate::tdm`]), for
@@ -140,6 +152,24 @@ pub fn current() -> GameMode {
 
 pub(crate) fn set_current(mode: GameMode) {
     CURRENT.store(mode as u8, Ordering::Relaxed);
+    for l in &RESPAWN_LOCKED {
+        l.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Sides whose dead can't come back yet: Search and Destroy's round past
+/// its grace period, the side holding Headquarters' HQ. [allies, axis].
+static RESPAWN_LOCKED: [std::sync::atomic::AtomicBool; 2] =
+    [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)];
+
+/// May `team`'s dead respawn now? Things that bring someone back early (a
+/// skipped killcam, a class picked) ask first.
+pub fn respawn_locked(team: crate::combat::Team) -> bool {
+    RESPAWN_LOCKED[(team == crate::combat::Team::Axis) as usize].load(Ordering::Relaxed)
+}
+
+pub(crate) fn lock_respawns(team: crate::combat::Team, locked: bool) {
+    RESPAWN_LOCKED[(team == crate::combat::Team::Axis) as usize].store(locked, Ordering::Relaxed);
 }
 
 /// What's at stake right now: Domination's flags, Search and Destroy's

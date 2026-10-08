@@ -50,12 +50,29 @@ fn spawn_props(
     let ents = content.map().map_ents().map(|m| iw3::ents::parse(&m.entity_string)).unwrap_or_default();
     let root = commands.spawn((Name::new("map props"), Transform::default(), Visibility::default())).id();
     let (mut drawn, mut missing) = (0, 0);
+    // Nothing moves them, so they're drawn as the static models are: their
+    // surfaces merged per material and 32 m cell. Spawned one by one as
+    // skinned models (a skeleton each), District's 1,900 surfaces cost the
+    // render thread more than the rest of the map.
+    let mut batches: std::collections::HashMap<(Handle<StandardMaterial>, IVec3), Vec<(Handle<Mesh>, Transform)>> = Default::default();
     for e in ents.iter().filter(|e| is_prop(e)) {
         let (Some(origin), Some(name)) = (e.origin(), e.get("model")) else { continue };
         let scale = e.get("modelscale").and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
         let tf = Transform::from_translation(crate::units::pos(origin))
             .with_rotation(crate::modes::koth::cod_rotation(e.angles()))
             .with_scale(Vec3::splat(scale));
+        if std::env::var_os("COD4RW_SKINNEDPROPS").is_none() {
+            if let Some(parts) = static_parts(&mut content, name, &mut meshes, &mut materials, &mut images) {
+                let cell = (tf.translation / 32.0).floor().as_ivec3();
+                for (material, mesh) in parts {
+                    batches.entry((material, cell)).or_default().push((mesh, tf));
+                }
+                drawn += 1;
+                continue;
+            }
+        }
+        // Debug aid (`COD4RW_SKINNEDPROPS`), or a model without static
+        // surfaces: as before.
         let Some(m) = content.model(name, &mut meshes, &mut materials, &mut images, &mut bindposes) else {
             missing += 1;
             continue;
@@ -64,7 +81,48 @@ fn spawn_props(
         spawn_model(&mut commands, &mut Skeleton::default(), SpawnModel { model: &m, owner, attach_to: None, layers: None, shadows: true });
         drawn += 1;
     }
-    info!("props: {drawn} map props{}", if missing > 0 { format!(", {missing} models not found") } else { String::new() });
+    let mut draws = 0;
+    for ((material, _), parts) in batches {
+        match crate::world::merge_meshes(&parts, &meshes) {
+            Some(mesh) => {
+                commands.spawn((Name::new("map props batch"), Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), Transform::default(), ChildOf(root)));
+                draws += 1;
+            }
+            // Meshes already handed to the renderer (shared with the static
+            // models) can't be read to merge: each its own, still unskinned.
+            None => {
+                for (mesh, tf) in parts {
+                    commands.spawn((Name::new("map prop"), Mesh3d(mesh), MeshMaterial3d(material.clone()), tf, ChildOf(root)));
+                    draws += 1;
+                }
+            }
+        }
+    }
+    info!("props: {drawn} map props ({draws} batches){}", if missing > 0 { format!(", {missing} models not found") } else { String::new() });
+}
+
+/// A model's first LOD as (material, unskinned mesh) per surface; `None` if
+/// it has none.
+pub(crate) fn static_parts(
+    content: &mut Content,
+    name: &str,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> Option<Vec<(Handle<StandardMaterial>, Handle<Mesh>)>> {
+    let (zi, id) = content.find(name)?;
+    let (zi, id) = content.resolve_xmodel(zi, id);
+    let xm = content.zone(zi).xmodel(id)?;
+    let lod = xm.lods.first().copied()?;
+    let mats = xm.materials.clone();
+    let mut out = Vec::new();
+    for surf in lod.surf_index as usize..(lod.surf_index + lod.num_surfs) as usize {
+        let Some(mat_id) = mats.get(surf).copied().flatten() else { continue };
+        let Some(mat) = content.material(zi, mat_id, materials, images) else { continue };
+        let Some(mesh) = content.static_mesh(zi, id, surf, meshes) else { continue };
+        out.push((mat.handle, mesh));
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 #[cfg(test)]

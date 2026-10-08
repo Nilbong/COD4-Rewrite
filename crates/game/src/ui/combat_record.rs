@@ -107,7 +107,7 @@ fn clean_name(text: &str, limit: usize) -> String {
         .to_owned()
 }
 
-fn identity(stats: &Stats) -> String {
+pub(super) fn identity(stats: &Stats) -> String {
     let name = clean_name(stats.dvars.get(NAME).map_or("Player", String::as_str), 16);
     let name = if name.is_empty() { "Player" } else { &name };
     let clan = clean_name(stats.dvars.get(CLAN).map_or("", String::as_str), 4);

@@ -12,6 +12,8 @@ mod bo1;
 mod browser;
 mod camos;
 mod combat_record;
+mod custom_camo;
+mod reticle_menu;
 mod draw;
 mod expr;
 mod figures;
@@ -19,6 +21,7 @@ mod hud;
 mod ingame;
 mod hq;
 mod lobby;
+mod modern;
 mod mastery;
 mod pad;
 mod preview;
@@ -29,7 +32,9 @@ mod settings_menu;
 pub use options::{film_tint, lighting};
 mod split;
 mod scope;
+mod scope3d;
 pub use scope::{LENS_OUTER_FOV, ScopeCamera, lens_scopes};
+pub use scope3d::{magnifies as scope_magnifies, scope_3d};
 mod script;
 mod sound;
 mod stats;
@@ -65,6 +70,8 @@ impl Plugin for UiPlugin {
                 Update,
                 (browser::sync_servers, sync_devices, menu_input.in_set(MenuInput), paint_menus, update_previews).chain().run_if(in_state(GameState::Frontend)),
             )
+            // The Private Match lobby's friends, in the menus and during the match.
+            .add_systems(Update, lobby::online_lobby.before(MenuInput).run_if(resource_exists::<Frontend>))
             .add_systems(Update, loading_screen.run_if(in_state(GameState::Loading)))
             .add_systems(PostUpdate, draw::sync_sprites.run_if(not(in_game)))
             .add_systems(OnEnter(GameState::InGame), leave_frontend)
@@ -76,6 +83,8 @@ impl Plugin for UiPlugin {
                     ingame::start,
                     menu_input.in_set(MenuInput),
                     ingame::update,
+                    ingame::switch_teams,
+                    ingame::leave_when_over,
                     split::update,
                     hud::sync_game,
                     hud::paint,
@@ -86,6 +95,8 @@ impl Plugin for UiPlugin {
                     .run_if(in_game.and_then(resource_exists::<Frontend>).and_then(|| !crate::perf::no_hud())),
             )
             .add_systems(PostUpdate, draw::sync_nodes.run_if(in_game))
+            // Headquarters' supply drop cards' 3D pictures.
+            .add_systems(Update, update_previews.after(MenuInput).run_if(in_game.and_then(|| crate::hq::active()).and_then(resource_exists::<Frontend>)))
             // The match's UI nodes go with it (`crate::session`).
             .add_systems(OnExit(GameState::InGame), (draw::reset_nodes, hud::end_game))
             .add_systems(Update, sound::play.after(MenuInput).run_if(resource_exists::<Frontend>));
@@ -93,10 +104,12 @@ impl Plugin for UiPlugin {
         progression::setup(app);
         challenges::setup(app);
         combat_record::setup(app);
+        modern::build(app);
         mastery::setup(app);
         hud::build(app);
         pad::build(app);
         scope::build(app);
+        scope3d::build(app);
         options::build(app);
         if let Ok(dir) = std::env::var("COD4RW_UISHOT") {
             // Debug runs stay quiet.
@@ -178,6 +191,11 @@ pub struct Frontend {
     quit: bool,
     /// `disconnect` ran (Leave Game): back to the main menu.
     pub(super) leave: bool,
+    /// A local player picked a side in the team menu: theirs, and `allies`,
+    /// `axis` or `autoassign` ([`ingame::switch_teams`]).
+    pub(super) team_change: Option<(usize, String)>,
+    /// The match ended: open the lobby again on the way back.
+    pub(super) back_to_lobby: bool,
     /// The Private Match lobby's settings ([`lobby`]).
     lobby: lobby::Lobby,
     /// The local player's side in a match (for the menus' `team()`).
@@ -223,9 +241,15 @@ pub struct Frontend {
 }
 
 impl Frontend {
-    /// The player's profile name (`com_playerProfile`).
+    /// Was the match started from the menus (not the command line or a
+    /// simulation)?
+    pub fn from_menus(&self) -> bool {
+        !self.match_only
+    }
+
+    /// The player's name: the combat record's, with its clan tag.
     pub fn profile_name(&self) -> String {
-        Some(self.dvar("com_playerProfile")).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Player".into())
+        combat_record::identity(&self.stats)
     }
 }
 
@@ -403,6 +427,7 @@ impl Frontend {
         // the player's.
         let debug = std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && k != "COD4RW_UNLOCKS" && !crate::net::setting(&k));
         let stats = Stats::load(&assets, !debug);
+        custom_camo::sync(&stats);
         let fe = Frontend {
             combat_record: combat_record::Editor::default(),
             dvars: DEFAULT_DVARS
@@ -423,6 +448,8 @@ impl Frontend {
             quit: false,
             start_hq: false,
             leave: false,
+            team_change: None,
+            back_to_lobby: false,
             lobby: lobby::Lobby::default(),
             player_team: crate::combat::Team::Allies,
             menu_slot: 0,
@@ -536,6 +563,12 @@ impl Frontend {
             }
             "setdvar" => self.set_dvar(a(1), a(2)),
             "settingsreset" => self.reset_settings(a(1)),
+            // Out of the settings in a match: its pause menu again.
+            "settingsback" if self.game.on && self.stack.is_empty() => {
+                self.menu_slot = 0;
+                self.open(if crate::hq::active() { hq::PAUSE_MENU } else { "class" });
+            }
+            "settingsback" => {}
             "exec" | "execnow" => self.exec(a(1)),
             "execondvarstringvalue" | "execnowondvarstringvalue" => {
                 if self.dvar(a(1)).eq_ignore_ascii_case(a(2)) {
@@ -630,6 +663,8 @@ impl Frontend {
             "quit" => self.quit = true,
             s if s.starts_with("supply") => self.supply_script(args),
             s if s.starts_with("combat") => self.combat_record_script(args),
+            s if s.starts_with("ccamo") => self.custom_camo_script(args),
+            s if s.starts_with("creticle") => self.reticle_script(args),
             s if s.starts_with("camo") => self.camo_script(args),
             s if s.starts_with("t5") => self.bo1_script(args),
             s if s.starts_with("t4") => self.waw_script(args),
@@ -657,11 +692,25 @@ impl Frontend {
         }
         let base = self.supply_menu(&key, self.assets.menu(&key).or_else(|| self.bo1_menu(&key)).or_else(|| self.waw_menu(&key)));
         let base = self.combat_record_menu(&key, base);
+        let base = self.custom_camo_menu(&key).or_else(|| self.reticle_menu(&key)).or(base);
         let base = if key == hq::PAUSE_MENU { self.assets.menu("class").and_then(|m| hq::pause_menu(&m)).map(Arc::new) } else { base };
+        let base = match key.as_str() {
+            "class" => base.map(|m| hq::match_pause_menu(&m).map_or(m, Arc::new)),
+            "team_marinesopfor" => base.map(|m| Arc::new(hq::team_menu(&m))),
+            _ => base,
+        };
         let Some(mut menu) = self.lobby_menu(&key, base) else {
             warn!("ui: no menu {name}");
             return;
         };
+        // The modern main menu stands in for the classic one's buttons
+        // (still opened, closed and found as `main_text` by its scripts).
+        if key == "main_text" && modern::wanted(self) {
+            if let Some(m) = modern::menu(self, &menu) {
+                menu = Arc::new(m);
+                modern::opened(self);
+            }
+        }
         // Attachment rows toggle (several per weapon), so the list needs a
         // way to move on.
         if key.contains("attachment_popup") {
@@ -896,6 +945,44 @@ impl Frontend {
         self.editing = Some((menu.to_owned(), i));
     }
 
+    /// Typing on a pad, as arcade name entry: up and down turn the last
+    /// character through the letters, digits and a few marks; right adds
+    /// another (a copy of it, so "AA" is two presses); left takes the last
+    /// one off. A accepts, B cancels (they arrive as Enter and Escape).
+    pub(super) fn pad_edit(&mut self, dir: IVec2) {
+        const CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -_.";
+        let Some((menu, i)) = self.editing.clone() else { return };
+        let Some(m) = self.menu_item(&menu) else { return };
+        let item = &m.items[i];
+        let max = match &item.data {
+            ItemData::EditField(e) if e.max_chars > 0 => e.max_chars as usize,
+            _ => 32,
+        };
+        let mut text: Vec<char> = self.dvar(&item.dvar).chars().collect();
+        let set: Vec<char> = CHARS.chars().collect();
+        match (dir.x, dir.y) {
+            (1, _) if text.len() < max => text.push(*text.last().unwrap_or(&'A')),
+            (-1, _) => {
+                text.pop();
+            }
+            (_, dy) if dy != 0 => {
+                // Screen y is down: up goes forward through the set.
+                let step = if dy < 0 { 1 } else { set.len() - 1 };
+                match text.last_mut() {
+                    Some(c) => {
+                        let at = set.iter().position(|s| s == c).unwrap_or(0);
+                        *c = set[(at + step) % set.len()];
+                    }
+                    None => text.push('A'),
+                }
+            }
+            _ => return,
+        }
+        let dvar = item.dvar.clone();
+        self.set_dvar(&dvar, &text.into_iter().collect::<String>());
+        self.run("\"play\" \"mouse_over\"", "");
+    }
+
     /// Typing into the text field being edited.
     fn edit_key(&mut self, key: &bevy::input::keyboard::KeyboardInput) {
         use bevy::input::keyboard::Key;
@@ -974,7 +1061,8 @@ impl Frontend {
         // Like Black Ops, the class's character stands in Create a Class:
         // over the class menu's full-screen backdrop, under its panels and
         // popups.
-        let class_menu = self.stack[first..].iter().position(|om| om.name.starts_with("menu_cac_"));
+        // (The top one: another class's may be open under it.)
+        let class_menu = self.stack[first..].iter().rposition(|om| om.name.starts_with("menu_cac_"));
         for (k, om) in self.stack[first..].iter().enumerate() {
             let figure_after = (Some(k) == class_menu).then(|| {
                 om.menu.items.iter().rposition(|it| {
@@ -991,6 +1079,9 @@ impl Frontend {
             self.paint_supply(om, pl, ops);
             self.paint_lobby(om, pl, ops);
             self.paint_combat_record(om, pl, ops);
+            self.paint_custom_camo(om, pl, ops);
+            self.paint_reticle(om, pl, ops);
+            self.paint_modern(om, pl, ops);
         }
     }
 
@@ -1052,8 +1143,11 @@ impl Frontend {
     /// attachments and camo (and any the open popup is previewing).
     fn paint_figure(&self, class_menu: &OpenMenu, pl: &Placement, ops: &mut Vec<Op>) {
         // The class's primary: the weapon stat its picture shows.
+        // The class's primary (the weapon stat its picture shows), or its
+        // second weapon while that's being picked or fitted out.
         let primary = class_menu.menu.items.iter().filter_map(|it| weapon_picture_stat(&it.material_exp)).find(|k| k % 10 == 1);
-        let Some((gun, camo)) = primary.and_then(|k| self.gun_for(k)) else { return };
+        let held = primary.map(|k| if self.editing_secondary() && self.class_weapon(k + 2) != "" { k + 2 } else { k });
+        let Some((gun, camo)) = held.and_then(|k| self.gun_for(k)) else { return };
         let (left, right) = (pl.w * 0.5 + FIGURE_LEFT * pl.scale, pl.w * 0.5 + FIGURE_RIGHT * pl.scale);
         let (top, bottom) = (FIGURE_TOP * pl.scale, FIGURE_BOTTOM * pl.scale);
         ops.push(Op::Gun {
@@ -1151,10 +1245,7 @@ impl Frontend {
         if let Some(top) = self.stack.last().map(|m| m.name.as_str()) {
             // `...2` popups are for the second weapon (Overkill), `pistol` and
             // `secondary` for the sidearm; Black Ops' popups name their stat.
-            let for_secondary = match camos::key_stat(top).or_else(|| bo1::key_stat(top)).or_else(|| waw::key_stat(top)) {
-                Some(stat) => stat % 10 == 3,
-                None => top.ends_with('2') || top.ends_with("secondary") || top.ends_with("pistol"),
-            };
+            let for_secondary = self.editing_secondary();
             if camos::key_stat(top).map_or(for_secondary != primary, |stat| stat == key) {
                 if top.contains("attachment_popup") {
                     // Show what clicking the hovered row would add.
@@ -1170,7 +1261,8 @@ impl Frontend {
                     }
                 } else if top.contains("popup_cac_camo") {
                     let c = self.table_lookup("mp/attachmenttable.csv", 4, &self.dvar("ui_camo_highlighted"), 11);
-                    if let Ok(c) = c.parse() {
+                    // (Not the rows opening the Camo Editor and reticles.)
+                    if let Some(c) = c.parse::<i32>().ok().filter(|&c| c != 999) {
                         camo = c;
                     }
                 }
@@ -1180,7 +1272,20 @@ impl Frontend {
             return None;
         }
         let camo = self.variant_camo(key, &weapon, camo);
-        Some((format!("{weapon}:{}", attachments::names(set).join("+")), camo.max(0) as usize))
+        // Its red dot's reticle rides on the camo number, as in a match.
+        let reticle = if key % 10 == 5 { Default::default() } else { self.class_reticle(key) };
+        Some((format!("{weapon}:{}", attachments::names(set).join("+")), crate::reticles::with_camo(camo.max(0) as usize, reticle)))
+    }
+
+    /// Is the open popup for the class's second weapon (Overkill's or the
+    /// sidearm)? `...2` popups are for the second weapon, `pistol` and
+    /// `secondary` for the sidearm; Black Ops' and ours name their stat.
+    fn editing_secondary(&self) -> bool {
+        let Some(top) = self.stack.last().map(|m| m.name.as_str()) else { return false };
+        match camos::key_stat(top).or_else(|| bo1::key_stat(top)).or_else(|| waw::key_stat(top)) {
+            Some(stat) => stat % 10 == 3,
+            None => top.ends_with('2') || top.ends_with("secondary") || top.ends_with("pistol"),
+        }
     }
 
     /// Resolve materials and fonts and append the sprites to draw.
@@ -1273,6 +1378,10 @@ fn enter_frontend(
             let vfs = fe.assets.vfs();
             fe.previews.start(vfs);
             fe.open("main");
+            // From a finished match: its lobby, ready for the next.
+            if std::mem::take(&mut fe.back_to_lobby) {
+                fe.open(lobby::LOBBY_MENU);
+            }
         }
         None => match UiAssets::load() {
             Ok(assets) => commands.insert_resource(Frontend::new(assets)),
@@ -1339,10 +1448,10 @@ fn menu_input(
     // The focused setting: the arrow keys step it, a right click steps it
     // back, holding the mouse on a slider drags it.
     if let Some(item) = fe.focus.clone().and_then(|(m, i)| fe.menu_item(&m).map(|menu| menu.items[i].clone())) {
-        if Frontend::setting_of(&item).is_some() && fe.editing.is_none() {
+        if (Frontend::setting_of(&item).is_some() || custom_camo::is_row(&item)) && fe.editing.is_none() {
             let step = keys.just_pressed(KeyCode::ArrowRight) as i32 - keys.just_pressed(KeyCode::ArrowLeft) as i32 - mouse.just_pressed(MouseButton::Right) as i32;
             if step != 0 {
-                fe.setting_step(&item, step.signum());
+                let _ = fe.setting_step(&item, step.signum()) || fe.camo_row_step(&item, step.signum());
                 fe.run("\"play\" \"mouse_click\"", "");
             }
             if item.ty == item_type::SLIDER && mouse.pressed(MouseButton::Left) && !mouse.just_pressed(MouseButton::Left) {
@@ -1414,6 +1523,12 @@ fn menu_input(
     }
     if let Some(map) = fe.start.take() {
         info!("ui: starting {map}");
+        // From Headquarters' lobby: its menus go with it.
+        if crate::hq::active() {
+            fe.stack.clear();
+            fe.focus = None;
+        }
+        crate::atmos::climate::set_map(&map);
         commands.insert_resource(MapName(map));
         next.set(GameState::Loading);
     }
@@ -1563,7 +1678,8 @@ fn ui_shots(
             // Focus the button that opens Start New Server.
             let top = fe.stack.last().map(|m| (m.name.clone(), m.menu.clone()));
             if let Some((name, menu)) = top {
-                if let Some(i) = menu.items.iter().position(|it| it.action.contains("createserver")) {
+                // (The modern menu: its Join Game row.)
+                if let Some(i) = menu.items.iter().position(|it| it.action.contains("createserver")).or_else(|| menu.items.iter().position(|it| it.window.name == "modern_1")) {
                     fe.set_focus(Some((name, i)));
                 }
             }
@@ -1605,7 +1721,14 @@ fn ui_shots(
                 }
             }
         }
-        _ if *state.get() == GameState::Frontend && n == 3 + extra.len() * 2 => fe.start = Some(fe.dvar("ui_mapname")),
+        _ if *state.get() == GameState::Frontend && n == 3 + extra.len() * 2 => {
+            // In a friend's online lobby: the host starts it.
+            if fe.lobby_guest() {
+                *step -= 1;
+            } else {
+                fe.start = Some(fe.dvar("ui_mapname"));
+            }
+        }
         _ if *state.get() == GameState::InGame => {
             let game: Vec<String> =
                 std::env::var("COD4RW_UIGAME").unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
@@ -1626,6 +1749,13 @@ fn ui_shots(
                 "KeyR" => Some(KeyCode::KeyR),
                 "Tab" => Some(KeyCode::Tab),
                 "KeyW" => Some(KeyCode::KeyW),
+                "KeyF" => Some(KeyCode::KeyF),
+                "F5" => Some(KeyCode::F5),
+                "KeyC" => Some(KeyCode::KeyC),
+                "KeyA" => Some(KeyCode::KeyA),
+                "KeyD" => Some(KeyCode::KeyD),
+                "Space" => Some(KeyCode::Space),
+                "ControlLeft" => Some(KeyCode::ControlLeft),
                 "ShiftLeft" => Some(KeyCode::ShiftLeft),
                 _ => None,
             };
@@ -1634,6 +1764,7 @@ fn ui_shots(
                     keys.release(code);
                 }
                 mouse.release(MouseButton::Right);
+                mouse.release(MouseButton::Left);
             }
             if k < game.len() * 2 {
                 let s = &game[k / 2];
@@ -1659,6 +1790,8 @@ fn ui_shots(
                     click_label(&mut fe, label);
                 } else if s == "hold:MouseRight" {
                     mouse.press(MouseButton::Right);
+                } else if s == "hold:MouseLeft" {
+                    mouse.press(MouseButton::Left);
                 } else if let Some(code) = key(s) {
                     keys.press(code);
                 }

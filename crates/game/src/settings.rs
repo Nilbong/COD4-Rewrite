@@ -56,12 +56,16 @@ const fn bind(action: Action, label: &'static str) -> Setting {
 pub const GRAPHICS: &[Setting] = &[
     s("r_preset", "Quality Preset", "Sets every quality setting at once. Changing one afterwards makes it Custom.", Kind::Choice(&[("Low", "low"), ("Medium", "medium"), ("High", "high"), ("Ultra", "ultra"), ("Custom", "custom")]), "high"),
     s("r_displaymode", "Display Mode", "Windowed, borderless full screen, or exclusive full screen.", Kind::Choice(&[("Windowed", "windowed"), ("Borderless", "borderless"), ("Fullscreen", "fullscreen")]), "windowed"),
+    s("r_monitor", "Monitor", "Which screen the game is on: full screen and borderless fill it, a window moves to it.", Kind::Choice(&[("Current", "current"), ("Primary", "primary"), ("Monitor 1", "0"), ("Monitor 2", "1"), ("Monitor 3", "2"), ("Monitor 4", "3")]), "current"),
     s("r_resolution", "Resolution", "The window's size (full screen: the screen's own unless set).", Kind::Choice(&[("Desktop", "desktop"), ("1280x720", "1280x720"), ("1366x768", "1366x768"), ("1600x900", "1600x900"), ("1920x1080", "1920x1080"), ("2560x1440", "2560x1440"), ("3440x1440", "3440x1440"), ("3840x2160", "3840x2160")]), "desktop"),
+    s("r_renderscale", "Render Scale", "The world drawn at this share of the resolution and scaled up (the HUD and gun stay sharp). Lower is faster on a busy graphics card.", Kind::Slider { min: 50.0, max: 100.0, step: 5.0, decimals: 0, suffix: "%" }, "100"),
     s("r_vsync", "Sync Every Frame", "Wait for the display's refresh (no tearing, a little more latency).", OFF_ON, "1"),
     s("com_maxfps", "Frame Rate Limit", "The most frames a second drawn.", Kind::Choice(&[("30", "30"), ("60", "60"), ("90", "90"), ("120", "120"), ("144", "144"), ("165", "165"), ("240", "240"), ("Unlimited", "0")]), "0"),
     s("cg_fov", "Field of View", "CoD4's is 65; 80 was its widest.", Kind::Slider { min: 65.0, max: 110.0, step: 1.0, decimals: 0, suffix: "" }, "65"),
     s("r_gamma", "Brightness", "How bright the picture is.", Kind::Slider { min: 0.5, max: 1.5, step: 0.05, decimals: 2, suffix: "" }, "1"),
+    s("r_tonemap", "Tonemapping", "Natural keeps light and shade soft; Rich gives deeper shadows and stronger colour.", Kind::Choice(&[("Natural", "agx"), ("Rich", "aces")]), "agx"),
     s("r_lighting", "Lighting", "Baked is CoD4's lightmaps; ray traced lights the world live (from the next match).", Kind::Choice(&[("Baked", "baked"), ("Ray Traced Low", "rt_low"), ("Ray Traced High", "rt_high")]), "baked"),
+    s("r_lightmaps", "Map Lighting", "Original is CoD4's lightmaps; Rebaked is the map lit again on this PC with modern bounce light, where a bake exists (from the next match).", Kind::Choice(&[("Original", "original"), ("Rebaked", "rebaked")]), "original"),
     s("r_filmtint", "Film Tint", "Keep each map's colour tint (Killhouse's yellow, for one).", Kind::Choice(&[("Off", "off"), ("On", "on")]), "off"),
     s("cg_drawfps", "Performance Overlay", "Frames a second and frame time in the corner.", Kind::Choice(&[("Off", "0"), ("FPS", "1"), ("FPS and Frame Time", "2")]), "0"),
 ];
@@ -73,10 +77,12 @@ pub const QUALITY: &[Setting] = &[
     s("r_ssao", "Ambient Occlusion", "Soft shadowing in corners and creases.", OFF_ON, "1"),
     s("r_aa", "Anti-aliasing", "Smooths jagged edges.", Kind::Choice(&[("Off", "off"), ("FXAA", "fxaa"), ("SMAA", "smaa"), ("SMAA High", "smaa_high")]), "smaa_high"),
     s("r_bloom", "Glow", "Bright light glows (maps that have it).", OFF_ON, "1"),
-    s("r_texfilter", "Texture Filtering", "Sharper textures at a glancing angle.", Kind::Choice(&[("Bilinear", "bilinear"), ("Trilinear", "trilinear"), ("Anisotropic 4x", "4"), ("Anisotropic 8x", "8"), ("Anisotropic 16x", "16")]), "16"),
+    s("r_volumetric", "Volumetric Lighting", "Sun shafts and light in the air, in each map's own haze.", Kind::Choice(&[("Off", "off"), ("Low", "low"), ("High", "high")]), "off"),
+    s("r_sky", "Sky", "Classic is CoD4's skybox; Dynamic draws our own drifting clouds and sun over the map's colours.", Kind::Choice(&[("Classic", "classic"), ("Dynamic", "dynamic")]), "classic"),
+    s("r_texfilter", "Texture Filtering", "Sharper textures at a glancing angle (from the next match).", Kind::Choice(&[("Bilinear", "bilinear"), ("Trilinear", "trilinear"), ("Anisotropic 4x", "4"), ("Anisotropic 8x", "8"), ("Anisotropic 16x", "16")]), "16"),
     s("r_drawdistance", "Draw Distance", "How far away small static models are still drawn.", Kind::Choice(&[("Near", "near"), ("Medium", "medium"), ("Far", "far")]), "far"),
     s("fx_density", "Effects", "How many particles smoke, fire and impacts make.", Kind::Choice(&[("Low", "low"), ("Medium", "medium"), ("High", "high")]), "high"),
-    s("fx_mapfx", "Map Effects", "The maps' ambient effects: smoke, fires, dust, insects.", OFF_ON, "1"),
+    s("fx_mapfx", "Map Effects", "The maps' ambient effects: smoke, fires, dust, insects (from the next match).", OFF_ON, "1"),
     s("ragdoll_enable", "Ragdolls", "Bodies go limp and fall as they would.", Kind::Choice(&[("On", "1"), ("Off", "0")]), "1"),
     s("r_corpses", "Number of Corpses", "How many bodies stay after their players respawn.", Kind::Choice(&[("Tiny", "2"), ("Small", "4"), ("Medium", "8"), ("Large", "16")]), "8"),
     s("phys_clutter", "Clutter Physics", "Bottles, cans and boxes react to shots and blasts.", OFF_ON, "1"),
@@ -100,8 +106,14 @@ pub const GAME: &[Setting] = &[
     s("cg_killfeed", "Kill Feed", "Who killed whom, at the bottom left.", OFF_ON, "1"),
     s("cg_minimap_rotate", "Minimap", "Turn the minimap with you, or keep north up.", Kind::Choice(&[("Rotating", "1"), ("North Up", "0")]), "1"),
     s("cg_damage_direction", "Damage Direction", "Red arcs showing where you're hit from.", OFF_ON, "1"),
-    s("cg_scopestyle", "Sniper Scope", "CoD4's scope, or a lens you see through.", Kind::Choice(&[("Classic", "classic"), ("Lens", "lens")]), "classic"),
+    s("cg_scopestyle", "Sniper Scope", "CoD4's scope, a lens you see through, or 3D: the view in the scope's own eyepiece (ACOGs too).", Kind::Choice(&[("Classic", "classic"), ("Lens", "lens"), ("3D", "3d")]), "classic"),
     s("cg_xp_popups", "Score Popups", "+10 and the like as you score.", OFF_ON, "1"),
+    s("cg_hudstyle", "HUD Style", "The in-game HUD: the new one, or CoD4's own.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "modern"),
+    s("cg_fullbody", "Full Body", "See your own body and legs when you look down.", OFF_ON, "1"),
+    s("cg_vmlighting", "Weapon Lighting", "Light your gun and arms by the world around you (shade, sun, rooms), or as CoD4 did.", Kind::Choice(&[("World", "world"), ("Classic", "classic")]), "world"),
+    s("cg_weaponsway", "Weapon Sway", "The gun lags a little behind the view as you turn.", OFF_ON, "1"),
+    s("cg_bobstyle", "Weapon Bob", "A fuller bob with footsteps, roll and landings, or CoD4's.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "modern"),
+    s("ui_menustyle", "Menu Style", "The main menu: the new one, or CoD4's own. Shows the next time it opens.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "modern"),
 ];
 
 /// Controls > Look.
@@ -296,6 +308,27 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for s in all() {
             assert!(seen.insert(dvar_of(s)), "{} twice", dvar_of(s));
+        }
+    }
+
+    /// Every row's default (and each preset's value) is one the row can show.
+    #[test]
+    fn defaults_and_presets_are_valid() {
+        let valid = |s: &Setting, v: &str| match s.kind {
+            Kind::Toggle => v == "0" || v == "1",
+            Kind::Choice(list) => list.iter().any(|(_, value)| *value == v),
+            Kind::Slider { min, max, .. } => v.parse::<f32>().is_ok_and(|x| (min..=max).contains(&x)),
+            Kind::Bind(_) => true,
+        };
+        for s in all() {
+            assert!(valid(s, &default_of(s)), "{}: default {:?}", dvar_of(s), default_of(s));
+            assert!(is_setting(dvar_of(s)), "{} not saved", dvar_of(s));
+        }
+        for (d, values) in PRESET_DVARS {
+            let s = find(d).unwrap_or_else(|| panic!("{d} not a setting"));
+            for v in values {
+                assert!(valid(s, v), "{d}: preset value {v:?}");
+            }
         }
     }
 

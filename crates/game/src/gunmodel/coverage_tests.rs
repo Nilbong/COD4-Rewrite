@@ -2,6 +2,7 @@
 //! and attachment variants rather than one install/zone per test case.
 
 use super::*;
+use bevy::camera::primitives::MeshAabb;
 use bevy::ecs::world::CommandQueue;
 use bevy::mesh::VertexAttributeValues;
 use iw3::menu::UiData;

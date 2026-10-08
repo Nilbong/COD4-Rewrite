@@ -11,14 +11,16 @@ use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
 pub struct Session {
     endpoint: Endpoint,
     connection: Connection,
-    // Keep the initiating stream open for the entire session.
-    _control_send: SendStream,
+    // Kept open for the entire session; carries this side's messages.
+    control_send: SendStream,
     control_rx: mpsc::Receiver<Control>,
     control_task: JoinHandle<()>,
     pub room: u64,
     pub peer: PeerId,
     pub map: String,
     pub invite: Option<Invite>,
+    /// The short code to give friends (host only).
+    pub code: Option<LobbyCode>,
 }
 
 impl Session {
@@ -29,14 +31,17 @@ impl Session {
         let (mut send, mut recv) = timeout(HANDSHAKE_TIMEOUT, connection.open_bi()).await??;
         timeout(HANDSHAKE_TIMEOUT, transport::write_frame(&mut send, &hello.encode()?)).await??;
         let welcome = Control::decode(&timeout(HANDSHAKE_TIMEOUT, transport::read_frame(&mut recv)).await??)?;
-        let Control::Welcome { room, peer, map, invite } = welcome else { anyhow::bail!("relay did not send welcome") };
+        let Control::Welcome { room, peer, map, invite, code } = welcome else {
+            anyhow::bail!("relay did not send welcome")
+        };
         match &hello {
             Hello::Create { map: requested } => {
-                ensure!(peer == HOST && invite.is_some() && map == *requested, "invalid host welcome")
+                ensure!(peer == HOST && invite.is_some() && code.is_some() && map == *requested, "invalid host welcome")
             }
             Hello::Join { room: requested, .. } => {
-                ensure!(room == *requested && peer != HOST && invite.is_none(), "invalid player welcome")
+                ensure!(room == *requested && peer != HOST && invite.is_none() && code.is_none(), "invalid player welcome")
             }
+            Hello::JoinCode(_) => ensure!(peer != HOST && invite.is_none() && code.is_none(), "invalid player welcome"),
         }
         let (tx, control_rx) = mpsc::channel(crate::security::CONTROL_QUEUE);
         let conn = connection.clone();
@@ -45,13 +50,28 @@ impl Session {
             // reads never cancels a partially read length-prefixed frame.
             while let Ok(data) = transport::read_frame(&mut recv).await {
                 let Ok(control) = Control::decode(&data) else { break };
-                if matches!(control, Control::Welcome { .. }) || peer != HOST || tx.try_send(control).is_err() {
+                // Players only ever hear from the host, through the relay.
+                let allowed = match &control {
+                    Control::Welcome { .. } => false,
+                    Control::PeerJoined(_) | Control::PeerLeft(_) => peer == HOST,
+                    Control::Message { peer: from, .. } => (peer == HOST) != (*from == HOST),
+                };
+                if !allowed || tx.try_send(control).is_err() {
                     break;
                 }
             }
             conn.close(VarInt::from_u32(1), b"control channel closed or invalid");
         });
-        Ok(Self { endpoint, connection, _control_send: send, control_rx, control_task, room, peer, map, invite })
+        Ok(Self { endpoint, connection, control_send: send, control_rx, control_task, room, peer, map, invite, code })
+    }
+
+    /// A reliable message for the game: a player to the host, or the host to
+    /// one player or [`EVERYONE`].
+    pub async fn send_message(&mut self, to: PeerId, data: Vec<u8>) -> Result<()> {
+        ensure!((self.peer == HOST) != (to == HOST), "players message the host; the host messages players");
+        let frame = Control::Message { peer: to, data }.encode()?;
+        timeout(HANDSHAKE_TIMEOUT, transport::write_frame(&mut self.control_send, &frame)).await??;
+        Ok(())
     }
 
     pub fn send_inputs(&self, commands: Vec<InputCommand>) -> Result<()> {
@@ -67,18 +87,12 @@ impl Session {
         Ok(())
     }
     pub async fn next_packet(&self) -> Result<Packet> {
-        let data = self.connection.read_datagram().await?;
-        let packet = Packet::decode(&data)?;
-        match &packet {
-            Packet::RemoteInputs { peer, .. } => {
-                ensure!(self.peer == HOST && *peer != HOST, "unexpected input delivery")
-            }
-            Packet::Snapshot { recipient, .. } => {
-                ensure!(self.peer != HOST && *recipient == self.peer, "unexpected snapshot delivery")
-            }
-            _ => anyhow::bail!("unexpected relay packet"),
-        }
-        Ok(packet)
+        self.packets().next().await
+    }
+    /// Reads this session's datagrams on its own, so they can be awaited
+    /// alongside [`Session::next_control`].
+    pub fn packets(&self) -> Packets {
+        Packets { connection: self.connection.clone(), peer: self.peer }
     }
     pub async fn next_control(&mut self) -> Option<Control> {
         self.control_rx.recv().await
@@ -95,6 +109,29 @@ impl Session {
     }
     pub fn close(&self) {
         self.connection.close(VarInt::from_u32(0), b"left match");
+    }
+}
+
+/// A session's incoming datagrams, checked for its role.
+pub struct Packets {
+    connection: Connection,
+    peer: PeerId,
+}
+
+impl Packets {
+    pub async fn next(&self) -> Result<Packet> {
+        let data = self.connection.read_datagram().await?;
+        let packet = Packet::decode(&data)?;
+        match &packet {
+            Packet::RemoteInputs { peer, .. } => {
+                ensure!(self.peer == HOST && *peer != HOST, "unexpected input delivery")
+            }
+            Packet::Snapshot { recipient, .. } => {
+                ensure!(self.peer != HOST && *recipient == self.peer, "unexpected snapshot delivery")
+            }
+            _ => anyhow::bail!("unexpected relay packet"),
+        }
+        Ok(packet)
     }
 }
 

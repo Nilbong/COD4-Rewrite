@@ -387,10 +387,22 @@ fn poll_browser(mut browser: ResMut<Browser>) {
     }
 }
 
-/// The network settings among the `COD4RW_*` variables: they're for real
-/// play, so they don't make a run a debug run (menus, sound, saving).
+/// The `COD4RW_*` variables meant for real play (network settings and the
+/// Wet Work showcase's weather and clock, first-person feel `COD4RW_FP_*`), so they don't make a run a debug
+/// run (menus, sound, saving).
 pub fn setting(key: &str) -> bool {
-    matches!(key, "COD4RW_ADVERTISE" | "COD4RW_MASTER")
+    matches!(
+        key,
+        "COD4RW_ADVERTISE"
+            | "COD4RW_MASTER"
+            | "COD4RW_RELAY"
+            | "COD4RW_RELAY_CERT"
+            | "COD4RW_RELAY_BIND"
+            | "COD4RW_SHOWCASE"
+            | "COD4RW_TOD"
+            | "COD4RW_TOD_SPEED"
+            | "COD4RW_RAIN"
+    ) || key.starts_with("COD4RW_FP_")
 }
 
 /// Whether matches announce themselves (`COD4RW_ADVERTISE=1`).

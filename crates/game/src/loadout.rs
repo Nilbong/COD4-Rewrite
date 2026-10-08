@@ -451,13 +451,30 @@ fn local_class(
     mut commands: Commands,
     time: Res<Time>,
     mut choice: ResMut<ClassChoice>,
-    mut players: Query<(Entity, &crate::splitscreen::LocalSlot, Option<&mut Dead>, Has<AwaitingClass>)>,
+    mut players: Query<(
+        Entity,
+        &crate::splitscreen::LocalSlot,
+        &crate::combat::Pawn,
+        Option<&mut Dead>,
+        Has<AwaitingClass>,
+        (&crate::combat::Health, &WeaponState),
+    )>,
 ) {
-    for (entity, slot, dead, awaiting) in &mut players {
+    for (entity, slot, pawn, dead, awaiting, (health, weapon)) in &mut players {
         let Some(class) = choice.next.get_mut(slot.0).and_then(Option::take) else { continue };
         commands.entity(entity).insert(PawnClass(class));
+        // Early in the match, before any fighting (`_menus.gsc`'s
+        // `menuClass` in the grace period): the new class now.
+        let fought = health.current < crate::combat::max_health() || weapon.shots_fired_total > 0;
+        if dead.is_none() && !fought && crate::tdm::in_grace_period(time.elapsed_secs()) {
+            commands.entity(entity).remove::<Loadout>();
+        }
         if let (Some(mut dead), true) = (dead, awaiting) {
-            dead.respawn_at = time.elapsed_secs();
+            // Mid-round in Search and Destroy (or while the side holds the
+            // HQ) they wait with the rest of the dead.
+            if !crate::modes::respawn_locked(pawn.team) {
+                dead.respawn_at = time.elapsed_secs();
+            }
             commands.entity(entity).remove::<AwaitingClass>();
         }
     }
@@ -570,7 +587,10 @@ fn local_switch_keys(mut players: Query<(&crate::splitscreen::PlayerInput, &Load
         } else if keys.just_pressed(KeyCode::Digit2) && count > 1 {
             Some(1)
         } else if player.scroll != 0.0 && count > 1 {
-            Some(if on_extra { loadout.previous } else { (loadout.current + 1) % count })
+            // Mid-switch, "next" counts from the gun on its way up (so a
+            // quick double tap goes back to the one you had).
+            let from = loadout.switching.map_or(loadout.current, |s| s.to);
+            Some(if on_extra { loadout.previous } else { (from + 1) % count })
         } else if keys.just_pressed(KeyCode::Digit5) {
             loadout.extra_slot().map(|x| if on_extra { loadout.previous } else { x })
         } else {
@@ -604,6 +624,26 @@ fn switch_weapons(
         // Out of claymores: back to the gun (C4 keeps its detonator).
         let spent = on_extra && weapon.clip + weapon.reserve == 0 && now >= weapon.next_fire && weapon.def.name == "claymore_mp";
         let wanted = switch.to.take().or(spent.then_some(loadout.previous));
+        // Mid-switch presses, as in CoD4 (the "quick swap"): while a gun
+        // comes up, another switch puts it straight back down from where it
+        // is; while one goes down, asking for it again brings it back up from
+        // there, and asking for a third gun just retargets the swap.
+        if let (Some(s), Some(to)) = (loadout.switching, wanted.filter(|&to| to < loadout.defs.len())) {
+            if !throwing && !s.alt {
+                let span = (s.until - s.started).max(1e-3);
+                let done = ((now - s.started) / span).clamp(0.0, 1.0);
+                if s.raising && to != loadout.current {
+                    loadout.previous = loadout.current;
+                    let drop = weapon.def.drop_time.max(0.05) * done;
+                    loadout.switching = Some(Switching { to, raising: false, alt: false, started: now - (weapon.def.drop_time.max(0.05) - drop), until: now + drop });
+                } else if !s.raising && to == loadout.current {
+                    let raise = weapon.def.raise_time.max(0.05);
+                    loadout.switching = Some(Switching { to, raising: true, alt: false, started: now - raise * (1.0 - done), until: now + raise * done });
+                } else if !s.raising && to != s.to {
+                    loadout.switching = Some(Switching { to, ..s });
+                }
+            }
+        }
         if loadout.switching.is_none() && !throwing {
             if let Some(to) = wanted.filter(|&to| to != loadout.current && to < loadout.defs.len()) {
                 if !on_extra {

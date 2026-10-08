@@ -24,7 +24,7 @@ fn run(
     mut commands: Commands,
     time: Res<Time>,
     dir: Res<ShotDir>,
-    mut player: Query<&mut ViewAngles, With<LocalPlayer>>,
+    mut player: Query<(&mut ViewAngles, &mut Transform), With<LocalPlayer>>,
     mut step: Local<usize>,
     mut initial_yaw: Local<Option<f32>>,
     mut exit: MessageWriter<AppExit>,
@@ -32,12 +32,45 @@ fn run(
 ) {
     // (time, yaw offset in degrees, pitch in degrees)
     const SHOTS: [(f32, f32, f32); 4] = [(6.0, 0.0, 0.0), (7.0, 90.0, -10.0), (8.0, 180.0, 10.0), (9.0, 270.0, 0.0)];
-    let t = time.elapsed_secs();
+    // `COD4RW_SHOT_LATE=<seconds>` waits longer (auto-exposure settled).
+    let late: f32 = std::env::var("COD4RW_SHOT_LATE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let t = time.elapsed_secs() - late;
+    // `COD4RW_SHOT_VIEWS=x,y,z,yaw,pitch;...` (CoD units and degrees, pitch
+    // up positive; the position is the feet): one shot per view, 1.5 s
+    // apart from 6 s, held there, for comparable showcase sheets.
+    if let Some(views) = std::env::var("COD4RW_SHOT_VIEWS").ok().map(|s| {
+        s.split(';')
+            .filter_map(|v| {
+                let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (v.len() == 5).then_some(v)
+            })
+            .collect::<Vec<_>>()
+    }) {
+        let k = (((t - 5.0) / 1.5).floor().max(0.0)) as usize;
+        if let (Some(v), Ok((mut angles, mut tf))) = (views.get(k.min(views.len().saturating_sub(1))), player.single_mut()) {
+            tf.translation = crate::units::pos([v[0], v[1], v[2]]);
+            angles.yaw = crate::units::yaw_from_cod_degrees(v[3]);
+            angles.pitch = v[4].to_radians();
+        }
+        if *step < views.len() && t >= 6.0 + *step as f32 * 1.5 {
+            std::fs::create_dir_all(&dir.0).ok();
+            let path = dir.0.join(format!("view{}.png", *step));
+            commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+            *step += 1;
+        } else if *step >= views.len() && t > 6.0 + views.len() as f32 * 1.5 + 0.5 {
+            exit.write(AppExit::Success);
+        }
+        return;
+    }
     if *step < SHOTS.len() {
-        let (at, yaw, pitch) = SHOTS[*step];
+        let (at, yaw, mut pitch) = SHOTS[*step];
+        // `COD4RW_SHOT_PITCH=<degrees>` aims every shot there (up is negative).
+        if let Some(p) = std::env::var("COD4RW_SHOT_PITCH").ok().and_then(|s| s.parse().ok()) {
+            pitch = p;
+        }
         // Aim slightly before capturing so the frame reflects the new view.
         if t >= at - 0.5 {
-            if let Ok(mut v) = player.single_mut() {
+            if let Ok((mut v, _)) = player.single_mut() {
                 let base = *initial_yaw.get_or_insert(v.yaw);
                 v.yaw = base + yaw.to_radians();
                 v.pitch = pitch.to_radians();
@@ -407,6 +440,7 @@ fn vm_test(
     dir: Res<VmTestDir>,
     mut player: Query<(&mut crate::weapons::WeaponInput, &mut crate::movement::MoveInput), With<LocalPlayer>>,
     mut shot: Local<usize>,
+    mut strip: Local<usize>,
     mut exit: MessageWriter<AppExit>,
 ) {
     use crate::movement::MoveInput;
@@ -430,6 +464,19 @@ fn vm_test(
     ];
     let t = time.elapsed_secs();
     let Ok((mut wi, mut mi)) = player.single_mut() else { return };
+    // `COD4RW_VMTEST_STRIP=start,count,every` (seconds): a strip of frames
+    // too (`strip_NN.png`), for watching a transition (ADS in at 7.6, out
+    // at 9.1).
+    if let Some((start, count, every)) = std::env::var("COD4RW_VMTEST_STRIP").ok().and_then(|v| {
+        let p: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (p.len() == 3).then(|| (p[0], p[1] as usize, p[2]))
+    }) {
+        if *strip < count && t >= start + *strip as f32 * every {
+            std::fs::create_dir_all(&dir.0).ok();
+            commands.spawn(Screenshot::primary_window()).observe(save_to_disk(dir.0.join(format!("strip_{:02}.png", *strip))));
+            *strip += 1;
+        }
+    }
     for (name, start, end, w, m, at) in phases {
         if t >= start && t < end {
             *wi = w;

@@ -16,14 +16,20 @@ pub struct TdmPlugin;
 impl Plugin for TdmPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(crate::state::GameState::InGame), start_match.in_set(crate::state::Setup::Spawn))
-            .add_systems(Update, (score_kills, check_end).run_if(crate::state::in_game));
+            .add_systems(Update, (score_kills, check_end).run_if(crate::state::in_game.and_then(crate::netplay::authority)));
     }
 }
 
 /// CoD4 TDM's defaults: 750 points at 10 per kill, ten minutes.
 pub const SCORE_LIMIT: u32 = 75;
 pub const TIME_LIMIT: f32 = 10.0 * 60.0;
-const POST_MATCH: f32 = 10.0;
+pub const POST_MATCH: f32 = 10.0;
+
+/// The match is over and its results have been shown: back to the menus
+/// (the Private Match lobby). Matches started without the menus (the
+/// command line, simulations) play again instead.
+#[derive(Resource)]
+pub struct MatchOver;
 
 /// Is the match Hardcore ([`MatchConfig::hardcore`])?
 pub fn hardcore() -> bool {
@@ -31,6 +37,17 @@ pub fn hardcore() -> bool {
 }
 
 static HARDCORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// When the match started (`Time::elapsed_secs` bits), for [`in_grace_period`].
+static STARTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// `level.gracePeriod`: the match's first seconds, when a new class is
+/// given at once to a player who hasn't fought yet.
+pub const GRACE_PERIOD: f32 = 15.0;
+
+/// Is the match still in its first [`GRACE_PERIOD`] seconds?
+pub fn in_grace_period(now: f32) -> bool {
+    now - f32::from_bits(STARTED.load(std::sync::atomic::Ordering::Relaxed)) < GRACE_PERIOD
+}
 
 /// How the next match is set up: from the command line, or the Private
 /// Match lobby.
@@ -85,6 +102,8 @@ pub struct MatchState {
     pub mode: GameMode,
     /// Free-for-all: the player who won (none on a tie).
     pub winner: Option<String>,
+    /// The match is over and going back to the lobby.
+    pub left: bool,
 }
 
 impl Default for MatchState {
@@ -98,6 +117,7 @@ impl Default for MatchState {
             score_limit: SCORE_LIMIT,
             mode: GameMode::Tdm,
             winner: None,
+            left: false,
         }
     }
 }
@@ -164,6 +184,7 @@ fn start_match(
         config.score_limit
     );
     crate::modes::set_current(config.mode);
+    STARTED.store(time.elapsed_secs().to_bits(), std::sync::atomic::Ordering::Relaxed);
     HARDCORE.store(config.hardcore, std::sync::atomic::Ordering::Relaxed);
     if config.hardcore {
         info!("match: hardcore");
@@ -172,7 +193,12 @@ fn start_match(
     commands.insert_resource(MatchState {
         started: time.elapsed_secs(),
         // Search and Destroy's rounds keep time instead.
-        time_limit: if config.mode.timed() { config.time_limit } else { f32::INFINITY },
+        // Debug: `COD4RW_TIMELIMIT=<seconds>` for a short match.
+        time_limit: match std::env::var("COD4RW_TIMELIMIT").ok().and_then(|s| s.parse::<f32>().ok()) {
+            Some(secs) => secs,
+            None if config.mode.timed() => config.time_limit,
+            None => f32::INFINITY,
+        },
         score_limit: config.score_limit,
         mode: config.mode,
         ..default()
@@ -222,6 +248,20 @@ fn start_match(
     }
 
     // Debug: frozen models in front of the player for screenshots.
+    // Debug: `COD4RW_DUMMY_AT=20,40,60`: enemies standing still that many
+    // metres ahead of the player (a little apart), for checking how they
+    // read at range.
+    if let Ok(list) = std::env::var("COD4RW_DUMMY_AT") {
+        let fwd = Quat::from_rotation_y(player_spawn.yaw) * Vec3::NEG_Z;
+        let right = Quat::from_rotation_y(player_spawn.yaw) * Vec3::X;
+        for (i, m) in list.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).enumerate() {
+            let sp = crate::world::SpawnPoint { pos: player_spawn.pos + fwd * m + right * (i as f32 - 1.0) * 1.5, yaw: player_spawn.yaw + std::f32::consts::PI, kind: player_spawn.kind };
+            let d = spawn_pawn(&mut commands, &assets, &format!("dummy {m} m"), Team::Axis, &sp);
+            let mut mover = crate::movement::Mover::default();
+            mover.on_ground = true;
+            commands.entity(d).insert((crate::movement::Frozen, mover));
+        }
+    }
     if std::env::var_os("COD4RW_DUMMY").is_some() {
         let fwd = Quat::from_rotation_y(player_spawn.yaw) * Vec3::NEG_Z;
         let right = Quat::from_rotation_y(player_spawn.yaw) * Vec3::X;
@@ -282,6 +322,7 @@ fn start_match(
         for lane in lanes {
             let spawn = pick_spawn(&map, &crate::combat::Spawning::start(team, &occupied));
             occupied.push(spawn.pos);
+            debug!("bot spawn ({team:?}) at CoD {:?} ({:?})", crate::units::to_cod(spawn.pos), spawn.kind);
             let name = names.next().unwrap_or_else(|| "Bot".into());
             let bot = spawn_pawn(&mut commands, &assets, &name, team, &spawn);
             let skill = skills.next().unwrap_or(config.bot_skill);
@@ -299,7 +340,7 @@ fn score_kills(mut killed: MessageReader<Killed>, pawns: Query<&Pawn>, mut state
         let Ok(att) = pawns.get(attacker) else { continue };
         // Only Team Deathmatch scores kills for the team (free-for-all's
         // score is each player's kills, Domination's its flags).
-        if attacker == k.victim || !hostile(att, victim) || state.mode != GameMode::Tdm {
+        if attacker == k.victim || !hostile(att, victim) || !matches!(state.mode, GameMode::Tdm | GameMode::Tdm3) {
             continue;
         }
         match att.team {
@@ -311,6 +352,8 @@ fn score_kills(mut killed: MessageReader<Killed>, pawns: Query<&Pawn>, mut state
 
 fn check_end(
     mut commands: Commands,
+    fe: Option<Res<crate::ui::Frontend>>,
+    over: Option<Res<MatchOver>>,
     time: Res<Time>,
     mut state: ResMut<MatchState>,
     mut feed: ResMut<KillFeed>,
@@ -341,6 +384,14 @@ fn check_end(
                 for (e, _) in &pawns {
                     commands.entity(e).insert(crate::movement::Frozen);
                 }
+            }
+        }
+        // (After the final killcam.)
+        Some((_, at)) if now - at > POST_MATCH && !crate::killcam::busy() && fe.as_ref().is_some_and(|f| f.from_menus()) => {
+            // (Inserted at the end of the frame: once.)
+            if over.is_none() && !std::mem::replace(&mut state.left, true) {
+                info!("match: over, back to the lobby");
+                commands.insert_resource(MatchOver);
             }
         }
         Some((_, at)) if now - at > POST_MATCH => {

@@ -60,6 +60,10 @@ struct BlackOpsRig;
 /// A body animation: Black Ops' own for its rigs (CoD4's tip their heads
 /// down and drop their jaws).
 fn body_anim(content: &mut Content, black_ops: bool, name: &str) -> Option<Arc<XAnim>> {
+    // Cover ([`crate::cover`]): the campaign's, loaded on a thread of their own.
+    if crate::cover::is_cover_anim(name) {
+        return crate::cover::anim(name);
+    }
     black_ops.then(|| crate::wardrobe::black_ops_anim(name)).flatten().or_else(|| content.anim(name))
 }
 
@@ -304,6 +308,17 @@ enum Dir {
     Right,
 }
 
+impl Motion {
+    /// The same gait the other way.
+    fn with_dir(self, d: Dir) -> Motion {
+        match self {
+            Motion::Walk(_) => Motion::Walk(d),
+            Motion::Run(_) => Motion::Run(d),
+            other => other,
+        }
+    }
+}
+
 impl Dir {
     fn name(self) -> &'static str {
         match self {
@@ -440,6 +455,30 @@ fn base_anim(stance: Stance, m: Motion, held: Held, ads: bool) -> String {
             Rifle | Grenade => format!("pb_crouch_run_{}", d.name()),
         },
     }
+}
+
+fn angle_blend_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COD4RW_ANIMBLEND").is_some())
+}
+
+/// For [`angle_blend_on`]: moving (walk or run, not prone or sprinting),
+/// the forward-or-back direction, the side one, and the side's weight
+/// (0 straight ahead, 1 straight sideways).
+fn angle_blend(mover: &Mover, view_yaw: f32, m: Motion) -> Option<(Dir, Dir, f32)> {
+    if !angle_blend_on() || mover.stance == Stance::Prone || !matches!(m, Motion::Walk(_) | Motion::Run(_)) {
+        return None;
+    }
+    let vel = Vec3::new(mover.velocity.x, 0.0, mover.velocity.z);
+    let speed = vel.length();
+    if speed < 1e-3 {
+        return None;
+    }
+    let forward = Quat::from_rotation_y(view_yaw) * Vec3::NEG_Z;
+    let right = Quat::from_rotation_y(view_yaw) * Vec3::X;
+    let (f, s) = (vel.dot(forward) / speed, vel.dot(right) / speed);
+    let w = s.abs().atan2(f.abs()) / std::f32::consts::FRAC_PI_2;
+    Some((if f >= 0.0 { Dir::Forward } else { Dir::Back }, if s >= 0.0 { Dir::Right } else { Dir::Left }, w.clamp(0.0, 1.0)))
 }
 
 /// Headquarters' relaxed standing and walking, from the single-player
@@ -668,6 +707,7 @@ fn turn_bodies(
     mut legs: Local<std::collections::HashMap<Entity, (f32, bool)>>,
     mut slopes: Local<std::collections::HashMap<Entity, (f32, f32)>>,
 ) {
+    let _t = crate::perf::Probe::start("turn_bodies");
     let dt = time.delta_secs();
     let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
     let filter = crate::collision::movement_filter();
@@ -819,6 +859,8 @@ struct TorsoEvent {
 /// What a body is doing, between frames.
 #[derive(Default)]
 struct BodyState {
+    /// Last frame in a moving animation.
+    moving: bool,
     airborne_since: Option<f32>,
     /// The highest it got while off the ground (for the landing).
     peak: f32,
@@ -870,6 +912,8 @@ fn drive_body_anims(
         Option<&crate::melee::Melee>,
         Has<Dead>,
         Has<crate::perks::Downed>,
+        Option<&crate::cover::InCover>,
+        Option<&crate::cover::LeavingCover>,
     )>,
     places: Query<&GlobalTransform>,
     mut players: Query<(&mut AnimPlayer, Has<BlackOpsRig>)>,
@@ -880,6 +924,7 @@ fn drive_body_anims(
     replay: Res<crate::killcam::ReplayPoses>,
     time: Res<Time>,
 ) {
+    let _t = crate::perf::Probe::start("drive_body_anims");
     let now = time.elapsed_secs();
     let mut rng = rand::rng();
     // Hits: how long they shake the body, and which way (`damageTimer`).
@@ -904,7 +949,7 @@ fn drive_body_anims(
             _ => Dir::Right,
         });
     }
-    for (pawn, body, mover, view, input, weapon, loadout, offhand, melee, dead, downed) in &pawns {
+    for (pawn, body, mover, view, input, weapon, loadout, offhand, melee, dead, downed, in_cover, leaving) in &pawns {
         // A killcam is posing it as it was.
         if replay.0.contains_key(&body.0) {
             continue;
@@ -917,8 +962,14 @@ fn drive_body_anims(
         let grip = if cooking { Held::Grenade } else { held(def) };
         let ads = input.is_some_and(|i| i.ads);
         let walking = ads || mover.lean.abs() > 0.1;
+        // Headquarters walks when slow, at ease (`hq_anim`'s patrol walk).
         let (m, offset) = motion(mover, view.yaw, walking, state.motion);
         state.motion = m;
+        // Debug, for comparing: `COD4RW_ANIMBLEND` mixes the forward (or
+        // back) loop with the side one by the angle of travel, the legs
+        // facing the view, instead of CoD4's switch at 60 degrees.
+        let angled = angle_blend(mover, view.yaw, m);
+        let offset = if angled.is_some() { 0.0 } else { offset };
         gaits.0.insert(body.0, Gait { offset, moving: m != Motion::Idle });
         let mut load = |name: &str| body_anim(&mut content, black_ops, name);
 
@@ -1067,24 +1118,61 @@ fn drive_body_anims(
         if now < state.landing_until && mover.stance == Stance::Stand && !mover.sprinting {
             continue;
         }
+        let cover_pose = in_cover
+            .and_then(|c| crate::cover::anim_name(c, mover.lean, ads, input.is_some_and(|i| i.fire), m != Motion::Idle, now - c.since))
+            .or_else(|| leaving.and_then(|l| crate::cover::exit_anim_name(l, m != Motion::Idle, mover.stance == Stance::Stand, now - l.since)));
         // In Last Stand, lying with the pistol.
         let name = match () {
             _ if downed && m == Motion::Idle => "pb_laststand_idle".to_owned(),
             _ if now < state.hurt_until && mover.stance != Stance::Prone => {
                 stumble_anim(m, grip).unwrap_or_else(|| base_anim(mover.stance, m, grip, ads))
             }
+            // In cover: the campaign's cover poses ([`crate::cover`]).
+            _ if cover_pose.is_some() => cover_pose.unwrap_or_default().to_owned(),
             // Headquarters: at ease, the gun lowered.
             _ if crate::hq::active() => hq_anim(mover.stance, m).map_or_else(|| base_anim(mover.stance, m, grip, ads), str::to_owned),
             _ => base_anim(mover.stance, m, grip, ads),
         };
+        // The angle blend's pair, instead of one direction's loop.
+        let (name, side) = match angled {
+            Some((fwd, side, w)) if !(downed || now < state.hurt_until || crate::hq::active()) => {
+                let main = base_anim(mover.stance, m.with_dir(fwd), grip, ads);
+                let other = load(&base_anim(mover.stance, m.with_dir(side), grip, ads)).map(|a| (a, w));
+                (main, other)
+            }
+            _ => (name, None),
+        };
+        anim.blend = side;
         if let Some(a) = load(&name) {
             // Stance changes blend over 400 ms; moving to standing 250.
-            let fade = if was != mover.stance { 0.4 } else if m == Motion::Idle { 0.25 } else { 0.12 };
+            // `BG_SetNewAnimation`'s blends: into a move 120 ms; out of one
+            // to standing still 250, still to still 170; stance changes 400.
+            let was_moving = state.moving;
+            state.moving = m != Motion::Idle;
+            let fade = match () {
+                _ if was != mover.stance => 0.4,
+                _ if m != Motion::Idle => 0.12,
+                _ if was_moving => 0.25,
+                _ => 0.17,
+            };
             let rate = if m == Motion::Idle { 1.0 } else { move_rate(&a, mover.horizontal_speed()) };
-            // Between moves the feet carry on where they were in the step.
+            // Between moves the feet carry on where they were in the step;
+            // setting off from still, each body at its own point of the
+            // cycle (CoD4's by time and client number), not all in step.
             let changed = anim.anim.as_ref().is_none_or(|c| !Arc::ptr_eq(c, &a));
-            let phase = anim.anim.as_ref().filter(|c| c.looping && a.looping && m != Motion::Idle).map(|c| anim.time / c.duration().max(1e-3));
+            let phase = match anim.anim.as_ref() {
+                Some(c) if was_moving && c.looping && a.looping && m != Motion::Idle => Some(anim.time / c.duration().max(1e-3)),
+                _ if a.looping && m != Motion::Idle => {
+                    let cycle = a.duration() + 0.2;
+                    Some((now % cycle) / cycle + (pawn.to_bits() % 64) as f32 * 0.36)
+                }
+                _ => None,
+            };
             anim.ensure(a.clone(), fade);
+            // Blind fire goes on while the trigger is held ([`crate::cover`]).
+            if cover_pose.is_some_and(|n| n.contains("blindfire")) && anim.finished() {
+                anim.play(a.clone(), 0.1);
+            }
             if let (true, Some(phase)) = (changed, phase) {
                 anim.time = phase.fract() * a.duration();
             }

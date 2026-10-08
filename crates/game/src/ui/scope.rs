@@ -12,8 +12,11 @@
 //!   puts the eyepiece over the whole view (it hides them), go once fully
 //!   aimed. The scope camera only renders while the lens shows.
 //!
+//! - 3D ([`super::scope3d`]): the scope's own eyepiece on the gun shows
+//!   the magnified view, the gun drawn throughout.
+//!
 //! The HUD stays on top. Not in Bodycam gunplay or third person, nor under a
-//! menu. `COD4RW_SCOPE=classic|lens` picks the style for a run;
+//! menu. `COD4RW_SCOPE=classic|lens|3d` picks the style for a run;
 //! `COD4RW_SCOPETEST=<dir>` aims in and screenshots the same view through
 //! both (`classic.png`, `lens.png`), then exits.
 
@@ -75,11 +78,22 @@ const LENS_RESOLUTION: u32 = 1024;
 const LENS_SHADER: &str = "cod4rw/scope_lens.wgsl";
 
 static LENS: AtomicBool = AtomicBool::new(false);
+static THREE_D: AtomicBool = AtomicBool::new(false);
 
-/// Lens scopes are the setting (the aimed field of view follows it:
+/// Lens or 3D scopes are the setting (the aimed field of view follows it:
 /// [`crate::bodycam::Gunplay::fovs`]).
 pub fn lens_scopes() -> bool {
     // Classic in splitscreen: the lens is drawn by one camera, Player 1's.
+    (LENS.load(Ordering::Relaxed) || THREE_D.load(Ordering::Relaxed)) && !crate::splitscreen::active()
+}
+
+/// 3D scopes are the setting ([`super::scope3d`]).
+pub(super) fn style_3d() -> bool {
+    THREE_D.load(Ordering::Relaxed)
+}
+
+/// The 2D lens is the setting.
+fn lens_2d() -> bool {
     LENS.load(Ordering::Relaxed) && !crate::splitscreen::active()
 }
 
@@ -191,8 +205,9 @@ fn spawn_camera(
     main: Query<(Entity, &Camera, Option<&Skybox>, Option<&DistanceFog>), With<MainCamera>>,
     finishing: Query<&AutoExposure, With<ViewModelCamera>>,
 ) {
-    // Only once lens scopes are the setting: classic needs no camera.
-    let (Some(view), true, true) = (view, existing.is_empty(), lens_scopes()) else { return };
+    // Only once lens scopes are the setting: classic needs no camera (3D
+    // has its own, `scope3d`).
+    let (Some(view), true, true) = (view, existing.is_empty(), lens_2d()) else { return };
     let Ok((main, main_camera, skybox, fog)) = main.single() else { return };
     let mut camera = commands.spawn((
         Name::new("scope camera"),
@@ -243,10 +258,13 @@ fn show(
             fe.set_dvar(SCOPE_STYLE_DVAR, &style);
         }
     }
-    let lens_style = fe.dvars.get(SCOPE_STYLE_DVAR).is_some_and(|v| v.eq_ignore_ascii_case("lens"));
-    LENS.store(lens_style, Ordering::Relaxed);
-    // Lens scopes are Player 1's alone, and not in splitscreen.
-    let lens_style = lens_scopes();
+    let style = fe.dvars.get(SCOPE_STYLE_DVAR).map(|v| v.to_ascii_lowercase()).unwrap_or_default();
+    LENS.store(style == "lens", Ordering::Relaxed);
+    THREE_D.store(style == "3d", Ordering::Relaxed);
+    // Lens scopes are Player 1's alone, and not in splitscreen; a 3D scope
+    // shows on the gun itself (`scope3d`): neither picture.
+    let lens_style = lens_2d();
+    let three_d = super::scope3d::scope_3d();
     let count = crate::splitscreen::count();
     let picture_of = |fe: &mut Frontend, images: &mut Assets<Image>, material: &str| fe.assets.material(material, images);
     let mut lens_on = None;
@@ -257,7 +275,7 @@ fn show(
         let cod4_gun = held.is_some_and(|w| !crate::waw::is_waw(&w.def.name) && !crate::bo1::is_bo1(&w.def.name));
 
         // Classic: the scope's picture over the player's view.
-        let classic = scoped.as_ref().filter(|(ads, ..)| !lens_style && *ads >= SHOWN_AT);
+        let classic = scoped.as_ref().filter(|(ads, ..)| !lens_style && !three_d && *ads >= SHOWN_AT);
         let image = classic.and_then(|(_, _, o)| Some((picture_of(&mut fe, &mut images, &o.material)?, o)));
         if let Some((image, o)) = &image {
             for (_, mut node, mut layout) in picture.iter_mut().filter(|p| p.0.0 == slot) {

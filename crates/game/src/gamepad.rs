@@ -223,6 +223,7 @@ fn detect_device(
     mut active: ResMut<ActiveDevice>,
     settings: Res<PadSettings>,
     pads: Query<(Entity, &Gamepad, Option<&Name>)>,
+    virtual_pads: Query<(), With<test::VirtualPad>>,
     sony: Option<Res<sony::SonyPads>>,
     mut connections: MessageReader<GamepadConnectionEvent>,
     mut keys: MessageReader<KeyboardInput>,
@@ -249,7 +250,8 @@ fn detect_device(
     let keyboard = keys.read().count() > 0 || clicks.read().count() > 0 || motion.delta.length_squared() > 4.0;
     let mut touched = None;
     for (entity, g, name) in &pads {
-        if sony::SonyPads::twin(sony.as_deref(), entity, g.vendor_id()) {
+        // (The test's virtual pad is no twin, whatever it claims to be.)
+        if !virtual_pads.contains(entity) && sony::SonyPads::twin(sony.as_deref(), entity, g.vendor_id()) {
             continue;
         }
         let stick = deadzone(g.left_stick()).length() > 0.3 || deadzone(g.right_stick()).length() > 0.3;
@@ -576,7 +578,9 @@ fn feed(
     }
     if let Some(down) = b.b_down {
         let tap = if !g.pressed(crouch) {
-            Some(KeyCode::KeyC)
+            // 3rd Person TDM: a tap takes (or leaves) cover when it can
+            // ([`crate::cover`]), else crouches.
+            Some(if crate::cover::button_is_cover() { crate::cover::COVER_KEY } else { KeyCode::KeyC })
         } else if now - down >= PRONE_HOLD {
             Some(KeyCode::ControlLeft)
         } else {

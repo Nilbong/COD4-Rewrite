@@ -139,7 +139,7 @@ pub fn body_layer(slot: usize) -> usize {
 /// other players' bodies, and in third person its own.
 pub fn world_layers(slot: usize, count: usize, third_person: bool) -> bevy::camera::visibility::RenderLayers {
     let layers: Vec<usize> =
-        std::iter::once(0).chain((0..count).filter(|&s| s != slot || third_person).map(body_layer)).collect();
+        std::iter::once(0).chain((0..count).filter(|&s| s != slot || third_person).map(body_layer)).chain((!third_person).then(|| crate::first_person::body::layer(slot))).collect();
     bevy::camera::visibility::RenderLayers::from_layers(&layers)
 }
 

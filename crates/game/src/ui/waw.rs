@@ -238,9 +238,19 @@ impl Frontend {
                 let row = Row {
                     label: str_exp("@T4_WEAPON_NO_CAMO"),
                     action: click(format!("\"uiScript\" \"t4NoCamo\" \"{class}\" \"{stat}\" ; \"close\" \"self\" ;")),
-                    rename: from.map(|f| (f, "camo_none".into())),
+                    rename: from.clone().map(|f| (f, "camo_none".into())),
                 };
-                with_rows(&t, key, &[row])?
+                let custom = Row {
+                    label: str_exp(&format!("@{}", super::custom_camo::ROW_LABEL)),
+                    action: click(format!("\"uiScript\" \"ccamoOpen\" \"{stat}\" ;")),
+                    rename: from.clone().map(|f| (f, super::custom_camo::ROW_NAME.into())),
+                };
+                let reticle = Row {
+                    label: str_exp(&format!("@{}", super::reticle_menu::ROW_LABEL)),
+                    action: click(format!("\"uiScript\" \"creticleOpen\" \"{stat}\" ;")),
+                    rename: from.map(|f| (f, super::reticle_menu::ROW_NAME.into())),
+                };
+                with_rows(&t, key, &[row, custom, reticle])?
             }
             _ => return None,
         };

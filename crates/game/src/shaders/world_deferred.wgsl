@@ -28,13 +28,63 @@ struct WorldParams {
     dist_falloff: vec4<f32>,
     // x: how much of the lightmap the traced light sits on.
     traced: vec4<f32>,
+    // Detail map: tiling, 1 if on, its last mip.
+    detail: vec4<f32>,
 }
 
+#ifdef BINDLESS
+// As `world.wgsl`'s bindless path.
+#import bevy_pbr::mesh_bindings::mesh
+#import bevy_render::bindless::{bindless_samplers_filtering, bindless_textures_2d}
+struct WorldIndices {
+    params: u32,
+    normal_map: u32,
+    normal_sampler: u32,
+    specular_map: u32,
+    specular_sampler: u32,
+    lightmap: u32,
+    lightmap_sampler: u32,
+    reflection_probe: u32,
+    probe_sampler: u32,
+    detail_map: u32,
+    detail_sampler: u32,
+    wet_map: u32,
+    ssr_history: u32,
+    ssr_sampler: u32,
+    height_map: u32,
+    height_sampler: u32,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(120) var<storage> world_indices: array<WorldIndices>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(121) var<storage> world_params: array<WorldParams>;
+var<private> params: WorldParams;
+var<private> world: WorldIndices;
+
+fn load_world_material(in: VertexOutput) {
+    let slot = mesh[in.instance_index].material_and_lightmap_bind_group_slot & 0xffffu;
+    world = world_indices[slot];
+    params = world_params[world.params];
+}
+fn sample_normal(uv: vec2<f32>) -> vec4<f32> {
+    return textureSample(bindless_textures_2d[world.normal_map], bindless_samplers_filtering[world.normal_sampler], uv);
+}
+fn sample_lightmap(uv: vec2<f32>) -> vec4<f32> {
+    return textureSample(bindless_textures_2d[world.lightmap], bindless_samplers_filtering[world.lightmap_sampler], uv);
+}
+#else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> params: WorldParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var normal_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var normal_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var lightmap: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var lightmap_sampler: sampler;
+
+fn load_world_material(in: VertexOutput) {}
+fn sample_normal(uv: vec2<f32>) -> vec4<f32> {
+    return sample_normal(uv);
+}
+fn sample_lightmap(uv: vec2<f32>) -> vec4<f32> {
+    return sample_lightmap(uv);
+}
+#endif
 
 fn iw3_slope(x: f32, y: f32) -> vec3<f32> {
     return vec3(x * 4.08 - 2.08, y * 4.0645161 - 2.0645161, 1.0);
@@ -42,6 +92,7 @@ fn iw3_slope(x: f32, y: f32) -> vec3<f32> {
 
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
+    load_world_material(in);
     var pbr_input = pbr_input_from_standard_material(in, is_front);
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 
@@ -49,7 +100,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VERTEX_UVS_A
 #ifdef VERTEX_TANGENTS
     if (params.flags.x > 0.5) {
-        let s = textureSample(normal_map, normal_sampler, in.uv);
+        let s = sample_normal(in.uv);
         n_t = normalize(iw3_slope(s.a, s.g));
         let n = pbr_input.world_normal;
         let t = normalize(in.world_tangent.xyz);
@@ -61,8 +112,8 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
 #ifdef VERTEX_UVS_B
     if (params.flags.z > 0.5) {
-        let a = textureSample(lightmap, lightmap_sampler, vec2(in.uv_b.x, in.uv_b.y * 0.5));
-        let b = textureSample(lightmap, lightmap_sampler, vec2(in.uv_b.x, in.uv_b.y * 0.5 + 0.5));
+        let a = sample_lightmap(vec2(in.uv_b.x, in.uv_b.y * 0.5));
+        let b = sample_lightmap(vec2(in.uv_b.x, in.uv_b.y * 0.5 + 0.5));
         let l = normalize(iw3_slope(a.a, b.a));
         let lit = a.rgb * n_t.z + b.rgb * saturate(dot(n_t, l));
         // Bevy packs this times the view's exposure, and Solari exposes what

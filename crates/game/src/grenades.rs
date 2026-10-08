@@ -92,6 +92,24 @@ pub enum Kind {
 const KINDS: [Kind; 4] = [Kind::Frag, Kind::Flash, Kind::Stun, Kind::Smoke];
 
 impl Kind {
+    /// For the network: its place in the list.
+    pub fn index(self) -> u8 {
+        KINDS.iter().position(|k| *k == self).unwrap_or(0) as u8
+    }
+    pub fn from_index(i: u8) -> Option<Kind> {
+        KINDS.get(i as usize).copied()
+    }
+}
+
+impl Pending {
+    /// A grenade into the world next frame (an online guest's copy of the
+    /// host's, [`crate::netplay`]).
+    pub(crate) fn queue_throw(&mut self, kind: Kind, thrower: Entity, at: Vec3, velocity: Vec3, explode_at: f32) {
+        self.throws.push((kind, thrower, at, velocity, explode_at, How::Thrown));
+    }
+}
+
+impl Kind {
     /// Its weapon (`<name>_mp`), as classes name it.
     fn weapon(self) -> &'static str {
         match self {
@@ -268,7 +286,7 @@ impl Offhand {
 
 /// Grenades to put in the world, and to set off, this frame.
 #[derive(Resource, Default)]
-struct Pending {
+pub(crate) struct Pending {
     /// Kind, thrower, where, velocity, when it goes off, how.
     throws: Vec<(Kind, Entity, Vec3, Vec3, f32, How)>,
     blasts: Vec<(Kind, Entity, Vec3, How)>,

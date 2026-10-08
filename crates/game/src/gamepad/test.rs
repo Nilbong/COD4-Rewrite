@@ -23,6 +23,7 @@ pub(super) fn register(app: &mut App) {
             at: 3.0,
             pad: None,
             releases: Vec::new(),
+            burst: None,
         })
         .add_systems(First, drive);
     }
@@ -44,6 +45,8 @@ struct PadTest {
     pad: Option<Entity>,
     /// Tapped buttons to let go of, and when.
     releases: Vec<(GamepadButton, f32)>,
+    /// `burst:name:n`: a screenshot every frame, n of them.
+    burst: Option<(String, usize, usize)>,
 }
 
 fn button(name: &str) -> Option<GamepadButton> {
@@ -76,6 +79,7 @@ fn drive(
     mut connect: MessageWriter<GamepadConnectionEvent>,
     mut raw: MessageWriter<RawGamepadEvent>,
     mut exit: MessageWriter<AppExit>,
+    mut window: Single<&mut Window, With<bevy::window::PrimaryWindow>>,
 ) {
     let now = real.elapsed_secs();
     let pad = match test.pad {
@@ -89,12 +93,20 @@ fn drive(
                 GamepadConnection::Connected { name: name.into(), vendor_id: Some(vendor), product_id: None },
             ));
             test.pad = Some(e);
+            // The real mouse cursor out of the way: resting over a menu it
+            // would hover (focus) an item, and the steps would start there.
+            window.set_cursor_position(Some(Vec2::ZERO));
             return;
         }
     };
     let set = |raw: &mut MessageWriter<RawGamepadEvent>, b: GamepadButton, v: f32| {
         raw.write(RawGamepadEvent::Button(RawGamepadButtonChangedEvent::new(pad, b, v)));
     };
+    if let Some((name, done, total)) = test.burst.clone() {
+        std::fs::create_dir_all(&test.dir).ok();
+        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(test.dir.join(format!("{name}_{done:03}.png"))));
+        test.burst = (done + 1 < total).then(|| (name, done + 1, total));
+    }
     test.releases.retain(|&(b, t)| {
         let due = now >= t;
         if due {
@@ -113,7 +125,9 @@ fn drive(
     test.next += 1;
     test.at = now + STEP;
     info!("pad test: {step}");
-    if let Some(name) = step.strip_prefix("shot:") {
+    if let Some((name, n)) = step.strip_prefix("burst:").and_then(|r| r.split_once(':')) {
+        test.burst = Some((name.to_owned(), 0, n.parse().unwrap_or(30)));
+    } else if let Some(name) = step.strip_prefix("shot:") {
         std::fs::create_dir_all(&test.dir).ok();
         commands.spawn(Screenshot::primary_window()).observe(save_to_disk(test.dir.join(format!("{name}.png"))));
     } else if let Some(secs) = step.strip_prefix("wait:").and_then(|s| s.parse::<f32>().ok()) {

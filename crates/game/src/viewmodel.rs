@@ -63,6 +63,9 @@ pub mod anim_slot {
     pub const ADS_FIRE: usize = 28;
     pub const ADS_UP: usize = 31;
     pub const ADS_DOWN: usize = 32;
+    /// How long switching between the ADS up and down anims cross-fades
+    /// (CoD4's `PlayADSAnim` goal-weight time).
+    pub const ADS_SWITCH_FADE: f32 = 0.1;
 }
 
 /// The weapon's animations, resolved once.
@@ -165,6 +168,10 @@ const INSPECT_KEYS: [(f32, InspectPose); 6] = {
         (INSPECT_TIME, pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
     ]
 };
+
+/// How much of the gun's drift during an inspect is taken back (0..1),
+/// keeping it in view (see `weapon_angles`).
+const INSPECT_KEEP_GUN: f32 = 0.6;
 
 /// How the support arm swings about its shoulder once it has let go:
 /// degrees down and out to the left.
@@ -337,7 +344,7 @@ fn drive_viewmodel_anims(
         Option<&crate::melee::Melee>,
     )>,
     mut vm: Query<(Entity, &ViewModelSlot, &mut AnimPlayer, &WeaponAnims, &mut Visibility, &mut WeaponMotion, &mut VmAnim), With<ViewModelRoot>>,
-    (third_person, killcam): (Res<crate::wardrobe::ThirdPerson>, Res<crate::killcam::Killcam>),
+    (third_person, killcam, time): (Res<crate::wardrobe::ThirdPerson>, Res<crate::killcam::Killcam>, Res<Time>),
 ) {
     for (built, slot, mut anim, anims, mut vis, mut motion, mut st) in &mut vm {
         let Some((_, w, input, mover, loadout, dead, offhand, melee)) = players.iter().find(|p| p.0.0 == slot.0) else { continue };
@@ -349,6 +356,7 @@ fn drive_viewmodel_anims(
             (built, &mut anim, anims, &mut vis, &mut motion),
             (state, last_shots, rechamber_due, last_ads_frac, last_built, last_reload, last_offhand, last_melee),
             outside,
+            time.delta_secs(),
         );
     }
 }
@@ -377,6 +385,7 @@ fn drive_one(
         &mut Option<u32>,
     ),
     outside: bool,
+    dt: f32,
 ) {
     use anim_slot::*;
     // An inspect carries on only while nothing else happens: every path
@@ -389,7 +398,7 @@ fn drive_one(
         *last_shots = w.shots_fired_total;
         *state = VmState::OneShot;
     }
-    let debug_hidden = std::env::var_os("COD4RW_DUMMY").is_some();
+    let debug_hidden = std::env::var_os("COD4RW_DUMMY").is_some() || std::env::var_os("COD4RW_DUMMY_AT").is_some();
     *vis = if dead || debug_hidden || outside { Visibility::Hidden } else { Visibility::Inherited };
 
     // Debug: hold one named animation.
@@ -406,19 +415,40 @@ fn drive_one(
     *last_shots = w.shots_fired_total;
     let ads = w.ads > 0.5 && input.ads;
 
-    // ADS only moves `tag_ads`, layered over whatever else is playing:
-    // ads_up while raising, ads_down while lowering, posed by the ADS fraction.
-    // World at War's other animations leave `tag_torso` alone: its ADS ones
-    // place it from the hip (their first frame) on, so they always apply.
-    let raising = w.ads > *last_ads_frac || (w.ads >= 1.0 && input.ads);
-    *last_ads_frac = w.ads;
-    anim.overlay = if w.ads <= 0.0 && !crate::waw::is_waw(&w.def.name) {
-        None
-    } else if raising || w.ads <= 0.0 {
+    // ADS only moves `tag_ads`, layered over whatever else is playing, as
+    // CoD4 does (`PlayADSAnim`): ads_up while aiming, ads_down otherwise
+    // (and while reloading), posed by the ADS fraction, and always applied:
+    // at the hip it's ads_down's last frame, so finishing an aim-out lands
+    // where the animation ends (dropping the layer there snapped the gun to
+    // the rest pose, 3 units on the Skorpion ACOG). Which one plays follows
+    // the aim, not whether the fraction grew this frame: frames on which it
+    // didn't move flipped it to ads_down and back, jittering every aim.
+    // (World at War's other animations leave `tag_torso` alone: its ADS
+    // ones place it from the hip on, which this covers too.)
+    let aiming = input.ads && *state != VmState::Reloading;
+    let wanted = if aiming {
         anims.get(ADS_UP).map(|a| (a, w.ads))
     } else {
-        anims.get(ADS_DOWN).map(|a| (a, 1.0 - w.ads))
+        anims.get(ADS_DOWN).or_else(|| anims.get(ADS_UP)).map(|a| if anims.get(ADS_DOWN).is_some() { (a, 1.0 - w.ads) } else { (a, w.ads) })
     };
+    // Switching between up and down cross-fades over CoD4's 0.1 s (the two
+    // seldom meet exactly: 1.3 units on the M14 ACOG, 3 on the Skorpion
+    // ACOG's hip end). The one left keeps its pose as it fades.
+    let switched = match (&anim.overlay, &wanted) {
+        (Some((old, _)), Some((new, _))) => !Arc::ptr_eq(old, new),
+        _ => false,
+    };
+    if switched {
+        anim.overlay_from = anim.overlay.take().map(|(a, p)| (a, p, 1.0));
+    }
+    if let Some(f) = anim.overlay_from.as_mut() {
+        f.2 -= dt / ADS_SWITCH_FADE;
+    }
+    if anim.overlay_from.as_ref().is_some_and(|f| f.2 <= 0.0) {
+        anim.overlay_from = None;
+    }
+    anim.overlay = wanted;
+    *last_ads_frac = w.ads;
 
     // Play an anim, optionally stretched to last `seconds` like CoD4's
     // timed weapon states (reload, sprint in/loop/out).
@@ -541,13 +571,13 @@ fn drive_one(
 /// movement bob, applied as a rotation about the eye on top of the view.
 pub(crate) fn weapon_angles(
     time: Res<Time>,
-    players: Query<(&crate::splitscreen::LocalSlot, &Mover, &WeaponState)>,
+    players: Query<(&crate::splitscreen::LocalSlot, &Mover, &WeaponState, Option<&crate::first_person::feel::Feel>)>,
     mut vm: Query<(&ViewModelSlot, &mut Transform, &mut WeaponMotion, &Skeleton, &GlobalTransform), With<ViewModelRoot>>,
     joints: Query<&GlobalTransform, Without<ViewModelRoot>>,
     mut poses: Query<(&mut Transform, &ChildOf), Without<ViewModelRoot>>,
 ) {
   for (vslot, mut tf, mut motion, skeleton, root) in &mut vm {
-    let Some((_, mover, w)) = players.iter().find(|p| p.0.0 == vslot.0) else { continue };
+    let Some((_, mover, w, feel)) = players.iter().find(|p| p.0.0 == vslot.0) else { continue };
     let (d, f, dt) = (&w.def, w.ads, time.delta_secs());
 
     // Idle sway: three slow sines, stronger in ADS, eased per stance.
@@ -602,6 +632,11 @@ pub(crate) fn weapon_angles(
     // The gun's own kick ([`WeaponState::gun_offset`]).
     pitch += w.gun_offset.x;
     yaw += w.gun_offset.y;
+    // Sway as the view turns and the richer bob ([`crate::first_person::feel`]).
+    let (feel_angles, feel_shift) = feel.map_or((Vec3::ZERO, Vec3::ZERO), |f| (f.gun_angles, f.gun_shift));
+    pitch += feel_angles.x;
+    yaw += feel_angles.y;
+    roll += feel_angles.z;
     // CoD angles: pitch down, yaw left, roll right side down.
     let euler = |a: Vec3| Quat::from_euler(EulerRot::YXZ, a.y.to_radians(), -a.x.to_radians(), -a.z.to_radians());
     // CoD's (forward, left, up) in inches, along the view's axes.
@@ -641,14 +676,40 @@ pub(crate) fn weapon_angles(
             (Some(elbow), Some(wrist)) => (at(elbow), (at(wrist) - at(elbow)).normalize_or(Vec3::NEG_Z)),
             _ => (pivot, Vec3::NEG_Z),
         };
+        // The roll: about the barrel (grip to muzzle), through the right
+        // wrist so the hand stays on the grip. (About the forearm, as it
+        // was, it only rolled where the forearm runs along the gun; on rigs
+        // holding it at an angle, the P90's and the Kar98k's among them, the
+        // roll became a pitch or a turn that swung the gun out of view.)
+        let barrel = match (joint("tag_weapon"), joint("tag_flash")) {
+            (Some(grip), Some(muzzle)) => (at(muzzle) - at(grip)).normalize_or(forearm),
+            _ => forearm,
+        };
+        let wrist = joint("j_wrist_ri").map_or(elbow, |g| at(g));
         let pivot = pivot.lerp(elbow, 0.35);
+        // Debug aid: `COD4RW_INSPECT_DEBUG` logs the pivots once per inspect.
+        if std::env::var_os("COD4RW_INSPECT_DEBUG").is_some() && motion.inspect.is_some_and(|t| t < 0.06) {
+            let names = ["tag_weapon", "j_elbow_ri", "j_wrist_ri", "j_shoulder_le", "tag_flash", "tag_torso"];
+            let found: Vec<String> = names.iter().map(|n| format!("{n}={:?}", joint(n).map(|g| (at(g) / crate::units::INCH).round()))).collect();
+            info!("inspect {}: forearm-barrel {:.0} deg; pivot {:?} elbow {:?} forearm {:.2?} barrel {:.2?} | {}", w.def.name, forearm.angle_between(barrel).to_degrees(), (pivot / crate::units::INCH).round(), (elbow / crate::units::INCH).round(), forearm, barrel, found.join(" "));
+        }
         let a = motion.inspect_pose.angles * fade;
         // CoD's roll turns the right side down: clockwise from behind,
-        // about the forearm pointing away.
+        // about the barrel pointing away.
         let twist = Quat::from_axis_angle(forearm, a.z.to_radians());
         let aim = euler(Vec3::new(a.x, a.y, 0.0));
         turn = aim * twist;
         moved = pivot + along(motion.inspect_pose.shift * fade) + aim * (elbow - twist * elbow - pivot);
+        // The roll is about the right forearm (so that arm stays put), but
+        // each rig's forearm lies its own way to the gun: on some (the RPD,
+        // the Thompson, the P90) the same roll carried the gun low or out of
+        // view. The viewmodel is moved back most of the way towards keeping
+        // the gun's middle (halfway from grip to muzzle) where it was.
+        if let (Some(grip), Some(muzzle)) = (joint("tag_weapon"), joint("tag_flash")) {
+            let middle = (at(grip) + at(muzzle)) * 0.5;
+            moved += (middle - (turn * middle + moved)) * INSPECT_KEEP_GUN;
+        }
+        let _ = (wrist, barrel);
 
         // The support arm swings down and out to the left about its
         // shoulder, out of sight, once the hand lets go: down and left on
@@ -673,6 +734,6 @@ pub(crate) fn weapon_angles(
     // up): IW's second axis points left, so a negative `sprintOfsR` is to
     // the right.
     let ofs = motion.sprint_pose.map_or(Vec3::ZERO, |p| p.ofs * k);
-    tf.translation = along(ofs) + offset * moved;
+    tf.translation = along(ofs + feel_shift) + offset * moved;
   }
 }

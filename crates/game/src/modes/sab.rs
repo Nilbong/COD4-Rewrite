@@ -417,6 +417,7 @@ fn rounds(
                 // (`endGame("tie")`).
                 info!("sab: a tie");
                 round.over = Some(now);
+                crate::killcam::round_over(now);
                 state.ended = Some((None, now));
                 objectives.using.clear();
                 for (e, ..) in &pawns {
@@ -433,11 +434,12 @@ fn rounds(
             objectives.round_over = Some((winner, key, text));
             objectives.using.clear();
             round.over = Some(now);
+            crate::killcam::round_over(now);
             for (e, ..) in &pawns {
                 commands.entity(e).insert(Frozen);
             }
         }
-        Some(at) if now - at >= ROUND_DELAY => start_round(&mut commands, &mut round, &mut objectives, now, &pawns, true),
+        Some(at) if now - at >= ROUND_DELAY && !crate::killcam::busy() => start_round(&mut commands, &mut round, &mut objectives, now, &pawns, true),
         Some(_) => {}
     }
 }

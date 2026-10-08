@@ -168,10 +168,32 @@ impl UiAssets {
 
     /// The image behind a 2D material, loaded on first use. Names no zone
     /// has as a material are tried as images (`damage_feedback`).
+    /// A material made here (an atlas or picture), under `name`.
+    pub fn add_image(&mut self, name: &str, image: UiImage) {
+        self.materials.insert(name.to_ascii_lowercase(), Some(image));
+    }
+
     pub fn material(&mut self, name: &str, images: &mut Assets<Image>) -> Option<UiImage> {
         let key = name.trim_start_matches(',').to_ascii_lowercase();
         if let Some(m) = self.materials.get(&key) {
             return m.clone();
+        }
+        // Custom camos' swatches: their textures, never kept here (they
+        // change as they're edited).
+        if let Some(rest) = key.strip_prefix("cod4rw_ccamo_") {
+            let def = match rest {
+                "icon" => std::sync::Arc::new(crate::custom_camos::CustomCamo::default()),
+                n => crate::custom_camos::get(n.parse().ok()?)?,
+            };
+            let handle = crate::custom_camos::texture(&def, images);
+            return Some(UiImage { handle, size: Vec2::splat(256.0) });
+        }
+        // Reticle pictures (`reticle_menu`).
+        if let Some(code) = key.strip_prefix("cod4rw_reticle_").and_then(|c| c.parse::<u16>().ok()) {
+            let handle = crate::reticles::preview(crate::reticles::Reticle::from_code(code), images);
+            let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
         }
         if key == super::camos::PLATINUM_SWATCH || key == super::camos::DIAMOND_SWATCH {
             let handle = if key == super::camos::DIAMOND_SWATCH {
@@ -180,6 +202,23 @@ impl UiAssets {
                 crate::gunmodel::platinum::texture(images)?
             };
             let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
+        }
+        // The modern main menu's own pictures, and the Modern HUD's atlases,
+        // embedded.
+        if let Some(bytes) = super::modern::picture(&key).or_else(|| super::hud::modern::picture(&key)) {
+            let image = Image::from_buffer(
+                bytes,
+                bevy::image::ImageType::Extension("png"),
+                bevy::image::CompressedImageFormats::NONE,
+                true,
+                ImageSampler::linear(),
+                bevy::asset::RenderAssetUsages::RENDER_WORLD,
+            )
+            .ok()
+            .map(|i| images.add(i))
+            .and_then(|h| Self::clamped(h, images));
             self.materials.insert(key, image.clone());
             return image;
         }

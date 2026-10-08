@@ -21,7 +21,15 @@ impl Plugin for CombatPlugin {
             .add_systems(OnEnter(crate::state::GameState::InGame), setup_pawn_assets.in_set(crate::state::Setup::Content))
             .add_systems(
                 Update,
-                (fall_damage, apply_damage, regen_health, respawn, mark_spawned, update_hitboxes)
+                // An online guest's health and deaths are the host's ([`crate::netplay`]).
+                (
+                    fall_damage.run_if(crate::netplay::authority),
+                    apply_damage.run_if(crate::netplay::authority),
+                    regen_health.run_if(crate::netplay::authority),
+                    respawn.run_if(crate::netplay::authority),
+                    mark_spawned,
+                    update_hitboxes,
+                )
                     .chain()
                     .after(crate::movement::MovementSet)
                     .run_if(crate::state::in_game),
@@ -135,7 +143,11 @@ pub enum HitLocation {
     Head,
     /// CoD4's neck: snipers do more there (1.5), it isn't a headshot.
     Neck,
+    /// The upper torso (the chest): CoD4's `torso_upper`.
     Torso,
+    /// The lower torso (the stomach): `torso_lower`, where snipers do less
+    /// (an M40A3 kills with a chest shot, not with one here).
+    TorsoLower,
     Legs,
 }
 
@@ -210,13 +222,18 @@ pub fn spawn_pawn(commands: &mut Commands, _assets: &PawnAssets, name: &str, tea
     };
     commands.spawn(hitbox(HitLocation::Head, Collider::sphere(u(5.0))));
     commands.spawn(hitbox(HitLocation::Neck, Collider::sphere(u(3.5))));
-    commands.spawn(hitbox(HitLocation::Torso, Collider::cuboid(u(20.0), u(22.0), u(14.0))));
+    commands.spawn(hitbox(HitLocation::Torso, Collider::cuboid(u(20.0), u(TORSO_UPPER), u(14.0))));
+    commands.spawn(hitbox(HitLocation::TorsoLower, Collider::cuboid(u(18.0), u(TORSO_LOWER), u(13.0))));
     commands.spawn(hitbox(HitLocation::Legs, Collider::cuboid(u(16.0), u(34.0), u(12.0))));
     pawn
 }
 
 /// Where the neck is between the head and the chest's middle.
 const NECK_ALONG: f32 = 0.36;
+/// The torso (22 units, its middle at the layout's) split in two: the
+/// chest above, the stomach below (CoD4's `torso_upper`, `torso_lower`).
+const TORSO_UPPER: f32 = 12.0;
+const TORSO_LOWER: f32 = 10.0;
 
 /// Hitbox and body placement for a stance. Returns (head, torso, legs) local
 /// centres and whether the pawn is lying down.
@@ -243,7 +260,10 @@ fn update_hitboxes(pawns: Query<(&Mover, &Children), With<Pawn>>, mut hitboxes: 
                     HitLocation::Head => head,
                     // A third of the way from the head to the chest.
                     HitLocation::Neck => head.lerp(torso, NECK_ALONG),
-                    HitLocation::Torso => torso,
+                    // Each half along the line from the torso to the head
+                    // (up standing, forward lying down).
+                    HitLocation::Torso => torso + (head - torso).normalize_or_zero() * u(TORSO_LOWER * 0.5),
+                    HitLocation::TorsoLower => torso - (head - torso).normalize_or_zero() * u(TORSO_UPPER * 0.5),
                     HitLocation::Legs => legs,
                 };
                 tf.rotation = if prone && hb.location != HitLocation::Head {
@@ -332,7 +352,7 @@ fn apply_damage(
             let headshot = d.location == HitLocation::Head;
             let text = match &attacker_name {
                 Some(a) if d.attacker != Some(d.target) => {
-                    format!("{a}  [{}{}]  {victim_name}", d.weapon, if headshot { " HS" } else { "" })
+                    format!("{a}  [{}{}]  {victim_name}", crate::killstreaks::feed_name(d.weapon), if headshot { " HS" } else { "" })
                 }
                 _ => format!("{victim_name} died"),
             };
@@ -581,9 +601,20 @@ pub fn pick_spawn(map: &MapInfo, sp: &Spawning) -> SpawnPoint {
             (Team::Allies, ..) => SpawnKind::AlliesStart,
             (Team::Axis, ..) => SpawnKind::AxisStart,
         };
-        let starts: Vec<_> = map.spawns.iter().filter(|s| s.kind == kind).filter(free).collect();
+        let all_starts: Vec<_> = map.spawns.iter().filter(|s| s.kind == kind).collect();
+        let starts: Vec<_> = all_starts.iter().copied().filter(free).collect();
         if !starts.is_empty() {
             return *starts[rng.random_range(0..starts.len())];
+        }
+        // More players than the side's start spots (Bloc has 8 a side, a
+        // full lobby 9): the free spawn nearest them, not one anywhere on
+        // the map (which put the odd one out by the enemy's start).
+        if !all_starts.is_empty() {
+            let centre = all_starts.iter().map(|s| s.pos).sum::<Vec3>() / all_starts.len() as f32;
+            let near = map.spawns.iter().filter(|s| matches!(s.kind, SpawnKind::Tdm | SpawnKind::Dm)).filter(free).min_by(|a, b| a.pos.distance(centre).total_cmp(&b.pos.distance(centre)));
+            if let Some(s) = near {
+                return SpawnPoint { yaw: all_starts[0].yaw, ..*s };
+            }
         }
     }
     let sab_kind = if team == Team::Allies { SpawnKind::SabAllies } else { SpawnKind::SabAxis };
@@ -634,7 +665,10 @@ pub fn pick_spawn(map: &MapInfo, sp: &Spawning) -> SpawnPoint {
         w -= DANGER_PENALTY * sp.grenades.iter().filter(|g| cod(g.distance(s.pos)) < GRENADE_DANGER).count() as f32;
         // An airstrike coming down there, as much as its danger.
         w -= DANGER_PENALTY * (sp.airstrike)(s.pos);
-        // Enemies that can see it (`spawnPerFrameUpdate`'s sight checks).
+        w
+    };
+    // Enemies that can see it (`spawnPerFrameUpdate`'s sight checks).
+    let sight = |s: &SpawnPoint| -> f32 {
         let facing = Vec3::new(-s.yaw.sin(), 0.0, -s.yaw.cos());
         let seen = sp
             .enemies
@@ -644,13 +678,70 @@ pub fn pick_spawn(map: &MapInfo, sp: &Spawning) -> SpawnPoint {
                 !(facing.dot(diff) < 0.0 && look.dot(diff) > 0.0) && (sp.sees)(*p + Vec3::Y * u(50.0), s.pos + Vec3::Y * u(50.0))
             })
             .count();
-        w - DANGER_PENALTY * seen as f32
+        DANGER_PENALTY * seen as f32
     };
     let mut candidates: Vec<(f32, SpawnPoint)> = map.spawns.iter().filter(wanted).filter(free).map(|s| (weight(s), *s)).collect();
-    if candidates.is_empty() {
-        candidates = map.spawns.iter().map(|s| (0.0, *s)).collect();
+    let top = if candidates.is_empty() { map.spawns.clone() } else { best_spawns(&mut candidates, sight) };
+    top[rng.random_range(0..top.len())]
+}
+
+/// The spawns with the best weight less their sight penalty, given each
+/// spawn's weight without it. The penalty only ever lowers a weight, so
+/// candidates are tried best first and the (raycasting) penalty is only
+/// worked out while one could still win.
+fn best_spawns(candidates: &mut [(f32, SpawnPoint)], penalty: impl Fn(&SpawnPoint) -> f32) -> Vec<SpawnPoint> {
+    candidates.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    let mut best = f32::MIN;
+    let mut top = Vec::new();
+    for (base, s) in candidates.iter() {
+        if *base < best {
+            break;
+        }
+        let w = base - penalty(s);
+        if w > best {
+            best = w;
+            top.clear();
+        }
+        if w >= best {
+            top.push(*s);
+        }
     }
-    let best = candidates.iter().map(|c| c.0).fold(f32::MIN, f32::max);
-    let top: Vec<&SpawnPoint> = candidates.iter().filter(|c| c.0 >= best).map(|c| &c.1).collect();
-    *top[rng.random_range(0..top.len())]
+    top
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    /// The bounded search picks exactly the spawns a full evaluation does.
+    #[test]
+    fn best_spawns_matches_full_evaluation() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for layout in 0..200 {
+            let count = 1 + (next() % 40) as usize;
+            // Coarse weights so ties happen; penalties in whole sightings.
+            let spawns: Vec<(f32, SpawnPoint, f32)> = (0..count)
+                .map(|i| {
+                    let base = (next() % 8) as f32 * 1000.0;
+                    let seen = if layout % 3 == 0 { 0.0 } else { (next() % 3) as f32 * DANGER_PENALTY };
+                    (base, SpawnPoint { pos: Vec3::X * i as f32, yaw: 0.0, kind: SpawnKind::Tdm }, seen)
+                })
+                .collect();
+            let penalty = |s: &SpawnPoint| spawns[s.pos.x as usize].2;
+            let full: Vec<f32> = spawns.iter().map(|(b, s, _)| b - penalty(s)).collect();
+            let best = full.iter().copied().fold(f32::MIN, f32::max);
+            let mut want: Vec<usize> = (0..count).filter(|&i| full[i] >= best).collect();
+            let mut candidates: Vec<(f32, SpawnPoint)> = spawns.iter().map(|(b, s, _)| (*b, *s)).collect();
+            let mut got: Vec<usize> = best_spawns(&mut candidates, penalty).iter().map(|s| s.pos.x as usize).collect();
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want, "layout {layout}");
+        }
+    }
 }

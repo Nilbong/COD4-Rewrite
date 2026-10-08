@@ -82,7 +82,7 @@ fn kill_values() -> (i32, i32, i32) {
         M::Ffa => (5, 5, 0),
         M::Dom | M::Koth => (5, 5, 1),
         M::Sd => (5, 5, 2),
-        M::Tdm | M::Sab => (10, 10, 2),
+        M::Tdm | M::Tdm3 | M::Sab => (10, 10, 2),
     }
 }
 

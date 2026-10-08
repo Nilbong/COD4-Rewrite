@@ -255,3 +255,78 @@ async fn per_ip_connection_cap_rejects_excess_sessions() {
     drop(host);
     f.stop().await;
 }
+
+#[tokio::test]
+async fn code_join_and_lobby_messages() {
+    let f = Fixture::start().await;
+    let mut host = f.host().await;
+    let code = host.code.unwrap();
+    let mut a = Session::connect(f.address, f.cert.clone(), Hello::JoinCode(code)).await.unwrap();
+    let mut b = Session::connect(f.address, f.cert.clone(), Hello::JoinCode(code)).await.unwrap();
+    assert!(a.code.is_none() && a.invite.is_none() && a.room == host.room);
+    for _ in 0..2 {
+        assert!(matches!(timeout(Duration::from_secs(2), host.next_control()).await.unwrap(), Some(Control::PeerJoined(_))));
+    }
+    // Player -> host, stamped with the real sender.
+    a.send_message(HOST, b"hello".to_vec()).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), host.next_control()).await.unwrap(),
+        Some(Control::Message { peer: a.peer, data: b"hello".to_vec() })
+    );
+    // Host -> everyone.
+    host.send_message(EVERYONE, b"roster".to_vec()).await.unwrap();
+    for s in [&mut a, &mut b] {
+        assert_eq!(
+            timeout(Duration::from_secs(2), s.next_control()).await.unwrap(),
+            Some(Control::Message { peer: HOST, data: b"roster".to_vec() })
+        );
+    }
+    // Host -> one player only.
+    host.send_message(b.peer, b"just b".to_vec()).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), b.next_control()).await.unwrap(),
+        Some(Control::Message { peer: HOST, data: b"just b".to_vec() })
+    );
+    assert!(timeout(Duration::from_millis(150), a.next_control()).await.is_err());
+    // Players can't message each other.
+    assert!(a.send_message(b.peer, b"x".to_vec()).await.is_err());
+    // The code dies with the room.
+    drop(a);
+    drop(b);
+    drop(host);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(Session::connect(f.address, f.cert.clone(), Hello::JoinCode(code)).await.is_err());
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn player_cannot_message_other_players_through_raw_frames() {
+    let f = Fixture::start().await;
+    let mut host = f.host().await;
+    let endpoint = transport::client_endpoint("127.0.0.1:0".parse().unwrap(), f.cert.clone()).unwrap();
+    let connection = endpoint.connect(f.address, transport::SERVER_NAME).unwrap().await.unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap();
+    transport::write_frame(&mut send, &Hello::JoinCode(host.code.unwrap()).encode().unwrap()).await.unwrap();
+    transport::read_frame(&mut recv).await.unwrap();
+    assert!(matches!(timeout(Duration::from_secs(2), host.next_control()).await.unwrap(), Some(Control::PeerJoined(_))));
+    let spoof = Control::Message { peer: EVERYONE, data: b"fake roster".to_vec() }.encode().unwrap();
+    transport::write_frame(&mut send, &spoof).await.unwrap();
+    timeout(Duration::from_secs(2), connection.closed()).await.unwrap();
+    assert!(!host.is_closed());
+    endpoint.close(VarInt::from_u32(0), b"done");
+    drop(host);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn guessing_codes_is_rate_limited() {
+    let f = Fixture::start().await;
+    let host = f.host().await;
+    for _ in 0..10 {
+        assert!(Session::connect(f.address, f.cert.clone(), Hello::JoinCode(LobbyCode::generate())).await.is_err());
+    }
+    // Locked out for a while, even with the right code.
+    assert!(Session::connect(f.address, f.cert.clone(), Hello::JoinCode(host.code.unwrap())).await.is_err());
+    drop(host);
+    f.stop().await;
+}

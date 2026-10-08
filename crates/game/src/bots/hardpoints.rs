@@ -25,13 +25,18 @@ pub(super) fn hardpoints(
     time: Res<Time>,
     radar: Option<Res<Radar>>,
     mut bots: Query<(Entity, &mut Bot, &Pawn, &Transform, &Killstreak, &mut HardpointInput), Without<Dead>>,
-    pawns: Query<(Entity, &Pawn, &Transform), Without<Dead>>,
+    pawns: Query<(Entity, &Pawn, &Transform, Option<&crate::loadout::Loadout>), Without<Dead>>,
     mut swept: Local<HashMap<Entity, (u32, f32)>>,
     mut ready: Local<HashMap<Entity, f32>>,
 ) {
     let now = time.elapsed_secs();
     let mut rng = rand::rng();
-    let everyone: Vec<(Entity, Pawn, Vec3)> = pawns.iter().map(|(e, p, tf)| (e, p.clone(), tf.translation)).collect();
+    // UAV Jammer keeps a pawn off the sweeps.
+    let everyone: Vec<(Entity, Pawn, Vec3)> = pawns
+        .iter()
+        .filter(|(.., loadout)| !crate::perks::has(*loadout, "specialty_gpsjammer"))
+        .map(|(e, p, tf, _)| (e, p.clone(), tf.translation))
+        .collect();
     let sim = std::env::var_os("COD4RW_SIM").is_some();
     for (me, mut bot, pawn, tf, streak, mut input) in &mut bots {
         // A new sweep of a UAV this bot sees (its team's; its own in

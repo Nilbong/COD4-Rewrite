@@ -87,7 +87,7 @@ impl Dressing {
             .iter()
             .map(|b| PreparedBone { name: b.name.clone(), parent: b.parent, bind_local: b.bind_local, anim_base: b.anim_base })
             .collect();
-        Some(PreparedModel { name: m.name.clone(), bones, surfaces, inverse_bindposes: m.inverse_bindposes.clone() })
+        Some(PreparedModel { name: m.name.clone(), bones, surfaces, inverse_bindposes: m.inverse_bindposes.clone(), extent: m.extent, bounds: m.bounds })
     }
 
     /// One surface: `None` leaves it out (the cornea); otherwise its mesh
@@ -132,8 +132,11 @@ impl Dressing {
         let Some(normal) = normal else { return unchanged };
         let image = self.normals.entry(normal.clone()).or_insert_with(|| normal_map(&content.vfs, &normal).map(|i| images.add(i))).clone();
         let Some(image) = image else { return unchanged };
-        let (Some(old_mesh), Some(old_material)) = (meshes.get(mesh), materials.get(material)) else { return unchanged };
-        let mut new_mesh = old_mesh.clone();
+        let Some(old_material) = materials.get(material) else { return unchanged };
+        // From the model, not the mesh asset: once that's on the GPU its
+        // vertices can't be read (a killcam dressing the gun again would
+        // panic).
+        let Some(mut new_mesh) = crate::content::surface_mesh(xm, surf, true) else { return unchanged };
         let tangents: Vec<[f32; 4]> = xm.surfs[surf]
             .verts
             .iter()
@@ -145,7 +148,7 @@ impl Dressing {
         new_mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
         let mut new_material = old_material.clone();
         new_material.normal_map_texture = Some(image);
-        Some((meshes.add(new_mesh), materials.add(new_material)))
+        Some((crate::mesh_bounds::add(meshes, new_mesh), materials.add(new_material)))
     }
 }
 

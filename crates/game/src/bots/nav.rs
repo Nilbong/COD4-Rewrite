@@ -470,43 +470,56 @@ impl NavGraph {
     /// One at a time (it uses [`NavGraph::path`]'s working arrays): a
     /// different bot asking while one runs gets [`Step::Busy`].
     pub fn path_sliced(&self, owner: u64, from: u32, to: u32, now: f32, budget: usize, slice: usize, extra: impl Fn(u32) -> f32) -> Step {
-        thread_local! {
-            static JOB: std::cell::RefCell<Option<(u64, f32, Job)>> = const { std::cell::RefCell::new(None) };
+        // One search at a time for all bots, kept across frames whichever
+        // thread the bots think on.
+        let mut sliced = SLICED.lock().unwrap_or_else(|e| e.into_inner());
+        let Sliced { job, scratch: s } = &mut *sliced;
+        s.fit(self.nodes.len());
+        // Another bot's search: wait, unless it's stale (its bot gone
+        // quiet for a second) or this bot now wants somewhere else.
+        if let Some((who, since, j)) = job.as_ref() {
+            let stale = now - since > 1.0;
+            let mine = *who == owner;
+            if !mine && !stale {
+                return Step::Busy;
+            }
+            if stale || j.to != to {
+                *job = None;
+                s.reset();
+            }
         }
-        let scratch = &SCRATCH;
-        JOB.with(|job| {
-            let mut job = job.borrow_mut();
-            scratch.with(|s| {
-                let mut s = s.borrow_mut();
-                s.fit(self.nodes.len());
-                // Another bot's search: wait, unless it's stale (its bot gone
-                // quiet for a second) or this bot now wants somewhere else.
-                if let Some((who, since, j)) = job.as_ref() {
-                    let stale = now - since > 1.0;
-                    let mine = *who == owner;
-                    if !mine && !stale {
-                        return Step::Busy;
-                    }
-                    if stale || j.to != to {
-                        *job = None;
-                        s.reset();
-                    }
+        if job.is_none() {
+            if from == to {
+                return Step::Found(vec![to]);
+            }
+            *job = Some((owner, now, Job::start(self, s, from, to)));
+        }
+        let (_, _, j) = job.as_mut().expect("job");
+        let result = self.step(j, s, budget, slice, extra);
+        if !matches!(result, Step::Working) {
+            *job = None;
+            s.reset();
+        }
+        result
+    }
+
+    /// What [`Self::path_sliced`] would do for `owner` heading to `to`,
+    /// without searching: `Busy` with another bot's search, `Working` to
+    /// carry on its own (its `from` unused), else `NoWay` (free to start).
+    pub fn sliced_state(&self, owner: u64, to: u32, now: f32) -> Step {
+        let sliced = SLICED.lock().unwrap_or_else(|e| e.into_inner());
+        match &sliced.job {
+            Some((who, since, j)) if now - since <= 1.0 => {
+                if *who != owner {
+                    Step::Busy
+                } else if j.to == to {
+                    Step::Working
+                } else {
+                    Step::NoWay
                 }
-                if job.is_none() {
-                    if from == to {
-                        return Step::Found(vec![to]);
-                    }
-                    *job = Some((owner, now, Job::start(self, &mut s, from, to)));
-                }
-                let (_, _, j) = job.as_mut().expect("job");
-                let result = self.step(j, &mut s, budget, slice, extra);
-                if !matches!(result, Step::Working) {
-                    *job = None;
-                    s.reset();
-                }
-                result
-            })
-        })
+            }
+            _ => Step::NoWay,
+        }
     }
 
     /// The link from `a` to `b`, if any.
@@ -588,7 +601,11 @@ mod tests {
             match g.path_sliced(1, 0, 899, frames as f32 * 0.016, 100_000, 50, avoid) {
                 Step::Found(p) => break p,
                 Step::Working => {
-                    assert!(matches!(g.path_sliced(2, 5, 10, frames as f32 * 0.016, 100_000, 50, avoid), Step::Busy));
+                    let now = frames as f32 * 0.016;
+                    assert!(matches!(g.sliced_state(2, 10, now), Step::Busy));
+                    assert!(matches!(g.sliced_state(1, 899, now), Step::Working));
+                    assert!(matches!(g.sliced_state(1, 898, now), Step::NoWay));
+                    assert!(matches!(g.path_sliced(2, 5, 10, now, 100_000, 50, avoid), Step::Busy));
                 }
                 _ => panic!("no way"),
             }
@@ -600,9 +617,16 @@ mod tests {
     }
 }
 
+/// The sliced search under way (whose, since when) and its working arrays.
+#[derive(Default)]
+struct Sliced {
+    job: Option<(u64, f32, Job)>,
+    scratch: Scratch,
+}
+static SLICED: std::sync::LazyLock<std::sync::Mutex<Sliced>> = std::sync::LazyLock::new(Default::default);
+
 thread_local! {
-    /// The sliced search's working arrays, and the one-off searches'.
-    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+    /// The one-off searches' working arrays.
     static PLAIN_SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 

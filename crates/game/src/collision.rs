@@ -204,12 +204,19 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
     }
     commands.insert_resource(faces);
 
-    // Terrain / curve patches: an indexed triangle soup.
+    // Terrain / curve patches: an indexed triangle soup. Not the brush
+    // entities' own triangles (kept about their origin: placed with their
+    // entity by [`spawn_brush_entity_collision`]); as world they stood
+    // unseen round the map's origin.
     if !clip.tri_indices.is_empty() {
         let verts: Vec<Vec3> = clip.verts.iter().map(|&v| units::pos(v)).collect();
+        let entity_tris: std::collections::HashSet<usize> = (1..clip.cmodels.len()).flat_map(|n| cmodel_tris(clip, n)).collect();
         let tris: Vec<[u32; 3]> = clip
             .tri_indices
             .chunks_exact(3)
+            .enumerate()
+            .filter(|(i, _)| !entity_tris.contains(i))
+            .map(|(_, t)| t)
             .filter(|t| t.iter().all(|&i| (i as usize) < verts.len()))
             .map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
             .collect();
@@ -223,42 +230,93 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
     info!("collision: {solid} solid brushes, {player_clip} player clip, {shot_clip} shot clip, {no_sight} sight-blocking, {skipped} other skipped");
 }
 
-/// The clip map's static models (props with collision: rocks, air
-/// conditioners, grass and shrub clumps). CoD4 traces them only for lines
-/// (bullets, sight: `CM_PointTraceStaticModels`), never for players moving,
-/// by the model's contents: solid ones stop bullets and sight
-/// ([`Layer::ShotClip`]), foliage only sight ([`Layer::NoSight`]). Each is
-/// its placed bounds, a box (CoD4 traces the model's collision triangles,
-/// which this doesn't read yet).
+/// The clip map's static models (props with collision: cars, crates,
+/// rocks, air conditioners, grass and shrub clumps). CoD4 traces them only
+/// for lines (bullets, sight: `CM_PointTraceStaticModels`), never for
+/// players moving, against each model's collision surfaces by their
+/// contents: solid ones stop bullets and sight ([`Layer::ShotClip`]),
+/// foliage only sight ([`Layer::NoSight`]). Each surface is its own
+/// triangles, placed with the model (its box where it has none).
+/// A model with no collision surfaces stops nothing, as in CoD4: the old
+/// way, one world-aligned box round the whole placed model, stopped shots
+/// well clear of a turned car's roof.
 pub fn spawn_static_model_collision(commands: &mut Commands, zone: &iw3::zone::Zone, clip: &ClipMap) {
-    let (mut solid, mut foliage) = (0, 0);
+    let (mut solid, mut foliage, mut boxes, mut tris) = (0, 0, 0, 0);
     for sm in &clip.static_models {
         let Some(model) = sm.model.and_then(|id| zone.xmodel(id)) else { continue };
-        let (layer, surface) = if model.contents & contents::SOLID != 0 {
-            solid += 1;
-            (Layer::ShotClip, "default")
-        } else if model.contents & contents::FOLIAGE != 0 {
-            foliage += 1;
-            (Layer::NoSight, "foliage")
-        } else {
-            continue;
+        let kind = |contents: i32| {
+            if contents & contents::SOLID != 0 {
+                Some((Layer::ShotClip, "default"))
+            } else if contents & contents::FOLIAGE != 0 {
+                Some((Layer::NoSight, "foliage"))
+            } else {
+                None
+            }
         };
-        let (a, b) = (units::pos(sm.absmin), units::pos(sm.absmax));
-        let (min, max) = (a.min(b), a.max(b));
-        let size = max - min;
-        if size.min_element() <= 0.0 {
+        let Some(model_kind) = kind(model.contents) else { continue };
+        if matches!(model_kind.0, Layer::ShotClip) {
+            solid += 1;
+        } else {
+            foliage += 1;
+        }
+        // The placement: `invScaledAxis` rows are the model's axes over its
+        // scale (CoD space).
+        let rows = sm.inv_scaled_axis.map(Vec3::from);
+        let len = rows[0].length();
+        if !(len > 1e-6) {
             continue;
         }
-        commands.spawn((
-            Collider::cuboid(size.x, size.y, size.z),
-            Surfaces([surface_index(surface); 6]),
-            CollisionLayers::new(layer, LayerMask::NONE),
-            Transform::from_translation((min + max) * 0.5),
-            Position((min + max) * 0.5),
-            static_body(),
-        ));
+        let scale = 1.0 / len;
+        let axes = rows.map(|r| r * scale * scale);
+        let origin = Vec3::from(sm.origin);
+        // Box axes in Bevy space: the model's forward, its up, and the
+        // third square to both (its left or right: a box doesn't mind).
+        let fx = units::dir(axes[0].normalize_or_zero().to_array());
+        let fy = units::dir(axes[2].normalize_or_zero().to_array());
+        let fz = fx.cross(fy).normalize_or_zero();
+        if fz == Vec3::ZERO {
+            continue;
+        }
+        let rotation = Quat::from_mat3(&Mat3::from_cols(fx, fy, fz));
+        for b in &model.coll_boxes {
+            let Some((layer, surface)) = kind(if b.contents != 0 { b.contents } else { model.contents }) else { continue };
+            // The surface's triangles, as CoD4 traces them.
+            if !b.tris.is_empty() {
+                let place = |v: [f32; 3]| units::pos((origin + axes[0] * v[0] + axes[1] * v[1] + axes[2] * v[2]).to_array());
+                let verts: Vec<Vec3> = b.tris.iter().flatten().map(|&v| place(v)).collect();
+                let indices: Vec<[u32; 3]> = (0..b.tris.len() as u32).map(|t| [t * 3, t * 3 + 1, t * 3 + 2]).collect();
+                tris += indices.len();
+                commands.spawn((
+                    Collider::trimesh(verts, indices),
+                    Surfaces([surface_index(surface); 6]),
+                    CollisionLayers::new(layer, LayerMask::NONE),
+                    Transform::default(),
+                    static_body(),
+                ));
+                continue;
+            }
+            let (mins, maxs) = (Vec3::from(b.mins), Vec3::from(b.maxs));
+            let size = (maxs - mins) * scale;
+            if size.min_element() <= 0.0 || !size.is_finite() {
+                continue;
+            }
+            let c = (mins + maxs) * 0.5;
+            let centre = units::pos((origin + axes[0] * c.x + axes[1] * c.y + axes[2] * c.z).to_array());
+            // Model X, Z, Y along the box's x, y, z.
+            let extent = Vec3::new(units::u(size.x), units::u(size.z), units::u(size.y));
+            commands.spawn((
+                Collider::cuboid(extent.x, extent.y, extent.z),
+                Surfaces([surface_index(surface); 6]),
+                CollisionLayers::new(layer, LayerMask::NONE),
+                Transform::from_translation(centre).with_rotation(rotation),
+                Position(centre),
+                Rotation(rotation),
+                static_body(),
+            ));
+            boxes += 1;
+        }
     }
-    info!("collision: {solid} solid and {foliage} foliage static models (bullets and sight only)");
+    info!("collision: {solid} solid and {foliage} foliage static models: {tris} triangles, {boxes} boxes (bullets and sight only)");
 }
 
 fn surface_index(name: &str) -> u8 {
@@ -285,6 +343,98 @@ fn brush_planes(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<(Vec3, f32)> {
     planes
 }
 
+/// Solid brush entities (`script_brushmodel`: Wet Work's water tank on
+/// its trailer, its radar, the hold's panels): their brushes, kept about
+/// their own origin in the clipMap, made solid where the entity stands
+/// (`places`: brush model, origin and turn, Bevy space). Triggers and
+/// other brush entities stay out (see [`spawn_collision`]).
+pub fn spawn_brush_entity_collision(commands: &mut Commands, clip: &ClipMap, places: &[(usize, Vec3, Quat)]) {
+    let mut count = 0;
+    for &(n, at, turn) in places {
+        let Some(m) = clip.cmodels.get(n) else { continue };
+        let mut brushes = Vec::new();
+        let mut stack = vec![(m.leaf_brush_node, 0)];
+        while let Some((i, depth)) = stack.pop() {
+            let Some(node) = usize::try_from(i).ok().and_then(|i| clip.leaf_brush_nodes.get(i)) else { continue };
+            if node.leaf_brush_count > 0 {
+                brushes.extend(node.brushes.iter().map(|&b| b as usize));
+            } else if depth < 64 {
+                for off in node.child_offsets.iter().filter(|&&o| o > 0) {
+                    stack.push((i + *off as i32, depth + 1));
+                }
+            }
+        }
+        for b in brushes {
+            let Some(brush) = clip.brushes.get(b) else { continue };
+            let layer = if brush.contents & (contents::SOLID | contents::GLASS) != 0 {
+                Layer::World
+            } else if brush.contents & contents::PLAYERCLIP != 0 {
+                Layer::PlayerClip
+            } else {
+                continue;
+            };
+            let points: Vec<Vec3> = brush_points(clip, brush).into_iter().map(|p| units::pos(p.to_array())).collect();
+            if points.len() < 4 {
+                continue;
+            }
+            let Some(collider) = Collider::convex_hull(points) else { continue };
+            let fallback = brush.side_materials.first().map_or(0, |&m| surface_type(clip, m as i64));
+            let surfaces = std::array::from_fn(|f| {
+                let m = brush.axial_materials[f / 3][f % 3];
+                if m < 0 { fallback } else { surface_type(clip, m as i64) }
+            });
+            commands.spawn((
+                collider,
+                Surfaces(surfaces),
+                CollisionLayers::new(layer, LayerMask::NONE),
+                Transform::from_translation(at).with_rotation(turn),
+                static_body(),
+            ));
+            count += 1;
+        }
+        // Its curved surfaces (a tank's round body): triangles.
+        let tris: Vec<[u32; 3]> = cmodel_tris(clip, n)
+            .into_iter()
+            .filter_map(|t| clip.tri_indices.get(t * 3..t * 3 + 3))
+            .filter(|t| t.iter().all(|&i| (i as usize) < clip.verts.len()))
+            .map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
+            .collect();
+        if !tris.is_empty() {
+            let verts: Vec<Vec3> = clip.verts.iter().map(|&v| units::pos(v)).collect();
+            commands.spawn((
+                Collider::trimesh(verts, tris),
+                CollisionLayers::new(Layer::World, LayerMask::NONE),
+                Transform::from_translation(at).with_rotation(turn),
+                static_body(),
+            ));
+            count += 1;
+        }
+    }
+    info!("collision: {count} brushes and meshes of {} brush entities", places.len());
+}
+
+/// A clipMap brush model's triangles (indices into `tri_indices` / 3),
+/// from its collision AABB trees down to their partitions.
+fn cmodel_tris(clip: &ClipMap, n: usize) -> Vec<usize> {
+    let Some(m) = clip.cmodels.get(n) else { return Vec::new() };
+    let mut out = Vec::new();
+    let first = m.first_coll_aabb as usize;
+    let mut stack: Vec<(usize, u32)> = (first..first + m.coll_aabb_count as usize).map(|i| (i, 0)).collect();
+    while let Some((i, depth)) = stack.pop() {
+        let Some(node) = clip.aabb_trees.get(i) else { continue };
+        if node.child_count > 0 {
+            if depth < 64 {
+                let c = node.index.max(0) as usize;
+                stack.extend((c..c + node.child_count as usize).map(|j| (j, depth + 1)));
+            }
+        } else if let Some(p) = usize::try_from(node.index).ok().and_then(|p| clip.partitions.get(p)) {
+            let f = p.first_tri.max(0) as usize;
+            out.extend(f..f + p.tri_count as usize);
+        }
+    }
+    out
+}
+
 fn brush_points(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<Vec3> {
     let planes = brush_planes(clip, brush);
     let mut out: Vec<Vec3> = Vec::new();
@@ -309,4 +459,29 @@ fn brush_points(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<Vec3> {
         }
     }
     out
+}
+
+/// Debug (`COD4RW_RAYTEST=x,y,z,x,y,z[;...]`, CoD units): a few seconds
+/// into the match, cast a bullet's ray between each pair of points and log
+/// what stops it, for checking collision without shooting.
+pub fn ray_test(time: Res<Time>, spatial: SpatialQuery, mut done: Local<bool>, layers: Query<&CollisionLayers>) {
+    if *done || time.elapsed_secs() < 8.0 {
+        return;
+    }
+    *done = true;
+    let Ok(spec) = std::env::var("COD4RW_RAYTEST") else { return };
+    for pair in spec.split(';') {
+        let v: Vec<f32> = pair.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        let [ax, ay, az, bx, by, bz] = v[..] else { continue };
+        let (a, b) = (units::pos([ax, ay, az]), units::pos([bx, by, bz]));
+        let Ok(dir) = Dir3::new(b - a) else { continue };
+        match spatial.cast_ray(a, dir, (b - a).length(), true, &bullet_filter()) {
+            Some(hit) => {
+                let at = units::to_cod(a + dir * hit.distance);
+                let layer = layers.get(hit.entity).map(|l| format!("{:?}", l.memberships)).unwrap_or_default();
+                info!("raytest {pair}: hit at ({:.0}, {:.0}, {:.0}) {layer}", at[0], at[1], at[2]);
+            }
+            None => info!("raytest {pair}: clear"),
+        }
+    }
 }

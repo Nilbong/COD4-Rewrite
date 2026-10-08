@@ -94,3 +94,76 @@ pub fn load(zone: &Zone, world: &GfxWorld, images: &mut Assets<Image>) -> Vec<Op
         })
         .collect()
 }
+
+/// Map lighting: CoD4's own lightmaps and grid (the default), or the
+/// re-baked ones (`crate::bake`) where a bake of the map is cached. Set from
+/// the settings (`r_maplighting`); `COD4RW_MAPLIGHTING=rebaked|original`
+/// overrides. Takes effect from the next map load.
+static REBAKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_rebaked(on: bool) {
+    REBAKED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn rebaked_wanted() -> bool {
+    // Ray-traced lighting reads CoD4's (`shaders/world_deferred.wgsl`).
+    if crate::ui::lighting() != crate::rtgi::Lighting::Baked {
+        return false;
+    }
+    match std::env::var("COD4RW_MAPLIGHTING") {
+        Ok(v) => v.eq_ignore_ascii_case("rebaked"),
+        Err(_) => REBAKED.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The re-baked lighting in use for a map: lightmaps indexed like
+/// `GfxWorld::lightmaps` (linear half floats, see `crate::bake::cache`)
+/// and the light grid's cubes.
+pub struct Rebaked {
+    pub lightmaps: Vec<Option<Handle<Image>>>,
+    /// Grid point -> light on surfaces facing CoD +x, -x, +y, -y, +z, -z.
+    pub grid: std::collections::HashMap<[u32; 3], [[f32; 3]; 6]>,
+}
+
+/// The map's cached bake, if wanted and made from this install's zone.
+///
+/// With the showcase on (`crate::tod_light`), the map's time-of-day
+/// keyframes instead, blended for the clock, when it has them.
+pub fn load_rebaked(commands: &mut Commands, map: &str, zone_path: &std::path::Path, images: &mut Assets<Image>) -> Option<Rebaked> {
+    if crate::atmos::climate::showcase() && crate::ui::lighting() == crate::rtgi::Lighting::Baked {
+        // The clock's start (`COD4RW_TOD`); without it, noon until the
+        // clock is set to the map's hour a frame or two in.
+        let hour = std::env::var("COD4RW_TOD").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(12.0).rem_euclid(24.0);
+        if let Some((rebaked, tod)) = crate::tod_light::load(map, zone_path, images, hour) {
+            commands.insert_resource(tod);
+            return Some(rebaked);
+        }
+    }
+    if !rebaked_wanted() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    let Some(baked) = crate::bake::cache::load(map, crate::bake::cache::source_stamp(zone_path)) else {
+        info!("rebaked lighting: no bake of {map} (COD4RW_BAKE={map} makes one)");
+        return None;
+    };
+    let lightmaps = baked
+        .atlases
+        .into_iter()
+        .map(|a| {
+            let a = a?;
+            let bytes: Vec<u8> = a.data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut image = Image::new(
+                Extent3d { width: a.w, height: a.h * 2, depth_or_array_layers: 1 },
+                TextureDimension::D2,
+                bytes,
+                TextureFormat::Rgba16Float,
+                RenderAssetUsages::RENDER_WORLD,
+            );
+            image.sampler = ImageSampler::linear();
+            Some(images.add(image))
+        })
+        .collect();
+    info!("rebaked lighting: {map} loaded in {:?}", t.elapsed());
+    Some(Rebaked { lightmaps, grid: baked.grid.into_iter().collect() })
+}

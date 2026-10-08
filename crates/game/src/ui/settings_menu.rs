@@ -60,6 +60,38 @@ pub(super) fn build(menus: &mut HashMap<String, Arc<Menu>>) {
         if has_nav(name) {
             fix_nav(Arc::make_mut(menu));
         }
+        // A page goes back to its list (Escape, B and its Back button): the
+        // list's buttons close the list to open a page, so CoD4's "close
+        // self" would drop all the way out.
+        // The lists themselves go back to where they were opened from: the
+        // main menu (under them) or, in a match, its pause menu.
+        if name == "main_options" || name == "main_controls" {
+            let menu = Arc::make_mut(menu);
+            let back = "\"close\" \"self\" ; \"settingsBack\" ; ".to_owned();
+            menu.on_esc = back.clone();
+            for it in menu.items.iter_mut().filter(|it| it.ty == item_type::BUTTON && it.text.eq_ignore_ascii_case("@MENU_BACK")) {
+                it.action = format!("\"play\" \"mouse_click\" ; {back}");
+            }
+        }
+        if let Some(parent) = parent_of(name) {
+            let menu = Arc::make_mut(menu);
+            let back = format!("\"close\" \"self\" ; \"open\" \"{parent}\" ; ");
+            menu.on_esc = back.clone();
+            for it in menu.items.iter_mut().filter(|it| it.ty == item_type::BUTTON && it.text.eq_ignore_ascii_case("@MENU_BACK")) {
+                it.action = format!("\"play\" \"mouse_click\" ; {back}");
+            }
+        }
+    }
+}
+
+/// The settings list a page belongs to.
+fn parent_of(page: &str) -> Option<&'static str> {
+    match page {
+        "options_look" | "options_move" | "options_shoot" | "options_misc" | "controls_multi" | "options_control_defaults" => Some("main_controls"),
+        "options_graphics" | "options_graphics_texture" | "options_sound" | "options_game" | "options_graphics_defaults" | "options_defaults" => {
+            Some("main_options")
+        }
+        _ => None,
     }
 }
 

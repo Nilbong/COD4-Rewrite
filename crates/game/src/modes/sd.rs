@@ -214,9 +214,17 @@ fn hold_still(objectives: Res<Objectives>, mut pawns: Query<&mut MoveInput>) {
     }
 }
 
+/// Joining (or changing side, or picking a class) this long into a round
+/// still spawns (`level.gracePeriod`).
+const GRACE: f32 = 15.0;
+
 /// One life a round: the dead wait for the next.
 fn one_life(time: Res<Time>, round: Option<Res<SdRound>>, mut dead: Query<&mut Dead, Added<Dead>>) {
     let now = time.elapsed_secs();
+    let locked = round.as_ref().is_some_and(|r| r.over.is_none() && now - r.started > GRACE);
+    for team in [Team::Allies, Team::Axis] {
+        crate::modes::lock_respawns(team, locked);
+    }
     if round.is_some_and(|r| r.over.is_none()) {
         for mut d in &mut dead {
             // Round restarts respawn at once; killed pawns wait.
@@ -433,11 +441,13 @@ fn rounds(
             objectives.round_over = Some((winner, key, text));
             objectives.using.clear();
             round.over = Some(now);
+            crate::killcam::round_over(now);
             for (e, ..) in &pawns {
                 commands.entity(e).insert(Frozen);
             }
         }
-        Some(at) if now - at >= ROUND_DELAY => {
+        // (After the round's final killcam, if there is one.)
+        Some(at) if now - at >= ROUND_DELAY && !crate::killcam::busy() => {
             let number = round.number + 1;
             // Sides swap every `ROUND_SWITCH` rounds (`onRoundSwitch`),
             // except at one round each from winning: then the team ahead

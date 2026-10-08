@@ -46,6 +46,12 @@ pub(super) fn start(
     let Ok((player, pawn)) = player.single() else { return };
     // The side the lobby put us on.
     fe.player_team = pawn.team;
+    // Headquarters' supply drop cards show their guns and characters in
+    // 3D, as the menus do (also when started without the menus).
+    if crate::hq::active() {
+        let vfs = fe.assets.vfs();
+        fe.previews.start(vfs);
+    }
     if fe.match_only {
         return;
     }
@@ -142,6 +148,17 @@ pub(super) fn respond(
                 fe.locals.insert("ui_team".into(), r.trim_start_matches("changeclass_").to_owned());
                 fe.open("changeclass");
             }
+            // Change Team: CoD4's team menu, which answers with a side.
+            "changeteam" => {
+                fe.close(&menu);
+                fe.open("team_marinesopfor");
+            }
+            "allies" | "axis" | "autoassign" => {
+                fe.close(&menu);
+                fe.team_change = Some((slot, r.clone()));
+            }
+            // No spectating yet: back to the match.
+            "spectator" => fe.close(&menu),
             // Back to the match, unless there's no class to play yet.
             "back" if !awaiting => fe.close(&menu),
             "back" => {}
@@ -153,7 +170,7 @@ pub(super) fn respond(
                     }
                     fe.stack.clear();
                     fe.focus = None;
-                    if equipped && !dead {
+                    if equipped && !dead && !crate::tdm::in_grace_period(now) {
                         let text = fe.assets.localize("@MP_CHANGE_CLASS_NEXT_SPAWN");
                         hud.message(text, now);
                     }
@@ -161,6 +178,65 @@ pub(super) fn respond(
                 None => debug!("ui: unhandled menu response {response:?} from {menu}"),
             },
         }
+    }
+}
+
+/// A side picked in the team menu (`_menus.gsc`'s `menuAllies`/`menuAxis`/
+/// `menuAutoAssign`): the player goes over, dying if alive (which isn't
+/// counted as a death), and picks a class for the new side. Picking the side
+/// they're on changes nothing; auto-assign takes the side with fewer players.
+pub(super) fn switch_teams(
+    mut commands: Commands,
+    mut fe: ResMut<Frontend>,
+    mut players: Query<(Entity, &crate::splitscreen::LocalSlot, &mut crate::combat::Pawn)>,
+    everyone: Query<&crate::combat::Pawn, Without<crate::splitscreen::LocalSlot>>,
+    (online, net): (Option<Res<crate::online::Online>>, Option<Res<crate::netplay::NetStart>>),
+) {
+    use crate::combat::Team;
+    let Some((slot, side)) = fe.team_change.take() else { return };
+    let counts = |team: Team| {
+        everyone.iter().filter(|p| p.team == team).count() + players.iter().filter(|(_, s, p)| s.0 != slot && p.team == team).count()
+    };
+    let (allies, axis) = (counts(Team::Allies), counts(Team::Axis));
+    let Some((e, _, mut pawn)) = players.iter_mut().find(|(_, s, _)| s.0 == slot) else { return };
+    let team = match side.as_str() {
+        "allies" => Team::Allies,
+        "axis" => Team::Axis,
+        _ => {
+            if allies == axis { pawn.team } else if allies < axis { Team::Allies } else { Team::Axis }
+        }
+    };
+    if team == pawn.team {
+        return;
+    }
+    info!("ui: player {} joins {team:?}", slot + 1);
+    // An online friend's side is the host's to change: ask it to.
+    if let (Some(online), Some(net)) = (online, net)
+        && net.me != crate::online::HOST
+    {
+        online.send(crate::online::HOST, &crate::online::lobby::LobbyMsg::SwitchTeam);
+    }
+    pawn.team = team;
+    if slot == 0 {
+        fe.player_team = team;
+    }
+    commands.entity(e).insert((AwaitingClass, Dead { respawn_at: f32::INFINITY, killer: None }, Frozen));
+    let name = if team == Team::Axis { "opfor" } else { "marines" };
+    if crate::splitscreen::active() {
+        fe.open_for(slot, "changeclass", team);
+    } else {
+        fe.locals.insert("ui_team".into(), name.into());
+        fe.menu_slot = 0;
+        fe.open("changeclass");
+    }
+}
+
+/// The match is over ([`crate::tdm::MatchOver`]): back to the lobby.
+pub(super) fn leave_when_over(mut commands: Commands, mut fe: ResMut<Frontend>, over: Option<Res<crate::tdm::MatchOver>>) {
+    if over.is_some() {
+        commands.remove_resource::<crate::tdm::MatchOver>();
+        fe.leave = true;
+        fe.back_to_lobby = true;
     }
 }
 
@@ -221,7 +297,11 @@ impl Frontend {
             let variant = custom.and_then(|_| crate::supply::inventory().equipped(base + k, &weapon));
             Some(Gun {
                 spec: format!("{weapon}:{}", attachments::names(set).join("+")),
-                camo: variant.filter(|_| camo == 0).map_or(camo, |v| v.camo),
+                // The red dot's reticle rides on the camo number.
+                camo: crate::reticles::with_camo(
+                    variant.filter(|_| camo == 0).map_or(camo, |v| v.camo),
+                    custom.map_or_else(Default::default, |_| self.class_reticle(base + k)),
+                ),
                 name: variant.map_or(name.clone(), |v| format!("{name} {}", v.name)),
                 variant: variant.map(|v| v.id.clone()),
             })

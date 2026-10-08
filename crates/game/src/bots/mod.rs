@@ -60,9 +60,10 @@ impl Plugin for BotsPlugin {
         app.init_resource::<Callouts>()
             .init_resource::<TeamIntel>()
             .init_resource::<NavTrouble>()
+            .add_systems(Update, accuracy_by_range.run_if(crate::state::in_game).run_if(|| std::env::var_os("COD4RW_SIM").is_some()))
             .add_systems(
                 Update,
-                (class::class_bots, floor_line, build_nav, build_tactics, check_objectives, hardpoints::hardpoints, grenade::plan_grenades, equipment::plan_gear, think, resupply::resupply, knife, objective::use_objectives)
+                (class::class_bots, floor_line, build_nav, build_tactics, check_objectives, hardpoints::hardpoints, grenade::plan_grenades, equipment::plan_gear, think, resupply::resupply, knife, objective::use_objectives, crate::cover::bots::cover_bots)
                     .chain()
                     .before(crate::movement::MovementSet)
                     .run_if(crate::state::in_game),
@@ -385,6 +386,37 @@ struct Engagement {
     /// Moving or not, and since when.
     moving: bool,
     moving_since: f32,
+    /// Where the bot thinks the target is, off from where it is: a slow
+    /// wander (radians, yaw and pitch) and when it was last moved on.
+    wander: Vec2,
+    wander_at: f32,
+}
+
+/// How far, as an angle, a bot's idea of where to aim wanders (its
+/// standard deviation, radians): about 0.72 degrees at the lowest skill,
+/// 0.32 at the highest. The same angle is nothing on a target 10 m away
+/// (its chest is 3 degrees wide) and much of one 50 m away (0.5 degrees),
+/// so bots miss more the further they shoot, as players do. With
+/// [`AIM_WANDER_FAR`], bot-vs-bot sims (Overgrown, Crossfire, Strike, 4
+/// min each) went from hitting 18, 14, 15 and 16% of shots at 0-15,
+/// 15-30, 30-45 and 45+ m to 18, 13, 8.5 and 7%.
+fn aim_wander_sd(skill: f32) -> f32 {
+    // Debug: `COD4RW_AIMWANDER=<scale>` (0 for none) for A/B sims.
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let scale = *SCALE.get_or_init(|| std::env::var("COD4RW_AIMWANDER").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
+    (0.0125 - 0.0069 * skill.clamp(0.0, 1.0)) * scale
+}
+/// How quickly it wanders (seconds to settle).
+const AIM_WANDER_TIME: f32 = 0.35;
+/// Past 15 m it widens, by this much more at 45 m and beyond.
+const AIM_WANDER_FAR: f32 = 0.28;
+/// A target strafing across the view at full run widens it this much more.
+const AIM_WANDER_STRAFE: f32 = 1.5;
+
+/// Reaction time grows with the target's distance past 30 m (1180 units),
+/// by up to 40% at 60 m and beyond: a far figure is harder to make out.
+fn reaction_scale(dist: f32) -> f32 {
+    1.0 + 0.4 * ((dist - u(1180.0)) / u(1180.0)).clamp(0.0, 1.0)
 }
 
 #[derive(Component)]
@@ -914,6 +946,14 @@ fn build_tactics(
 
 /// Seconds between perception updates and between tactical decisions.
 const LOOK_INTERVAL: f32 = 0.05;
+/// On the move, someone remembered is pre-aimed only within this (cosine)
+/// of the way the bot is going: about 50 degrees.
+const PREAIM_AHEAD: f32 = 0.64;
+/// Seconds between checks of the angles along the way (before skill): real
+/// players walking look to the side 28% of the time, bots did 51% at 1.5-3.5.
+const CHECK_GAP: (f32, f32) = (3.0, 6.0);
+/// Out of sight this long on the way to cover, a bot turns to run.
+const COVER_TURN_AFTER: f32 = 0.35;
 const DECIDE_INTERVAL: f32 = 0.25;
 
 /// With `COD4RW_SIM`: time spent thinking (all of `think`) and planning
@@ -930,6 +970,15 @@ static ROUTES_THIS_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 const ROUTES_PER_FRAME: u32 = 1;
 /// Expansions a route search gets a frame (about 0.3 ms).
 const ROUTE_SLICE: usize = 1500;
+/// Extra route cost (units per node) for leaving the ground real players
+/// walk (`tools/route_overlap.py` measures how close bots come);
+/// `COD4RW_ROUTEPULL=<units>` overrides it for tuning.
+static REAL_ROUTE_PULL_OVERRIDE: std::sync::LazyLock<Option<f32>> =
+    std::sync::LazyLock::new(|| std::env::var("COD4RW_ROUTEPULL").ok().and_then(|v| v.parse().ok()));
+const REAL_ROUTE_PULL_DEFAULT: f32 = 16.0;
+fn real_route_pull() -> f32 {
+    REAL_ROUTE_PULL_OVERRIDE.unwrap_or(REAL_ROUTE_PULL_DEFAULT)
+}
 static DECIDES_THIS_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const DECIDES_PER_FRAME: u32 = 3;
 /// Phases of [`think`] (µs over the log period): the shared start (team
@@ -989,8 +1038,12 @@ fn think(
     let dt = time.delta_secs().max(1e-4);
     let mut rng = rand::rng();
 
+    // A suppressed gun gives nobody away (as it keeps them off the radar).
     for s in shots.read() {
-        fired_at.insert(s.shooter, now);
+        let silenced = pawns.get(s.shooter).ok().and_then(|p| p.4).is_some_and(|l| l.gun().spec.contains("silencer"));
+        if !silenced {
+            fired_at.insert(s.shooter, now);
+        }
     }
     let hits: Vec<(Entity, Entity)> = damage.read().filter_map(|d| d.attacker.map(|a| (d.target, a))).collect();
     let snapshot: Vec<PawnView> = pawns
@@ -1174,7 +1227,7 @@ fn think(
             mates: plans.iter().filter(|m| m.team == pawn.team && m.entity != me && !crate::combat::free_for_all()).collect(),
             lateral,
             trouble: &trouble.0,
-            motion: motion_lib.as_deref().map(|m| &*m.0),
+            motion: motion_lib.as_deref().map(|m| &*m.0).filter(|_| !lab::on("nomotion")),
             objectives: objectives.as_deref().filter(|o| !o.flags.is_empty() || !o.sites.is_empty() || o.hq.is_some()),
         };
         // At most a few decisions a frame: one over waits a frame.
@@ -1459,8 +1512,8 @@ fn decide(
             if bot.engagement.as_ref().is_none_or(|e| e.target != target) {
                 let noticed = c.noticed_at.unwrap_or(now);
                 let alarmed = bot.alarm.is_some_and(|a| a.target == target && now >= a.at);
-                let reaction = bot.reaction * (0.25 * gaussian(rng)).exp() * if alarmed { ALARMED_REACTION } else { 1.0 };
                 let dist = c.pos.distance(feet);
+                let reaction = bot.reaction * (0.25 * gaussian(rng)).exp() * if alarmed { ALARMED_REACTION } else { 1.0 } * reaction_scale(dist);
                 bot.engagement = Some(Engagement {
                     target,
                     react_at: noticed + reaction,
@@ -1483,6 +1536,8 @@ fn decide(
                     ads_roll: 1.0,
                     moving: false,
                     moving_since: now,
+                    wander: Vec2::ZERO,
+                    wander_at: now,
                 });
             }
             bot.set_mode(Mode::Engage, now);
@@ -1496,7 +1551,7 @@ fn decide(
                     bot.engagement = Some(Engagement {
                         target,
                         react_at: noticed
-                            + bot.reaction * (0.25 * gaussian(rng)).exp() * if alarmed { ALARMED_REACTION } else { 1.0 },
+                            + bot.reaction * (0.25 * gaussian(rng)).exp() * if alarmed { ALARMED_REACTION } else { 1.0 } * reaction_scale(c.pos.distance(feet)),
                         aim_head: false,
                         crouch: false,
                         last_visible: now,
@@ -1508,6 +1563,8 @@ fn decide(
                         ads_roll: 1.0,
                         moving: false,
                         moving_since: now,
+                        wander: Vec2::ZERO,
+                        wander_at: now,
                     });
                 }
             }
@@ -1917,7 +1974,16 @@ fn act(
     let sprint_leg = bot.sprint_choice && !contact_imminent && far_to_go && mover.sprint_left > 0.5;
 
     // Aim and shoot at whoever we're fighting, even on the way to cover.
-    let fight_dist = if matches!(bot.mode, Mode::Engage | Mode::Cover) {
+    // Breaking for cover with them out of sight: turn and run, eyes on the
+    // way (bots backpedalled 80% of their way to cover; real players run).
+    let running_for_cover = bot.mode == Mode::Cover
+        && bot.dest.is_some_and(|d| d.distance(feet) > u(150.0))
+        && bot.engagement.as_ref().is_none_or(|e| {
+            // (Its own record: `fight_aim`, which keeps `last_visible`, isn't
+            // run while turned away.)
+            bot.know.contacts.get(&e.target).is_none_or(|c| !c.noticed() && now - c.last_visible > COVER_TURN_AFTER)
+        });
+    let fight_dist = if matches!(bot.mode, Mode::Engage | Mode::Cover) && !running_for_cover {
         let moving = Vec2::new(mover.velocity.x, mover.velocity.z).length() > u(40.0);
         fight_aim(bot, view, eye, feet, moving, weapon, now, rng, &mut plan)
     } else {
@@ -1983,6 +2049,18 @@ fn act(
             plan.forward = 1.0;
         } else if dist < p.preferred_range * 0.5 && p.aggression < 0.5 {
             plan.forward = -1.0;
+        }
+        // A flag we want close by: fight our way onto it, as real players
+        // take a flag under fire (Killhouse's B in the demos changed hands
+        // all match; bots met there, fought, and nobody ever stood on it).
+        if let Some(to) = flag_under_fire(tc, feet).filter(|&to| walkable(spatial, nav, feet, to)) {
+            let fwd = (rot * Vec3::NEG_Z).with_y(0.0).normalize_or_zero();
+            let (f, r) = (to.dot(fwd), to.dot(right));
+            plan.forward = if f.abs() > 0.38 { f.signum() } else { 0.0 };
+            plan.right = if r.abs() > 0.38 { r.signum() } else { 0.0 };
+            if plan.stance == Stance::Prone {
+                plan.stance = Stance::Crouch;
+            }
         }
         // Prone: no strafing.
         if plan.stance == Stance::Prone {
@@ -2070,7 +2148,9 @@ fn act(
         // On the move, people mostly look where they're going: pre-aim
         // someone remembered only if they're roughly ahead (unless they were
         // just seen close by).
-        let behind = going.is_some_and(|g| level(c.pos - feet).dot(g) < 0.26)
+        // (Real players walking look a median 30 degrees off their way, against
+        // bots' 80 with the old 75-degree allowance: `COD4RW_LOOKSTAT`.)
+        let behind = going.is_some_and(|g| level(c.pos - feet).dot(g) < PREAIM_AHEAD)
             && !(c.age(now) < 3.0 && dist < u(800.0));
         dist < u(2500.0) && !flanking && !behind && now >= bot.no_preaim_until
     }) {
@@ -2198,7 +2278,7 @@ fn act(
         if bot.check.is_some_and(|(_, until)| now > until) {
             bot.check = None;
             // Better players check more of them.
-            bot.next_check = now + rng.random_range(1.5..3.5) * (1.0 + 0.6 - bot.skill);
+            bot.next_check = now + rng.random_range(CHECK_GAP.0..CHECK_GAP.1) * (1.0 + 0.6 - bot.skill);
         }
         if let (Some(t), None, Some(steer), false) = (tc.tactics, bot.check, bot.steer, sprint_leg) {
             if now >= bot.next_check {
@@ -2434,7 +2514,18 @@ fn fight_aim(
     };
     let half = if eng.aim_head { u(5.0) } else { u(9.0) };
     let width = 2.0 * (half / dist.max(u(16.0))).atan();
-    let goal = angles_to(eye, point);
+    // The aim point wanders (an Ornstein-Uhlenbeck walk), wider while the
+    // target crosses the view: the bot fires believing it's on.
+    let dt = (now - eng.wander_at).clamp(0.0, 0.1);
+    eng.wander_at = now;
+    let to = (pos - feet).with_y(0.0).normalize_or_zero();
+    let across = (c.vel - to * c.vel.dot(to)).with_y(0.0).length();
+    // (Wider still the further away: past 15 m, up to 28% more at 45.)
+    let far = 1.0 + AIM_WANDER_FAR * ((dist - u(590.0)) / u(1180.0)).clamp(0.0, 1.0);
+    let sd = aim_wander_sd(skill) * far * (1.0 + AIM_WANDER_STRAFE * (across / u(190.0)).min(1.0));
+    let k = dt / AIM_WANDER_TIME;
+    eng.wander += -eng.wander * k + Vec2::new(gaussian(rng), gaussian(rng) * 0.6) * sd * (2.0 * k).sqrt();
+    let goal = angles_to(eye, point) + eng.wander;
     let reacted = now >= eng.react_at;
     bot.look_src = if reacted { "fight" } else { "react" };
     if reacted {
@@ -2580,6 +2671,23 @@ fn emergence_point(nav: &NavGraph, spatial: &SpatialQuery, feet: Vec3, eye: Vec3
 }
 
 /// Whether a few steps in `dir` stay on walkable ground.
+/// In a fight, the way (flat, unit) onto a flag the team wants within
+/// [`FIGHT_FOR_FLAG`], if the bot isn't standing on it already.
+fn flag_under_fire(tc: &TacCtx, feet: Vec3) -> Option<Vec3> {
+    let o = tc.objectives?;
+    o.flags
+        .iter()
+        .filter(|f| f.owner != Some(tc.team) || f.contested || f.capture.is_some_and(|(t, _)| t != tc.team))
+        .filter(|f| !f.contains(feet + Vec3::Y * u(1.0)))
+        .map(|f| (f, (f.pos - feet).with_y(0.0)))
+        .filter(|(_, d)| d.length() < FIGHT_FOR_FLAG)
+        .min_by(|a, b| a.1.length().total_cmp(&b.1.length()))
+        .map(|(_, d)| d.normalize_or_zero())
+}
+
+/// How near a wanted flag a bot in a fight keeps moving onto it.
+const FIGHT_FOR_FLAG: f32 = u(450.0);
+
 fn walkable(spatial: &SpatialQuery, nav: Option<&NavGraph>, feet: Vec3, dir: Vec3) -> bool {
     let probe = feet + dir.normalize_or_zero() * u(48.0);
     let wall_free = {
@@ -2627,7 +2735,17 @@ fn follow_path(
             bot.next_repath = now + 3.0;
         }
         if let Some(nav) = nav {
-            if let (Some(a), Some(b)) = (reachable_node(nav, spatial, feet), nav.nearest(dest)) {
+            let b = nav.nearest(dest);
+            // Another bot's search under way: wait without working out a
+            // start; carrying on our own: its start is already set.
+            let state = b.map(|b| nav.sliced_state(bot.route_id, b, now));
+            if matches!(state, Some(nav::Step::Busy)) {
+                bot.routing = false;
+                bot.next_repath = now;
+            } else if let (Some(a), Some(b)) = (
+                if matches!(state, Some(nav::Step::Working)) { b } else { reachable_node(nav, spatial, feet) },
+                b,
+            ) {
                 // Prefer routes along walls and cover over open ground;
                 // rushers take the main lanes, flankers avoid them.
                 let caution = 0.3 + 0.7 * (1.0 - bot.personality.aggression);
@@ -2653,10 +2771,13 @@ fn follow_path(
                         .map_or(0.0, |&(n, led)| n.min(2) as f32 + if led { 2.0 } else { 0.0 })
                 };
                 let cost = |i: u32| {
+                    // Where real players walk (demos, `learned`) is the way
+                    // to go for most: off it costs extra. Flankers still
+                    // keep to the edges of the busiest lanes.
                     let lane = match role {
-                        Role::Rusher => (1.0 - traffic(i)) * u(8.0),
+                        Role::Rusher => (1.0 - traffic(i)) * u(real_route_pull() * 1.5),
                         Role::Flanker => traffic(i) * u(40.0),
-                        Role::Anchor => 0.0,
+                        Role::Anchor => (1.0 - traffic(i)) * u(real_route_pull()),
                     };
                     let pos = nav.nodes[i as usize].pos;
                     let side = tc.lateral.map_or(0.0, |l| (l.of(pos) - bot.lane).abs().min(1.5));
@@ -2820,10 +2941,9 @@ fn follow_path(
         // as players do, while the way is roughly ahead and clear.
         let facing = Vec3::new(view.forward().x, 0.0, view.forward().z).normalize_or_zero();
         let want = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
-        let clear_ahead = walkable(spatial, nav, feet, facing);
         // Once steering like that, keep at it through bends (up to 65°).
         let limit = if bot.last_keys == (1.0, 0.0) { 65f32 } else { 45f32 };
-        if bot.prev_look == "steer" && want.dot(facing) > limit.to_radians().cos() && clear_ahead {
+        if bot.prev_look == "steer" && want.dot(facing) > limit.to_radians().cos() && walkable(spatial, nav, feet, facing) {
             keys = (1.0, 0.0);
         } else if keys != keys_for(dir, view.yaw) {
             // Only if that way isn't into a wall.
@@ -3362,5 +3482,31 @@ mod tests {
             ranks.iter().sum::<f32>() / ranks.len() as f32
         };
         assert!(mean(0.25, &mut rng) + 10.0 < mean(0.7, &mut rng));
+    }
+}
+
+/// Debug (`COD4RW_SIM`): bots' shots and hits by how far their target is
+/// (0-15, 15-30, 30-45, 45+ m), logged every 10 s.
+fn accuracy_by_range(
+    time: Res<Time>,
+    mut shots: MessageReader<crate::weapons::ShotFired>,
+    bots: Query<(&Bot, &Transform)>,
+    places: Query<&Transform>,
+    mut counts: Local<[(u32, u32); 4]>,
+    mut next: Local<f32>,
+) {
+    for s in shots.read() {
+        let Ok((bot, tf)) = bots.get(s.shooter) else { continue };
+        let Some(target) = bot.engagement.as_ref().and_then(|e| places.get(e.target).ok()) else { continue };
+        let metres = tf.translation.distance(target.translation);
+        let bucket = ((metres / 15.0) as usize).min(3);
+        counts[bucket].0 += 1;
+        counts[bucket].1 += s.hit_pawn as u32;
+    }
+    let now = time.elapsed_secs();
+    if now >= *next {
+        *next = now + 10.0;
+        let rate = |(s, h): (u32, u32)| if s > 0 { format!("{:.0}% of {s}", 100.0 * h as f32 / s as f32) } else { "-".into() };
+        info!("accuracy by range: 0-15 m {}, 15-30 m {}, 30-45 m {}, 45+ m {}", rate(counts[0]), rate(counts[1]), rate(counts[2]), rate(counts[3]));
     }
 }

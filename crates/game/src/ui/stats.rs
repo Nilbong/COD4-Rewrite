@@ -131,6 +131,7 @@ impl Stats {
             || name == super::options::LIGHTING_DVAR
             || crate::settings::is_setting(name)
             || super::combat_record::keeps_dvar(name)
+            || super::custom_camo::keeps_dvar(name)
     }
 
     pub fn set_dvar(&mut self, name: &str, value: &str) {

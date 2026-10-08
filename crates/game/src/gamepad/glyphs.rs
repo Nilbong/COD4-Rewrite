@@ -130,17 +130,136 @@ const PS_RED: [f32; 4] = [0.96, 0.38, 0.41, 1.0];
 const PS_PINK: [f32; 4] = [0.91, 0.52, 0.86, 1.0];
 const PS_GREEN: [f32; 4] = [0.27, 0.86, 0.72, 1.0];
 
-/// Startup: every glyph for both pads.
+/// Startup: every glyph for both pads: the button art
+/// (`assets/ui/buttons`), else drawn here.
 pub fn build(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let mut glyphs = Glyphs::default();
-    for kind in [PadKind::Xbox, PadKind::PlayStation] {
+    let atlases = [(PadKind::Xbox, atlas(XBOX_ATLAS)), (PadKind::PlayStation, atlas(PS_ATLAS))];
+    for (kind, sheet) in &atlases {
         for glyph in Glyph::ALL {
-            let (canvas, label) = draw(kind, glyph);
-            let aspect = canvas.w as f32 / canvas.h as f32;
-            glyphs.0.insert((kind, glyph), Art { image: images.add(canvas.image()), aspect, label });
+            let art = sheet.as_ref().and_then(|_| sprite_of(*kind, glyph)).and_then(|name| {
+                let platform = if *kind == PadKind::PlayStation { "playstation" } else { "xbox" };
+                let rect = SPRITES.iter().find(|(p, n, _)| *p == platform && *n == name)?.2;
+                let image = crop(sheet.as_ref()?, rect, ART_HEIGHT)?;
+                let aspect = image.width() as f32 / image.height() as f32;
+                Some(Art { image: images.add(image), aspect, label: None })
+            });
+            let art = art.unwrap_or_else(|| {
+                let (canvas, label) = draw(*kind, glyph);
+                let aspect = canvas.w as f32 / canvas.h as f32;
+                Art { image: images.add(canvas.image()), aspect, label }
+            });
+            glyphs.0.insert((*kind, glyph), art);
         }
     }
     commands.insert_resource(glyphs);
+}
+
+/// The button art's atlases and their sprites (`controller-buttons-manifest.json`).
+const XBOX_ATLAS: &[u8] = include_bytes!("../../assets/ui/buttons/xbox-buttons.png");
+const PS_ATLAS: &[u8] = include_bytes!("../../assets/ui/buttons/playstation-buttons.png");
+const SPRITES: &[(&str, &str, [u32; 4])] = &[
+    ("playstation", "circle", [343, 60, 275, 267]),
+    ("playstation", "create", [941, 670, 272, 189]),
+    ("playstation", "cross", [45, 60, 270, 268]),
+    ("playstation", "dpad_down", [351, 924, 274, 256]),
+    ("playstation", "dpad_left", [628, 922, 288, 280]),
+    ("playstation", "dpad_right", [943, 922, 254, 312]),
+    ("playstation", "dpad_up", [55, 924, 257, 259]),
+    ("playstation", "l1", [0, 395, 327, 206]),
+    ("playstation", "l2", [642, 343, 268, 260]),
+    ("playstation", "l3", [43, 624, 269, 276]),
+    ("playstation", "options", [642, 671, 280, 225]),
+    ("playstation", "r1", [334, 395, 295, 214]),
+    ("playstation", "r2", [943, 356, 271, 245]),
+    ("playstation", "r3", [345, 628, 270, 265]),
+    ("playstation", "square", [640, 61, 270, 267]),
+    ("playstation", "triangle", [924, 61, 287, 267]),
+    ("xbox", "a", [49, 70, 278, 258]),
+    ("xbox", "b", [327, 71, 276, 256]),
+    ("xbox", "dpad_down", [357, 906, 242, 328]),
+    ("xbox", "dpad_left", [662, 923, 271, 331]),
+    ("xbox", "dpad_right", [966, 906, 256, 322]),
+    ("xbox", "dpad_up", [0, 913, 283, 341]),
+    ("xbox", "lb", [0, 387, 312, 233]),
+    ("xbox", "ls", [18, 638, 307, 259]),
+    ("xbox", "lt", [648, 340, 281, 280]),
+    ("xbox", "menu", [630, 684, 288, 176]),
+    ("xbox", "rb", [342, 340, 287, 244]),
+    ("xbox", "rs", [325, 640, 302, 266]),
+    ("xbox", "rt", [929, 355, 311, 251]),
+    ("xbox", "view", [939, 682, 285, 198]),
+    ("xbox", "x", [626, 44, 280, 296]),
+    ("xbox", "y", [928, 37, 284, 297]),
+];
+
+/// The art's height once cut out (it shows at 20-40 pixels).
+const ART_HEIGHT: u32 = 96;
+
+/// Which sprite shows a glyph; `None` keeps the drawn one.
+fn sprite_of(kind: PadKind, glyph: Glyph) -> Option<&'static str> {
+    use Glyph::*;
+    Some(match (kind, glyph) {
+        (PadKind::PlayStation, South) => "cross",
+        (PadKind::PlayStation, East) => "circle",
+        (PadKind::PlayStation, West) => "square",
+        (PadKind::PlayStation, North) => "triangle",
+        (PadKind::PlayStation, LeftBumper) => "l1",
+        (PadKind::PlayStation, RightBumper) => "r1",
+        (PadKind::PlayStation, LeftTrigger) => "l2",
+        (PadKind::PlayStation, RightTrigger) => "r2",
+        (PadKind::PlayStation, LeftStick | LeftStickClick) => "l3",
+        (PadKind::PlayStation, RightStick | RightStickClick) => "r3",
+        (PadKind::PlayStation, Select) => "create",
+        (PadKind::PlayStation, Start) => "options",
+        (PadKind::Xbox, South) => "a",
+        (PadKind::Xbox, East) => "b",
+        (PadKind::Xbox, West) => "x",
+        (PadKind::Xbox, North) => "y",
+        (PadKind::Xbox, LeftBumper) => "lb",
+        (PadKind::Xbox, RightBumper) => "rb",
+        (PadKind::Xbox, LeftTrigger) => "lt",
+        (PadKind::Xbox, RightTrigger) => "rt",
+        (PadKind::Xbox, LeftStick | LeftStickClick) => "ls",
+        (PadKind::Xbox, RightStick | RightStickClick) => "rs",
+        (PadKind::Xbox, Select) => "view",
+        (PadKind::Xbox, Start) => "menu",
+        (_, DPadUp) => "dpad_up",
+        (_, DPadDown) => "dpad_down",
+        (_, DPadLeft) => "dpad_left",
+        (_, DPadRight) => "dpad_right",
+        (_, DPad) => return None,
+    })
+}
+
+/// An atlas, decoded to RGBA (`None` if it can't be).
+fn atlas(bytes: &[u8]) -> Option<image::RgbaImage> {
+    match image::load_from_memory(bytes) {
+        Ok(i) => Some(i.to_rgba8()),
+        Err(e) => {
+            warn!("button art: {e}");
+            None
+        }
+    }
+}
+
+/// A sprite cut out of the atlas and scaled to `height` pixels.
+fn crop(sheet: &image::RgbaImage, [x, y, w, h]: [u32; 4], height: u32) -> Option<Image> {
+    if w == 0 || h == 0 || x + w > sheet.width() || y + h > sheet.height() {
+        return None;
+    }
+    let cut = image::imageops::crop_imm(sheet, x, y, w, h).to_image();
+    let width = ((w as f32 * height as f32 / h as f32).round() as u32).max(1);
+    let small = image::imageops::resize(&cut, width, height, image::imageops::FilterType::Triangle);
+    let mut img = Image::new(
+        Extent3d { width, height, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        small.into_raw(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.sampler = bevy::image::ImageSampler::linear();
+    Some(img)
 }
 
 /// A glyph's picture and label.

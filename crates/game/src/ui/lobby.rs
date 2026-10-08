@@ -8,7 +8,13 @@
 //! listed with their devices ("Player 2 - DualSense Edge"); clicking one
 //! moves them to the next device. Built from Create a Class's frame and
 //! rows, like the supply drop screens, so the menu interpreter lays it out
-//! and runs it.
+//! and runs it. Under the teams, Invite Friends and Join with Code take the
+//! lobby online ([`online`]).
+
+#[path = "lobby_online.rs"]
+mod online;
+pub(super) use online::online_lobby;
+use online::{CODE_DVAR, OnlineLobby};
 
 use super::attachments::{highlight_rows, retarget_highlight};
 use super::draw::{self, Placement};
@@ -18,7 +24,7 @@ use crate::combat::Team;
 use crate::modes::GameMode;
 use crate::splitscreen::{Device, LocalPlayers, MAX_PLAYERS};
 use crate::tdm::{MatchConfig, bot_name};
-use iw3::menu::{Item, Menu, Rect as VRect, Statement, Token, flags, item_type, op};
+use iw3::menu::{EditField, Item, ItemData, Menu, Rect as VRect, Statement, Token, flags, item_type, op};
 use std::sync::Arc;
 
 pub(super) const LOBBY_MENU: &str = "private_match";
@@ -73,6 +79,8 @@ const ROW_H: f32 = 20.0;
 /// pointing at the other team's panel.
 const SWITCH_W: f32 = 24.0;
 const SWITCH_ARROW: [&str; 2] = [">>", "<<"];
+/// The online box, under the teams.
+const ONLINE_TOP: f32 = PANEL_TOP + TEAM_SIZE as f32 * ROW_H + 96.0;
 
 /// The lobby's settings.
 pub(super) struct Lobby {
@@ -90,6 +98,8 @@ pub(super) struct Lobby {
     bots: [Vec<String>; 2],
     /// Start Match was pressed: the next match is this lobby's.
     starting: bool,
+    /// Friends in the lobby, through the relay.
+    online: OnlineLobby,
 }
 
 impl Default for Lobby {
@@ -106,6 +116,7 @@ impl Default for Lobby {
             teams: [Team::Allies; MAX_PLAYERS],
             bots: [Vec::new(), Vec::new()],
             starting: false,
+            online: OnlineLobby::default(),
         }
     }
 }
@@ -131,7 +142,8 @@ impl Lobby {
 
     pub(super) fn config(&self) -> MatchConfig {
         MatchConfig {
-            bots: self.bots.clone(),
+            // An online guest's bots are the host's: seen, not played.
+            bots: if self.online.guest() { [Vec::new(), Vec::new()] } else { self.bots.clone() },
             player_team: self.teams[0],
             time_limit: TIMES[self.time] as f32 * 60.0,
             score_limit: self.score_limit(),
@@ -159,9 +171,9 @@ impl Lobby {
         (0..self.players).filter(move |&i| side(self.teams[i]) == s)
     }
 
-    /// Players on `s` (you, and any splitscreen players, included).
+    /// Players on `s` (you, any splitscreen players and friends included).
     fn count(&self, s: usize) -> usize {
-        self.bots[s].len() + self.locals_on(s).count()
+        self.bots[s].len() + self.locals_on(s).count() + self.online.others_on(s).count()
     }
 
     /// Splitscreen: one more local player, back to one after four (or with
@@ -370,13 +382,32 @@ impl Frontend {
         let a = |i: usize| args.get(i).map_or("", String::as_str);
         let n = |i: usize| a(i).parse::<usize>().unwrap_or(0);
         let mut roster_changed = false;
+        let cmd = a(0).to_ascii_lowercase();
+        if matches!(cmd.as_str(), "lobbyinvite" | "lobbyjoincode" | "lobbyleave") {
+            self.online_script(&cmd);
+            self.rebuild_lobby();
+            return;
+        }
+        // In a friend's lobby, the host sets everything; you can only ask
+        // to switch teams.
+        if self.lobby.online.guest() {
+            if cmd == "lobbyteam" {
+                self.ask_switch();
+            }
+            return;
+        }
+        let online = self.lobby.online.active();
         let l = &mut self.lobby;
-        match a(0).to_ascii_lowercase().as_str() {
+        match cmd.as_str() {
             "lobbymap" => l.map = n(1).min(MAPS.len() - 1),
             "lobbynext" => match a(1) {
                 "mode" => {
-                    // Each game type starts on its own default limit.
+                    // Each game type starts on its own default limit. Online,
+                    // only the modes friends can play yet (no objectives).
                     l.mode = (l.mode + 1) % GameMode::ALL.len();
+                    while online && !matches!(l.mode(), GameMode::Tdm | GameMode::Ffa) {
+                        l.mode = (l.mode + 1) % GameMode::ALL.len();
+                    }
                     l.score = l.mode().score_limits().1;
                     let minutes = l.mode().default_time_limit();
                     l.time = TIMES.iter().position(|&t| t == minutes).unwrap_or(l.time);
@@ -385,7 +416,7 @@ impl Frontend {
                 "score" => l.score = (l.score + 1) % l.mode().score_limits().0.len(),
                 "difficulty" => l.difficulty = (l.difficulty + 1) % DIFFICULTY.len(),
                 "hardcore" => l.hardcore = !l.hardcore,
-                "splitscreen" => {
+                "splitscreen" if !online => {
                     l.next_players(&self.devices);
                     roster_changed = true;
                 }
@@ -414,8 +445,9 @@ impl Frontend {
                 }
                 roster_changed = true;
             }
-            "lobbystart" => {
+            "lobbystart" if !l.online.connecting => {
                 l.starting = true;
+                l.online.start = l.online.host();
                 self.start = Some(l.map_id().to_string());
             }
             _ => {}
@@ -423,8 +455,28 @@ impl Frontend {
         self.sync_lobby();
         // The team lists are rows of their own: rebuild the screen.
         if roster_changed {
+            self.rebuild_lobby();
+        }
+    }
+
+    /// In a friend's online lobby.
+    pub(super) fn lobby_guest(&self) -> bool {
+        self.lobby.online.guest()
+    }
+
+    /// The lobby screen again, if it's up, for a changed roster.
+    pub(super) fn rebuild_lobby(&mut self) {
+        self.sync_lobby();
+        if self.stack.iter().any(|m| m.name == LOBBY_MENU) {
+            let top = self.stack.last().is_some_and(|m| m.name == LOBBY_MENU);
             self.close(LOBBY_MENU);
             self.open(LOBBY_MENU);
+            // Kept under whatever was open over it (the map list).
+            if !top && let Some(i) = self.stack.iter().position(|m| m.name == LOBBY_MENU) {
+                let lobby = self.stack.remove(i);
+                let at = self.stack.len().saturating_sub(1);
+                self.stack.insert(at, lobby);
+            }
         }
     }
 
@@ -441,9 +493,16 @@ impl Frontend {
             (202.0, "ui_pm_split", script(&[&ui_script("lobbyNext splitscreen")])),
             (236.0, "", script(&[&ui_script("lobbyStart")])),
         ];
+        let guest = self.lobby.online.guest();
         for (i, (y, dvar, action)) in rows.iter().enumerate() {
-            let label = if dvar.is_empty() { str_exp("Start Match") } else { dvar_exp(dvar) };
-            m.items.extend(place_row(&template, *y, i as i32 + 1, label, action));
+            let label = match (dvar.is_empty(), guest) {
+                (true, false) => str_exp("Start Match"),
+                (true, true) => str_exp("Waiting for the host"),
+                _ => dvar_exp(dvar),
+            };
+            // The map list is the host's alone.
+            let action = if guest && i == 0 { String::new() } else { action.clone() };
+            m.items.extend(place_row(&template, *y, i as i32 + 1, label, &action));
         }
         // The teams: splitscreen players are buttons (click to change their
         // device) with an arrow to the other team, bots are buttons too
@@ -466,16 +525,47 @@ impl Frontend {
                 }
                 locals += 1;
             }
-            let mut y = PANEL_TOP + 26.0 + ROW_H * locals as f32;
+            let others = self.lobby.online.others_on(s).count();
+            let mut y = PANEL_TOP + 26.0 + ROW_H * (locals + others) as f32;
             for (i, name) in self.lobby.bots[s].iter().enumerate() {
-                let action = script(&[&ui_script(&format!("lobbyRemove {s} {i}"))]);
+                let action = if guest { String::new() } else { script(&[&ui_script(&format!("lobbyRemove {s} {i}"))]) };
                 m.items.push(side_button(x, y, PANEL_W, name, &action, GREY));
                 y += ROW_H;
             }
-            if self.lobby.count(s) < TEAM_SIZE {
+            if !guest && self.lobby.count(s) < TEAM_SIZE {
                 let action = script(&[&ui_script(&format!("lobbyAdd {s}"))]);
                 m.items.push(side_button(x, y + 4.0, PANEL_W, "+ Add Bot", &action, GOLD));
             }
+        }
+        // Online: Invite Friends, or a code to join a friend's lobby; once
+        // in one, leaving it.
+        let o = &self.lobby.online;
+        let x = PANEL_X[0];
+        if o.active() {
+            let label = if o.host() { "Close Lobby" } else { "Leave Lobby" };
+            let action = script(&[&ui_script("lobbyLeave")]);
+            m.items.push(side_button(PANEL_X[1] + PANEL_W - 120.0, ONLINE_TOP + 30.0, 120.0, label, &action, GOLD));
+        } else {
+            let action = script(&[&ui_script("lobbyInvite")]);
+            m.items.push(side_button(x, ONLINE_TOP, PANEL_W, "Invite Friends", &action, GOLD));
+            let mut field = side_button(PANEL_X[1], ONLINE_TOP, PANEL_W - 64.0, "", "", WHITE);
+            field.ty = item_type::EDITFIELD;
+            field.window.name = CODE_DVAR.into();
+            field.dvar = CODE_DVAR.into();
+            field.text_exp.clear();
+            field.data = ItemData::EditField(EditField { max_chars: 9, max_paint_chars: 9, ..EditField::default() });
+            field.on_accept = script(&[&ui_script("lobbyJoinCode")]);
+            field.window.style = 1;
+            field.window.back_color = [0.1, 0.1, 0.1, 0.45];
+            field.window.border = 1;
+            field.window.border_size = 0.5;
+            field.window.border_color = [0.9, 0.9, 0.95, 0.3];
+            m.items.push(field);
+            let action = script(&[&ui_script("lobbyJoinCode")]);
+            let mut join = side_button(PANEL_X[1] + PANEL_W - 60.0, ONLINE_TOP, 60.0, "Join", &action, GOLD);
+            join.text_align_mode = 9;
+            join.text_align_x = 0.0;
+            m.items.push(join);
         }
         Some(m)
     }
@@ -556,6 +646,18 @@ impl Frontend {
         // The map, under the settings.
         p.map_card(6.0, 264.0, 212.0, MAPS[l.map]);
 
+        // The right side's focused button (a pad's, or the mouse's): a bar
+        // like the left column's highlight, not just its text turning white.
+        if let Some((_, i)) = self.focus.as_ref().filter(|(m, _)| m == LOBBY_MENU)
+            && let Some(it) = om.menu.items.get(*i).filter(|it| it.window.rect.horz_align == 3)
+        {
+            let r = &it.window.rect;
+            p.horz_align = 3;
+            p.fill(r.x, r.y, r.w, r.h, [1.0, 0.85, 0.45, 0.16]);
+            p.fill(r.x, r.y, 3.0, r.h, [0.85, 0.82, 0.45, 0.95]);
+            p.horz_align = 1;
+        }
+
         // The teams.
         p.horz_align = 3;
         for s in 0..2 {
@@ -574,14 +676,56 @@ impl Frontend {
             } else if side(l.teams[0]) == s {
                 let y = PANEL_TOP + 26.0;
                 p.fill(x + 2.0, y, PANEL_W - 4.0, ROW_H - 2.0, [1.0, 0.85, 0.45, 0.12]);
-                let name = self.dvar("com_playerProfile");
-                let name = if name.is_empty() { "You".to_string() } else { name };
-                let w = p.text(x + 8.0, y + 13.0, 0, 0.3, &name, GOLD);
-                p.text(x + 14.0 + w, y + 13.0, 0, 0.24, "(you)", GREY);
+                let (rank, prestige) = self.my_rank();
+                let w = p.member(x, y, rank, prestige, &self.profile_name(), GOLD);
+                p.text(x + 32.0 + w, y + 13.0, 0, 0.24, "(you)", GREY);
+            }
+            // Friends, after this game's players.
+            let mut row = l.locals_on(s).count();
+            for m in l.online.others_on(s) {
+                let y = PANEL_TOP + 26.0 + ROW_H * row as f32;
+                p.fill(x + 2.0, y, PANEL_W - 4.0, ROW_H - 2.0, [1.0, 1.0, 1.0, 0.06]);
+                let w = p.member(x, y, m.profile.rank as i32, m.profile.prestige as i32, &m.profile.name, WHITE);
+                if m.peer == crate::online::HOST {
+                    p.text(x + 32.0 + w, y + 13.0, 0, 0.24, "(host)", GREY);
+                }
+                row += 1;
             }
         }
-        let hint = if l.players > 1 { "Click a player to change their device, an arrow to switch their team" } else { "Click a bot to remove it" };
+        let o = &l.online;
+        let hint = if o.guest() {
+            "The host picks the settings. Join Team asks to switch sides"
+        } else if l.players > 1 {
+            "Click a player to change their device, an arrow to switch their team"
+        } else {
+            "Click a bot to remove it"
+        };
         p.text(-212.0 + PANEL_W, PANEL_TOP + TEAM_SIZE as f32 * ROW_H + 52.0, 2, 0.24, hint, GREY);
+
+        // Online.
+        let x = PANEL_X[0];
+        let w = PANEL_X[1] + PANEL_W - x;
+        p.fill(x, ONLINE_TOP - 26.0, w, 82.0, [0.0, 0.0, 0.0, 0.45]);
+        p.text(x + 8.0, ONLINE_TOP - 9.0, 0, 0.27, "PLAY WITH FRIENDS", WHITE);
+        if let Some(code) = &o.code {
+            p.text(x + 8.0, ONLINE_TOP + 16.0, 0, 0.27, "Lobby code:", GREY);
+            p.text(x + 100.0, ONLINE_TOP + 18.0, 0, 0.42, code, GOLD);
+            p.text(x + 8.0, ONLINE_TOP + 44.0, 0, 0.22, "Give it to friends. It only works for this lobby.", GREY);
+        } else if o.guest() {
+            let host = o.members.iter().find(|m| m.peer == crate::online::HOST).map_or("the host", |m| m.profile.name.as_str());
+            p.text(x + 8.0, ONLINE_TOP + 16.0, 0, 0.27, &format!("In {host}'s lobby"), WHITE);
+        } else if !o.active() && self.dvar(CODE_DVAR).is_empty() && self.editing.is_none() {
+            p.text(PANEL_X[1] + 8.0, ONLINE_TOP + 13.0, 0, 0.27, "Enter a code", GREY);
+        }
+        if !o.note.is_empty() {
+            p.text(x + 8.0, ONLINE_TOP + 44.0 + 4.0 * o.code.is_some() as u8 as f32, 0, 0.22, &o.note, GOLD);
+        }
+    }
+
+    /// This player's rank and prestige (as the HUD has them).
+    fn my_rank(&self) -> (i32, i32) {
+        let stat = |name: &str| self.table_lookup("mp/playerStatsTable.csv", 1, name, 0).parse::<i32>().ok().map_or(0, |i| self.stat(i));
+        (stat("rank").max(0), stat("plevel").max(0))
     }
 }
 
@@ -620,6 +764,15 @@ impl Paint<'_> {
         let x = pos.x - [0.0, w * 0.5, w][align.min(2) as usize];
         self.ops.push(Op::Text { text: text.into(), x, y: pos.y, font, k, color, shadow: self.pl.scale });
         w / self.pl.scale
+    }
+
+    /// A lobby row's player: rank icon, level and name. Returns the name's
+    /// width.
+    fn member(&mut self, x: f32, y: f32, rank: i32, prestige: i32, name: &str, color: [f32; 4]) -> f32 {
+        let icon = super::hud::rank_icon(self.fe, rank, prestige);
+        self.pic(x + 6.0, y + 1.0, 16.0, 16.0, &icon, WHITE);
+        self.text(x + PANEL_W - 8.0, y + 13.0, 2, 0.24, &(rank + 1).to_string(), GREY);
+        self.text(x + 26.0, y + 13.0, 0, 0.3, name, color)
     }
 
     /// A map's loading screen picture (16:9) with its name under it.

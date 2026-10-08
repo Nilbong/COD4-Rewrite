@@ -414,13 +414,26 @@ impl<'a> Loader<'a> {
             .collect();
 
         let num_coll_surfs = s.i32(156).max(0) as usize;
+        let mut coll_boxes = Vec::new();
         if s.ptr(152).is_inline() {
             let (_, arr) = self.r.array(4, 44, num_coll_surfs)?;
             for i in 0..num_coll_surfs {
                 let c = arr.elem(i, 44);
+                // collTris, numCollTris, mins, maxs, boneIdx, contents, surfFlags.
+                let v = |o: usize| [c.f32(o), c.f32(o + 4), c.f32(o + 8)];
+                let mut tris = Vec::new();
                 if c.ptr(0).is_inline() {
-                    self.r.array(4, 48, c.i32(4).max(0) as usize)?;
+                    let n = c.i32(4).max(0) as usize;
+                    let (_, t) = self.r.array(4, 48, n)?;
+                    for k in 0..n {
+                        let e = t.elem(k, 48);
+                        let f4 = |o: usize| [e.f32(o), e.f32(o + 4), e.f32(o + 8), e.f32(o + 12)];
+                        if let Some(corners) = coll_tri_corners(f4(0), f4(16), f4(32)) {
+                            tris.push(corners);
+                        }
+                    }
                 }
+                coll_boxes.push(CollBox { mins: v(8), maxs: v(20), contents: c.i32(36), tris });
             }
         }
         self.fixed_array(s.ptr(164), 4, 40, num_bones)?; // boneInfo
@@ -446,6 +459,7 @@ impl<'a> Loader<'a> {
             mins: s.vec3(172),
             maxs: s.vec3(184),
             contents: s.i32(160),
+            coll_boxes,
         })
     }
 

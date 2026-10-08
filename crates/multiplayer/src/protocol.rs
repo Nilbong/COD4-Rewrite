@@ -3,11 +3,15 @@
 
 use anyhow::{Result, bail, ensure};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 3;
 pub const MAX_PACKET: usize = 1100;
 pub const MAX_PLAYERS: usize = 18;
 pub const INPUT_REDUNDANCY: usize = 3;
-pub const MAX_CONTROL: usize = 256;
+pub const MAX_CONTROL: usize = 1400;
+/// Largest relayed message payload (lobby rosters, match start).
+pub const MAX_MESSAGE: usize = 1200;
+/// `Control::Message` target meaning every other member of the room (host only).
+pub const EVERYONE: PeerId = u16::MAX;
 pub const TICK_RATE: u32 = 60;
 pub const SNAPSHOT_RATE: u32 = 20;
 pub type PeerId = u16;
@@ -41,17 +45,72 @@ impl Invite {
     }
 }
 
+/// The short code a host reads out to friends ("K7QM-2X9D"). The relay
+/// makes one per room; it stops working when the host leaves. 8 characters
+/// from 31 unambiguous ones (~40 bits), and the relay limits failed guesses
+/// per address, so codes can't be found by trying them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LobbyCode(pub [u8; 8]);
+
+impl LobbyCode {
+    /// No 0/O, 1/I/L: easy to read out loud and type.
+    pub const ALPHABET: &'static [u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+    pub fn generate() -> Self {
+        let mut code = [0; 8];
+        for c in &mut code {
+            *c = Self::ALPHABET[rand::random_range(0..Self::ALPHABET.len())];
+        }
+        Self(code)
+    }
+    /// Lenient about what people type: case, spaces and dashes.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut code = Vec::with_capacity(8);
+        for c in text.chars().filter(|c| !c.is_whitespace() && *c != '-') {
+            let c = c.to_ascii_uppercase();
+            ensure!(c.is_ascii() && Self::ALPHABET.contains(&(c as u8)), "invalid code character");
+            code.push(c as u8);
+        }
+        ensure!(code.len() == 8, "a lobby code is 8 characters");
+        Ok(Self(code.try_into().unwrap()))
+    }
+    fn check(&self) -> Result<()> {
+        ensure!(self.0.iter().all(|c| Self::ALPHABET.contains(c)), "invalid lobby code");
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for LobbyCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = std::str::from_utf8(&self.0).unwrap_or("????????");
+        write!(f, "{}-{}", &s[..4], &s[4..])
+    }
+}
+
+impl std::fmt::Debug for LobbyCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LobbyCode([redacted])")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Hello {
     Create { map: String },
     Join { room: u64, invite: Invite },
+    /// Join by the host's short code.
+    JoinCode(LobbyCode),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Control {
-    Welcome { room: u64, peer: PeerId, map: String, invite: Option<Invite> },
+    /// `invite` and `code` are only sent to the host.
+    Welcome { room: u64, peer: PeerId, map: String, invite: Option<Invite>, code: Option<LobbyCode> },
     PeerJoined(PeerId),
     PeerLeft(PeerId),
+    /// A reliable, ordered message for the game (lobby roster, match start).
+    /// Sent to the relay, `peer` is the target: players may only message the
+    /// host; the host messages a player or [`EVERYONE`]. Delivered, `peer`
+    /// is the sender, stamped by the relay.
+    Message { peer: PeerId, data: Vec<u8> },
 }
 
 /// Only controls are accepted from clients: never positions, damage, health,
@@ -104,6 +163,18 @@ pub struct PawnState {
     pub stance: u8,
     /// 0 alive, 1 dead. Extend the versioned protocol for other states.
     pub life: u8,
+    /// Shots fired, wrapping: a change means it fired (for animation, sound).
+    pub shots: u8,
+    /// [`pawn_flags`].
+    pub flags: u8,
+}
+
+pub mod pawn_flags {
+    pub const ADS: u8 = 1;
+    pub const SPRINT: u8 = 2;
+    pub const ON_GROUND: u8 = 4;
+    pub const RELOADING: u8 = 8;
+    pub const ALL: u8 = 15;
 }
 
 impl PawnState {
@@ -113,6 +184,7 @@ impl PawnState {
         ensure!(self.yaw.is_finite() && self.yaw.abs() <= std::f32::consts::PI, "invalid yaw");
         ensure!(self.pitch.is_finite() && self.pitch.abs() <= 1.55, "invalid pitch");
         ensure!(self.health <= 100 && self.stance <= 2 && self.life <= 1, "invalid pawn state");
+        ensure!(self.flags & !pawn_flags::ALL == 0, "invalid pawn flags");
         Ok(())
     }
 }
@@ -220,12 +292,17 @@ impl Hello {
         let mut out = header(match self {
             Self::Create { .. } => 1,
             Self::Join { .. } => 2,
+            Self::JoinCode(_) => 6,
         });
         match self {
             Self::Create { map } => map_out(&mut out, map)?,
             Self::Join { room, invite } => {
                 u64_out(&mut out, *room);
                 out.extend(invite.0);
+            }
+            Self::JoinCode(code) => {
+                code.check()?;
+                out.extend(code.0);
             }
         }
         Ok(out)
@@ -235,6 +312,11 @@ impl Hello {
         let hello = match kind {
             1 => Self::Create { map: r.map()? },
             2 => Self::Join { room: r.u64()?, invite: Invite(r.take(32)?.try_into()?) },
+            6 => {
+                let code = LobbyCode(r.take(8)?.try_into()?);
+                code.check()?;
+                Self::JoinCode(code)
+            }
             _ => bail!("invalid hello"),
         };
         r.done()?;
@@ -248,9 +330,10 @@ impl Control {
             Self::Welcome { .. } => 3,
             Self::PeerJoined(_) => 4,
             Self::PeerLeft(_) => 5,
+            Self::Message { .. } => 7,
         });
         match self {
-            Self::Welcome { room, peer, map, invite } => {
+            Self::Welcome { room, peer, map, invite, code } => {
                 u64_out(&mut out, *room);
                 u16_out(&mut out, *peer);
                 map_out(&mut out, map)?;
@@ -258,9 +341,20 @@ impl Control {
                 if let Some(invite) = invite {
                     out.extend(invite.0);
                 }
+                out.push(code.is_some() as u8);
+                if let Some(code) = code {
+                    code.check()?;
+                    out.extend(code.0);
+                }
             }
             Self::PeerJoined(peer) | Self::PeerLeft(peer) => u16_out(&mut out, *peer),
+            Self::Message { peer, data } => {
+                ensure!(!data.is_empty() && data.len() <= MAX_MESSAGE, "invalid message length");
+                u16_out(&mut out, *peer);
+                out.extend(data);
+            }
         }
+        ensure!(out.len() <= MAX_CONTROL, "control too large");
         Ok(out)
     }
     pub fn decode(data: &[u8]) -> Result<Self> {
@@ -275,10 +369,25 @@ impl Control {
                     1 => Some(Invite(r.take(32)?.try_into()?)),
                     _ => bail!("invalid invite flag"),
                 };
-                Self::Welcome { room, peer, map, invite }
+                let code = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let code = LobbyCode(r.take(8)?.try_into()?);
+                        code.check()?;
+                        Some(code)
+                    }
+                    _ => bail!("invalid code flag"),
+                };
+                Self::Welcome { room, peer, map, invite, code }
             }
             4 => Self::PeerJoined(r.u16()?),
             5 => Self::PeerLeft(r.u16()?),
+            7 => {
+                let peer = r.u16()?;
+                let data = r.take(r.rest.len())?.to_vec();
+                ensure!(!data.is_empty() && data.len() <= MAX_MESSAGE, "invalid message length");
+                Self::Message { peer, data }
+            }
             _ => bail!("invalid relay control"),
         };
         r.done()?;
@@ -349,7 +458,7 @@ impl Packet {
                     }
                     f32_out(&mut out, p.yaw);
                     f32_out(&mut out, p.pitch);
-                    out.extend([p.health, p.stance, p.life]);
+                    out.extend([p.health, p.stance, p.life, p.shots, p.flags]);
                 }
             }
         }
@@ -379,6 +488,8 @@ impl Packet {
                         health: r.u8()?,
                         stance: r.u8()?,
                         life: r.u8()?,
+                        shots: r.u8()?,
+                        flags: r.u8()?,
                     };
                     p.validate()?;
                     ensure!(ids.insert(p.id), "duplicate pawn ID");
@@ -426,7 +537,7 @@ mod tests {
         extra.push(0);
         assert!(Packet::decode(&extra).is_err());
         let mut future = data;
-        future[4] = 2;
+        future[4] = 99;
         assert!(Packet::decode(&future).is_err());
         assert!(Packet::decode(&vec![0; MAX_PACKET + 1]).is_err());
     }
@@ -445,7 +556,31 @@ mod tests {
         let invite = Invite::generate();
         assert_eq!(Invite::from_hex(&invite.to_hex()).unwrap(), invite);
         assert!(!format!("{invite:?}").contains(&invite.to_hex()));
-        let c = Control::Welcome { room: 123, peer: HOST, map: "mp_crash".into(), invite: Some(invite) };
+        let code = LobbyCode::generate();
+        let c = Control::Welcome { room: 123, peer: HOST, map: "mp_crash".into(), invite: Some(invite), code: Some(code) };
         assert_eq!(Control::decode(&c.encode().unwrap()).unwrap(), c);
+        assert!(!format!("{c:?}").contains(&code.to_string()));
+        let m = Control::Message { peer: EVERYONE, data: vec![7; MAX_MESSAGE] };
+        assert_eq!(Control::decode(&m.encode().unwrap()).unwrap(), m);
+        assert!(Control::Message { peer: 1, data: vec![7; MAX_MESSAGE + 1] }.encode().is_err());
+        assert!(Control::Message { peer: 1, data: vec![] }.encode().is_err());
+    }
+    #[test]
+    fn lobby_codes_parse_leniently() {
+        let code = LobbyCode::generate();
+        let shown = code.to_string();
+        assert_eq!(shown.len(), 9);
+        assert_eq!(LobbyCode::parse(&shown).unwrap(), code);
+        assert_eq!(LobbyCode::parse(&shown.to_lowercase().replace('-', " ")).unwrap(), code);
+        assert_eq!(LobbyCode::parse("k7qm 2x9d").unwrap().to_string(), "K7QM-2X9D");
+        assert!(LobbyCode::parse("K7QM-0X1D").is_err());
+        assert!(LobbyCode::parse("ABC").is_err());
+        assert!(LobbyCode::parse("ABCD-EFG!").is_err());
+        assert!(Hello::decode(&{
+            let mut d = Hello::JoinCode(code).encode().unwrap();
+            *d.last_mut().unwrap() = b'0';
+            d
+        })
+        .is_err());
     }
 }

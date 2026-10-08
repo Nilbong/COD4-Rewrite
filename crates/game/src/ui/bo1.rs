@@ -432,7 +432,7 @@ impl Frontend {
             "popup_cac_camo" => {
                 let t = template("popup_cac_camo")?;
                 let from = highlighted_name(&t, "ui_camo_highlighted");
-                let rows: Vec<Row> = data
+                let mut rows: Vec<Row> = data
                     .camos
                     .iter()
                     .map(|c| {
@@ -448,6 +448,16 @@ impl Frontend {
                         }
                     })
                     .collect();
+                rows.push(Row {
+                    label: str_exp(&format!("@{}", super::custom_camo::ROW_LABEL)),
+                    action: click(format!("\"uiScript\" \"ccamoOpen\" \"{stat}\" ;")),
+                    rename: from.clone().map(|f| (f, super::custom_camo::ROW_NAME.into())),
+                });
+                rows.push(Row {
+                    label: str_exp(&format!("@{}", super::reticle_menu::ROW_LABEL)),
+                    action: click(format!("\"uiScript\" \"creticleOpen\" \"{stat}\" ;")),
+                    rename: from.clone().map(|f| (f, super::reticle_menu::ROW_NAME.into())),
+                });
                 with_rows(&t, key, &rows)?
             }
             _ => return None,

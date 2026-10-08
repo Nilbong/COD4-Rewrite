@@ -1,14 +1,9 @@
 [package]
 name = "cod4rw-multiplayer"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
 description = "Relay-only multiplayer transport and authoritative netcode foundation for cod4rw."
-
-# Independent while another editor is working in the game workspace. This
-# avoids changing its manifest, lockfile, or sharing Cargo's build lock.
-[workspace]
-resolver = "3"
 
 [dependencies]
 anyhow = "1"

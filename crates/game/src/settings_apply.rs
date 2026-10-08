@@ -13,6 +13,7 @@ use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, NotShad
 use bevy::pbr::ScreenSpaceAmbientOcclusion;
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
+use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::render::view::ColorGrading;
 use bevy::window::{MonitorSelection, PresentMode, PrimaryWindow, VideoModeSelection, WindowMode};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -46,6 +47,7 @@ static MOUSE: Value = Value::new(1.0);
 static ADS_MOUSE: Value = Value::new(1.0);
 static INVERT: AtomicBool = AtomicBool::new(false);
 static BLOOM: AtomicBool = AtomicBool::new(true);
+static MODERN_HUD: AtomicBool = AtomicBool::new(true);
 static FPS_LIMIT: Value = Value::new(0.0);
 static EFFECTS_VOLUME: Value = Value::new(1.0);
 static MUSIC_VOLUME: Value = Value::new(1.0);
@@ -104,7 +106,8 @@ pub fn invert_mouse() -> bool {
 
 /// A sound's volume scale by what it is (and the master).
 pub fn volume(category: Sound) -> f32 {
-    MASTER_VOLUME.get()
+    crate::audio::audible()
+        * MASTER_VOLUME.get()
         * match category {
             Sound::Effects => EFFECTS_VOLUME.get(),
             Sound::Music => MUSIC_VOLUME.get(),
@@ -133,6 +136,11 @@ pub fn corpses() -> usize {
 }
 
 /// The performance overlay: 0 off, 1 FPS, 2 with the frame time.
+/// The settings' HUD Style: Modern unless Classic.
+pub fn modern_hud() -> bool {
+    MODERN_HUD.load(Ordering::Relaxed)
+}
+
 /// Whether the frame glows: Bevy's bloom, or a map's own glow
 /// (`crate::vision`).
 pub fn bloom() -> bool {
@@ -154,6 +162,8 @@ fn keep_values(settings: Res<Settings>) {
     ADS_MOUSE.set(s.num("cg_ads_sens").clamp(0.1, 4.0));
     INVERT.store(s.on("m_invert"), Ordering::Relaxed);
     BLOOM.store(s.on("r_bloom"), Ordering::Relaxed);
+    RICH.store(rich_tonemap(s), Ordering::Relaxed);
+    MODERN_HUD.store(s.text("cg_hudstyle") != "classic", Ordering::Relaxed);
     FPS_LIMIT.set(s.num("com_maxfps").max(0.0));
     MASTER_VOLUME.set(s.num("snd_volume") / 100.0);
     EFFECTS_VOLUME.set(s.num("snd_effects") / 100.0);
@@ -171,6 +181,11 @@ fn keep_values(settings: Res<Settings>) {
         HUD[which as usize].store(s.on(dvar), Ordering::Relaxed);
     }
     crate::ragdoll::set_enabled(s.on("ragdoll_enable"));
+    crate::first_person::apply(s);
+    crate::lightmaps::set_rebaked(s.text("r_lightmaps") == "rebaked");
+    if let Ok(mut k) = crate::hq::CALL_KEY.lock() {
+        *k = s.bindings().key_name(crate::bindings::Action::Frag);
+    }
     if let Ok(mut k) = crate::splitscreen::USE_KEY.lock() {
         *k = s.bindings().key_name(crate::bindings::Action::Use);
     }
@@ -215,15 +230,30 @@ fn sim() -> bool {
 }
 
 /// Display mode, resolution and vsync.
-fn window(settings: Res<Settings>, mut window: Single<&mut Window, With<PrimaryWindow>>) {
+fn window(
+    settings: Res<Settings>,
+    mut window: Single<&mut Window, With<PrimaryWindow>>,
+    monitors: Query<(), With<bevy::window::Monitor>>,
+    mut placed_on: Local<Option<String>>,
+) {
     if !settings.is_changed() || sim() {
         return;
     }
+    // The settings' Monitor: the current one, the primary, or one by number
+    // (if there's that many).
+    let chosen = settings.text("r_monitor").to_owned();
+    let monitor = match chosen.as_str() {
+        "primary" => MonitorSelection::Primary,
+        n => match n.parse::<usize>() {
+            Ok(i) if i < monitors.iter().count() => MonitorSelection::Index(i),
+            _ => MonitorSelection::Current,
+        },
+    };
     let size = settings.text("r_resolution").split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
     let mode = match settings.text("r_displaymode") {
-        "borderless" => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+        "borderless" => WindowMode::BorderlessFullscreen(monitor),
         "fullscreen" => WindowMode::Fullscreen(
-            MonitorSelection::Current,
+            monitor,
             match size {
                 Some((w, h)) => VideoModeSelection::Specific(bevy::window::VideoMode { physical_size: UVec2::new(w, h), bit_depth: 32, refresh_rate_millihertz: 0 }),
                 None => VideoModeSelection::Current,
@@ -233,6 +263,15 @@ fn window(settings: Res<Settings>, mut window: Single<&mut Window, With<PrimaryW
     };
     if window.mode != mode {
         window.mode = mode;
+    }
+    // A window moves to the chosen screen when the choice changes (not with
+    // every other setting, nor at start with "current").
+    if placed_on.as_deref() != Some(chosen.as_str()) {
+        let first = placed_on.is_none();
+        *placed_on = Some(chosen.clone());
+        if mode == WindowMode::Windowed && !(first && chosen == "current") && monitor != MonitorSelection::Current {
+            window.position = WindowPosition::Centered(monitor);
+        }
     }
     // Debug runs' own window size (`COD4RW_RES`) and vsync off
     // (`COD4RW_PERF=novsync`) win over the saved settings.
@@ -267,31 +306,47 @@ fn frame_limit(mut last: Local<Option<std::time::Instant>>) {
 
 /// Anti-aliasing and glow on the cameras that finish the frame (the
 /// viewmodel's), ambient occlusion on the world's; anew for new cameras.
+/// Only what's different is changed: any setting changing (a volume
+/// slider dragged) re-inserted them all, each a pipeline or texture
+/// rebuild, every frame of the drag.
 #[allow(clippy::type_complexity)]
 fn camera(
     mut commands: Commands,
     settings: Res<Settings>,
-    finishing: Query<(Entity, Ref<crate::player::ViewModelCamera>, Has<Bloom>)>,
+    finishing: Query<(Entity, Ref<crate::player::ViewModelCamera>, Has<Bloom>, Option<&Smaa>, Has<Fxaa>, Option<&Tonemapping>)>,
     world: Query<(Entity, Ref<crate::player::MainCamera>, Has<ScreenSpaceAmbientOcclusion>)>,
 ) {
-    for (e, marker, bloom) in &finishing {
+    for (e, marker, bloom, smaa, fxaa, tonemapping) in &finishing {
         if !(settings.is_changed() || marker.is_added()) {
             continue;
         }
         let mut c = commands.entity(e);
+        let smaa_preset = smaa.map(|s| s.preset);
         match settings.text("r_aa") {
             "off" => {
-                c.remove::<(Smaa, Fxaa)>();
+                if smaa.is_some() || fxaa {
+                    c.remove::<(Smaa, Fxaa)>();
+                }
             }
             "fxaa" => {
-                c.remove::<Smaa>().insert(Fxaa::default());
+                if smaa.is_some() || !fxaa {
+                    c.remove::<Smaa>().insert(Fxaa::default());
+                }
             }
             "smaa" => {
-                c.remove::<Fxaa>().insert(Smaa { preset: SmaaPreset::Medium });
+                if fxaa || !matches!(smaa_preset, Some(SmaaPreset::Medium)) {
+                    c.remove::<Fxaa>().insert(Smaa { preset: SmaaPreset::Medium });
+                }
             }
             _ => {
-                c.remove::<Fxaa>().insert(Smaa { preset: SmaaPreset::High });
+                if fxaa || !matches!(smaa_preset, Some(SmaaPreset::High)) {
+                    c.remove::<Fxaa>().insert(Smaa { preset: SmaaPreset::High });
+                }
             }
+        }
+        // (Rich is graded on top: `crate::vision`.)
+        if tonemapping != Some(&Tonemapping::AgX) {
+            c.insert(Tonemapping::AgX);
         }
         // A map's own glow (its vision file) takes Bevy's off again
         // (`crate::vision`).
@@ -316,7 +371,7 @@ fn camera(
                 commands.entity(e).remove::<ScreenSpaceAmbientOcclusion>();
             }
             (true, false) => {
-                commands.entity(e).insert(ScreenSpaceAmbientOcclusion::default());
+                commands.entity(e).insert(crate::player::ssao());
             }
             _ => {}
         }
@@ -327,8 +382,10 @@ fn camera(
 fn sun(
     mut commands: Commands,
     settings: Res<Settings>,
-    mut suns: Query<(Entity, &mut DirectionalLight)>,
+    // (The viewmodels' suns follow the map's: `crate::model_lighting`.)
+    mut suns: Query<(Entity, &mut DirectionalLight), Without<crate::model_lighting::ViewModelSun>>,
     mut map_size: ResMut<DirectionalLightShadowMap>,
+    mut applied: Local<Option<(usize, f32)>>,
 ) {
     // Splitscreen keeps its lighter shadows (`crate::splitscreen`).
     if crate::splitscreen::active() {
@@ -339,21 +396,33 @@ fn sun(
         "off" => (false, 1, 30.0, 1024),
         "low" => (true, 1, 30.0, 1024),
         "medium" => (true, 2, 60.0, 1024),
-        "ultra" => (true, 4, 120.0, 4096),
+        // Ultra at 2048: 4096 cost ~7 ms on open maps (Bloc) for no visible
+        // difference (perf, 2026-10-08); its 4 cascades and 120 m stay.
+        "ultra" => (true, 4, 120.0, 2048),
         _ => (true, 2, 80.0, 2048),
     };
     if settings.is_changed() && map_size.size != size {
         map_size.size = size;
     }
+    // The cascades anew only when they change (or for a new sun).
+    let new_cascades = *applied != Some((cascades, distance));
+    let mut any = false;
     for (e, mut light) in &mut suns {
-        if !(settings.is_changed() || light.is_added()) {
+        let added = light.is_added();
+        if !(settings.is_changed() || added) {
             continue;
         }
+        any = true;
         if light.shadow_maps_enabled != on {
             light.shadow_maps_enabled = on;
         }
-        let config = CascadeShadowConfigBuilder { num_cascades: cascades, maximum_distance: distance, first_cascade_far_bound: 12f32.min(distance), ..default() };
-        commands.entity(e).insert(config.build());
+        if new_cascades || added {
+            let config = CascadeShadowConfigBuilder { num_cascades: cascades, maximum_distance: distance, first_cascade_far_bound: 12f32.min(distance), ..default() };
+            commands.entity(e).insert(config.build());
+        }
+    }
+    if any {
+        *applied = Some((cascades, distance));
     }
 }
 
@@ -369,7 +438,7 @@ fn models(
     settings: Res<Settings>,
     names: Query<(Entity, &Name)>,
     children: Query<&Children>,
-    meshes: Query<(Has<NotShadowCaster>, Option<&VisibilityRange>, Option<&BaseRange>), With<Mesh3d>>,
+    meshes: Query<(Has<NotShadowCaster>, Option<&VisibilityRange>, Option<&BaseRange>, Has<crate::world::ShadowViaProxy>), With<Mesh3d>>,
     mut next: Local<f32>,
 ) {
     let now = time.elapsed_secs();
@@ -385,8 +454,10 @@ fn models(
         _ => 1.0,
     };
     for model in children.iter_descendants(root) {
-        let Ok((no_shadow, range, base)) = meshes.get(model) else { continue };
+        let Ok((no_shadow, range, base, via_proxy)) = meshes.get(model) else { continue };
+        // Opaque batches shadow through the merged proxy, which this switches.
         match (shadows, no_shadow) {
+            _ if via_proxy => {}
             (true, true) => {
                 commands.entity(model).remove::<NotShadowCaster>();
             }
@@ -409,12 +480,27 @@ fn models(
 
 /// Brightness: the frame's exposure, on every camera that grades colour.
 fn brightness(settings: Res<Settings>, mut grading: Query<&mut ColorGrading>) {
-    let exposure = settings.num("r_gamma").clamp(0.3, 3.0).log2();
+    // (Plus Headquarters' outdoor darkening, `crate::hq`.)
+    let exposure = settings.num("r_gamma").clamp(0.3, 3.0).log2() + crate::hq::exposure_offset();
     for mut g in &mut grading {
         if (g.global.exposure - exposure).abs() > 1e-4 {
             g.global.exposure = exposure;
         }
     }
+}
+
+/// The look (`r_tonemap`): Natural, or Rich (`aces`, its old name), which
+/// is Natural with more contrast and colour (`crate::vision`).
+/// `COD4RW_TONEMAP=agx|aces` sets it for debug runs.
+fn rich_tonemap(settings: &Settings) -> bool {
+    std::env::var("COD4RW_TONEMAP").ok().as_deref().unwrap_or(settings.text("r_tonemap")) == "aces"
+}
+
+static RICH: AtomicBool = AtomicBool::new(false);
+
+/// The Rich look is on.
+pub fn rich() -> bool {
+    RICH.load(Ordering::Relaxed)
 }
 
 /// Silence when the window isn't in front (if asked), else the master

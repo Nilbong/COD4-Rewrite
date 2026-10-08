@@ -92,14 +92,16 @@ fn print_elem(i: usize, e: &iw3::fx::FxElemDef) {
         e.atlas
     );
     println!(
-        "  fade in {} out {} sort {} lighting {} impact {:?} death {:?} emitted {:?}",
+        "  fade in {} out {} sort {} lighting {} impact {:?} death {:?} emitted {:?} spawn range {} cull radius {}",
         r(&e.fade_in_range),
         r(&e.fade_out_range),
         e.sort_order,
         e.lighting_frac,
         e.effect_on_impact,
         e.effect_on_death,
-        e.effect_emitted
+        e.effect_emitted,
+        r(&e.spawn_range),
+        e.spawn_frustum_cull_radius
     );
     for (k, s) in e.vel_samples.iter().enumerate() {
         println!(

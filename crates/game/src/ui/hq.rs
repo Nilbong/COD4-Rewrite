@@ -7,6 +7,14 @@ use iw3::menu::{Item, Menu, Statement, Token, item_type, op};
 
 pub(super) const PAUSE_MENU: &str = "hq_pause";
 
+impl super::Frontend {
+    /// A Headquarters station's menu ([`crate::hq::STATIONS`]).
+    pub fn run_station(&mut self, script: &str) {
+        self.menu_slot = 0;
+        self.run(script, PAUSE_MENU);
+    }
+}
+
 fn str_exp(s: &str) -> Statement {
     vec![Token::Op(op::LEFTPAREN), Token::Str(s.into())]
 }
@@ -21,6 +29,35 @@ fn label(it: &Item) -> String {
 /// The left column's rows (buttons and their bars).
 fn left(it: &Item) -> bool {
     it.window.rect.x < -200.0 && it.window.rect.horz_align == 2
+}
+
+/// A match's Escape menu (`class`) without Call Vote and Mute Players: there
+/// are no votes or voice to mute, and both led nowhere. The rows under them
+/// move up.
+pub(super) fn match_pause_menu(class: &Menu) -> Option<Menu> {
+    let mut out = class.clone();
+    let row_y = |label_name: &str| out.items.iter().find(|it| it.ty == item_type::BUTTON && label(it) == label_name).map(|it| it.window.rect.y);
+    let (vote, mute) = (row_y("@MPUI_CALL_VOTE")?, row_y("@MPUI_MUTE_PLAYERS")?);
+    let at = |it: &Item, y: f32| left(it) && (it.window.rect.y - y).abs() < 0.5;
+    out.items.retain(|it| !(at(it, vote) || at(it, mute)));
+    // Two rows out: the next row takes the place after the last one kept
+    // (Call Vote's row also had a gap above it).
+    let pitch = mute - vote;
+    let kept = out.items.iter().filter(|it| it.ty == item_type::BUTTON && left(it) && it.window.rect.y < vote).map(|it| it.window.rect.y).fold(f32::MIN, f32::max);
+    let shift = if kept > f32::MIN { mute + pitch - (kept + pitch) } else { 2.0 * pitch };
+    for it in out.items.iter_mut() {
+        if left(it) && it.window.rect.y > mute {
+            it.window.rect.y -= shift;
+        }
+    }
+    Some(out)
+}
+
+/// CoD4's team menu without Spectator (there's no spectating yet).
+pub(super) fn team_menu(team: &Menu) -> Menu {
+    let mut out = team.clone();
+    out.items.retain(|it| !(it.ty == item_type::BUTTON && it.action.contains("\"spectator\"")));
+    out
 }
 
 pub(super) fn pause_menu(class: &Menu) -> Option<Menu> {

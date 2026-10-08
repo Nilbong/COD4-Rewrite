@@ -248,7 +248,7 @@ pub struct Effects {
     model_names: HashMap<String, Option<u16>>,
     /// Live model particles.
     model_count: usize,
-    decal_materials: HashMap<(String, [u8; 4]), Option<Handle<StandardMaterial>>>,
+    decal_materials: HashMap<String, Option<Handle<StandardMaterial>>>,
     impacts: Option<Option<ImpactTable>>,
     weapons: HashMap<String, WeaponFx>,
     queue: Vec<Play>,
@@ -258,8 +258,10 @@ pub struct Effects {
     new_decals: Vec<DecalSpawn>,
     batches: HashMap<(u16, FxLayer), Batch>,
     lights: Vec<Entity>,
-    decals: VecDeque<Entity>,
-    decal_mesh: Option<Handle<Mesh>>,
+    /// Impact marks, oldest first: each one's material (its batch).
+    decals: VecDeque<AssetId<StandardMaterial>>,
+    /// Marks drawn as one mesh per material ([`DecalBatch`]).
+    decal_batches: HashMap<AssetId<StandardMaterial>, DecalBatch>,
     fatal: Vec<PendingFatal>,
     /// The effects clock, ms.
     now: f64,
@@ -272,6 +274,11 @@ pub struct Effects {
     preloaded_impacts: Vec<i32>,
     /// Time spent updating and drawing, and frames (for `COD4RW_FXLOG`).
     busy: (std::time::Duration, u32),
+    /// Of that: lighting blended sprites, building the batches' meshes, and
+    /// placing marks (`COD4RW_FXLOG`).
+    busy_parts: [std::time::Duration; 3],
+    /// The frame's quads per batch, kept between frames for their room.
+    quad_lists: HashMap<(u16, FxLayer), Vec<Quad>>,
 }
 
 impl Effects {
@@ -389,6 +396,22 @@ struct Particle {
     travel: f32,
     emit_every: f32,
     impacted: bool,
+    /// A cloud's specks: each one's offset within the unit ball and spin,
+    /// worked out once from its seed (they're fixed for its life).
+    cloud: Option<Box<[(Vec3, f32)]>>,
+}
+
+/// A cloud particle's specks ([`CLOUD_POINTS`]), scattered by its seed.
+fn cloud_specks(seed: u32) -> Box<[(Vec3, f32)]> {
+    (0..CLOUD_POINTS)
+        .map(|k| {
+            let s = seed ^ (k + 1).wrapping_mul(0x85eb_ca6b);
+            let z = 2.0 * rand(s, 0) - 1.0;
+            let a = rand(s, 1) * std::f32::consts::TAU;
+            let ring = (1.0 - z * z).max(0.0).sqrt();
+            (Vec3::new(ring * a.cos(), z, ring * a.sin()) * rand(s, 2).cbrt(), rand(s, 3) * std::f32::consts::TAU)
+        })
+        .collect()
 }
 
 struct ModelState {
@@ -525,6 +548,31 @@ impl Effects {
             def.elems.iter().map(|e| e.visuals.iter().map(|v| self.visual(content, a, e, v)).collect()).collect();
         let id = FxId(self.defs.len() as u32);
         debug!("effect {name}: {} elements", def.elems.len());
+        // Debug aid: `COD4RW_FXDUMP=<part>` logs matching effects' elements.
+        if std::env::var("COD4RW_FXDUMP").is_ok_and(|v| !v.is_empty() && name.contains(&v)) {
+            for (i, e) in def.elems.iter().enumerate() {
+                let first = e.vis_samples.first();
+                info!(
+                    "fxdump {name}[{i}]: {:?} flags {:x} spawn {:?} life {:?} fade in {:?} out {:?} samples {} colour {:?}+{:?} size {:?}+{:?} scale {:?}+{:?} visuals {:?}",
+                    e.elem_type,
+                    e.flags,
+                    e.spawn,
+                    e.life_span_msec,
+                    e.fade_in_range,
+                    e.fade_out_range,
+                    e.vis_samples.len(),
+                    first.map(|v| v.base.color),
+                    first.map(|v| v.amplitude.color),
+                    first.map(|v| v.base.size),
+                    first.map(|v| v.amplitude.size),
+                    first.map(|v| v.base.scale),
+                    first.map(|v| v.amplitude.scale),
+                    e.visuals
+                );
+                let alphas: Vec<u8> = e.vis_samples.iter().map(|v| v.base.color[3].max(v.amplitude.color[3])).collect();
+                info!("fxdump {name}[{i}] alpha over life: {alphas:?} atlas {:?} spawn origin {:?} offset radius {:?} vel samples {}", e.atlas, e.spawn_origin, e.spawn_offset_radius, e.vel_samples.len());
+            }
+        }
         self.defs.push(Loaded { def, visuals });
         self.names.insert(name.to_owned(), Some(id));
         Some(id)
@@ -599,31 +647,16 @@ impl Effects {
         made
     }
 
-    /// An impact mark's material: the world one, tinted.
-    fn decal_material(
-        &mut self,
-        content: &mut Content,
-        a: &mut FxAssets,
-        name: &str,
-        color: [u8; 4],
-    ) -> Option<Handle<StandardMaterial>> {
-        let key = (name.to_owned(), color);
-        if let Some(m) = self.decal_materials.get(&key) {
+    /// An impact mark's material: the world one (tinted per mark by its
+    /// vertices' colour, [`DecalBatch`]).
+    fn decal_material(&mut self, content: &mut Content, a: &mut FxAssets, name: &str) -> Option<Handle<StandardMaterial>> {
+        if let Some(m) = self.decal_materials.get(name) {
             return m.clone();
         }
-        let name = name.trim_start_matches(',');
-        let made = find_material(content, name)
+        let made = find_material(content, name.trim_start_matches(','))
             .and_then(|(zi, id)| content.material(zi, id, &mut a.materials, &mut a.images))
-            .map(|info| {
-                if color == [255; 4] {
-                    return info.handle;
-                }
-                let mut m = a.materials.get(&info.handle).cloned().unwrap_or_default();
-                let [r, g, b, al] = color.map(|c| c as f32 / 255.0);
-                m.base_color = Color::srgba(r, g, b, al);
-                a.materials.add(m)
-            });
-        self.decal_materials.insert(key, made.clone());
+            .map(|info| info.handle);
+        self.decal_materials.insert(name.to_owned(), made.clone());
         made
     }
 }
@@ -635,6 +668,13 @@ fn find_material(content: &Content, name: &str) -> Option<(usize, iw3::zone::Ass
         .iter()
         .enumerate()
         .find_map(|(zi, z)| z.find(name).filter(|&id| z.material(id).is_some()).map(|id| (zi, id)))
+}
+
+/// Trial (`COD4RW_FXFEATHER=<scale>`): blended sprites' soft-particle fade
+/// distance, scaled.
+fn feather_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| std::env::var("COD4RW_FXFEATHER").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
 }
 
 fn make_material(content: &mut Content, a: &mut FxAssets, name: &str) -> Option<FxMaterial> {
@@ -652,6 +692,15 @@ fn make_material(content: &mut Content, a: &mut FxAssets, name: &str) -> Option<
         .or_else(|| mat.state_bits.first().copied())
         .unwrap_or([0, 0]);
     let (src, dst) = (bits[0] & 0xf, (bits[0] >> 4) & 0xf);
+    if std::env::var("COD4RW_FXDUMP").is_ok_and(|v| !v.is_empty() && name.contains(&v)) {
+        let consts: Vec<String> = mat.constants.iter().map(|c| format!("{} {:?}", c.name, c.literal)).collect();
+        let images: Vec<String> = mat
+            .textures
+            .iter()
+            .map(|t| format!("{:?}:{}", t.semantic, t.image.and_then(|i| zone.image(i)).map_or("?".to_owned(), |i| i.name.clone())))
+            .collect();
+        info!("fxdump material {name} [{techset}] bits {bits:x?} constants {consts:?} images {images:?}");
+    }
     // ONE/ONE and INVDESTCOLOR/ONE (a screen) add; SRCALPHA/INVSRCALPHA and
     // alpha-tested ones blend.
     let additive = dst == 2 && matches!(src, 2 | 5 | 10);
@@ -661,7 +710,8 @@ fn make_material(content: &mut Content, a: &mut FxAssets, name: &str) -> Option<
         .iter()
         .find(|c| c.name == "featherParms")
         .filter(|c| c.literal[0] > 0.0)
-        .map_or(0.0, |c| u(1.0 / c.literal[0]));
+        .map_or(0.0, |c| u(1.0 / c.literal[0]))
+        * if additive { 1.0 } else { feather_scale() };
     let texture = content.material_texture(zi, id, TextureSemantic::Color, true, &mut a.images).or_else(|| {
         // Some effects only have a "2D" map: the standard material finds it.
         let info = content.material(zi, id, &mut a.materials, &mut a.images)?;
@@ -869,6 +919,7 @@ impl Effects {
                     travel: 0.0,
                     emit_every,
                     impacted: false,
+                    cloud: None,
                 });
                 if let Some(inst) = self.instances[slot as usize].as_mut() {
                     inst.live += 1;
@@ -1188,7 +1239,7 @@ fn sweep_trail(
             let verts = [at(a, v0), at(a, v1), at(b, v1), at(b, v0)];
             let uv = [Vec2::new(v0.tex_coord, va), Vec2::new(v1.tex_coord, va), Vec2::new(v1.tex_coord, vb), Vec2::new(v0.tex_coord, vb)];
             let depth = ((a.pos + b.pos) * 0.5 - view.pos).dot(view.forward);
-            list.push(Quad { verts, uv, colors, depth });
+            list.push(Quad { verts, uv, colors, depth, ambient: false });
         }
         along += len;
     }
@@ -1202,6 +1253,8 @@ struct Quad {
     colors: [[f32; 4]; 4],
     /// Distance along the view, for sorting.
     depth: f32,
+    /// A map's ambient effect's (lit by default, [`lit_shares`]).
+    ambient: bool,
 }
 
 /// A point light wanted this frame.
@@ -1261,6 +1314,10 @@ fn run_effects(
     >,
     mut models: Query<(&mut Transform, &mut GlobalTransform), (With<FxModel>, Without<FxBatch>, Without<FxLight>)>,
     spatial: SpatialQuery,
+    (grid, suns): (
+        Option<Res<crate::model_lighting::LightGridLookup>>,
+        Query<(&DirectionalLight, &GlobalTransform), (Without<crate::model_lighting::ViewModelSun>, Without<FxBatch>, Without<FxLight>, Without<FxModel>)>,
+    ),
 ) {
     let (Some(mut fx), Some(mut content)) = (fx, content) else { return };
     let started = std::time::Instant::now();
@@ -1342,10 +1399,16 @@ fn run_effects(
     }
 
     // Particles: drawn, then dropped once their life is over.
-    let mut quads: HashMap<(u16, FxLayer), Vec<Quad>> = HashMap::new();
+    // Last frame's lists, emptied (their room kept: a snowy map's specks
+    // are thousands of quads a frame).
+    let mut quads = std::mem::take(&mut fx.quad_lists);
+    for list in quads.values_mut() {
+        list.clear();
+    }
     let mut trails: HashMap<(u32, u16), TrailRun> = HashMap::new();
     let mut wanted_lights = Vec::new();
     let mut ended = Vec::new();
+    let mut cloud_time = std::time::Duration::ZERO;
     let Effects { defs, instances, particles, models: model_parts, model_count, queue, .. } = &mut *fx;
     let mut despawn = |p: &Particle, commands: &mut Commands| {
         if let Some(m) = &p.model {
@@ -1495,20 +1558,37 @@ fn run_effects(
                 return true;
             }
             // `CLOUD_POINTS` specks through a ball of radius `scale` (the
-            // cloud's size is each speck's), scattered by its seed.
+            // cloud's size is each speck's), scattered by its seed. A
+            // moving cloud's specks are streaks along its velocity (the
+            // engine's cloud `endpos`): rain falls straight, whichever way
+            // the camera looks.
             ElemType::Cloud => {
+                let cloud_started = std::time::Instant::now();
                 let radius = look.scale.max(0.0) * INCH;
                 let list = quads.entry((*material, inst.layer)).or_default();
-                for k in 0..CLOUD_POINTS {
-                    let s = p.seed ^ (k + 1).wrapping_mul(0x85eb_ca6b);
-                    let z = 2.0 * rand(s, 0) - 1.0;
-                    let a = rand(s, 1) * std::f32::consts::TAU;
-                    let ring = (1.0 - z * z).max(0.0).sqrt();
-                    let center = pos + Vec3::new(ring * a.cos(), z, ring * a.sin()) * rand(s, 2).cbrt() * radius;
-                    let spin = rand(s, 3) * std::f32::consts::TAU;
-                    let (verts, uv) = sprite_quad(center, view.right, view.up, look.size, spin, rect);
-                    list.push(Quad { verts, uv, colors: [look.color; 4], depth: (center - view.pos).dot(view.forward) });
+                list.reserve(CLOUD_POINTS as usize);
+                let seed = p.seed;
+                let along = velocity(e, rv, t, &frame, gravity, age_s).try_normalize();
+                for &(offset, spin) in p.cloud.get_or_insert_with(|| cloud_specks(seed)).iter() {
+                    let center = pos + offset * radius;
+                    let streak = along.and_then(|dir| Some((dir.cross(view.pos - center).try_normalize()?, dir)));
+                    let (verts, uv) = match streak {
+                        Some((tangent, dir)) => sprite_quad(center, tangent, dir, look.size, 0.0, rect),
+                        None => sprite_quad(center, view.right, view.up, look.size, spin, rect),
+                    };
+                    // A streak born at the lens would fill the screen for a
+                    // frame: those right by the camera fade out instead.
+                    let mut color = look.color;
+                    if streak.is_some() {
+                        let near = ((center - view.pos).length() / INCH - 48.0) / 96.0;
+                        color[3] *= near.clamp(0.0, 1.0);
+                        if color[3] <= 0.0 {
+                            continue;
+                        }
+                    }
+                    list.push(Quad { verts, uv, colors: [color; 4], depth: (center - view.pos).dot(view.forward), ambient: inst.forever });
                 }
+                cloud_time += cloud_started.elapsed();
                 return true;
             }
             _ => {}
@@ -1526,7 +1606,7 @@ fn run_effects(
         };
         let (verts, uv) = sprite_quad(center, tangent, binormal, look.size, look.rotation, rect);
         let depth = (center - view.pos).dot(view.forward);
-        quads.entry((*material, inst.layer)).or_default().push(Quad { verts, uv, colors: [look.color; 4], depth });
+        quads.entry((*material, inst.layer)).or_default().push(Quad { verts, uv, colors: [look.color; 4], depth, ambient: inst.forever });
         true
     });
     for slot in ended {
@@ -1542,7 +1622,15 @@ fn run_effects(
         }
     }
 
+    fx.busy_parts[2] += cloud_time;
+    let part = std::time::Instant::now();
+    if lit_shares() != (0.0, 0.0) {
+        light_blended(fx, &assets, &mut quads, grid.as_deref(), &suns, &spatial);
+    }
+    fx.busy_parts[0] += part.elapsed();
+    let part = std::time::Instant::now();
     draw_batches(&mut commands, fx, &mut assets, quads, &mut batches);
+    fx.busy_parts[1] += part.elapsed();
     place_lights(&mut commands, fx, wanted_lights, &mut lights);
     place_decals(&mut commands, fx, &mut content, &mut assets, &spatial);
     fx.busy.0 += started.elapsed();
@@ -1576,6 +1664,80 @@ impl Effects {
 
 /// Build each batch's mesh from its quads, back to front, about their
 /// centre (so the batch sorts against other transparent things there).
+/// Alpha-blended sprites (smoke, fog, dust) lit by where they are, as a
+/// white diffuse surface there would be (the light grid's light, and the
+/// map's sun where nothing's in the way), rather than drawn at one
+/// brightness everywhere: fog in a dark street stays dark. Additive ones
+/// (flashes, glows, sparks) give their own light and are left alone.
+///
+/// The map's ambient effects (fog wisps, dust) are lit; combat effects
+/// (smoke grenades, impacts) keep their fixed brightness.
+/// `COD4RW_FXLIT=<0..1>` sets how much for both (1 fully lit; between,
+/// mixed with the fixed brightness).
+fn lit_shares() -> (f32, f32) {
+    static SHARES: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    *SHARES.get_or_init(|| match std::env::var("COD4RW_FXLIT").ok().and_then(|v| v.parse::<f32>().ok()) {
+        Some(v) => (v.clamp(0.0, 1.0), v.clamp(0.0, 1.0)),
+        None => (1.0, 0.0),
+    })
+}
+
+/// Past this many quads in a batch, the batch's centre lights them all.
+const LIT_QUADS_EACH: usize = 256;
+
+#[allow(clippy::type_complexity)]
+fn light_blended(
+    fx: &Effects,
+    assets: &FxAssets,
+    quads: &mut HashMap<(u16, FxLayer), Vec<Quad>>,
+    grid: Option<&crate::model_lighting::LightGridLookup>,
+    suns: &Query<(&DirectionalLight, &GlobalTransform), (Without<crate::model_lighting::ViewModelSun>, Without<FxBatch>, Without<FxLight>, Without<FxModel>)>,
+    spatial: &SpatialQuery,
+) {
+    let sun = suns.iter().find(|(l, _)| l.shadow_maps_enabled).map(|(l, g)| {
+        let c = l.color.to_linear();
+        (Vec3::new(c.red, c.green, c.blue) * l.illuminance, -g.forward().as_vec3())
+    });
+    let filter = collision::sight_filter();
+    let light_at = |p: Vec3| {
+        let mut light = grid.map_or(Vec3::ZERO, |g| g.at(p));
+        if let Some((sun_light, to_sun)) = sun
+            && let Ok(dir) = Dir3::new(to_sun)
+            && spatial.cast_ray(p, dir, u(4000.0), true, &filter).is_none()
+        {
+            // A sprite faces every way: half the sun's light, as diffuse.
+            light += sun_light * 0.5 / std::f32::consts::PI;
+        }
+        light / FX_BRIGHTNESS
+    };
+    let (ambient_share, other_share) = lit_shares();
+    for (&(material, _), list) in quads.iter_mut() {
+        let additive = fx.materials.get(material as usize).and_then(|h| assets.fx_materials.get(h)).is_none_or(|m| m.params.x > 0.5);
+        if additive || list.is_empty() {
+            continue;
+        }
+        let share = |q: &Quad| if q.ambient { ambient_share } else { other_share };
+        let lit: Vec<&Quad> = list.iter().filter(|q| share(q) > 0.0).collect();
+        if lit.is_empty() {
+            continue;
+        }
+        let shared = (lit.len() > LIT_QUADS_EACH)
+            .then(|| light_at(lit.iter().map(|q| (q.verts[0] + q.verts[2]) * 0.5).sum::<Vec3>() / lit.len() as f32));
+        for q in list.iter_mut() {
+            let k = share(q);
+            if k <= 0.0 {
+                continue;
+            }
+            let light = Vec3::ONE.lerp(shared.unwrap_or_else(|| light_at((q.verts[0] + q.verts[2]) * 0.5)), k);
+            for c in &mut q.colors {
+                c[0] *= light.x;
+                c[1] *= light.y;
+                c[2] *= light.z;
+            }
+        }
+    }
+}
+
 fn draw_batches(
     commands: &mut Commands,
     fx: &mut Effects,
@@ -1583,11 +1745,14 @@ fn draw_batches(
     mut quads: HashMap<(u16, FxLayer), Vec<Quad>>,
     batches: &mut Query<(&mut Transform, &mut GlobalTransform), (With<FxBatch>, Without<FxLight>, Without<FxModel>)>,
 ) {
-    for &(material, layer) in quads.keys() {
-        fx.batch(commands, assets, material, layer);
+    for (&(material, layer), list) in quads.iter() {
+        if !list.is_empty() {
+            fx.batch(commands, assets, material, layer);
+        }
     }
+    let mut none = Vec::new();
     for (key, batch) in fx.batches.iter_mut() {
-        let mut list = quads.remove(key).unwrap_or_default();
+        let list = quads.get_mut(key).unwrap_or(&mut none);
         if list.is_empty() && batch.empty {
             continue;
         }
@@ -1595,16 +1760,19 @@ fn draw_batches(
         let mesh = if list.is_empty() {
             empty_mesh()
         } else {
-            list.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+            // Far to near, by index (the quads are big to move about).
+            let mut order: Vec<(f32, u32)> = list.iter().enumerate().map(|(i, q)| (q.depth, i as u32)).collect();
+            order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
             let center = list.iter().map(|q| (q.verts[0] + q.verts[2]) * 0.5).sum::<Vec3>() / list.len() as f32;
             if let Ok((mut tf, mut g)) = batches.get_mut(batch.entity) {
                 *tf = Transform::from_translation(center);
                 *g = GlobalTransform::from_translation(center);
             }
-            quads_mesh(&list, center)
+            quads_mesh(list, &order, center)
         };
         let _ = assets.meshes.insert(batch.mesh.id(), mesh);
     }
+    fx.quad_lists = quads;
 }
 
 impl Effects {
@@ -1664,7 +1832,8 @@ impl Effects {
 
 /// A mesh with nothing to draw (one degenerate triangle).
 fn empty_mesh() -> Mesh {
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    // The render world's only: rebuilt every frame, so moved there, not copied.
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; 3]);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; 3]);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.0f32; 4]; 3]);
@@ -1672,22 +1841,36 @@ fn empty_mesh() -> Mesh {
     mesh
 }
 
-fn quads_mesh(quads: &[Quad], center: Vec3) -> Mesh {
+fn quads_mesh(quads: &[Quad], order: &[(f32, u32)], center: Vec3) -> Mesh {
     let n = quads.len();
     let (mut pos, mut uv, mut color, mut idx) =
         (Vec::with_capacity(n * 4), Vec::with_capacity(n * 4), Vec::with_capacity(n * 4), Vec::with_capacity(n * 6));
-    for (i, q) in quads.iter().enumerate() {
+    // Each quad as a ball for `shaders/fx.wgsl`'s soft fade: its corners'
+    // place across it (-1..1 each way) and the ball's depth radius (the
+    // quad's smaller half side, metres) in the tangent's w.
+    let (mut corner, mut ball) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 4));
+    for (i, q) in order.iter().map(|&(_, k)| &quads[k as usize]).enumerate() {
         let base = (i * 4) as u32;
+        let mid = (q.verts[0] + q.verts[1] + q.verts[2] + q.verts[3]) * 0.25;
+        let (across, down) = (q.verts[3] - q.verts[0], q.verts[0] - q.verts[1]);
+        let radius = across.length().min(down.length()) * 0.5;
         for k in 0..4 {
             pos.push((q.verts[k] - center).to_array());
             uv.push(q.uv[k].to_array());
             color.push(q.colors[k]);
+            let d = q.verts[k] - mid;
+            let at = |axis: Vec3| if axis.length_squared() > 1e-12 { 2.0 * d.dot(axis) / axis.length_squared() } else { 0.0 };
+            corner.push([at(across), at(down)]);
+            ball.push([1.0, 0.0, 0.0, radius]);
         }
         idx.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
     }
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    // The render world's only: rebuilt every frame, so moved there, not copied.
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, corner);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, ball);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, color);
     mesh.insert_indices(Indices::U32(idx));
     mesh
@@ -1777,7 +1960,9 @@ fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content
         let at = start + dir * hit.distance;
         // Facing the side the ray came from.
         let n = if hit.normal.dot(start - at) < 0.0 { -hit.normal } else { hit.normal };
-        let Some(material) = fx.decal_material(content, assets, &d.material, d.color) else {
+        // Untinted: each mark's colour goes on its vertices (`DecalBatch`),
+        // so a material's marks share one batch.
+        let Some(material) = fx.decal_material(content, assets, &d.material) else {
             debug!("fx: mark material {} not found", d.material);
             continue;
         };
@@ -1788,7 +1973,6 @@ fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content
             d.color,
             assets.materials.get(&material).map(|m| (m.alpha_mode, m.unlit, m.depth_bias, m.base_color_texture.is_some()))
         );
-        let mesh = fx.decal_mesh.get_or_insert_with(|| assets.meshes.add(Rectangle::new(1.0, 1.0))).clone();
         // The quad's +Z faces out of the surface, spun as the effect says.
         let (sin, cos) = d.rotation.sin_cos();
         let t = d.frame.axis.col(1).reject_from_normalized(n).normalize_or(n.any_orthonormal_vector());
@@ -1796,17 +1980,78 @@ fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content
         let x = t * cos + b * sin;
         let rotation = Quat::from_mat3(&Mat3::from_cols(x, n.cross(x), n));
         let tf = Transform { translation: at + n * u(0.1), rotation, scale: Vec3::splat(u(d.size * 2.0)) };
-        let e = commands
-            .spawn((Name::new("impact mark"), Mesh3d(mesh), MeshMaterial3d(material), tf, NotShadowCaster))
-            .id();
-        fx.decals.push_back(e);
+        let order = fx.decal_batches.len();
+        let batch = fx.decal_batches.entry(material.id()).or_insert_with(|| {
+            let mesh = assets.meshes.add(Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD));
+            commands.spawn((Name::new("impact marks"), Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::IDENTITY, NotShadowCaster, NoFrustumCulling));
+            DecalBatch { mesh, quads: VecDeque::new(), order, dirty: false }
+        });
+        batch.quads.push_back((tf.compute_affine(), Color::srgba_u8(d.color[0], d.color[1], d.color[2], d.color[3]).to_linear().to_f32_array()));
+        batch.dirty = true;
+        fx.decals.push_back(material.id());
         if fx.decals.len() > MAX_DECALS {
-            if let Some(old) = fx.decals.pop_front() {
-                commands.entity(old).try_despawn();
+            if let Some(old) = fx.decals.pop_front().and_then(|id| fx.decal_batches.get_mut(&id)) {
+                old.quads.pop_front();
+                old.dirty = true;
             }
         }
     }
+    for batch in fx.decal_batches.values_mut().filter(|b| b.dirty) {
+        batch.dirty = false;
+        assets.meshes.insert(batch.mesh.id(), batch.build()).ok();
+    }
 }
+
+/// One material's impact marks as one mesh (a draw, not one a mark), in
+/// world space, oldest first so newer marks lay over older ones.
+struct DecalBatch {
+    mesh: Handle<Mesh>,
+    /// Each mark's unit quad's placement, and its colour (linear; the
+    /// material's base colour, white, times this).
+    quads: VecDeque<(bevy::math::Affine3A, [f32; 4])>,
+    /// When the batch was made (its place among the batches).
+    order: usize,
+    dirty: bool,
+}
+
+impl DecalBatch {
+    /// Marks draw before the other transparent things, as CoD4's do (its
+    /// own pass, after opaque): sorted by the mesh's centre, so an unused
+    /// vertex far below puts that a long way off, and older batches a
+    /// little further (their order among each other stays put).
+    fn build(&self) -> Mesh {
+        let n = self.quads.len();
+        let (mut pos, mut normals, mut uvs, mut colors, mut indices) =
+            (Vec::with_capacity(n * 4 + 1), Vec::with_capacity(n * 4 + 1), Vec::with_capacity(n * 4 + 1), Vec::with_capacity(n * 4 + 1), Vec::with_capacity(n * 6));
+        // Bevy's `Rectangle::new(1.0, 1.0)`, as the marks were.
+        const CORNERS: [([f32; 2], [f32; 2]); 4] = [([0.5, 0.5], [1.0, 0.0]), ([-0.5, 0.5], [0.0, 0.0]), ([-0.5, -0.5], [0.0, 1.0]), ([0.5, -0.5], [1.0, 1.0])];
+        for (q, color) in &self.quads {
+            let base = pos.len() as u32;
+            let normal = q.transform_vector3(Vec3::Z).normalize_or_zero();
+            for (p, uv) in CORNERS {
+                pos.push(q.transform_point3(Vec3::new(p[0], p[1], 0.0)).to_array());
+                normals.push(normal.to_array());
+                uvs.push(uv);
+                colors.push(*color);
+            }
+            indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        let far = DECAL_SORT_FAR - self.order as f32 * 1000.0;
+        pos.push([0.0, -far, 0.0]);
+        normals.push([0.0, 1.0, 0.0]);
+        uvs.push([0.0, 0.0]);
+        colors.push([0.0; 4]);
+        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+            .with_inserted_indices(Indices::U32(indices))
+    }
+}
+
+/// How far below the map the marks' batches' unused vertex sits (metres).
+const DECAL_SORT_FAR: f32 = 2.0e6;
 
 // ---------------------------------------------------------------------------
 // Guns and bullets

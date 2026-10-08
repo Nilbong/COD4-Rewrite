@@ -20,5 +20,10 @@ fn main() -> Result<()> {
         print!("{f}={} ", w.float(f));
     }
     println!();
+    print!("minDamage={} locationDamageMultipliers=", w.int("minDamage"));
+    for i in 0..19 {
+        print!("{} ", w.float(&format!("locationDamageMultipliers[{i}]")));
+    }
+    println!();
     Ok(())
 }

@@ -81,6 +81,14 @@ struct StanceToggle([Stance; crate::splitscreen::MAX_PLAYERS]);
 const EXPOSURE_TARGET_EV: f32 = -2.5;
 const EXPOSURE_RANGE_EV: f32 = 3.0;
 
+/// The world camera's ambient occlusion. Objects are taken to be 3 m
+/// thick rather than Bevy's 0.25 m, so a car or crate darkens the ground
+/// under it (a thin shell lets the ground "see" past it): cars standing in
+/// shade, which CoD4 never baked into the lightmaps, sit on the ground.
+pub fn ssao() -> bevy::pbr::ScreenSpaceAmbientOcclusion {
+    bevy::pbr::ScreenSpaceAmbientOcclusion { constant_object_thickness: 3.0, ..default() }
+}
+
 /// Sky luminance in cd/m^2 for a fully white sky texel, tuned to sit
 /// alongside sunlit surfaces: at 3000 (and 1500, with the exposure set by the
 /// darker part of the view) overcast skies (Bloc, Vacant) clipped
@@ -132,6 +140,9 @@ fn spawn_view(commands: &mut Commands, slot: usize, count: usize, compensation_c
             Camera {
                 order: 2 * slot as isize,
                 clear_color: ClearColorConfig::Custom(Color::srgb(0.55, 0.65, 0.78)),
+                // The viewmodel camera draws over this image and writes the
+                // finished frame out; this one's own copy out was wasted.
+                output_mode: bevy::camera::CameraOutputMode::Skip,
                 ..default()
             },
             Projection::from(PerspectiveProjection { fov: hip_fov().to_radians(), near: 0.05, far: 2000.0, ..default() }),
@@ -346,20 +357,74 @@ fn keyboard_input(
 /// CoD4's camera, each local player's; [`crate::bodycam`] re-poses it
 /// afterwards in Bodycam gunplay.
 #[allow(clippy::type_complexity)]
+/// Out for the round (Search and Destroy, a held HQ): the teammate each
+/// local player watches, by slot, and their name for the HUD.
+static WATCHING: std::sync::Mutex<[Option<String>; crate::splitscreen::MAX_PLAYERS]> =
+    std::sync::Mutex::new([const { None }; crate::splitscreen::MAX_PLAYERS]);
+
+/// Who a local player out for the round is watching.
+pub fn watching(slot: usize) -> Option<String> {
+    WATCHING.lock().ok().and_then(|w| w.get(slot).cloned().flatten())
+}
+
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn follow_camera(
     players: Query<
-        (&LocalSlot, &Transform, &Mover, &ViewAngles, &WeaponState, Has<Dead>, Has<crate::loadout::AwaitingClass>),
+        (
+            (&LocalSlot, &crate::combat::Pawn, &crate::splitscreen::PlayerInput),
+            &Transform,
+            &Mover,
+            &ViewAngles,
+            &WeaponState,
+            Option<&Dead>,
+            Has<crate::loadout::AwaitingClass>,
+            Option<&crate::first_person::feel::Feel>,
+        ),
         Without<crate::splitscreen::SlotCamera>,
     >,
+    teammates: Query<(Entity, &crate::combat::Pawn, &Transform, &Mover, &ViewAngles), (Without<Dead>, Without<crate::splitscreen::SlotCamera>)>,
+    mut watched: Local<[Option<Entity>; crate::splitscreen::MAX_PLAYERS]>,
     mut cameras: Query<(&crate::splitscreen::SlotCamera, &mut Transform, &mut Projection), Without<LocalSlot>>,
     mut vm_cameras: Query<(&crate::splitscreen::SlotViewModelCamera, &mut Projection), (Without<crate::splitscreen::SlotCamera>, Without<LocalSlot>)>,
     gunplay: Res<Gunplay>,
     time: Res<Time>,
 ) {
-    for (slot, tf, mover, view, weapon, dead, picking_class) in &players {
+    for ((slot, me, input), tf, mover, view, weapon, dead_state, picking_class, feel) in &players {
         let Some((_, mut cam_tf, mut proj)) = cameras.iter_mut().find(|c| c.0.0 == slot.0) else { continue };
+        // Out until the next round: watch a teammate (fire for the next), as
+        // CoD4's spectating does.
+        let out = dead_state.is_some_and(|d| d.respawn_at.is_infinite()) && !picking_class && !crate::combat::free_for_all()
+            // (An online guest's dead wait on the host instead.)
+            && crate::netplay::authority();
+        let s = slot.0.min(crate::splitscreen::MAX_PLAYERS - 1);
+        if out {
+            let mut team: Vec<_> = teammates.iter().filter(|t| t.1.team == me.team && t.1.id != me.id).collect();
+            team.sort_by_key(|t| t.1.id);
+            let at = watched[s].and_then(|w| team.iter().position(|t| t.0 == w));
+            let next = input.live && input.mouse.just_pressed(MouseButton::Left);
+            let pick = match at {
+                Some(i) if next => Some((i + 1) % team.len()),
+                Some(i) => Some(i),
+                None if !team.is_empty() => Some(0),
+                None => None,
+            };
+            if let Some(&(e, p, t_tf, t_mover, t_view)) = pick.and_then(|i| team.get(i)) {
+                watched[s] = Some(e);
+                if let Ok(mut w) = WATCHING.lock() {
+                    w[s] = Some(p.name.clone());
+                }
+                cam_tf.translation = t_mover.eye(t_tf.translation);
+                cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, t_view.yaw, t_view.pitch, 0.0);
+                continue;
+            }
+        }
+        if watched[s].take().is_some()
+            && let Ok(mut w) = WATCHING.lock()
+        {
+            w[s] = None;
+        }
         // Waiting to spawn with a class: a level view from the spawn.
-        let dead = dead && !picking_class;
+        let dead = dead_state.is_some() && !picking_class;
         let mut eye = if dead { tf.translation + Vec3::Y * u(8.0) } else { mover.eye(tf.translation) };
         // View angle bob while aiming down sights (`BG_CalculateViewAngles`),
         // in CoD degrees: pitch down, yaw left.
@@ -379,10 +444,12 @@ pub fn follow_camera(
                 bob_yaw = -mover.horizontal_bob(cycle, speed, 45.0) * scale;
             }
         }
-        cam_tf.translation = eye;
-        let roll = if dead { 0.6 } else { 0.0 };
+        // The richer bob's dips and roll ([`crate::first_person::feel`]).
+        let (feel_up, feel_pitch, feel_roll) = feel.filter(|_| !dead).map_or((0.0, 0.0, 0.0), |f| (f.cam_up, f.cam_pitch, f.cam_roll));
+        cam_tf.translation = eye + Vec3::Y * feel_up;
+        let roll = if dead { 0.6 } else { feel_roll };
         cam_tf.rotation =
-            Quat::from_euler(EulerRot::YXZ, view.yaw + bob_yaw.to_radians(), view.pitch - bob_pitch.to_radians(), roll);
+            Quat::from_euler(EulerRot::YXZ, view.yaw + bob_yaw.to_radians(), view.pitch - bob_pitch.to_radians() + feel_pitch, roll);
         if let Projection::Perspective(p) = proj.as_mut() {
             let target = view_fov(*gunplay, weapon).to_radians();
             p.fov += (target - p.fov) * (1.0 - (-20.0 * time.delta_secs()).exp());

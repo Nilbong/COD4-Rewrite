@@ -140,6 +140,9 @@ fn load_look(
         on(look.film.is_some_and(|f| f.glow_on())),
         on(look.sun.is_some())
     );
+    if let Some(f) = look.film {
+        debug!("vision: glow {:?}, tint {:?} + {:?}, bias {:?}", f.glow, f.tint_base, f.tint_delta, f.bias);
+    }
 }
 
 /// A raw file of the match's zones, as text.
@@ -164,11 +167,35 @@ pub struct FilmUniform {
     glow: Vec4,
     /// The blur's radius (pixels at 640x480), and 1 when the glow is on.
     glow_blur: Vec4,
+    /// The Rich look (`r_tonemap`) over the film: x: its S-curve, y: its
+    /// saturation (0 and 1 for none).
+    grade: Vec4,
 }
 
 impl FilmUniform {
     /// No film: the frame as it is.
     const NO_FILM: [Vec4; 3] = [Vec4::new(1.0, 1.0, 1.0, 0.0), Vec4::ZERO, Vec4::ZERO];
+
+    /// No film or glow, the frame as it is (for the Rich look's grade on
+    /// maps without a vision file).
+    const NEUTRAL: FilmUniform = FilmUniform {
+        tint_base: Self::NO_FILM[0],
+        tint_delta: Self::NO_FILM[1],
+        bias: Self::NO_FILM[2],
+        glow: Vec4::new(0.99, 100.0, 0.0, 0.0),
+        glow_blur: Vec4::ZERO,
+        grade: Self::NO_GRADE,
+    };
+    const NO_GRADE: Vec4 = Vec4::new(0.0, 1.0, 1.0, 0.0);
+
+    /// The Rich look: Natural's exposure and curve with more contrast and
+    /// colour, graded on screen after tonemapping, so it can't brighten
+    /// or darken one map more than another (ACES did: its toe sank dark
+    /// maps such as Wet Work while its steeper middle lifted bright ones).
+    fn rich(self) -> FilmUniform {
+        let to_half = 0.5f32.ln() / RICH_PIVOT.ln();
+        FilmUniform { grade: Vec4::new(RICH_CONTRAST, RICH_SATURATION, to_half, 0.0), ..self }
+    }
 
     fn film_on(&self) -> bool {
         [self.tint_base, self.tint_delta, self.bias] != Self::NO_FILM
@@ -205,8 +232,8 @@ impl FilmUniform {
     /// was), which on a frame auto-exposure already brightened blew the
     /// highlights out and crushed the shadows. Here the tints and
     /// desaturation keep each map's mood, but mid-grey (0.5 on screen) stays
-    /// mid-grey (no added contrast: AgX gives the curve), black lifts a
-    /// touch (`FILM_LIFT`), highlights stretch (`HIGHLIGHT_GAIN`) so backlit trees and guns keep some shape, and
+    /// mid-grey (no added contrast: AgX gives the curve), black stays
+    /// black (`FILM_LIFT`), highlights stretch (`HIGHLIGHT_GAIN`) so backlit trees and guns keep some shape, and
     /// the desaturation is gentler (AgX already desaturates).
     /// Maps the file lowers contrast on (Bog's 0.82) keep a little of that.
     fn balanced(self, contrast: f32) -> FilmUniform {
@@ -214,7 +241,9 @@ impl FilmUniform {
             return self;
         }
         const MID: f32 = 0.5;
-        const FILM_LIFT: f32 = 0.035;
+        // No lift: black stays black. (0.035 here greyed every shadow and
+        // dark uniform, which read as flat next to CoD4.)
+        const FILM_LIFT: f32 = 0.0;
         // Highlights stretched (twice as steep over 0.6 on screen): AgX
         // rolls them off well below white, which with the brighter middle
         // CoD4's look lost to left Crash's ground flat and pale.
@@ -230,8 +259,21 @@ impl FilmUniform {
             tint_delta: self.tint_delta * gain,
             bias: Vec3::splat(MID * (1.0 - slope) + FILM_LIFT).extend(self.bias.w * 0.3),
             glow_blur: Vec4::new(self.glow_blur.x, self.glow_blur.y, HIGHLIGHT_GAIN, HIGHLIGHT_FROM),
+            glow: Self::balanced_glow(self.glow),
             ..self
         }
+    }
+
+    /// The glow for the exposed frame: CoD4 set its cutoff for its own darker
+    /// raw frame, so on ours a low one (Bloc's 0.23) made half the scene glow
+    /// into a milky haze. The cutoff moves 40% of the way to white and the
+    /// intensity halves; maps that only glowed their brightest bits (Crash's
+    /// 0.99) hardly change.
+    fn balanced_glow(glow: Vec4) -> Vec4 {
+        const CUTOFF_TOWARDS_WHITE: f32 = 0.4;
+        const INTENSITY: f32 = 0.5;
+        let cutoff = (glow.x + (1.0 - glow.x) * CUTOFF_TOWARDS_WHITE).min(0.995);
+        Vec4::new(cutoff, 1.0 / (1.0 - cutoff), glow.z, glow.w * INTENSITY)
     }
 
     /// From a `.vision` file: its `r_film*` settings (the frame as it is if
@@ -265,9 +307,18 @@ impl FilmUniform {
                 Vec3::splat(brightness).extend(one("r_filmDesaturation", 0.0)),
             ]
         };
-        FilmUniform { tint_base, tint_delta, bias, glow, glow_blur }
+        FilmUniform { tint_base, tint_delta, bias, glow, glow_blur, grade: Self::NO_GRADE }
     }
 }
+
+/// The Rich look's S-curve: the middle's slope is `1 + this`, black and
+/// white stay put.
+const RICH_CONTRAST: f32 = 0.25;
+/// Where the S-curve turns (on screen): about the maps' mean, which on
+/// 0.5 sank the darker maps (Chinatown, Winter Crash) 16% below Natural.
+const RICH_PIVOT: f32 = 0.33;
+/// The Rich look's saturation (luminance kept).
+const RICH_SATURATION: f32 = 1.2;
 
 /// Debug aid: `COD4RW_FILM=cod4` grades maps exactly as CoD4's film does
 /// (see [`FilmUniform::balanced`]), for comparing.
@@ -313,6 +364,7 @@ fn apply_film(
     // The Bloom setting off takes the map's glow off too.
     let base = look.film.map(|f| if crate::ui::film_tint() { f } else { f.untinted() });
     let base = base.map(|f| if crate::settings_apply::bloom() { f } else { f.unglowing() });
+    let base = if crate::settings_apply::rich() { Some(base.unwrap_or(FilmUniform::NEUTRAL).rich()) } else { base };
     for (e, film, bloom, slot) in &cameras {
         let nv = night_vision.get(slot.map_or(0, |s| s.0));
         let wanted = if nv.showing(time.elapsed_secs()) { look.night.or(base) } else { base };
@@ -692,8 +744,10 @@ fn sun_effects(
     let dt = time.delta_secs();
     let ms = |t: i32| t as f32 / 1000.0;
     let dot = cam_tf.forward().dot(sun.dir);
+    // The showcase's storm hides the sun (or Wet Work's moon) and its flare.
+    let veiled = crate::atmos::climate::showcase() && crate::atmos::climate::storm_veil();
     // Nothing solid between the eye and the sky towards the sun.
-    let clear = dot > 0.0
+    let clear = !veiled && dot > 0.0
         && Dir3::new(sun.dir).is_ok_and(|d| {
             spatial.cast_ray(cam_tf.translation(), d, crate::units::u(32768.0), true, &crate::collision::sight_filter()).is_none()
         });

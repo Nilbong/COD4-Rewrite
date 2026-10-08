@@ -11,6 +11,7 @@ mod dressing;
 pub mod load;
 
 pub use camera::{LocalBody, ThirdPerson};
+pub(crate) use camera::place_camera;
 pub use dressing::Dressing;
 pub use load::{Source, black_ops_anim, load, load_black_ops_anims};
 
@@ -88,6 +89,8 @@ pub struct Wardrobe {
     /// Ready to wear, by character id.
     outfits: HashMap<&'static str, Outfit>,
     arms: Option<Arc<PreparedModel>>,
+    /// Shown, not worn: Headquarters' supply drop reveal ([`Self::request`]).
+    extra: Vec<&'static Character>,
 }
 
 impl Wardrobe {
@@ -122,6 +125,35 @@ impl Wardrobe {
     /// The player's first-person arms.
     pub fn arms(&self) -> Option<Arc<PreparedModel>> {
         self.arms.clone()
+    }
+
+    /// A character to show in this match (Headquarters' supply drop reveal):
+    /// the map's own are converted now, others' zones start loading and
+    /// are converted as they finish ([`poll`]). Then [`Self::outfit_of`].
+    pub fn request(&mut self, c: &'static Character, map: &str, content: &mut Content, a: &mut ModelAssets) {
+        if self.outfits.contains_key(c.id) || self.extra.iter().any(|o| o.id == c.id) {
+            return;
+        }
+        self.extra.push(c);
+        if in_map(c, map) {
+            dress(&mut self.outfits, c, content, &mut Dressing::default(), a);
+            return;
+        }
+        let src = Source::of(c);
+        if !self.loading.iter().any(|(s, _)| *s == src) {
+            info!("wardrobe: loading {} to show {}", src.zone, c.name);
+            self.loading.push((src.clone(), load(src)));
+        }
+    }
+
+    /// A character's models, once ready.
+    pub fn outfit_of(&self, id: &str) -> Option<&Outfit> {
+        self.outfits.get(id)
+    }
+
+    /// Is a requested character still loading?
+    pub fn loading(&self, c: &Character) -> bool {
+        !self.outfits.contains_key(c.id) && self.loading.iter().any(|(s, _)| *s == Source::of(c))
     }
 }
 
@@ -440,7 +472,7 @@ impl Wardrobe {
     /// Everyone's characters, once each.
     fn worn(&self) -> Vec<&'static Character> {
         let mut worn: Vec<&'static Character> = Vec::new();
-        for &c in self.player.iter().chain(self.casts.iter().flatten()) {
+        for &c in self.player.iter().chain(self.casts.iter().flatten()).chain(&self.extra) {
             if !worn.iter().any(|o| o.id == c.id) {
                 worn.push(c);
             }
@@ -477,7 +509,7 @@ impl Wardrobe {
     }
 }
 
-type ModelAssets<'a> =
+pub type ModelAssets<'a> =
     (&'a mut Assets<Mesh>, &'a mut Assets<StandardMaterial>, &'a mut Assets<Image>, &'a mut Assets<SkinnedMeshInverseBindposes>);
 
 /// Convert `c`'s models from `content`.

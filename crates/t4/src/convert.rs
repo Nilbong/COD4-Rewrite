@@ -136,6 +136,7 @@ pub fn xmodel(zone: &Zone, m: &GNode, remap: &dyn Fn(Option<usize>) -> Option<us
         mins: vec3(m, "mins"),
         maxs: vec3(m, "maxs"),
         contents: m.int("contents") as i32,
+        coll_boxes: Vec::new(),
     }
 }
 

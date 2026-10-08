@@ -21,6 +21,26 @@ use replay::Replay;
 
 pub struct KillcamPlugin;
 
+/// A round just ended (Search and Destroy, Sabotage): when, as `f32` bits,
+/// taken by [`flow`] for that round's final killcam. `u32::MAX`: none.
+static ROUND_OVER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// A round's final killcam shows a kill this long before the round ended
+/// at most (s): later than that, the round wasn't won by it.
+const ROUND_KILL_WINDOW: f32 = 4.0;
+/// A killcam is on or due: rounds and the match wait for it.
+static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A round ended now: replay its last kill (the modes call this).
+pub fn round_over(now: f32) {
+    ROUND_OVER.store(now.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is a killcam showing or about to? The next round, and the trip back to
+/// the lobby, wait for it.
+pub fn busy() -> bool {
+    BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Plugin for KillcamPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<History>()
@@ -146,6 +166,7 @@ fn flow(
         return;
     }
     let now = time.elapsed_secs();
+    BUSY.store(killcam.replay.is_some() || killcam.pending.is_some(), std::sync::atomic::Ordering::Relaxed);
     let me = pawns.iter().find(|p| p.2).map(|p| p.0);
     let ended = state.as_ref().and_then(|s| s.ended);
     // Killed by someone: the killcam, once the death has sunk in.
@@ -171,6 +192,18 @@ fn flow(
     }
     if ended.is_none() {
         killcam.final_shown = false;
+    }
+    // A round of Search and Destroy (or Sabotage) is over: its last kill
+    // again, for everyone, unless it was long before the round ended (the
+    // bomb, the clock).
+    let round_end = ROUND_OVER.swap(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+    if round_end != u32::MAX && ended.is_none() {
+        let at = f32::from_bits(round_end);
+        if let Some(kill) = history.kills.iter().rev().find(|x| x.time <= at + 0.1 && x.time >= at - ROUND_KILL_WINDOW).cloned() {
+            let start = (kill.time + replay::AFTER).max(now + 0.5);
+            killcam.pending = Some((start, (kill.victim, kill.attacker, kill.time), "FINAL KILLCAM", false));
+            stop(&mut commands, &mut killcam, &ghosts, &mut visibility);
+        }
     }
     // Due: play it.
     if killcam.pending.as_ref().is_some_and(|p| now >= p.0) {
@@ -199,8 +232,13 @@ fn flow(
     let skipped = r.skippable && (keys.just_pressed(KeyCode::KeyF) || pad_pressed);
     if r.done(now) || skipped {
         if skipped {
-            if let Some(Ok((_, _, _, Some(mut dead)))) = me.map(|e| pawns.get_mut(e)) {
-                dead.respawn_at = now;
+            // Sooner, not later: a dead player waiting for the next round
+            // (Search and Destroy) or for their HQ to go stays waiting.
+            if let Some(Ok((_, pawn, _, Some(mut dead)))) = me.map(|e| pawns.get_mut(e))
+                && dead.respawn_at.is_finite()
+                && !crate::modes::respawn_locked(pawn.team)
+            {
+                dead.respawn_at = dead.respawn_at.min(now);
             }
         }
         stop(&mut commands, &mut killcam, &ghosts, &mut visibility);

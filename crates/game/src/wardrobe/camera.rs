@@ -95,13 +95,14 @@ pub(super) fn show_body(
 
 /// Pull each third-person camera back from the eye, short of any wall
 /// behind.
-pub(super) fn place_camera(
+pub(crate) fn place_camera(
     view: Res<ThirdPerson>,
     spectate: Option<Res<Spectate>>,
     players: Query<&LocalSlot>,
     mut cameras: Query<(&SlotCamera, &mut Transform)>,
     spatial: SpatialQuery,
     killcam: Res<crate::killcam::Killcam>,
+    cover: Res<crate::cover::CoverView>,
 ) {
     if spectate.is_some() {
         return;
@@ -112,6 +113,11 @@ pub(super) fn place_camera(
             continue;
         }
         let eye = tf.translation;
+        // 3rd Person TDM: the over-the-shoulder camera ([`crate::cover`]).
+        if crate::cover::active() {
+            tf.translation = crate::cover::camera_position(eye, tf.rotation, slot, &cover, &spatial);
+            continue;
+        }
         // The camera looks down -Z: behind is +Z.
         let offset = tf.rotation * Vec3::new(u(RIGHT), u(UP), u(BEHIND));
         let Ok(dir) = Dir3::new(offset) else { continue };

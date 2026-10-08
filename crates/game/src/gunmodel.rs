@@ -20,7 +20,6 @@
 use crate::content::{Content, PreparedModel};
 use crate::models::{Skeleton, SpawnModel, spawn_model};
 use crate::textures::TextureCache;
-use bevy::camera::primitives::MeshAabb;
 use bevy::camera::visibility::RenderLayers;
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
@@ -31,6 +30,7 @@ use iw3::zone::AssetType;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+mod custom;
 mod diamond;
 #[cfg(test)]
 mod coverage_tests;
@@ -75,6 +75,12 @@ pub struct ReflexMaterial {
     #[texture(3)]
     #[sampler(4)]
     grain: Handle<Image>,
+    /// The reticle ([`crate::reticles`]): x its shape (0: CoD4's dot), y
+    /// its size; and its colour.
+    #[uniform(5)]
+    style: Vec4,
+    #[uniform(6)]
+    tint: Vec4,
 }
 
 impl Material for ReflexMaterial {
@@ -100,24 +106,25 @@ struct ReflexInfo {
 const REFLEX_SCALE: f32 = 25.0;
 
 /// A red dot surface just spawned, waiting for its [`ReflexMaterial`]: the
-/// dot's and grain's textures and scale.
+/// dot's and grain's textures and scale, and the reticle picked.
 #[derive(Component)]
-struct ReflexDot(Handle<Image>, Option<Handle<Image>>, Vec2);
+struct ReflexDot(Handle<Image>, Option<Handle<Image>>, Vec2, crate::reticles::Reticle);
 
 fn light_reflex_dots(
     mut commands: Commands,
     dots: Query<(Entity, &ReflexDot)>,
     mut materials: ResMut<Assets<ReflexMaterial>>,
     mut images: ResMut<Assets<Image>>,
-    mut made: Local<HashMap<(AssetId<Image>, Option<AssetId<Image>>), Handle<ReflexMaterial>>>,
+    mut made: Local<HashMap<(AssetId<Image>, Option<AssetId<Image>>, u16), Handle<ReflexMaterial>>>,
     mut white: Local<Option<Handle<Image>>>,
 ) {
-    for (e, ReflexDot(dot, grain, scale)) in &dots {
+    for (e, ReflexDot(dot, grain, scale, reticle)) in &dots {
         let grain = grain.clone().unwrap_or_else(|| white.get_or_insert_with(|| images.add(Image::default())).clone());
+        let (style, tint) = reticle.uniforms();
         let material = made
-            .entry((dot.id(), Some(grain.id())))
+            .entry((dot.id(), Some(grain.id()), reticle.code()))
             .or_insert_with(|| {
-                materials.add(ReflexMaterial { scale: scale.extend(0.0).extend(0.0), dot: dot.clone(), grain })
+                materials.add(ReflexMaterial { scale: scale.extend(0.0).extend(0.0), dot: dot.clone(), grain, style, tint })
             })
             .clone();
         commands.entity(e).remove::<(ReflexDot, MeshMaterial3d<StandardMaterial>)>().insert(MeshMaterial3d(material));
@@ -247,6 +254,17 @@ pub struct CamoCache {
 }
 
 impl CamoCache {
+    /// Editing a custom camo makes materials for each version: keep only
+    /// the versions in use once there are many.
+    fn drop_stale_custom(&mut self) {
+        let custom = |k: &str| k.strip_prefix("cod4rw/custom/").and_then(|r| u64::from_str_radix(r.split('/').next()?, 16).ok());
+        if self.camos.keys().filter(|(_, k)| custom(k).is_some()).count() < 64 {
+            return;
+        }
+        let live = crate::custom_camos::live_material_keys();
+        self.camos.retain(|(_, k), _| custom(k).is_none_or(|v| live.contains(&v)));
+    }
+
     /// `m` (model `name`) normal-mapped, its surfaces in the same order.
     fn dress(
         &mut self,
@@ -355,6 +373,16 @@ fn spawn_model_of(
 ) -> Option<((Vec3, Vec3), Vec<Entity>)> {
     let (meshes, materials, images) = (&mut *a.meshes, &mut *a.materials, &mut *a.images);
     let (weapon, attachments) = parse(spec);
+    // The red dot's reticle rides on the camo number.
+    let (camo, reticle) = crate::reticles::split(camo);
+    // A custom camo is painted on the plain gun; one not defined here
+    // (another player's) shows none.
+    let custom = crate::custom_camos::get(camo);
+    let camo = match &custom {
+        Some(_) => custom::model_camo(crate::bo1::is_bo1(weapon), crate::waw::is_waw(weapon)),
+        None if crate::custom_camos::is_custom(camo) => 0,
+        None => camo,
+    };
     let finish = platinum::Finish::selected(weapon, camo);
     let camo = finish.map_or(camo, |f| f.model_camo(weapon));
     // Keep the native gold models and materials where CoD4 supplies them.
@@ -397,6 +425,10 @@ fn spawn_model_of(
     } else {
         camo_surfaces(content, &model_name, materials, images)
     };
+    let paint_surfaces = match &custom {
+        Some(_) => custom::surfaces(content, &model_name, weapon, (bo1, waw), materials, images),
+        None => HashMap::new(),
+    };
     let finish_surfaces: HashSet<_> = if finish.is_some() {
         platinum::surfaces(content, &model_name, materials, images)
     } else {
@@ -407,6 +439,7 @@ fn spawn_model_of(
             diamond_model(content, &model_name, &prepared, &worn, &finish_surfaces, meshes, &mut camos.diamond_meshes);
     }
     let reflex_surfaces = reflex_surfaces(content, &model_name, materials, images);
+    let lens_surfaces = lens_surfaces(content, &model_name, materials, images);
     let mut shine_surfaces = shine_surfaces(content, &model_name, materials, images);
     if waw {
         // World at War's guns give negative fresnel powers (`envMapParms.z`,
@@ -425,16 +458,17 @@ fn spawn_model_of(
             content.model(&name, meshes, materials, images, a.bindposes).map(|m| (m, keep))
         });
 
-    // The bind-pose bounds of every surface on show.
-    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-    let extra = suppressor.iter().flat_map(|(m, keep)| m.surfaces.iter().filter(|(_, mat)| keep.contains(&mat.id())));
-    for (mesh, _) in prepared.surfaces.iter().chain(extra) {
-        if let Some(aabb) = meshes.get(mesh).and_then(|m| m.compute_aabb()) {
-            lo = lo.min(Vec3::from(aabb.min()));
-            hi = hi.max(Vec3::from(aabb.max()));
-        }
+    // The bind-pose bounds of the gun (and its suppressor), as worked out
+    // when they were prepared: once a mesh is on the GPU its vertices can't
+    // be read back (a gun spawned again, dropped on death, would panic).
+    let (mut lo, mut hi) = prepared.bounds;
+    if let Some((m, _)) = &suppressor
+        && m.bounds.0.x <= m.bounds.1.x
+    {
+        lo = lo.min(m.bounds.0);
+        hi = hi.max(m.bounds.1);
     }
-    if lo.x > hi.x {
+    if lo.x > hi.x || prepared.surfaces.is_empty() {
         return None;
     }
 
@@ -460,10 +494,34 @@ fn spawn_model_of(
     }
     let vfs = content.vfs.clone();
     for (entity, ((_, material), (_, worn))) in surfaces.into_iter().zip(prepared.surfaces.iter().zip(&worn.surfaces)) {
+        // A magnifying scope's eyepiece: a 3D scope draws its view there.
+        // (Kept as it is meanwhile: no camo or shine of its own.)
+        if lens_surfaces.contains(&material.id()) {
+            commands.entity(entity).insert(ScopeLens);
+            continue;
+        }
         if let Some(info) = reflex_surfaces.get(&material.id()) {
             if let Some(dot) = camos.textures.get(&info.dot, true, &vfs, images) {
                 let grain = info.grain.as_ref().and_then(|g| camos.textures.get(g, true, &vfs, images));
-                commands.entity(entity).insert(ReflexDot(dot, grain, info.scale));
+                commands.entity(entity).insert(ReflexDot(dot, grain, info.scale, reticle));
+                continue;
+            }
+        }
+        if let (Some(def), Some(&surface)) = (&custom, paint_surfaces.get(&material.id())) {
+            let key = (worn.id(), format!("cod4rw/custom/{:x}/{}", def.key(), surface.1));
+            let handle = camos.camos.get(&key).cloned().or_else(|| {
+                let base = materials.get(worn)?.clone();
+                let paint = crate::custom_camos::texture(def, images);
+                let specular = shine_surfaces
+                    .get(&material.id())
+                    .and_then(|(s, env)| Some((camos.textures.get(s, false, &vfs, images)?, *env)));
+                let h = a.camo_materials.add(custom::material(base, def, paint, specular, surface));
+                camos.drop_stale_custom();
+                camos.camos.insert(key, h.clone());
+                Some(h)
+            });
+            if let Some(handle) = handle {
+                commands.entity(entity).remove::<MeshMaterial3d<StandardMaterial>>().insert(MeshMaterial3d(handle));
                 continue;
             }
         }
@@ -582,7 +640,7 @@ fn diamond_model(
                     })
                     .collect();
                 source.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
-                let h = meshes.add(diamond::studded_with_budget(&source, stud_budget)?);
+                let h = crate::mesh_bounds::add(meshes, diamond::studded_with_budget(&source, stud_budget)?);
                 cache.insert(mesh.id(), h.clone());
                 Some(h)
             });
@@ -604,6 +662,8 @@ fn diamond_model(
         bones,
         surfaces,
         inverse_bindposes: worn.inverse_bindposes.clone(),
+        extent: worn.extent,
+        bounds: worn.bounds,
     })
 }
 
@@ -801,6 +861,36 @@ fn bo1_camo_surfaces(
         }
     }
     out
+}
+
+/// A magnifying scope's eyepiece lens (a sniper scope's, an ACOG's): what
+/// `ui::scope3d` draws the scope's view on.
+#[derive(Component)]
+pub struct ScopeLens;
+
+/// The surfaces of a model that are a scope's eyepiece: CoD4's
+/// `mtl_weapon_*_scope_lens` and `mtl_weapon_acog_lens` (not red dots'
+/// `reflex_lens`, nor the front lenses).
+fn lens_surfaces(
+    content: &mut Content,
+    model: &str,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> HashSet<AssetId<StandardMaterial>> {
+    let Some((zi, id)) = content.find(model) else { return HashSet::new() };
+    let zone = &content.zones[zi];
+    let Some(xm) = zone.xmodel(id) else { return HashSet::new() };
+    let Some(lod) = xm.lods.first() else { return HashSet::new() };
+    let ids: Vec<_> = (lod.surf_index as usize..(lod.surf_index + lod.num_surfs) as usize)
+        .filter_map(|i| xm.materials.get(i).copied().flatten())
+        .filter(|&i| {
+            zone.material(i).is_some_and(|m| {
+                let name = m.name.trim_start_matches(',').to_ascii_lowercase();
+                name.ends_with("scope_lens") || name.ends_with("acog_lens")
+            })
+        })
+        .collect();
+    ids.into_iter().filter_map(|id| content.material(zi, id, materials, images)).map(|m| m.handle.id()).collect()
 }
 
 /// The surfaces of a model drawn with `mc_reflexsight` (a red dot sight's

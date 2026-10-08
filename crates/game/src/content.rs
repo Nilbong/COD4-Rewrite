@@ -40,6 +40,11 @@ pub struct PreparedModel {
     pub bones: Vec<PreparedBone>,
     pub surfaces: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
     pub inverse_bindposes: Handle<SkinnedMeshInverseBindposes>,
+    /// The size of its bind pose's bounds (metres): the meshes themselves
+    /// can't be read back once they're on the GPU.
+    pub extent: Vec3,
+    /// Those bounds' corners, for the same reason.
+    pub bounds: (Vec3, Vec3),
 }
 
 #[derive(Resource)]
@@ -143,6 +148,20 @@ impl Content {
         zone.image(image).map(|i| i.name.clone())
     }
 
+    /// A material's detail map (IW3's `detailMap`, a second colour texture
+    /// tiled `detailScale` times over the first) and that scale.
+    pub fn material_detail(&mut self, zi: usize, id: AssetId, images: &mut Assets<Image>) -> Option<(Handle<Image>, Vec2)> {
+        /// IW3's hash of "detailMap".
+        const DETAIL_MAP: u32 = 0xeb52_9b4d;
+        let zone = &self.zones[zi];
+        let mat = zone.material(id)?;
+        let image = mat.textures.iter().find(|t| t.name_hash == DETAIL_MAP)?.image?;
+        let name = zone.image(image)?.name.clone();
+        let scale = mat.constants.iter().find(|c| c.name == "detailScale").map_or(Vec2::splat(8.0), |c| Vec2::new(c.literal[0], c.literal[1]));
+        // Raw (gamma) values: the shader multiplies in gamma space as IW3 did.
+        Some((self.textures.get(&name, false, &self.vfs, images)?, scale))
+    }
+
     /// One of a material's textures by semantic, e.g. its normal map.
     pub fn material_texture(
         &mut self,
@@ -164,16 +183,34 @@ impl Content {
         if techset.trim_start_matches(',').ends_with("_shadowcaster") {
             return None;
         }
+        // Debug aid: `COD4RW_HIDEMAT=<part>[,<part>...]` leaves out materials
+        // whose name contains one, to find what draws a spot.
+        if std::env::var("COD4RW_HIDEMAT").is_ok_and(|v| v.split(',').any(|p| !p.is_empty() && mat.name.contains(p))) {
+            return None;
+        }
         let sky = techset.contains("sky");
         let image_name = |sem: TextureSemantic| {
             mat.textures.iter().find(|t| t.semantic == sem).and_then(|t| t.image).and_then(|i| zone.image(i)).map(|i| i.name.clone())
         };
         let color = image_name(TextureSemantic::Color).or_else(|| {
-            // Effects and some decals only have a "2D" texture.
-            mat.textures.first().and_then(|t| t.image).and_then(|i| zone.image(i)).map(|i| i.name.clone())
+            // Effects and some decals only have a "2D" texture (semantic 0),
+            // or a function one. Never a normal or specular map: a normal
+            // map drawn as colour comes out a flat blue.
+            mat.textures
+                .iter()
+                .find(|t| matches!(t.semantic, TextureSemantic::Other(0) | TextureSemantic::Function))
+                .and_then(|t| t.image)
+                .and_then(|i| zone.image(i))
+                .map(|i| i.name.clone())
         });
         let bits = state_bits(mat);
-        let base_color_texture = color.and_then(|n| self.textures.get(&n, true, &self.vfs, images));
+        let base_color_texture = color.as_ref().and_then(|n| self.textures.get(n, true, &self.vfs, images));
+        // Debug aid: `COD4RW_MATAUDIT` reports materials drawn without their
+        // colour (none found, or its image failed to load).
+        if std::env::var_os("COD4RW_MATAUDIT").is_some() && !sky && base_color_texture.is_none() {
+            let sems: Vec<String> = mat.textures.iter().map(|t| format!("{:?}:{}", t.semantic, t.image.and_then(|i| zone.image(i)).map_or("?", |i| i.name.as_str()))).collect();
+            warn!("mataudit: {} [{techset}] no colour (wanted {:?}); textures {:?}", mat.name, color, sems);
+        }
 
         let mut m = StandardMaterial { base_color_texture, perceptual_roughness: 0.85, reflectance: 0.2, ..default() };
         // Render state comes from the lit technique's state bits.
@@ -211,12 +248,20 @@ impl Content {
             if (b1 >> 4) & 3 != 0 {
                 m.depth_bias = 2.0;
             }
-            if matches!(m.alpha_mode, AlphaMode::Add) || (src, dst) == (9, 3) {
+            // Unlit techniques too (`wc_unlit_multiply`: dark-stain decals,
+            // which lit multiplied the surface under them by the lightmap's
+            // light a second time, black on night maps: Chinatown's gateway).
+            if matches!(m.alpha_mode, AlphaMode::Add) || (src, dst) == (9, 3) || techset.contains("unlit") {
                 m.unlit = true;
             }
         }
         if techset.contains("nofog") || techset.contains("distfalloff") {
             m.fog_enabled = false;
+        }
+        // Debug aid: `COD4RW_MATLOG=<part>` logs how materials whose name
+        // contains it are drawn.
+        if std::env::var("COD4RW_MATLOG").is_ok_and(|v| !v.is_empty() && mat.name.contains(&v)) {
+            info!("matlog: {} [{techset}] bits {:x?} alpha {:?} depth bias {} colour {:?}", mat.name, bits, m.alpha_mode, m.depth_bias, color);
         }
         Some(MatInfo { handle: materials.add(m), sky })
     }
@@ -246,7 +291,7 @@ impl Content {
                 }
                 Some(mesh)
             })
-            .map(|m| meshes.add(m));
+            .map(|m| crate::mesh_bounds::add(meshes, m));
         self.static_meshes.insert((zi, model, surf), h.clone());
         h
     }
@@ -332,13 +377,24 @@ impl Content {
         let surf_range = lod.surf_index as usize..(lod.surf_index + lod.num_surfs) as usize;
         let mats: Vec<Option<AssetId>> = surf_range.clone().map(|s| xm.materials.get(s).copied().flatten()).collect();
         let surf_meshes: Vec<Option<Mesh>> = surf_range.clone().map(|s| surface_mesh(xm, s, true)).collect();
+        let (mut lo, mut hi) = (Vec3::MAX, Vec3::MIN);
+        for m in surf_meshes.iter().flatten() {
+            if let Some(VertexAttributeValues::Float32x3(ps)) = m.attribute(Mesh::ATTRIBUTE_POSITION) {
+                for p in ps {
+                    lo = lo.min(Vec3::from_array(*p));
+                    hi = hi.max(Vec3::from_array(*p));
+                }
+            }
+        }
+        let extent = (hi - lo).max(Vec3::ZERO);
+        let bounds = (lo.min(hi), hi.max(lo));
         let mut surfaces = Vec::new();
         for (mesh, mat) in surf_meshes.into_iter().zip(mats) {
             let (Some(mesh), Some(mat)) = (mesh, mat) else { continue };
             let Some(info) = self.material(zi, mat, materials, images) else { continue };
-            surfaces.push((meshes.add(mesh), info.handle));
+            surfaces.push((crate::mesh_bounds::add(meshes, mesh), info.handle));
         }
-        Some(PreparedModel { name: name.to_owned(), bones, surfaces, inverse_bindposes })
+        Some(PreparedModel { name: name.to_owned(), bones, surfaces, inverse_bindposes, extent, bounds })
     }
 
     /// Decode an animation by name.

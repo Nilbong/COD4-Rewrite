@@ -17,6 +17,12 @@ use std::cmp::Ordering;
 pub(super) fn build(app: &mut App) {
     app.init_resource::<Ambience>()
         .add_systems(OnEnter(crate::state::GameState::InGame), |mut a: ResMut<Ambience>| *a = Ambience::default())
+        // The ambient track's carrier goes with the match (its loop with it).
+        .add_systems(OnExit(crate::state::GameState::InGame), |mut c: Commands, q: Query<Entity, With<AmbientTrack>>| {
+            for e in &q {
+                c.entity(e).despawn();
+            }
+        })
         .add_systems(Update, (spawn_cue, lead_changes, closing_time, match_end, chatter, ambience, emitters).run_if(crate::state::in_game));
 }
 
@@ -154,7 +160,12 @@ fn chatter(
 
 /// The map script's `ambientPlay("ambient_...")`, looped once its alias
 /// has loaded.
-fn ambience(mut sfx: ResMut<Sfx>, content: Res<Content>, map: Res<crate::world::MapName>, bank: Option<Res<Bank>>, mut state: ResMut<Ambience>) {
+/// What the map's ambient track plays on: a looping alias loops only on an
+/// entity (`Sfx::play_flat_on`); played free it played once and ended.
+#[derive(Component)]
+struct AmbientTrack;
+
+fn ambience(mut commands: Commands, mut sfx: ResMut<Sfx>, content: Res<Content>, map: Res<crate::world::MapName>, bank: Option<Res<Bank>>, mut state: ResMut<Ambience>) {
     if state.track_done {
         return;
     }
@@ -172,7 +183,8 @@ fn ambience(mut sfx: ResMut<Sfx>, content: Res<Content>, map: Res<crate::world::
         return;
     };
     if bank.is_some_and(|b| b.has(&alias)) {
-        sfx.play(alias, None);
+        let carrier = commands.spawn((Name::new("ambient track"), AmbientTrack, Transform::default())).id();
+        sfx.play_flat_on(alias, carrier);
         state.track_done = true;
     }
 }
@@ -205,6 +217,12 @@ fn emitters(
         if !bank.has(alias) {
             // Not loaded yet (localized_common_mp's come in the background).
             return true;
+        }
+        // In the showcase's storm the rain is one bed round the listener
+        // (`crate::weather`), not the map's dozens of rain loops: right by
+        // one, its steady noise sounded like hissing gas.
+        if crate::weather::showcase() && alias.to_ascii_lowercase().starts_with("emt_rain_") {
+            return false;
         }
         let at = crate::units::pos(*origin);
         let e = commands.spawn((Name::new(format!("emitter {alias}")), Transform::from_translation(at), GlobalTransform::from_translation(at))).id();

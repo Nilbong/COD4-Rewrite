@@ -12,3 +12,7 @@
 *.ff
 *.iwd
 *.iwi
+
+# Local test helpers.
+/NewPlayerTest.cmd
+/test-*.cmd

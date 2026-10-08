@@ -5,8 +5,12 @@
 
 pub mod client;
 pub mod hosting;
+pub mod lobby;
 pub mod netcode;
 pub mod protocol;
 pub mod relay;
 pub mod security;
 pub mod transport;
+
+/// For embedding a relay (the game's test relay) without depending on quinn.
+pub use quinn::Endpoint;

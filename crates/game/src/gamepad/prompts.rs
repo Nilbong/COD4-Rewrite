@@ -103,6 +103,10 @@ struct PadHint;
 #[derive(Component)]
 struct PadMantleHint;
 
+/// "Press B to take cover" (3rd Person TDM, [`crate::cover`]).
+#[derive(Component)]
+struct PadCoverHint;
+
 fn spawn_match_prompts(mut commands: Commands) {
     use Glyph::*;
     let hint = commands
@@ -193,6 +197,22 @@ fn spawn_match_prompts(mut commands: Commands) {
         GlobalZIndex(PROMPT_Z),
         Visibility::Hidden,
     ));
+    commands.spawn((
+        PadCoverHint,
+        PadPrompt { parts: vec![text("Press"), glyph(East), text("to take cover")], height: 32.0 },
+        Node {
+            position_type: PositionType::Absolute,
+            top: percent(63),
+            width: percent(100),
+            flex_direction: FlexDirection::Row,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::Center,
+            column_gap: px(7),
+            ..default()
+        },
+        GlobalZIndex(PROMPT_Z),
+        Visibility::Hidden,
+    ));
 }
 
 /// The controls hint shows while the game doesn't have the mouse and no
@@ -203,8 +223,9 @@ fn show_match_prompts(
     cursor: Single<&CursorOptions, With<PrimaryWindow>>,
     menus: Option<Res<crate::ui::Frontend>>,
     player: Query<&Mover, With<LocalPlayer>>,
-    mut hint: Query<&mut Visibility, (With<PadHint>, Without<PadMantleHint>)>,
-    mut mantle: Query<&mut Visibility, (With<PadMantleHint>, Without<PadHint>)>,
+    mut hint: Query<&mut Visibility, (With<PadHint>, Without<PadMantleHint>, Without<PadCoverHint>)>,
+    mut mantle: Query<&mut Visibility, (With<PadMantleHint>, Without<PadHint>, Without<PadCoverHint>)>,
+    mut cover: Query<&mut Visibility, (With<PadCoverHint>, Without<PadHint>, Without<PadMantleHint>)>,
 ) {
     // Not in splitscreen: they'd cover everyone's views.
     let pad = active.pad.is_some() && !crate::splitscreen::active();
@@ -212,9 +233,13 @@ fn show_match_prompts(
     let free = cursor.grab_mode == CursorGrabMode::None && !crate::ui::menu_open(menus.as_deref());
     let show = |on: bool| if on { Visibility::Inherited } else { Visibility::Hidden };
     for mut v in &mut hint {
-        v.set_if_neq(show(pad && me.is_some() && free));
+        // (Headquarters says what to do where it matters: its prompts.)
+        v.set_if_neq(show(pad && me.is_some() && free && !crate::hq::active()));
     }
     for mut v in &mut mantle {
         v.set_if_neq(show(pad && me.is_some_and(|m| m.mantle_hint)));
+    }
+    for mut v in &mut cover {
+        v.set_if_neq(show(pad && crate::cover::available()));
     }
 }

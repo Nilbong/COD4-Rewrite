@@ -1,0 +1,776 @@
+{
+  "format_version": 1,
+  "generation_mode": "built-in image_gen",
+  "style": "charcoal/gunmetal, thin desert-tan borders, olive accents and warm-ivory glyphs",
+  "rect_format": "[x, y, width, height] in pixels; origin at top left",
+  "uv_format": "[u_min, v_min, u_max, v_max]; v increases downward",
+  "usage": "Use each sprite rectangle independently. Preserve panel aspect ratios. Draw the live map, player markers, scores, weapon name, ammo values and time using game state. The frames contain no fixed gameplay values.",
+  "integration": "Artwork and metadata only; no game code or existing assets modified.",
+  "sheets": {
+    "hud_elements": {
+      "atlas": "hud-elements.png",
+      "size": [
+        1254,
+        1254
+      ],
+      "alpha": true,
+      "sprites": {
+        "minimap_frame": {
+          "grid_row": 0,
+          "grid_column": 0,
+          "rect": [
+            59,
+            75,
+            220,
+            216
+          ],
+          "uv": [
+            0.04704944,
+            0.05980861,
+            0.22248804,
+            0.23205742
+          ],
+          "core_rect": [
+            65,
+            81,
+            208,
+            204
+          ]
+        },
+        "compass_rail": {
+          "grid_row": 0,
+          "grid_column": 1,
+          "rect": [
+            343,
+            163,
+            256,
+            48
+          ],
+          "uv": [
+            0.27352472,
+            0.12998405,
+            0.47767145,
+            0.16826156
+          ],
+          "core_rect": [
+            349,
+            169,
+            244,
+            36
+          ]
+        },
+        "match_score_panel": {
+          "grid_row": 0,
+          "grid_column": 2,
+          "rect": [
+            645,
+            156,
+            276,
+            62
+          ],
+          "uv": [
+            0.51435407,
+            0.12440191,
+            0.73444976,
+            0.1738437
+          ],
+          "core_rect": [
+            651,
+            162,
+            264,
+            50
+          ]
+        },
+        "team_score_panel": {
+          "grid_row": 0,
+          "grid_column": 3,
+          "rect": [
+            963,
+            130,
+            239,
+            114
+          ],
+          "uv": [
+            0.76794258,
+            0.10366826,
+            0.9585327,
+            0.19457735
+          ],
+          "core_rect": [
+            969,
+            136,
+            227,
+            102
+          ]
+        },
+        "ammo_counter_panel": {
+          "grid_row": 1,
+          "grid_column": 0,
+          "rect": [
+            39,
+            437,
+            257,
+            84
+          ],
+          "uv": [
+            0.03110048,
+            0.34848485,
+            0.23604466,
+            0.41547049
+          ],
+          "core_rect": [
+            45,
+            443,
+            245,
+            72
+          ]
+        },
+        "weapon_name_plate": {
+          "grid_row": 1,
+          "grid_column": 1,
+          "rect": [
+            341,
+            452,
+            260,
+            54
+          ],
+          "uv": [
+            0.27192982,
+            0.36044657,
+            0.47926635,
+            0.40350877
+          ],
+          "core_rect": [
+            347,
+            458,
+            248,
+            42
+          ]
+        },
+        "match_timer_plate": {
+          "grid_row": 1,
+          "grid_column": 2,
+          "rect": [
+            669,
+            439,
+            229,
+            79
+          ],
+          "uv": [
+            0.53349282,
+            0.35007974,
+            0.71610845,
+            0.41307815
+          ],
+          "core_rect": [
+            675,
+            445,
+            217,
+            67
+          ]
+        },
+        "kill_feed_row": {
+          "grid_row": 1,
+          "grid_column": 3,
+          "rect": [
+            950,
+            452,
+            271,
+            52
+          ],
+          "uv": [
+            0.75757576,
+            0.36044657,
+            0.97368421,
+            0.40191388
+          ],
+          "core_rect": [
+            956,
+            458,
+            259,
+            40
+          ]
+        },
+        "crosshair": {
+          "grid_row": 2,
+          "grid_column": 0,
+          "rect": [
+            72,
+            679,
+            195,
+            198
+          ],
+          "uv": [
+            0.05741627,
+            0.5414673,
+            0.21291866,
+            0.69936204
+          ],
+          "core_rect": [
+            78,
+            685,
+            183,
+            186
+          ]
+        },
+        "hit_marker": {
+          "grid_row": 2,
+          "grid_column": 1,
+          "rect": [
+            387,
+            694,
+            167,
+            165
+          ],
+          "uv": [
+            0.30861244,
+            0.55342903,
+            0.44178628,
+            0.68500797
+          ],
+          "core_rect": [
+            393,
+            700,
+            155,
+            153
+          ]
+        },
+        "bullet_tick_strip": {
+          "grid_row": 2,
+          "grid_column": 2,
+          "rect": [
+            668,
+            753,
+            230,
+            53
+          ],
+          "uv": [
+            0.53269537,
+            0.60047847,
+            0.71610845,
+            0.64274322
+          ],
+          "core_rect": [
+            674,
+            759,
+            218,
+            41
+          ]
+        },
+        "frag_grenade": {
+          "grid_row": 2,
+          "grid_column": 3,
+          "rect": [
+            1030,
+            690,
+            120,
+            171
+          ],
+          "uv": [
+            0.82137161,
+            0.55023923,
+            0.91706539,
+            0.68660287
+          ],
+          "core_rect": [
+            1036,
+            696,
+            108,
+            159
+          ]
+        },
+        "tactical_grenade": {
+          "grid_row": 3,
+          "grid_column": 0,
+          "rect": [
+            123,
+            972,
+            97,
+            202
+          ],
+          "uv": [
+            0.09808612,
+            0.77511962,
+            0.1754386,
+            0.93620415
+          ],
+          "core_rect": [
+            129,
+            978,
+            85,
+            190
+          ]
+        },
+        "player_arrow": {
+          "grid_row": 3,
+          "grid_column": 1,
+          "rect": [
+            416,
+            1017,
+            108,
+            109
+          ],
+          "uv": [
+            0.33173844,
+            0.81100478,
+            0.41786284,
+            0.89792663
+          ],
+          "core_rect": [
+            422,
+            1023,
+            96,
+            97
+          ]
+        },
+        "friendly_arrow": {
+          "grid_row": 3,
+          "grid_column": 2,
+          "rect": [
+            739,
+            1026,
+            89,
+            91
+          ],
+          "uv": [
+            0.58931419,
+            0.81818182,
+            0.66028708,
+            0.8907496
+          ],
+          "core_rect": [
+            745,
+            1032,
+            77,
+            79
+          ]
+        },
+        "enemy_blip": {
+          "grid_row": 3,
+          "grid_column": 3,
+          "rect": [
+            1055,
+            1043,
+            61,
+            60
+          ],
+          "uv": [
+            0.84130781,
+            0.83173844,
+            0.88995215,
+            0.87958533
+          ],
+          "core_rect": [
+            1061,
+            1049,
+            49,
+            48
+          ]
+        }
+      },
+      "empty_region_checks": {
+        "minimap_interior_alpha": 0,
+        "crosshair_centre_alpha": 0
+      }
+    },
+    "numeric_glyphs": {
+      "atlas": "hud-numeric-glyphs.png",
+      "size": [
+        1254,
+        1254
+      ],
+      "alpha": true,
+      "sprites": {
+        "0": {
+          "grid_row": 0,
+          "grid_column": 0,
+          "rect": [
+            120,
+            101,
+            135,
+            224
+          ],
+          "uv": [
+            0.09569378,
+            0.08054226,
+            0.20334928,
+            0.25917065
+          ],
+          "core_rect": [
+            126,
+            107,
+            123,
+            212
+          ],
+          "bearing_x": 13,
+          "bearing_y": 218
+        },
+        "1": {
+          "grid_row": 0,
+          "grid_column": 1,
+          "rect": [
+            442,
+            101,
+            81,
+            224
+          ],
+          "uv": [
+            0.35247209,
+            0.08054226,
+            0.41706539,
+            0.25917065
+          ],
+          "core_rect": [
+            448,
+            107,
+            69,
+            212
+          ],
+          "bearing_x": 40,
+          "bearing_y": 218
+        },
+        "2": {
+          "grid_row": 0,
+          "grid_column": 2,
+          "rect": [
+            690,
+            101,
+            136,
+            224
+          ],
+          "uv": [
+            0.55023923,
+            0.08054226,
+            0.65869219,
+            0.25917065
+          ],
+          "core_rect": [
+            696,
+            107,
+            124,
+            212
+          ],
+          "bearing_x": 12,
+          "bearing_y": 218
+        },
+        "3": {
+          "grid_row": 0,
+          "grid_column": 3,
+          "rect": [
+            994,
+            100,
+            137,
+            225
+          ],
+          "uv": [
+            0.79266348,
+            0.07974482,
+            0.90191388,
+            0.25917065
+          ],
+          "core_rect": [
+            1000,
+            106,
+            125,
+            213
+          ],
+          "bearing_x": 12,
+          "bearing_y": 219
+        },
+        "4": {
+          "grid_row": 1,
+          "grid_column": 0,
+          "rect": [
+            114,
+            396,
+            149,
+            229
+          ],
+          "uv": [
+            0.09090909,
+            0.31578947,
+            0.20972887,
+            0.4984051
+          ],
+          "core_rect": [
+            120,
+            402,
+            137,
+            217
+          ],
+          "bearing_x": 6,
+          "bearing_y": 223
+        },
+        "5": {
+          "grid_row": 1,
+          "grid_column": 1,
+          "rect": [
+            416,
+            396,
+            137,
+            229
+          ],
+          "uv": [
+            0.33173844,
+            0.31578947,
+            0.44098884,
+            0.4984051
+          ],
+          "core_rect": [
+            422,
+            402,
+            125,
+            217
+          ],
+          "bearing_x": 12,
+          "bearing_y": 223
+        },
+        "6": {
+          "grid_row": 1,
+          "grid_column": 2,
+          "rect": [
+            691,
+            396,
+            141,
+            229
+          ],
+          "uv": [
+            0.55103668,
+            0.31578947,
+            0.66347687,
+            0.4984051
+          ],
+          "core_rect": [
+            697,
+            402,
+            129,
+            217
+          ],
+          "bearing_x": 10,
+          "bearing_y": 223
+        },
+        "7": {
+          "grid_row": 1,
+          "grid_column": 3,
+          "rect": [
+            997,
+            396,
+            135,
+            229
+          ],
+          "uv": [
+            0.79505582,
+            0.31578947,
+            0.90271132,
+            0.4984051
+          ],
+          "core_rect": [
+            1003,
+            402,
+            123,
+            217
+          ],
+          "bearing_x": 13,
+          "bearing_y": 223
+        },
+        "8": {
+          "grid_row": 2,
+          "grid_column": 0,
+          "rect": [
+            120,
+            690,
+            140,
+            225
+          ],
+          "uv": [
+            0.09569378,
+            0.55023923,
+            0.20733652,
+            0.72966507
+          ],
+          "core_rect": [
+            126,
+            696,
+            128,
+            213
+          ],
+          "bearing_x": 10,
+          "bearing_y": 219
+        },
+        "9": {
+          "grid_row": 2,
+          "grid_column": 1,
+          "rect": [
+            417,
+            690,
+            139,
+            224
+          ],
+          "uv": [
+            0.33253589,
+            0.55023923,
+            0.44338118,
+            0.72886762
+          ],
+          "core_rect": [
+            423,
+            696,
+            127,
+            212
+          ],
+          "bearing_x": 11,
+          "bearing_y": 219
+        },
+        "colon": {
+          "grid_row": 2,
+          "grid_column": 2,
+          "rect": [
+            735,
+            733,
+            67,
+            149
+          ],
+          "uv": [
+            0.5861244,
+            0.58452951,
+            0.63955343,
+            0.70334928
+          ],
+          "core_rect": [
+            741,
+            739,
+            55,
+            137
+          ],
+          "bearing_x": 47,
+          "bearing_y": 176
+        },
+        "slash": {
+          "grid_row": 2,
+          "grid_column": 3,
+          "rect": [
+            1002,
+            690,
+            130,
+            224
+          ],
+          "uv": [
+            0.79904306,
+            0.55023923,
+            0.90271132,
+            0.72886762
+          ],
+          "core_rect": [
+            1008,
+            696,
+            118,
+            212
+          ],
+          "bearing_x": 16,
+          "bearing_y": 219
+        },
+        "plus": {
+          "grid_row": 3,
+          "grid_column": 0,
+          "rect": [
+            112,
+            993,
+            153,
+            156
+          ],
+          "uv": [
+            0.08931419,
+            0.79186603,
+            0.21132376,
+            0.91626794
+          ],
+          "core_rect": [
+            118,
+            999,
+            141,
+            144
+          ],
+          "bearing_x": 4,
+          "bearing_y": 151
+        },
+        "minus": {
+          "grid_row": 3,
+          "grid_column": 1,
+          "rect": [
+            409,
+            1043,
+            147,
+            57
+          ],
+          "uv": [
+            0.3261563,
+            0.83173844,
+            0.44338118,
+            0.87719298
+          ],
+          "core_rect": [
+            415,
+            1049,
+            135,
+            45
+          ],
+          "bearing_x": 7,
+          "bearing_y": 101
+        },
+        "decimal_point": {
+          "grid_row": 3,
+          "grid_column": 2,
+          "rect": [
+            737,
+            1079,
+            61,
+            63
+          ],
+          "uv": [
+            0.5877193,
+            0.86044657,
+            0.63636364,
+            0.91068581
+          ],
+          "core_rect": [
+            743,
+            1085,
+            49,
+            51
+          ],
+          "bearing_x": 50,
+          "bearing_y": 65
+        },
+        "multiply": {
+          "grid_row": 3,
+          "grid_column": 3,
+          "rect": [
+            990,
+            993,
+            157,
+            157
+          ],
+          "uv": [
+            0.78947368,
+            0.79186603,
+            0.91467305,
+            0.91706539
+          ],
+          "core_rect": [
+            996,
+            999,
+            145,
+            145
+          ],
+          "bearing_x": 2,
+          "bearing_y": 151
+        }
+      },
+      "font_metrics": {
+        "cap_height": 213,
+        "monospace_advance": 161,
+        "instructions": "Use one common scale based on cap_height for all glyphs. Keep punctuation at this same scale instead of stretching every sprite to a uniform box."
+      }
+    }
+  }
+}

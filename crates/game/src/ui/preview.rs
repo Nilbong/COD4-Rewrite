@@ -116,6 +116,18 @@ impl GunPreviews {
         slot.showing.as_ref().filter(|(w, _)| w == weapon).map(|_| slot.image.clone())
     }
 
+    /// Is `weapon` on show in preview `key` (not still loading)?
+    pub fn shown(&self, key: i32, weapon: &str) -> bool {
+        self.slots.iter().any(|s| s.key == key && s.showing.as_ref().is_some_and(|(w, _)| w == weapon))
+    }
+
+    /// Build preview `key`'s gun again (its custom camo was edited).
+    pub fn refresh(&mut self, key: i32) {
+        if let Some(s) = self.slots.iter_mut().find(|s| s.key == key) {
+            s.showing = None;
+        }
+    }
+
     /// Mouse dragging: returns true while a preview is being turned.
     pub fn drag(&mut self, cursor: Option<Vec2>, pressed: bool, just_pressed: bool, over_item: bool) -> bool {
         let Some(p) = cursor else { return self.drag.is_some() };
@@ -163,12 +175,13 @@ impl GunPreviews {
 
     /// Remove every preview entity (leaving the menus).
     pub fn clear(&mut self, commands: &mut Commands) {
+        // (Leaving a match, they may be gone already: `crate::session`.)
         for s in self.slots.drain(..) {
-            commands.entity(s.camera).despawn();
-            commands.entity(s.pivot).despawn();
+            commands.entity(s.camera).try_despawn();
+            commands.entity(s.pivot).try_despawn();
         }
         for e in self.lights.drain(..) {
-            commands.entity(e).despawn();
+            commands.entity(e).try_despawn();
         }
         self.requests.clear();
         self.drag = None;
@@ -268,6 +281,9 @@ pub fn update(
             } else {
                 spawn_gun(commands, previews, &mut assets, &r.weapon, r.camo, layer, pivot)
             };
+            if gun.is_none() {
+                warn!("ui: preview of {} made nothing", r.weapon);
+            }
             let s = &mut previews.slots[index];
             s.showing = Some(wanted);
             if let Some((model, distance)) = gun {

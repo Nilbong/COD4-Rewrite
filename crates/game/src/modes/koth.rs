@@ -357,6 +357,9 @@ fn hold_respawns(
 ) {
     let now = time.elapsed_secs();
     let holders = objectives.hq.as_ref().and_then(|h| h.owner);
+    for team in [Team::Allies, Team::Axis] {
+        crate::modes::lock_respawns(team, holders == Some(team));
+    }
     held.retain(|e| dead.contains(*e));
     for (e, p, mut d) in &mut dead {
         match holders {

@@ -10,6 +10,10 @@ name = "cod4rw"
 path = "src/main.rs"
 
 [dependencies]
+# Rasterises the modern main menu's system font (ui/modern.rs).
+ab_glyph = "0.2"
+# Cuts the controller button art out of its atlases (gamepad/glyphs.rs).
+image = { version = "0.25", default-features = false, features = ["png"] }
 iw3 = { path = "../iw3" }
 t5 = { path = "../t5" }
 t4 = { path = "../t4" }
@@ -23,7 +27,14 @@ rand = "0.9"
 serde_json = "1"
 winit = { version = "0.30", default-features = false }
 cod4rw-net = { path = "../net" }
+# Online private matches through a relay (crates/multiplayer).
+cod4rw-multiplayer = { path = "../multiplayer" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
 half = "2"
+# Offline lighting re-bake (src/bake): a BVH, its maths, and threads.
+obvhs = "0.3.3"
+glam33 = { package = "glam", version = "0.33" }
+rayon = "1"
 
 # DualSense and DualShock 4 rumble: Windows' controller API (through gilrs)
 # can't rumble them, so it goes to them as HID output reports.

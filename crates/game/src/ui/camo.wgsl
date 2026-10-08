@@ -52,10 +52,24 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VERTEX_UVS_B
     // The appended facets carry a second UV marker; original gun vertices
     // carry zero. No texture alpha or weapon silhouette is faked.
-    diamond_stud = detail_scale.z > 4.5 && in.uv_b.x > 0.5;
+    diamond_stud = abs(detail_scale.z - 5.0) < 0.5 && in.uv_b.x > 0.5;
 #endif
 #ifdef VERTEX_UVS_A
-    if (detail_scale.w > 0.5) {
+    if (detail_scale.w > 0.5 && detail_scale.z > 5.5) {
+        // A custom camo (6; 7 only where the colour map's alpha says, as
+        // Black Ops' camos): painted on, turned and scaled by `look.xy`,
+        // shaded by the gun's own wear (the colour map against its local
+        // average) so edges, scratches and engraving still read.
+        let t = in.uv * detail_scale.xy;
+        let uv = vec2(t.x * look.x - t.y * look.y, t.x * look.y + t.y * look.x);
+        let paint = textureSample(detail_map, detail_sampler, uv).rgb;
+        let base = pow(pbr_input.material.base_color.rgb, vec3(1.0 / 2.2));
+        let around = pow(textureSampleLevel(color_map, color_sampler, in.uv, 5.0).rgb, vec3(1.0 / 2.2));
+        let relief = clamp(luma(base) / max(luma(around), 0.05), 0.35, 1.4);
+        let mask = select(1.0, pbr_input.material.base_color.a, detail_scale.z > 6.5);
+        let painted = paint * mix(1.0, relief, 0.75);
+        pbr_input.material.base_color = vec4(mix(pbr_input.material.base_color.rgb, painted, mask), pbr_input.material.base_color.a);
+    } else if (detail_scale.w > 0.5) {
         let detail = textureSample(detail_map, detail_sampler, in.uv * detail_scale.xy).rgb;
         let base = pow(pbr_input.material.base_color.rgb, vec3(1.0 / 2.2));
         var camo = pow(detail, vec3(1.0 / 2.2));
@@ -90,7 +104,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         pbr_input.material.base_color = vec4(color, pbr_input.material.base_color.a);
     }
 #endif
-    if (detail_scale.z > 4.5) {
+    if (abs(detail_scale.z - 5.0) < 0.5) {
         // Clearcoat is specialised on the CPU for Diamond, but only the
         // crystal crowns use it; the gold backing keeps its metal finish.
         pbr_input.material.clearcoat = 0.0;
@@ -114,8 +128,13 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VERTEX_UVS_A
     if (shine.x > 0.5) {
         var s = textureSample(specular_map, specular_sampler, in.uv);
-        // Gold (its specular map is gold): as polished as CoD4's gold guns.
-        if (detail_scale.z > 2.5) {
+        if (detail_scale.z > 5.5) {
+            // Custom camo: the map's wear in grey, as glossy as its finish
+            // (`look.z`: matte 0, satin 0.5, gloss 1).
+            let silver = max(s.r, max(s.g, s.b));
+            s = vec4(vec3(silver * mix(0.3, 1.0, look.z)), mix(0.15, 0.8, look.z));
+        } else if (detail_scale.z > 2.5) {
+            // Gold (its specular map is gold): as polished as CoD4's gold guns.
             // Keep specular wear while neutralising source material hues.
             let silver = max(s.r, max(s.g, s.b));
             s = vec4(vec3(silver), clamp(s.a * 0.8 + 0.14, 0.42, 0.78));
@@ -133,11 +152,19 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
         let r = reflect(v, n);
         // Without a map (the menus' previews): a plain studio, bright above
         // and dim below.
-        var light = vec3(mix(0.08, 0.45, saturate(r.y * 0.5 + 0.5)));
+        let studio = vec3(mix(0.08, 0.45, saturate(r.y * 0.5 + 0.5)));
+        var light = studio;
         if (shine.y > 0.5) {
             // Probes are looked up with CoD axes: Bevy (x, y, z) is CoD (x, -z, y).
             let p = textureSampleLevel(reflection_probe, probe_sampler, vec3(r.x, -r.z, r.y), clamp(6.0 - 8.0 * s.a, 0.0, shine.z));
             light = p.rgb * p.a;
+            // Polished metal (gold, platinum, diamond: a fresnel minimum of
+            // 3 and up, ordinary gun metal's is at most 2) never goes flat:
+            // night maps' probes are near black (Wet Work's), which left
+            // them dull brown; at least some of the studio's light.
+            if (detail_scale.z > 2.5 && detail_scale.z < 5.5 || env.x > 2.9) {
+                light = max(light, studio * 0.35);
+            }
         }
         let fresnel = mix(env.x, env.y, pow(max(1.0 - abs(dot(v, n)), 0.0), env.z));
         var raw = s.rgb * fresnel * light;
