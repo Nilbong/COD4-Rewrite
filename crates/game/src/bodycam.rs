@@ -82,7 +82,7 @@ impl Gunplay {
             Gunplay::Cod4 if crate::ui::scope_3d() && crate::ui::scope_magnifies(def) => (hip_fov(), crate::ui::LENS_OUTER_FOV.max(def.ads_fov)),
             Gunplay::Cod4 => (hip_fov(), def.ads_fov),
             // A wide body-worn lens that barely zooms when aiming.
-            Gunplay::Bodycam => (BODYCAM_FOV, BODYCAM_FOV - 12.0),
+            Gunplay::Bodycam => (BODYCAM_FOV, BODYCAM_FOV - 5.0),
         }
     }
 }
@@ -121,18 +121,26 @@ const REACH: f32 = u(32.0);
 const TUCK_BLOCKS: f32 = 0.55;
 
 // --- camera
-/// Where the camera sits on the helmet: right, up and forward of the eye.
-const HELMET_CAM: Vec3 = Vec3::new(u(2.5), u(3.0), -u(1.0));
+/// Where the camera sits on the helmet: right, up and forward of the eye
+/// (a little left, so the gun at the right shoulder shows to the right).
+const HELMET_CAM: Vec3 = Vec3::new(-u(1.5), u(3.0), -u(0.5));
 /// How quickly the head turns after the weapon (1/s), hip and aimed. Aiming
 /// down sights brings the camera onto the sights.
-const HEAD_FOLLOW_HIP: f32 = 2.5;
-const HEAD_FOLLOW_ADS: f32 = 14.0;
+const HEAD_FOLLOW_HIP: f32 = 1.6;
+const HEAD_FOLLOW_ADS: f32 = 6.0;
 /// Furthest the weapon can point from the camera's centre (yaw, pitch
 /// degrees) before the head is dragged along.
-const DEADZONE_HIP: Vec2 = Vec2::new(16.0, 10.0);
-const DEADZONE_ADS: Vec2 = Vec2::new(0.5, 0.5);
-const SHAKE_SPRING: (f32, f32) = (160.0, 14.0);
-const SHAKE_POS_SPRING: (f32, f32) = (200.0, 18.0);
+const DEADZONE_HIP: Vec2 = Vec2::new(19.0, 12.0);
+const DEADZONE_ADS: Vec2 = Vec2::new(3.0, 2.0);
+/// Aiming, the head looks this far (yaw left, pitch up, degrees) off the
+/// weapon's aim: the camera is on the helmet, not behind the sights, so the
+/// raised gun sits low and right in frame.
+const ADS_HEAD_OFFSET: Vec2 = Vec2::new(4.0, 2.0);
+/// The head follows faster while moving (per unit of speed, 1/s), so a
+/// running gun stays in frame.
+const HEAD_FOLLOW_MOVING: f32 = 2.5;
+const SHAKE_SPRING: (f32, f32) = (160.0, 22.0);
+const SHAKE_POS_SPRING: (f32, f32) = (200.0, 26.0);
 /// Camera roll at full lean, degrees.
 const LEAN_ROLL: f32 = 12.0;
 
@@ -313,9 +321,9 @@ fn update_handling(
     if step != h.step && mover.on_ground && speed > 0.1 {
         let side = if step % 2 == 0 { 1.0 } else { -1.0 };
         let s = speed * steady * (1.0 - 0.5 * ads) * if mover.sprinting { 1.6 } else { 1.0 };
-        h.shake.v += deg(Vec3::new(side * 5.0, -14.0, side * 10.0)) * s;
-        h.shake_pos.v.y -= 0.15 * s;
-        h.aim.v += deg(Vec3::new(side * 3.0, -4.0, side * 3.0)) * s;
+        h.shake.v += deg(Vec3::new(side * 2.5, -7.0, side * 5.0)) * s;
+        h.shake_pos.v.y -= 0.08 * s;
+        h.aim.v += deg(Vec3::new(side * 1.5, -2.0, side * 1.5)) * s.min(1.0);
     }
     h.step = step;
     if fall > 0.0 {
@@ -330,7 +338,8 @@ fn update_handling(
         AIM_SPRING_HIP.1 + (AIM_SPRING_ADS.1 - AIM_SPRING_HIP.1) * ads,
     );
     h.aim.step(aim_spring, dt);
-    let max = deg(MAX_AIM_OFFSET);
+    // Moving, the weapon strays less (it stays low in frame).
+    let max = deg(MAX_AIM_OFFSET) * (1.0 - 0.4 * speed.min(1.0));
     h.aim.x = h.aim.x.clamp(-max, max);
     h.push.step(PUSH_SPRING, dt);
     h.shake.step(SHAKE_SPRING, dt);
@@ -341,7 +350,8 @@ fn update_handling(
     let view_rot = view.rotation();
     let right = Quat::from_rotation_y(view.yaw) * Vec3::X;
     let strafe = (mover.velocity.dot(right) / full_speed).clamp(-1.0, 1.0);
-    let walk = speed * (1.0 - 0.65 * ads) * if mover.sprinting { 1.6 } else { 1.0 };
+    // A steady carry when running: the bob grows with speed only so far.
+    let walk = speed.min(1.0) * (1.0 - 0.65 * ads) * if mover.sprinting { 1.2 } else { 1.0 };
     let walk_rot = deg(Vec3::new(phase.sin() * 1.2, (2.0 * phase).sin() * 0.7, 0.0)) * walk
         + deg(Vec3::Z * -strafe * 3.0) * (1.0 - 0.65 * ads);
     let walk_pos = Vec3::new(phase.sin() * u(0.4), -(1.0 - (2.0 * phase).cos()) * u(0.25), 0.0) * walk;
@@ -365,17 +375,31 @@ fn update_handling(
     let tuck_rot = deg(Vec3::new(10.0, 35.0, 25.0)) * h.tuck;
     let tuck_pos = Vec3::new(0.0, -u(2.0), u(7.0)) * h.tuck;
 
-    h.gun_rot = euler(h.aim.x + walk_rot + breath + tuck_rot + Vec3::Z * lean_roll);
-    h.gun_pos = h.push.x + walk_pos + tuck_pos;
+    // Sprinting: CoD4's sprint animation drops the gun well down, out of a
+    // helmet camera's frame: lifted back, so it's carried in the lower
+    // right.
+    let carry = if mover.sprinting && mover.on_ground { (1.0 - ads) * speed.min(1.0) } else { 0.0 };
+    let carry_rot = deg(Vec3::new(-4.0, 6.0, 6.0)) * carry;
+    let carry_pos = Vec3::new(u(1.0), u(3.0), -u(1.0)) * carry;
+    h.gun_rot = euler(h.aim.x + walk_rot + breath + tuck_rot + carry_rot + Vec3::Z * lean_roll);
+    h.gun_pos = h.push.x + walk_pos + tuck_pos + carry_pos;
 
     // The camera rides on the head: a bob stronger than CoD's with a nod and
     // sway per step, a slow drift, a roll when strafing, and the shake springs.
     let (bob_side, bob_up) = mover.view_bob();
-    let drift = deg(Vec3::new((t * 0.37).sin() * 0.2, (t * 0.61 + 2.0).sin() * 0.15, (t * 0.29).sin() * 0.25));
-    let cam_walk =
-        deg(Vec3::new(phase.sin() * 0.6, (2.0 * phase).sin() * 0.8, phase.sin() * 1.0 - strafe * 1.5)) * speed;
-    h.cam_rot = euler(h.shake.x + drift + cam_walk + Vec3::Z * lean_roll);
-    h.cam_pos = h.shake_pos.x + Vec3::new(bob_side, bob_up, 0.0) * 1.8 * (1.0 - 0.5 * ads);
+    // The head moves on its own (a person looking about, not a camera bolted
+    // to the gun): a slow look-around, a stronger nod and sway per step, and
+    // a glance the way you strafe, all fading out while aiming.
+    let loose = 1.0 - 0.85 * ads;
+    let drift = deg(Vec3::new(
+        (t * 0.31).sin() * 0.45 + (t * 0.17 + 1.3).sin() * 0.3,
+        (t * 0.47 + 2.0).sin() * 0.25 + (t * 0.23).sin() * 0.15,
+        (t * 0.29).sin() * 0.2,
+    )) * loose;
+    let cam_walk = deg(Vec3::new(phase.sin() * 0.5, (2.0 * phase).sin() * 0.6, phase.sin() * 0.7 - strafe * 1.0)) * speed.min(1.2) * loose;
+    let glance = deg(Vec3::X * -strafe * 3.0) * loose;
+    h.cam_rot = euler(h.shake.x + drift + cam_walk + glance + Vec3::Z * lean_roll);
+    h.cam_pos = h.shake_pos.x + Vec3::new(bob_side, bob_up, 0.0) * 1.3 * (1.0 - 0.6 * ads);
 
     let aim = FreeAim {
         origin: eye + view_rot * h.gun_pos,
@@ -400,8 +424,14 @@ fn euler(v: Vec3) -> Quat {
 /// Turn the head toward where the weapon points (`aim`, yaw/pitch): smoothly,
 /// but never letting the weapon leave the deadzone.
 fn follow_head(head: Vec2, aim: Vec2, ads: f32, dt: f32) -> Vec2 {
+    follow_head_moving(head, aim, ads, 0.0, dt)
+}
+
+/// [`follow_head`], moving at `speed` (0..1+ of full speed).
+fn follow_head_moving(head: Vec2, aim: Vec2, ads: f32, speed: f32, dt: f32) -> Vec2 {
     use std::f32::consts::{PI, TAU};
-    let rate = HEAD_FOLLOW_HIP + (HEAD_FOLLOW_ADS - HEAD_FOLLOW_HIP) * ads;
+    let rate = HEAD_FOLLOW_HIP + (HEAD_FOLLOW_ADS - HEAD_FOLLOW_HIP) * ads + HEAD_FOLLOW_MOVING * speed.min(1.5);
+    let aim = aim + ADS_HEAD_OFFSET * (PI / 180.0) * ads;
     let zone = (DEADZONE_HIP + (DEADZONE_ADS - DEADZONE_HIP) * ads) * (PI / 180.0);
     let off = |head: Vec2| Vec2::new((aim.x - head.x + PI).rem_euclid(TAU) - PI, aim.y - head.y);
     let head = head + off(head) * (1.0 - (-rate * dt).exp());
@@ -432,12 +462,13 @@ pub(crate) fn pose_view(
         return;
     };
     let aim = Vec2::new(view.yaw, view.pitch);
-    let head = follow_head(h.head.unwrap_or(aim), aim, weapon.ads, time.delta_secs());
+    let speed = (mover.horizontal_speed() / RUN_SPEED).min(1.6);
+    let head = follow_head_moving(h.head.unwrap_or(aim), aim, weapon.ads, speed, time.delta_secs());
     h.head = Some(head);
     let head_rot = euler(head.extend(0.0));
     let eye = mover.eye(tf.translation) + mover.lean_offset(view.yaw);
     let view_rot = view.rotation();
-    let cam_pos = eye + head_rot * (HELMET_CAM * (1.0 - weapon.ads) + h.cam_pos);
+    let cam_pos = eye + head_rot * (HELMET_CAM + h.cam_pos);
     let cam_rot = head_rot * h.cam_rot;
     camera.translation = cam_pos;
     camera.rotation = cam_rot;
@@ -584,9 +615,9 @@ mod tests {
         // A flick far past the deadzone drags the head to its edge.
         let head = follow_head(Vec2::ZERO, Vec2::new(1.0, 0.0), 0.0, 1.0 / 60.0);
         assert!((1.0 - head.x - zone).abs() < 1e-4, "{head}");
-        // Then it catches up.
+        // Then it catches up (in about three seconds: the head is loose).
         let mut head = head;
-        for _ in 0..120 {
+        for _ in 0..180 {
             head = follow_head(head, Vec2::new(1.0, 0.0), 0.0, 1.0 / 60.0);
         }
         assert!((head.x - 1.0).abs() < 0.01, "{head}");

@@ -18,7 +18,7 @@
 //! own), so the frame's finishing camera exposes and tonemaps it with
 //! everything else; it has none of the main camera's extra passes.
 
-use crate::gunmodel::ScopeLens;
+use crate::gunmodel::{LensGeom, ScopeLens};
 use crate::player::{LocalPlayer, MainCamera};
 use crate::weapons::WeaponState;
 use bevy::camera::{Hdr, RenderTarget};
@@ -48,7 +48,7 @@ pub(super) fn build(app: &mut App) {
     app.add_plugins(MaterialPlugin::<ScopeGlass>::default())
         .add_systems(
             Update,
-            (spawn_camera, glaze, drive, blur).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+            (spawn_camera, glaze, drive, blur, hide_crosshairs).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
         )
         .add_systems(
             PostUpdate,
@@ -81,10 +81,22 @@ fn optic(def: &crate::weapons::WeaponDef) -> usize {
 fn relief(w: &WeaponState) -> (f32, f32) {
     let k = optic(w.def);
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
-    let (relief, eyepiece) = (env("COD4RW_SCOPE_RELIEF").unwrap_or(RELIEF[k]), env("COD4RW_SCOPE_EYEPIECE").unwrap_or(EYEPIECE[k]));
+    // CoD4's Dragunov is aimed with its rubber eyecup against the eye.
+    let base = RELIEF[k] + if w.def.name.starts_with("dragunov") { 2.5 } else { 0.0 };
+    let relief = env("COD4RW_SCOPE_RELIEF").unwrap_or_else(|| knob(w.def, "relief", base));
+    let eyepiece = env("COD4RW_SCOPE_EYEPIECE").unwrap_or_else(|| knob(w.def, "eyepiece", EYEPIECE[k]));
     let a = w.ads.clamp(0.0, 1.0);
     let out = relief * a * a * (3.0 - 2.0 * a);
     (out, eyepiece / (eyepiece + out))
+}
+
+/// A live-tuned number for a scope (`crate::tune`): `scope.<weapon>.<what>`
+/// (the gun's name without `_mp`), else `scope.sniper.<what>` /
+/// `scope.acog.<what>`, else `default`.
+fn knob(def: &crate::weapons::WeaponDef, what: &str, default: f32) -> f32 {
+    let kind = if optic(def) == 0 { "sniper" } else { "acog" };
+    let general = crate::tune::get(&format!("scope.{kind}.{what}"), default);
+    crate::tune::get(&format!("scope.{}.{what}", def.name.trim_end_matches("_mp")), general)
 }
 
 /// A gun aimed through a 3D scope: one with a scope picture (CoD4's
@@ -105,6 +117,10 @@ pub struct ScopeGlass {
     /// lens's normals: the eyepiece is curved.
     #[uniform(3)]
     axis: Vec4,
+    /// The lens as the eye sees it, off the scope's axis (tangents, in the
+    /// axis's frame): xy its middle, z its radius; w 1 when known.
+    #[uniform(4)]
+    lens: Vec4,
     #[texture(1)]
     #[sampler(2)]
     view: Handle<Image>,
@@ -118,6 +134,17 @@ impl Material for ScopeGlass {
     fn enable_shadows() -> bool {
         false
     }
+
+    /// Seen from either side (a lens disc's facing isn't known).
+    fn specialize(
+        _pipeline: &bevy::pbr::MaterialPipeline,
+        descriptor: &mut bevy::render::render_resource::RenderPipelineDescriptor,
+        _layout: &bevy::mesh::MeshVertexBufferLayoutRef,
+        _key: bevy::pbr::MaterialPipelineKey<Self>,
+    ) -> Result<(), bevy::render::render_resource::SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
 }
 
 #[derive(Component)]
@@ -126,6 +153,7 @@ struct ScopeCamera3d;
 /// The scope camera's picture and the glass made with it.
 #[derive(Resource)]
 struct Glass {
+    image: Handle<Image>,
     material: Handle<ScopeGlass>,
     /// The camera renders until then, so its shaders are ready before the
     /// first aim (the first frames otherwise came out garbled).
@@ -138,21 +166,42 @@ const WARM_UP: f32 = 1.5;
 fn spawn_camera(
     mut commands: Commands,
     time: Res<Time>,
-    glass: Option<Res<Glass>>,
-    main: Query<(Entity, &Camera, Option<&Skybox>, Option<&DistanceFog>), With<MainCamera>>,
+    glass: Option<ResMut<Glass>>,
+    main: Query<(Entity, &Camera, Option<&Skybox>, Option<&DistanceFog>), (With<MainCamera>, Without<ScopeCamera3d>)>,
+    mut existing: Query<(&ChildOf, Option<&mut Skybox>, Option<&mut DistanceFog>), With<ScopeCamera3d>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<ScopeGlass>>,
 ) {
-    if glass.is_some() || !scope_3d() {
+    if !scope_3d() {
         return;
     }
     let Ok((main, main_camera, skybox, fog)) = main.single() else { return };
-    let image = images.add(Image::new_target_texture(RESOLUTION, RESOLUTION, TextureFormat::Rgba16Float, None));
+    // One on this match's camera, seeing this match's sky and fog (a new
+    // match has a new main camera; the old one went with the old camera,
+    // and its picture, the last match's map, stayed in the lens).
+    if let Some((parent, mut own_sky, mut own_fog)) = existing.iter_mut().find(|c| c.0.parent() == main) {
+        if let (Some(s), Some(own)) = (skybox, own_sky.as_mut())
+            && own.image != s.image
+        {
+            **own = s.clone();
+        }
+        if let (Some(f), Some(own)) = (fog, own_fog.as_mut())
+            && (own.color != f.color || format!("{:?}", own.falloff) != format!("{:?}", f.falloff))
+        {
+            **own = f.clone();
+        }
+        let _ = parent;
+        return;
+    }
+    let image = match &glass {
+        Some(g) => g.image.clone(),
+        None => images.add(Image::new_target_texture(RESOLUTION, RESOLUTION, TextureFormat::Rgba16Float, None)),
+    };
     let mut camera = commands.spawn((
         Name::new("scope camera (3D)"),
         ScopeCamera3d,
         Camera3d::default(),
-        Camera { order: -2, is_active: false, clear_color: main_camera.clear_color.clone(), ..default() },
+        Camera { order: -2, is_active: true, clear_color: main_camera.clear_color.clone(), ..default() },
         RenderTarget::Image(image.clone().into()),
         Projection::from(PerspectiveProjection { fov: 10f32.to_radians(), near: 0.05, far: 2000.0, ..default() }),
         Hdr,
@@ -168,13 +217,28 @@ fn spawn_camera(
     if let Some(f) = fog {
         camera.insert(f.clone());
     }
-    let material = materials.add(ScopeGlass { params: Vec4::ZERO, axis: Vec4::NEG_Z, view: image.clone() });
-    commands.insert_resource(Glass { material, warm_until: time.elapsed_secs() + WARM_UP });
+    let warm_until = time.elapsed_secs() + WARM_UP;
+    match glass {
+        Some(mut g) => g.warm_until = warm_until,
+        None => {
+            let material = materials.add(ScopeGlass { params: Vec4::ZERO, axis: Vec4::NEG_Z, lens: Vec4::ZERO, view: image.clone() });
+            commands.insert_resource(Glass { image, material, warm_until });
+        }
+    }
 }
 
 /// The eyepieces' own material, kept to put back.
 #[derive(Component)]
 struct Unglazed(Handle<StandardMaterial>);
+
+/// Scopes' own reticle surfaces: hidden in the 3D style (the glass draws
+/// the reticle).
+fn hide_crosshairs(mut crosshairs: Query<&mut Visibility, With<crate::gunmodel::ScopeCrosshair>>) {
+    let want = if scope_3d() { Visibility::Hidden } else { Visibility::Inherited };
+    for mut v in &mut crosshairs {
+        v.set_if_neq(want);
+    }
+}
 
 /// Eyepieces take the glass in the 3D style, and their own back otherwise.
 fn glaze(
@@ -258,7 +322,11 @@ fn drive(
     glass: Option<Res<Glass>>,
     gun: Query<&GlobalTransform, With<crate::viewmodel::ViewModelRoot>>,
     player: Query<&WeaponState, With<LocalPlayer>>,
-    mut camera: Query<(&mut Camera, &mut Projection), With<ScopeCamera3d>>,
+    mut camera: Query<(&mut Camera, &mut Projection, &mut Transform), With<ScopeCamera3d>>,
+    main: Query<&GlobalTransform, With<MainCamera>>,
+    lenses: Query<(&LensGeom, &GlobalTransform, &InheritedVisibility, Option<&bevy::mesh::skinning::SkinnedMesh>), With<ScopeLens>>,
+    joints: Query<&GlobalTransform>,
+    bindposes: Res<Assets<bevy::mesh::skinning::SkinnedMeshInverseBindposes>>,
     mut materials: ResMut<Assets<ScopeGlass>>,
 ) {
     let Some(glass) = glass else { return };
@@ -267,14 +335,58 @@ fn drive(
     // The lens's reach (tangent), the gun's zoom over the aimed view round
     // it, and the scope camera's field to cover it with a margin.
     let outer = (super::LENS_OUTER_FOV.to_radians() * 0.5).tan();
-    // (Smaller, the scope pushed out: `eye_relief`.)
-    let reach = LENS_SHARE * outer * aimed.map_or(1.0, |w| relief(w).1);
+    // The scope's axis (the gun's forward: CoD models face +X) and its
+    // frame as the shader takes it (up the view's).
+    let axis_world = gun.iter().next().map(|g| (g.rotation() * Vec3::X).normalize_or(Vec3::NEG_Z));
+    let eye = main.iter().next().map(|m| (m.translation(), m.rotation() * Vec3::Y));
+    // The lens as seen from the eye: where it is off the axis and how big,
+    // so the eye's reach (the dark ring) fits the lens on every model.
+    // How much of the lens the clear view fills (the rest the dark rim).
+    let ring = aimed.map_or(0.86, |w| knob(w.def, "ring", 0.86).clamp(0.55, 1.5));
+    let lens = axis_world.zip(eye).filter(|_| aimed.is_some()).and_then(|(n, (at, up))| {
+        let t = n.cross(up).normalize_or_zero();
+        let b = t.cross(n);
+        lenses
+            .iter()
+            .filter(|(_, _, v, _)| v.get())
+            .filter_map(|(g, tf, _, skin)| {
+                let (centre, scale) = match (g.bone, skin) {
+                    (Some(bone), Some(skin)) => {
+                        let joint = joints.get(*skin.joints.get(bone)?).ok()?;
+                        let ibp = bindposes.get(&skin.inverse_bindposes)?.get(bone)?;
+                        let m = joint.affine() * bevy::math::Affine3A::from_mat4(*ibp);
+                        (m.transform_point3(g.centre), m.matrix3.x_axis.length())
+                    }
+                    (None, _) => (tf.transform_point(g.centre), tf.scale().x),
+                    _ => return None,
+                };
+                // A hidden attachment's lens has its bones scaled to nothing.
+                let c = centre - at;
+                let along = c.dot(n);
+                (scale > 1e-3 && along > 1e-3)
+                    .then(|| Vec4::new(c.dot(-t) / along, c.dot(b) / along, g.radius * scale / along, ring))
+            })
+            .min_by(|a, b| a.truncate().truncate().length().total_cmp(&b.truncate().truncate().length()))
+    });
+    // (Smaller, the scope pushed out: `eye_relief`.) The measured lens when
+    // there is one.
+    let reach = lens.map_or(LENS_SHARE * outer * aimed.map_or(1.0, |w| relief(w).1), |l| l.z + l.truncate().truncate().length());
     let (zoom, field) = aimed.map_or((1.0, 0.2), |w| {
         let ads = (w.def.ads_fov.max(1.0).to_radians() * 0.5).tan();
-        let zoom = ads / outer;
+        // (`zoom`: more or less magnified than the gun's own.)
+        let zoom = ads / outer / knob(w.def, "zoom", 1.0).max(0.05);
         (zoom, reach * zoom * MARGIN)
     });
-    for (mut cam, mut projection) in &mut camera {
+    // The scope camera looks along the scope's axis (in the main camera's
+    // frame: it's its child), its up the view's.
+    let local_axis = axis_world.zip(main.iter().next()).map(|(a, m)| m.rotation().inverse() * a);
+    for (mut cam, mut projection, mut tf) in &mut camera {
+        if let Some(a) = local_axis.filter(|_| aimed.is_some()) {
+            let look = Transform::default().looking_to(a, Vec3::Y);
+            if tf.rotation.angle_between(look.rotation) > 1e-5 {
+                tf.rotation = look.rotation;
+            }
+        }
         let active = aimed.is_some() || time.elapsed_secs() < glass.warm_until;
         if cam.is_active != active {
             cam.is_active = active;
@@ -289,13 +401,14 @@ fn drive(
     let reticle = aimed.map_or(1.0, |w| if w.def.ads_overlay.is_some() { 1.0 } else { 2.0 });
     // An eye direction's tangent `d` off the middle shows the world at
     // `d * zoom`, which is `d * zoom / (2 * field)` of the picture's width.
-    let params = Vec4::new(fade, reticle, zoom / (2.0 * field), reach);
-    // The gun's forward: CoD models face +X.
-    let axis = gun.iter().next().map_or(Vec4::NEG_Z, |g| (g.rotation() * Vec3::X).normalize_or(Vec3::NEG_Z).extend(0.0));
-    if materials.get(&glass.material).is_some_and(|m| m.params != params || m.axis != axis)
+    let params = Vec4::new(fade, reticle, zoom / (2.0 * field), lens.map_or(reach, |l| l.z));
+    let axis = axis_world.map_or(Vec4::NEG_Z, |a| a.extend(0.0));
+    let lens = lens.unwrap_or(Vec4::ZERO);
+    if materials.get(&glass.material).is_some_and(|m| m.params != params || m.axis != axis || m.lens != lens)
         && let Some(mut m) = materials.get_mut(&glass.material)
     {
         m.params = params;
         m.axis = axis;
+        m.lens = lens;
     }
 }

@@ -51,7 +51,9 @@ const FLY_SPEED: f32 = 8.0;
 
 pub fn setup(app: &mut App) {
     let arg = app.world().get_resource::<SpectateArg>().and_then(|a| a.0.clone());
-    let Some(name) = arg.or_else(|| std::env::var("COD4RW_SPECTATE").ok()) else { return };
+    // Photo mode ([`crate::photo`]) always flies free.
+    let photo = crate::photo::active().then(String::new);
+    let Some(name) = arg.or_else(|| std::env::var("COD4RW_SPECTATE").ok()).or(photo) else { return };
     let start_with = Some(name).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case("free"));
     app.insert_resource(Spectate {
         start_with,
@@ -310,6 +312,19 @@ fn overlay(
     mut player_hints: Query<&mut Visibility, With<crate::hud::HintText>>,
 ) {
     let now = time.elapsed_secs();
+    // Photo mode: nothing over the view.
+    if crate::photo::active() {
+        for mut v in &mut player_hints {
+            v.set_if_neq(Visibility::Hidden);
+        }
+        if !text.0.is_empty() {
+            text.0.clear();
+        }
+        if !match_text.0.is_empty() {
+            match_text.0.clear();
+        }
+        return;
+    }
     let mut lines = Vec::new();
     if let Some(state) = &state {
         let left = state.time_left(now);

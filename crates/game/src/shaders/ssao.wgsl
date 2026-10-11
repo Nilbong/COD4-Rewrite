@@ -3,8 +3,8 @@
 // the effect radius is AO_RADIUS instead of 0.73 m, and the result is raised
 // to AO_POWER for stronger contact shadows.
 
-const AO_RADIUS: f32 = 1.0;
-const AO_POWER: f32 = 1.5;
+const AO_RADIUS: f32 = 1.6;
+const AO_POWER: f32 = 1.8;
 
 // Visibility Bitmask Ambient Occlusion (VBAO)
 // Paper: ttps://ar5iv.labs.arxiv.org/html/2301.11376

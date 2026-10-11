@@ -47,6 +47,9 @@ pub struct PreparedModel {
     pub bounds: (Vec3, Vec3),
 }
 
+/// Ambient-only techniques' colour scale (see `build_material`).
+const AMBIENT_ONLY: f32 = 0.5;
+
 #[derive(Resource)]
 pub struct Content {
     pub zones: Vec<Zone>,
@@ -138,7 +141,7 @@ impl Content {
     pub fn sky_cube(&mut self, images: &mut Assets<Image>) -> Option<Handle<Image>> {
         let zone = &self.zones[MAP_ZONE];
         let name = zone.gfx_world()?.sky_image.and_then(|i| zone.image(i))?.name.clone();
-        self.textures.get_cube(&name, &self.vfs, images)
+        self.textures.get_cube_mirrored(&name, crate::mw2::active(), &self.vfs, images)
     }
 
     /// The image name behind one of a material's textures, e.g. its normal map.
@@ -213,6 +216,14 @@ impl Content {
         }
 
         let mut m = StandardMaterial { base_color_texture, perceptual_roughness: 0.85, reflectance: 0.2, ..default() };
+        // Ambient-only techniques (`*_ambient_*`: tree canopies, bushes) take
+        // no sun in IW3, only the light grid. Here the sun lights them too,
+        // both sides of every card, and distant trees read as pale ghosts:
+        // their colour scaled down to what's left without it.
+        if techset.contains("_ambient") {
+            m.base_color = Color::linear_rgb(AMBIENT_ONLY, AMBIENT_ONLY, AMBIENT_ONLY);
+            m.reflectance = 0.0;
+        }
         // Render state comes from the lit technique's state bits.
         if let Some([b0, b1]) = bits {
             let src = b0 & 0xf;

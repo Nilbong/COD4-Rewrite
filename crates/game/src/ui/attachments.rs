@@ -30,7 +30,7 @@ const UNDERBARREL: i32 = GRIP | GL;
 /// Ops and World at War guns' attachments follow (see [`super::bo1`],
 /// [`super::waw`]); their sets are kept whole, so CoD's stat holds none of
 /// them.
-const BY_PRIORITY: [(&str, i32); 27] = [
+const BY_PRIORITY: [(&str, i32); 38] = [
     ("gl", GL),
     ("acog", ACOG),
     ("reflex", REFLEX),
@@ -58,7 +58,23 @@ const BY_PRIORITY: [(&str, i32); 27] = [
     ("bigammo", 1 << 25),
     ("bipod", 1 << 26),
     ("sawoff", 1 << 27),
+    // Modern Warfare 2's own, on bits Black Ops' and World at War's use (a
+    // gun's set is one game's: [`names_of`] reads it as its game's).
+    ("akimbo", 1 << 6),
+    ("thermal", 1 << 7),
+    ("shotgun", 1 << 8),
+    ("heartbeat", 1 << 9),
+    ("fmj", 1 << 10),
+    ("rof", 1 << 11),
+    ("xmags", 1 << 12),
+    ("eotech", 1 << 13),
+    ("tactical", 1 << 14),
+    ("lockair", 1 << 15),
+    ("boom", 1 << 16),
 ];
+/// Modern Warfare 2's, as its sets list them.
+const MW2_LISTED: [&str; 16] =
+    ["reflex", "eotech", "acog", "thermal", "silencer", "grip", "gl", "shotgun", "akimbo", "tactical", "heartbeat", "fmj", "rof", "xmags", "lockair", "boom"];
 /// In the order they are listed (CoD4's five keep their order).
 const LISTED: [&str; 27] = [
     "reflex", "elbit", "acog", "lps", "vzoom", "ir", "upgradesight", "silencer", "snub", "grip", "gl", "mk", "ft", "extclip",
@@ -72,6 +88,16 @@ pub fn bit(name: &str) -> i32 {
 
 pub fn names(set: i32) -> Vec<&'static str> {
     LISTED.into_iter().filter(|n| set & bit(n) != 0).collect()
+}
+
+/// A Modern Warfare 2 gun's set's attachments.
+pub fn mw2_names(set: i32) -> Vec<&'static str> {
+    MW2_LISTED.into_iter().filter(|n| set & bit(n) != 0).collect()
+}
+
+/// A set's attachments as `weapon`'s game names them.
+pub fn names_of(set: i32, weapon: &str) -> Vec<&'static str> {
+    if crate::mw2guns::is_mw2(weapon) { mw2_names(set) } else { names(set) }
 }
 
 pub fn has(set: i32, name: &str) -> bool {

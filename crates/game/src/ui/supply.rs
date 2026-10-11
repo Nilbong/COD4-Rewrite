@@ -17,7 +17,7 @@ use iw3::menu::{Item, Menu, Rect as VRect, Statement, Token, flags, item_type, o
 use std::sync::Arc;
 
 /// The screen that opens drops, and Create a Class's variant popup.
-const DROPS_MENU: &str = "supply_drops";
+pub(in crate::ui) const DROPS_MENU: &str = "supply_drops";
 const VARIANTS_MENU: &str = "supply_variants";
 /// The screen that picks the character worn.
 const CHARACTER_MENU: &str = "supply_character";
@@ -29,16 +29,16 @@ const CHAR_PAGE_SIZE: usize = 13;
 /// The main menu entry's text: "Supply Drops (2)".
 const LABEL_DVAR: &str = "ui_supply_label";
 /// "1" while there are drops to open.
-const CAN_OPEN_DVAR: &str = "ui_supply_can_open";
+pub(in crate::ui) const CAN_OPEN_DVAR: &str = "ui_supply_can_open";
 /// When the last drop was opened ([`Env::millis`]), for the reveal.
-const OPENED_DVAR: &str = "ui_supply_opened";
+pub(in crate::ui) const OPENED_DVAR: &str = "ui_supply_opened";
 /// The class weapon stat the variant popup is for.
 const SLOT_DVAR: &str = "ui_supply_slot";
 /// The variant under the mouse in the popup ("none": standard issue).
 const HIGHLIGHT_DVAR: &str = "ui_variant_highlighted";
 /// Preview keys for the three cards and the character screen's figure (0
 /// and 201..249 are Create a Class's).
-const CARD_KEY: i32 = 1000;
+pub(in crate::ui) const CARD_KEY: i32 = 1000;
 const FIGURE_KEY: i32 = 1010;
 
 /// Card layout, right-aligned virtual units.
@@ -48,9 +48,9 @@ const CARD_W: f32 = 136.0;
 const CARD_H: f32 = 280.0;
 const CARD_GAP: f32 = 8.0;
 /// The first card turns over this long after opening, the others after it.
-const REVEAL_FIRST_MS: i64 = 450;
-const REVEAL_STEP_MS: i64 = 550;
-const FLASH_MS: i64 = 400;
+pub(in crate::ui) const REVEAL_FIRST_MS: i64 = 450;
+pub(in crate::ui) const REVEAL_STEP_MS: i64 = 550;
+pub(in crate::ui) const FLASH_MS: i64 = 400;
 
 const GREY: [f32; 4] = [0.69, 0.69, 0.69, 1.0];
 const UP: [f32; 4] = [0.55, 0.95, 0.55, 1.0];
@@ -449,12 +449,12 @@ impl Frontend {
         0
     }
 
-    fn weapon_name(&self, weapon: &str) -> String {
+    pub(in crate::ui) fn weapon_name(&self, weapon: &str) -> String {
         let key = self.table_lookup("mp/statstable.csv", 4, weapon, 3);
         if key.is_empty() { weapon.to_ascii_uppercase() } else { self.localize(&format!("@{key}")) }
     }
 
-    fn camo_name(&self, camo: usize) -> String {
+    pub(in crate::ui) fn camo_name(&self, camo: usize) -> String {
         let key = self.table_lookup("mp/attachmenttable.csv", 11, &camo.to_string(), 3);
         self.localize(&format!("@{key}"))
     }
@@ -595,13 +595,13 @@ impl Frontend {
     /// Drawing for the supply drop menus: the cards, the variant details,
     /// and the variants on Create a Class's weapons.
     pub(super) fn paint_supply(&self, om: &OpenMenu, pl: &Placement, ops: &mut Vec<Op>) {
-        if om.name == DROPS_MENU {
+        if om.name == DROPS_MENU && om.menu.window.name != super::next::drops::MENU {
             self.paint_drops(pl, ops);
-        } else if om.name == CHARACTER_MENU {
+        } else if om.name == CHARACTER_MENU && om.menu.window.name != super::next::character::MENU {
             self.paint_characters(om, pl, ops);
         } else if om.name == VARIANTS_MENU {
             self.paint_variants(om, pl, ops);
-        } else if om.name.starts_with("menu_cac_") {
+        } else if om.name.starts_with("menu_cac_") && om.menu.window.name != super::next::cac::EDITOR {
             if let Some(base) = class_base(&om.menu) {
                 self.paint_cac_variants(base, pl, ops);
             }

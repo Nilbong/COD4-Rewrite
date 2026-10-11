@@ -53,9 +53,50 @@ impl Install {
         self.root.join("main")
     }
 
-    /// Path of a zone, e.g. `zone_path("mp_killhouse")`.
+    /// Path of a zone, e.g. `zone_path("mp_killhouse")`: the game's own,
+    /// else a custom map's (`usermaps/<map>/<map>.ff`, and its `_load` zone
+    /// beside it).
     pub fn zone_path(&self, name: &str) -> PathBuf {
-        self.root.join("zone").join("english").join(format!("{name}.ff"))
+        let own = self.root.join("zone").join("english").join(format!("{name}.ff"));
+        if own.is_file() {
+            return own;
+        }
+        let dir = name.strip_suffix("_load").unwrap_or(name);
+        let custom = self.root.join("usermaps").join(dir).join(format!("{name}.ff"));
+        if custom.is_file() { custom } else { own }
+    }
+
+    /// Custom maps installed in `usermaps/` (folders holding `<name>.ff`),
+    /// sorted by name.
+    pub fn usermaps(&self) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir(self.root.join("usermaps")) else { return Vec::new() };
+        let mut out: Vec<String> = dir
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|name| self.root.join("usermaps").join(name).join(format!("{name}.ff")).is_file())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A custom map's own archives (its textures, sounds and load screen),
+    /// none for the game's maps.
+    pub fn usermap_iwds(&self, map: &str) -> Vec<PathBuf> {
+        let Ok(dir) = std::fs::read_dir(self.root.join("usermaps").join(map)) else { return Vec::new() };
+        let mut out: Vec<PathBuf> = dir
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iwd")))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The archives a match on `map` reads: the game's, then the map's own
+    /// (which override them).
+    pub fn map_iwd_paths(&self, map: &str) -> Result<Vec<PathBuf>> {
+        let mut out = self.iwd_paths()?;
+        out.extend(self.usermap_iwds(map));
+        Ok(out)
     }
 
     pub fn iwd_paths(&self) -> Result<Vec<PathBuf>> {

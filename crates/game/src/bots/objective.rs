@@ -32,6 +32,9 @@ pub(super) enum Goal {
     Defuse(Vec3),
     /// Headquarters: stand in the HQ to take it.
     Hq,
+    /// Open a care package there ([`crate::killstreaks::carepackage`]), in
+    /// any mode.
+    Crate(Vec3),
 }
 
 impl Goal {
@@ -45,6 +48,7 @@ impl Goal {
             Goal::Guard(_) => 0.9,
             Goal::Defuse(_) => 1.8,
             Goal::Hq => 1.2,
+            Goal::Crate(_) => 1.3,
         }
     }
 
@@ -52,7 +56,7 @@ impl Goal {
     fn same(self, other: Goal) -> bool {
         match (self, other) {
             (Goal::Flag(a, _), Goal::Flag(b, _)) | (Goal::Plant(a), Goal::Plant(b)) => a == b,
-            (Goal::Pickup(_), Goal::Pickup(_)) | (Goal::Defuse(_), Goal::Defuse(_)) | (Goal::Hq, Goal::Hq) => true,
+            (Goal::Pickup(_), Goal::Pickup(_)) | (Goal::Defuse(_), Goal::Defuse(_)) | (Goal::Hq, Goal::Hq) | (Goal::Crate(_), Goal::Crate(_)) => true,
             (Goal::Guard(a), Goal::Guard(b)) => a.distance(b) < u(400.0),
             _ => false,
         }
@@ -71,6 +75,9 @@ pub(super) const BLOCKED_FOR: f32 = 20.0;
 /// head for one this often.
 pub(super) const HUNT_FLAGS: f32 = 0.6;
 const FLAG_NEAR: f32 = u(700.0);
+/// Up to this much extra distance per bot and flag in choosing one: a
+/// fixed, personal preference (so not everyone goes to the nearest).
+const FLAG_LEAN: f32 = u(2600.0);
 
 /// How well `p` suits fighting round the flags: up to 2 by a flag the team
 /// doesn't hold (or holds but is losing), down to 0.5 far from them all.
@@ -93,7 +100,8 @@ pub(super) fn flag_fit(o: &Objectives, team: crate::combat::Team, p: Vec3) -> f3
 /// What this bot should be doing for the mode's objective, if anything (not
 /// one it couldn't find a way to lately).
 pub(super) fn goal(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx) -> Option<Goal> {
-    goal_of(bot, me, feet, tc).filter(|g| !blocked(bot, *g))
+    let care_package = crate::killstreaks::carepackage::bot_goal(me).map(Goal::Crate);
+    care_package.or_else(|| goal_of(bot, me, feet, tc)).filter(|g| !blocked(bot, *g))
 }
 
 fn blocked(bot: &Bot, g: Goal) -> bool {
@@ -103,7 +111,7 @@ fn blocked(bot: &Bot, g: Goal) -> bool {
 fn goal_of(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx) -> Option<Goal> {
     let o = tc.objectives?;
     if !o.flags.is_empty() {
-        return flag(bot, feet, tc, o);
+        return flag(bot, me, feet, tc, o);
     }
     if let Some(h) = &o.hq {
         return hq(bot, feet, tc, h);
@@ -197,7 +205,7 @@ fn round_target(o: &Objectives, live: &[usize]) -> Option<usize> {
 /// not one enough teammates are already on or heading for (one to take it,
 /// two to keep it: real players were mostly alone on a flag; one more for
 /// every six on the team).
-fn flag(bot: &Bot, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Option<Goal> {
+fn flag(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Option<Goal> {
     let current = match bot.goal {
         Some(Goal::Flag(i, _)) if bot.mode == super::Mode::Objective => Some(i),
         _ => None,
@@ -229,7 +237,14 @@ fn flag(bot: &Bot, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Option<Goal> {
             if !mine && on_it >= crew {
                 return None;
             }
-            let cost = feet.distance(f.pos) + on_it as f32 * u(600.0)
+            // Each player's own lean towards some flags (real players spread
+            // over all three: Vacant's demo 30/39/32%, where nearest-first
+            // bots crowded the middle one 70%).
+            let lean = {
+                let h = (me.to_bits() ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                ((h >> 40) as f32 / (1u64 << 24) as f32) * FLAG_LEAN
+            };
+            let cost = feet.distance(f.pos) + lean + on_it as f32 * u(600.0)
                 - if attacked { u(800.0) } else { 0.0 }
                 - if mine { u(500.0) } else { 0.0 };
             Some((Goal::Flag(i, ours), cost))
@@ -243,6 +258,17 @@ fn flag(bot: &Bot, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Option<Goal> {
 /// in it (outside a flag on another floor, a contested flag to search).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pursue(bot: &mut Bot, goal: Goal, tc: &TacCtx, nav: Option<&NavGraph>, feet: Vec3, now: f32, rng: &mut impl Rng) {
+    // A care package: straight there (no mode's objectives needed).
+    if let Goal::Crate(p) = goal {
+        let changed = bot.mode != super::Mode::Objective || !bot.goal.is_some_and(|g| g.same(goal));
+        bot.goal = Some(goal);
+        if changed || (bot.dest.is_none() && feet.distance(p) > u(40.0)) {
+            bot.set_mode(super::Mode::Objective, now);
+            bot.hold = None;
+            bot.go_to(p);
+        }
+        return;
+    }
     let o = tc.objectives.expect("objectives");
     let there = bot.mode == super::Mode::Objective && bot.dest.is_none();
     let redo = there
@@ -254,6 +280,7 @@ pub(super) fn pursue(bot: &mut Bot, goal: Goal, tc: &TacCtx, nav: Option<&NavGra
             // (Respawned for a new round with the same goal, say.)
             Goal::Guard(p) => feet.distance(p) > u(700.0),
             Goal::Hq => !o.hq.as_ref().is_some_and(|h| h.contains(feet)),
+            Goal::Crate(_) => false,
         };
     bot.blocked.retain(|b| b.1 > now);
     let changed = bot.mode != super::Mode::Objective || !bot.goal.is_some_and(|g| g.same(goal));
@@ -282,7 +309,7 @@ pub(super) fn pursue(bot: &mut Bot, goal: Goal, tc: &TacCtx, nav: Option<&NavGra
             let s = &o.sites[i];
             within(s.pos, u(80.0), &|p| s.contains(p))
         }
-        Goal::Pickup(p) | Goal::Defuse(p) => p,
+        Goal::Pickup(p) | Goal::Defuse(p) | Goal::Crate(p) => p,
         // A walkable point inside the HQ's box, at whatever height (random
         // spots near the radio snapped to the ground floor below one
         // upstairs: Crash), spread from teammates; else the radio.

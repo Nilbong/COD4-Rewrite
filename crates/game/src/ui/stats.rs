@@ -27,7 +27,11 @@ pub struct Stats {
     dirty: bool,
 }
 
-fn data_dir() -> Option<PathBuf> {
+/// Where the profiles are kept (`COD4RW_PROFILEDIR` for tests: a sandbox).
+pub(super) fn data_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("COD4RW_PROFILEDIR") {
+        return Some(PathBuf::from(dir));
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_DATA_HOME"))
         .map(PathBuf::from)
@@ -50,6 +54,18 @@ impl Stats {
     /// by rank and challenges. A new profile starts with CoD4's; one saved
     /// before there was a choice (and debug runs) with everything.
     pub fn load(assets: &UiAssets, persist: bool) -> Stats {
+        let path = super::profiles::stats_path(&super::profiles::active()).filter(|_| persist);
+        // Debug runs can read (never write) stats from `COD4RW_STATSFILE`.
+        let read_from = path.clone().or_else(|| std::env::var_os("COD4RW_STATSFILE").map(PathBuf::from));
+        Self::read(assets, path, read_from, persist)
+    }
+
+    /// Another profile's stats (`None` in a debug run, which keeps its own).
+    pub fn load_from(&self, assets: &UiAssets, path: PathBuf) -> Option<Stats> {
+        self.path.is_some().then(|| Self::read(assets, Some(path.clone()), Some(path), true))
+    }
+
+    fn read(assets: &UiAssets, path: Option<PathBuf>, read_from: Option<PathBuf>, persist: bool) -> Stats {
         let mut values = HashMap::from([(260, 1)]);
         let mut unlocked = HashMap::new();
         let num = |s: Option<&str>| s.and_then(|s| s.trim().parse::<i32>().ok());
@@ -72,9 +88,6 @@ impl Stats {
                 unlocked.insert(stat, v);
             }
         }
-        let path = data_dir().map(|d| d.join("stats.txt")).filter(|_| persist);
-        // Debug runs can read (never write) stats from `COD4RW_STATSFILE`.
-        let read_from = path.clone().or_else(|| std::env::var_os("COD4RW_STATSFILE").map(PathBuf::from));
         let mut dvars = HashMap::new();
         let text = read_from.and_then(|p| std::fs::read_to_string(p).ok());
         let saved = text.is_some();

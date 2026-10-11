@@ -62,6 +62,15 @@ impl Skeleton {
             self.hidden[i] = true;
         }
     }
+
+    /// Show a joint [`Skeleton::hide`] hid.
+    pub fn show(&mut self, name: &str) {
+        if let Some(&i) = self.by_name.get(name)
+            && let Some(h) = self.hidden.get_mut(i)
+        {
+            *h = false;
+        }
+    }
 }
 
 /// Options for spawning a model into a skeleton.
@@ -238,6 +247,11 @@ pub struct AnimPlayer {
     /// The pose last sampled, put back on frames a distant body skips
     /// (what's applied over it afterwards, such as aiming, starts afresh).
     last_pose: Vec<Transform>,
+    /// The base pose last sampled (before any overlay), and a copy of it
+    /// taken when a crossfade is cut short: the next one fades from there,
+    /// not from the animation that was half faded in.
+    base_pose: Vec<Transform>,
+    from_pose: Option<Vec<Transform>>,
 }
 
 impl Default for AnimPlayer {
@@ -259,6 +273,8 @@ impl Default for AnimPlayer {
             overlay_from_map: (0, Vec::new()),
             blend_map: (0, Vec::new()),
             last_pose: Vec::new(),
+            base_pose: Vec::new(),
+            from_pose: None,
         }
     }
 }
@@ -266,6 +282,8 @@ impl Default for AnimPlayer {
 impl AnimPlayer {
     /// Switch animation (restarting it) with a crossfade of `fade` seconds.
     pub fn play(&mut self, anim: Arc<XAnim>, fade: f32) {
+        // Mid-crossfade: carry on from the pose as it is.
+        self.from_pose = (fade > 0.0 && self.fade < 1.0 && !self.base_pose.is_empty()).then(|| self.base_pose.clone());
         if let Some(cur) = self.anim.take() {
             self.prev = Some((cur, self.time));
             self.prev_map = std::mem::take(&mut self.map);
@@ -286,6 +304,7 @@ impl AnimPlayer {
         }
         self.time = time;
         self.prev = None;
+        self.from_pose = None;
         self.fade = 1.0;
     }
 
@@ -368,9 +387,12 @@ fn cached_map<'a>(cache: &'a mut (usize, Vec<Option<usize>>), skel: &Skeleton, a
 /// beyond these distances (metres) from the camera, every 2nd and every
 /// 3rd frame, divided by the zoom (aiming down sights or through a scope
 /// brings them close). Their joints and skins are the same as near ones'.
-/// Never during a killcam.
+/// Never during a killcam, and never below [`LOD_MIN_HZ`] poses a second
+/// (at 60 frames a second every frame is posed: halving it showed as
+/// stepping limbs in third person).
 const SAMPLE_EVERY_2ND: f32 = 15.0;
 const SAMPLE_EVERY_3RD: f32 = 35.0;
+const LOD_MIN_HZ: f32 = 55.0;
 
 pub(crate) fn animate_skeletons(
     time: Res<Time>,
@@ -381,9 +403,13 @@ pub(crate) fn animate_skeletons(
     lenses: Query<(&Camera, &Projection), Or<(With<crate::player::MainCamera>, With<crate::ui::ScopeCamera>)>>,
     killcam: Option<Res<crate::killcam::Killcam>>,
     mut frame_no: Local<u32>,
+    mut fps: Local<f32>,
 ) {
     let _t = crate::perf::Probe::start("animate_skeletons");
     let dt = time.delta_secs();
+    // The frame rate, smoothed: how many frames a pose may be held.
+    *fps = if *fps > 0.0 { *fps + (1.0 / dt.max(1e-4) - *fps) * 0.05 } else { 60.0 };
+    let most = (*fps / LOD_MIN_HZ).floor().max(1.0) as u32;
     *frame_no = frame_no.wrapping_add(1);
     // (Each splitscreen player has their own camera: no skipping there.)
     let lod = !crate::splitscreen::active() && !killcam.is_some_and(|k| k.showing());
@@ -407,12 +433,19 @@ pub(crate) fn animate_skeletons(
         player.time += dt * player.speed;
         if player.fade < 1.0 {
             player.fade = (player.fade + dt / player.fade_len.max(1e-3)).min(1.0);
+            // The animation being left carries on as it fades.
+            let speed = player.speed;
+            if let Some((_, t)) = &mut player.prev {
+                *t += dt * speed;
+            }
+        } else {
+            player.from_pose = None;
         }
         // Far away: this frame, maybe only the last pose again.
         let every = match (eye, skel.joints.first().and_then(|j| globals.get(j.entity).ok())) {
             (Some(eye), Some(at)) => {
                 let d = eye.distance(at.translation()) / zoom;
-                if d > SAMPLE_EVERY_3RD { 3 } else if d > SAMPLE_EVERY_2ND { 2 } else { 1 }
+                (if d > SAMPLE_EVERY_3RD { 3 } else if d > SAMPLE_EVERY_2ND { 2 } else { 1 }).min(most)
             }
             _ => 1,
         };
@@ -431,7 +464,8 @@ pub(crate) fn animate_skeletons(
                 player.prev_map = track_map(skel, p);
             }
         }
-        let w = player.fade;
+        // Eased in and out.
+        let w = player.fade * player.fade * (3.0 - 2.0 * player.fade);
         let fix = spine_fix(skel, &anim);
         let prev_fix = prev.as_ref().and_then(|(p, _)| spine_fix(skel, p));
         let player = &mut *player;
@@ -444,6 +478,8 @@ pub(crate) fn animate_skeletons(
         let phase = frame / (anim.num_frames.max(1) as f32);
         let blend = player.blend.as_ref().filter(|b| b.1 > 0.001).map(|(b, w)| (b, cached_map(&mut player.blend_map, skel, b), phase * b.num_frames as f32, *w));
         player.last_pose.resize(skel.joints.len(), Transform::IDENTITY);
+        player.base_pose.resize(skel.joints.len(), Transform::IDENTITY);
+        let from_pose = player.from_pose.take().filter(|p| p.len() == skel.joints.len());
         let ow = player.overlay_weight.clamp(0.0, 1.0);
         for (i, j) in skel.joints.iter().enumerate() {
             let Ok(mut tf) = joints.get_mut(j.entity) else { continue };
@@ -456,12 +492,20 @@ pub(crate) fn animate_skeletons(
                     pose.rotation = pose.rotation.slerp(other.rotation, *bw);
                 }
             }
-            if let Some((p, pt)) = &prev {
-                let mut from = sample(p, player.prev_map[i], p.frame_at(*pt), j);
-                fix_spine(&mut from, j, i, prev_fix);
+            let from = match (&from_pose, &prev) {
+                (Some(f), _) => Some(f[i]),
+                (None, Some((p, pt))) => {
+                    let mut from = sample(p, player.prev_map[i], p.frame_at(*pt), j);
+                    fix_spine(&mut from, j, i, prev_fix);
+                    Some(from)
+                }
+                _ => None,
+            };
+            if let Some(from) = from.filter(|_| w < 1.0) {
                 pose.translation = from.translation.lerp(pose.translation, w);
                 pose.rotation = from.rotation.slerp(pose.rotation, w);
             }
+            player.base_pose[i] = pose;
             if let Some((a, map, frame)) = &overlay {
                 if map[i].is_some() {
                     let mut over = sample(a, map[i], *frame, j);
@@ -486,5 +530,6 @@ pub(crate) fn animate_skeletons(
             player.last_pose[i] = pose;
             *tf = pose;
         }
+        player.from_pose = from_pose;
     }
 }

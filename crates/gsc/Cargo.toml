@@ -1,0 +1,12 @@
+[package]
+name = "gsc"
+description = "Call of Duty 4's game scripts (GSC): parser and interpreter for the campaign's level scripts."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+iw3 = { path = "../iw3" }

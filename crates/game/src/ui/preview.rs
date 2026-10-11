@@ -88,6 +88,8 @@ pub struct GunPreviews {
     bo1: crate::bo1::MatchContent,
     /// World at War's guns' content, likewise.
     waw: crate::waw::MatchContent,
+    /// Modern Warfare 2's guns' content, likewise.
+    mw2: crate::mw2guns::MatchContent,
 }
 
 impl GunPreviews {
@@ -171,6 +173,7 @@ impl GunPreviews {
             || self.figures.busy()
             || matches!(&self.bo1, crate::bo1::MatchContent::Loading(t) if !t.is_finished())
             || self.waw.busy()
+            || self.mw2.busy()
     }
 
     /// Remove every preview entity (leaving the menus).
@@ -190,6 +193,7 @@ impl GunPreviews {
         self.figures = Default::default();
         self.bo1 = Default::default();
         self.waw = Default::default();
+        self.mw2 = Default::default();
     }
 }
 
@@ -255,8 +259,12 @@ pub fn update(
             // Characters wait for their zone to load, Black Ops' and World at
             // War's guns for their content.
             let gun = |is: fn(&str) -> bool| r.weapon.split('|').any(|p| is(crate::gunmodel::parse(p.trim_start_matches("gun:")).0));
-            let (bo1_gun, waw_gun) = (gun(crate::bo1::is_bo1), gun(crate::waw::is_waw));
-            if !previews.figures.ready(&r.weapon) || (bo1_gun && previews.bo1.get().is_none()) || (waw_gun && previews.waw.get().is_none()) {
+            let (bo1_gun, waw_gun, mw2_gun) = (gun(crate::bo1::is_bo1), gun(crate::waw::is_waw), gun(crate::mw2guns::is_mw2));
+            if !previews.figures.ready(&r.weapon)
+                || (bo1_gun && previews.bo1.get().is_none())
+                || (waw_gun && previews.waw.get().is_none())
+                || (mw2_gun && previews.mw2.get().is_none())
+            {
                 previews.slots[index].rect = Some((r.pos, r.size));
                 continue;
             }
@@ -273,8 +281,8 @@ pub fn update(
                 let Some(common) = loaded(&mut previews.loading) else { continue };
                 let (figures, camos) = (&mut previews.figures, &mut previews.camos);
                 // The gun's own game's content, if not CoD4's.
-                let other = match (previews.bo1.get().filter(|_| bo1_gun), previews.waw.get().filter(|_| waw_gun)) {
-                    (Some(c), _) | (_, Some(c)) => Some(c),
+                let other = match (previews.bo1.get().filter(|_| bo1_gun), previews.waw.get().filter(|_| waw_gun), previews.mw2.get().filter(|_| mw2_gun)) {
+                    (Some(c), ..) | (_, Some(c), _) | (.., Some(c)) => Some(c),
                     _ => None,
                 };
                 super::figures::spawn(commands, figures, common, other, camos, &mut assets, &r.weapon, layer, pivot, FOV)
@@ -377,6 +385,8 @@ fn spawn_gun(
         previews.bo1.get()?
     } else if crate::waw::is_waw(weapon) {
         previews.waw.get()?
+    } else if crate::mw2guns::is_mw2(weapon) {
+        previews.mw2.get()?
     } else {
         loaded(&mut previews.loading)?
     };

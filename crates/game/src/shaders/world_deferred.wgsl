@@ -86,6 +86,12 @@ fn sample_lightmap(uv: vec2<f32>) -> vec4<f32> {
 }
 #endif
 
+// Modern Warfare 2's: a unit normal's x and y in alpha and green.
+fn mw2_normal(x: f32, y: f32) -> vec3<f32> {
+    let xy = vec2(x, y) * 2.0 - 1.0;
+    return vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+}
+
 fn iw3_slope(x: f32, y: f32) -> vec3<f32> {
     return vec3(x * 4.08 - 2.08, y * 4.0645161 - 2.0645161, 1.0);
 }
@@ -101,7 +107,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 #ifdef VERTEX_TANGENTS
     if (params.flags.x > 0.5) {
         let s = sample_normal(in.uv);
-        n_t = normalize(iw3_slope(s.a, s.g));
+        n_t = select(normalize(iw3_slope(s.a, s.g)), mw2_normal(s.a, s.g), params.probe.w > 0.5);
         let n = pbr_input.world_normal;
         let t = normalize(in.world_tangent.xyz);
         let b = in.world_tangent.w * cross(n, t);

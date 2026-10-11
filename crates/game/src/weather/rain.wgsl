@@ -12,7 +12,8 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var<uniform> velocity: vec4<f32>;
 // rgb: light, w: lightning.
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> light: vec4<f32>;
-// x: 0 near streaks, 1 far streaks, 2 splashes, 3 drips; y: map cell size;
+// x: 0 near streaks, 1 far streaks, 2 splashes, 3 drips, 4 curtains,
+// 5 near snowflakes, 6 far; y: map cell size;
 // z: cells.
 @group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> kind: vec4<f32>;
 // The rain map: how high rain gets in each cell.
@@ -20,11 +21,19 @@
 // Toward the key light (the moon by night), and its light on the drops.
 @group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> key_dir: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(7) var<uniform> key_light: vec4<f32>;
+// Snow: lamps near the camera, two each: (where, reach), (colour, -).
+@group(#{MATERIAL_BIND_GROUP}) @binding(8) var<uniform> lamps: array<vec4<f32>, 16>;
 
 // The near box's half size: the far layer leaves it alone.
 const NEAR_EXTENT: vec3<f32> = vec3<f32>(14.0, 9.0, 14.0);
 // Splashes a second, per splash.
 const SPLASH_RATE: f32 = 2.2;
+// How bright a flake is against the light it catches.
+const SNOW_STRENGTH: f32 = 0.03;
+// A lamp's light on a flake beside it, against the air's.
+const LAMP_GLOW: f32 = 40.0;
+// The near snow's box (half size): the far flakes leave it alone.
+const SNOW_NEAR: vec3<f32> = vec3<f32>(12.0, 8.0, 12.0);
 const PI: f32 = 3.14159265;
 
 struct Out {
@@ -33,6 +42,8 @@ struct Out {
     @location(1) fade: f32,
     // Where it is (for the light's scatter, the curtains' noise).
     @location(2) world: vec3<f32>,
+    // Snow: the lamps' light on the flake.
+    @location(3) glow: vec3<f32>,
 }
 
 fn hash(n: u32) -> u32 {
@@ -88,6 +99,58 @@ fn vertex(@location(0) v: vec3<f32>) -> Out {
     }
     let t = centre.w;
     let eye = view.world_position;
+    if k == 5 || k == 6 {
+        // A snowflake: drifting down through the box round the camera (and
+        // wrapping in it, so it stays put in the world as the box moves),
+        // fluttering side to side as it goes; none under a roof.
+        let size = extent.xyz * 2.0;
+        let lo = centre.xyz - extent.xyz;
+        let base = vec3<f32>(rand(i * 9u), rand(i * 9u + 1u), rand(i * 9u + 2u)) * size;
+        let speed = 0.8 + 0.4 * rand(i * 9u + 4u);
+        let ph = rand(i * 9u + 5u) * 2.0 * PI;
+        let f = 0.6 + 0.8 * rand(i * 9u + 6u);
+        let flutter = vec3<f32>(sin(t * f * 2.1 + ph), 0.0, cos(t * f * 1.7 + ph * 1.3)) * (0.18 / f);
+        let p0 = lo + fract((base + velocity.xyz * speed * t - lo) / size) * size;
+        let p = p0 + flutter;
+        let off = p0 - centre.xyz;
+        if k == 6 && all(abs(off) < SNOW_NEAR) {
+            return hidden(out);
+        }
+        if p.y < height_at(p) {
+            return hidden(out);
+        }
+        let to_eye = eye - p;
+        let dist = length(to_eye);
+        let fwd = to_eye / max(dist, 1e-3);
+        let side = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), fwd));
+        let up = cross(fwd, side);
+        // 1-2.5 cm across; at least a pixel or so far off, fainter as it grows.
+        // (Near ones smaller: 0.6-1.6 cm across, far 1-2.6.)
+        let r = select(0.005 + 0.008 * rand(i * 9u + 7u), 0.003 + 0.005 * rand(i * 9u + 7u), k == 5);
+        let width = max(r, dist * 0.0007);
+        let world = p + (side * corner.x + up * (corner.y * 2.0 - 1.0)) * width;
+        out.world = world;
+        let edge = min(min(extent.x - abs(off.x), extent.y - abs(off.y)), extent.z - abs(off.z));
+        // Shrinking past a pixel they fade; the far field less so (a faint
+        // depth), the nearest dimmer (none reads as a dot on the lens).
+        let shrink = select((r / width) * (r / width), r / width, k == 6);
+        let close = select(1.0, mix(0.45, 1.0, smoothstep(1.5, 5.0, dist)), k == 5);
+        out.fade = smoothstep(0.4, 1.4, dist) * smoothstep(0.0, 2.0, edge) * shrink * close * (0.6 + 0.4 * rand(i * 9u + 8u));
+        // The lamps it's passing: their colour, by how close (inside their
+        // reach, falling off as its square).
+        var glow = vec3<f32>(0.0);
+        for (var l = 0u; l < 8u; l++) {
+            let lamp = lamps[l * 2u];
+            if lamp.w <= 0.0 {
+                break;
+            }
+            let x = 1.0 - min(distance(p, lamp.xyz) / lamp.w, 1.0);
+            glow += lamps[l * 2u + 1u].rgb * x * x;
+        }
+        out.glow = glow;
+        out.clip = view.clip_from_world * vec4<f32>(world, 1.0);
+        return out;
+    }
     if k == 4 {
         // A distant curtain of rain: a big soft sheet standing in a ring
         // 30-150 m out, turned to face the eye, drifting with the wind.
@@ -120,16 +183,19 @@ fn vertex(@location(0) v: vec3<f32>) -> Out {
             return hidden(out);
         }
         let fall = 0.5 * 9.8 * pow(life * sqrt(2.0 * (top - below) / 9.8), 2.0);
-        let p = vec3<f32>(spot.x, top - fall, spot.z) + step * 0.5;
+        // (Just past the lip, and hanging from it: the old drips started
+        // half a cell out and a streak above the edge.)
+        let p = vec3<f32>(spot.x, top - fall, spot.z) + step * 0.12;
         let to_eye = eye - p;
         let dist = length(to_eye);
         let side = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), to_eye));
-        let width = max(0.004, dist * 0.0011);
+        let width = max(0.0025, dist * 0.0007);
         // Close to the eye a drip would fill the view as a bright bar: it
         // fades out within ~1.5 m, and is dimmer and shorter up to ~4 m.
         let near = smoothstep(1.0, 4.0, dist);
-        let world = p + vec3<f32>(0.0, corner.y * 0.18 * mix(0.4, 1.0, near), 0.0) + side * corner.x * width;
-        out.fade = (1.0 - smoothstep(extent.x * 0.6, extent.x, dist)) * (0.004 / width) * 1.6 * smoothstep(1.5, 2.5, dist) * mix(0.35, 1.0, near);
+        let len = min(0.18 * mix(0.4, 1.0, near), fall + 0.02);
+        let world = p - vec3<f32>(0.0, (1.0 - corner.y) * len, 0.0) + side * corner.x * width;
+        out.fade = (1.0 - smoothstep(extent.x * 0.6, extent.x, dist)) * (0.0025 / width) * 1.6 * smoothstep(1.5, 2.5, dist) * mix(0.35, 1.0, near);
         out.clip = view.clip_from_world * vec4<f32>(world, 1.0);
         return out;
     }
@@ -202,6 +268,20 @@ fn fragment(in: Out) -> @location(0) vec4<f32> {
     let k = i32(kind.x + 0.5);
     var a = 0.0;
     var strength = 0.0;
+    if k == 5 || k == 6 {
+        // A soft round flake, white: the air's light, and the moon's (some
+        // forward scatter, much less than rain's).
+        let d = length(vec2<f32>(in.uv.x, in.uv.y * 2.0 - 1.0));
+        a = smoothstep(1.0, 0.25, d);
+        let v = normalize(in.world - view.world_position);
+        let cs = dot(v, normalize(key_dir.xyz));
+        let g = 0.35;
+        let hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cs, 1.5) / (4.0 * PI);
+        let lit = light.rgb + key_light.rgb * (0.4 + 2.0 * hg);
+        let air = dot(light.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let white = vec3<f32>(dot(lit, vec3<f32>(0.2126, 0.7152, 0.0722))) * vec3<f32>(0.96, 0.98, 1.0) + in.glow * air * LAMP_GLOW;
+        return vec4<f32>(white * max(a * in.fade, 0.0) * SNOW_STRENGTH, 0.0);
+    }
     if k == 2 {
         // A ripple: a thin ring spreading out and fading (flat on the
         // ground; uv -1..1 across it).
@@ -216,7 +296,8 @@ fn fragment(in: Out) -> @location(0) vec4<f32> {
     } else if k == 3 {
         let across = 1.0 - abs(in.uv.x);
         a = across * across * sin(in.uv.y * PI);
-        strength = 0.016;
+        // (Thin and clear: water, not white paint.)
+        strength = 0.006;
     } else if k == 4 {
         // Streaky noise falling down the sheet, densest low (mist over the
         // sea), soft at the sides and top. Faint: a soldier 40 m off stays

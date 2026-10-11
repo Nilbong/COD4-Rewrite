@@ -3028,10 +3028,12 @@ dependencies = [
  "flate2",
  "gilrs",
  "glam 0.33.12",
+ "gsc",
  "half",
  "hidapi",
  "image",
  "iw3",
+ "iw4",
  "log",
  "obvhs",
  "rand 0.9.5",
@@ -3279,6 +3281,14 @@ name = "grid"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
+
+[[package]]
+name = "gsc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "iw3",
+]
 
 [[package]]
 name = "guillotiere"
@@ -3682,6 +3692,17 @@ dependencies = [
  "serde",
  "serde_json",
  "zip",
+]
+
+[[package]]
+name = "iw4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "iw3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

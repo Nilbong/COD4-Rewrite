@@ -143,8 +143,24 @@ impl Frontend {
         }
     }
 
+    /// The new UI's preview: the lens picture, the reticle's name and the
+    /// note under it.
+    pub(in crate::ui) fn reticle_preview(&self) -> (String, String, &'static str) {
+        let stat: i32 = self.dvar(STAT).parse().unwrap_or(201);
+        let r = self.reticle_rows();
+        let name = format!("{} {} - {}", COLOURS[r.colour as usize].0, SHAPES[r.shape as usize], SIZES[match r.size {
+            1 => 2,
+            2 => 0,
+            _ => 1,
+        }]
+        .0);
+        let gun = self.gun_for(stat).map(|g| g.0).unwrap_or_default();
+        let note = if gun.contains("reflex") { "Shown in this weapon's Red Dot Sight." } else { "Shown when this weapon has a Red Dot Sight." };
+        (picture(r.code()), name, note)
+    }
+
     pub(super) fn paint_reticle(&self, om: &OpenMenu, pl: &Placement, ops: &mut Vec<Op>) {
-        if om.name != MENU {
+        if om.name != MENU || om.menu.window.name.starts_with(super::next::picker::PREFIX) {
             return;
         }
         let stat: i32 = self.dvar(STAT).parse().unwrap_or(201);

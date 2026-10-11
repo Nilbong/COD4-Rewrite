@@ -19,6 +19,8 @@ use iw3::xanim::XAnim;
 use rand::Rng;
 use std::sync::Arc;
 
+mod anim_test;
+
 pub struct ThirdPersonPlugin;
 
 impl Plugin for ThirdPersonPlugin {
@@ -35,6 +37,7 @@ impl Plugin for ThirdPersonPlugin {
                     .before(bevy::transform::TransformSystems::Propagate)
                     .run_if(crate::state::in_game),
             );
+        anim_test::build(app);
     }
 }
 
@@ -94,17 +97,19 @@ fn attach_bodies(
     mut commands: Commands,
     mut content: ResMut<Content>,
     wardrobe: Res<Wardrobe>,
-    pawns: Query<(Entity, &Pawn, Has<LocalPlayer>, Option<&crate::splitscreen::LocalSlot>), Without<Body>>,
+    pawns: Query<(Entity, &Pawn, Has<LocalPlayer>, Option<&crate::splitscreen::LocalSlot>, Option<&crate::campaign::BodyModels>), Without<Body>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
 ) {
-    for (pawn, p, local, slot) in &pawns {
-        let outfit = wardrobe.outfit(&p.name, p.team, local);
-        let models: Vec<Arc<PreparedModel>> = match outfit {
-            Some(o) => o.models.clone(),
-            None => {
+    for (pawn, p, local, slot, sp_models) in &pawns {
+        // The campaign's soldiers wear their spawners' own models.
+        let outfit = if sp_models.is_some() { None } else { wardrobe.outfit(&p.name, p.team, local) };
+        let models: Vec<Arc<PreparedModel>> = match (outfit, sp_models) {
+            (_, Some(m)) => m.0.iter().filter_map(|name| content.model(name, &mut meshes, &mut materials, &mut images, &mut bindposes)).collect(),
+            (Some(o), None) => o.models.clone(),
+            (None, None) => {
                 let (body, head) = character_models(&content, p.team);
                 [body, head]
                     .into_iter()
@@ -180,6 +185,7 @@ fn hold_guns(
     mut content: ResMut<Content>,
     mut bo1_content: ResMut<crate::bo1::MatchContent>,
     mut waw_content: ResMut<crate::waw::MatchContent>,
+    mut mw2_content: ResMut<crate::mw2guns::MatchContent>,
     pawns: Query<(&Body, &crate::weapons::WeaponState, Option<&crate::loadout::Loadout>, Option<&crate::grenades::Offhand>, Has<Dead>)>,
     mut owners: Query<(&mut Skeleton, &mut AnimPlayer, Option<&HeldGun>, Option<&mut LocalBody>), Without<Limp>>,
     layers: Query<&RenderLayers>,
@@ -242,8 +248,8 @@ fn hold_guns(
                 (format!("{gun}:{}", parts.collect::<Vec<_>>().join("+")), 0)
             });
         let gun = crate::gunmodel::parse(&spec).0;
-        let (bo1, waw) = (crate::bo1::is_bo1(gun), crate::waw::is_waw(gun));
-        if (bo1 && bo1_content.get().is_none()) || (waw && waw_content.get().is_none()) {
+        let (bo1, waw, mw2) = (crate::bo1::is_bo1(gun), crate::waw::is_waw(gun), crate::mw2guns::is_mw2(gun));
+        if (bo1 && bo1_content.get().is_none()) || (waw && waw_content.get().is_none()) || (mw2 && mw2_content.get().is_none()) {
             continue;
         }
         if let Some(h) = held {
@@ -259,8 +265,8 @@ fn hold_guns(
         let hand = skeleton.joint("tag_weapon_right");
         // Seen as the body is (the player's own: per the third person view).
         let shown = local_body.as_ref().and_then(|b| b.0.first()).and_then(|&e| layers.get(e).ok()).cloned();
-        let content: &mut Content = match (bo1_content.get().filter(|_| bo1), waw_content.get().filter(|_| waw)) {
-            (Some(c), _) | (_, Some(c)) => c,
+        let content: &mut Content = match (bo1_content.get().filter(|_| bo1), waw_content.get().filter(|_| waw), mw2_content.get().filter(|_| mw2)) {
+            (Some(c), ..) | (_, Some(c), _) | (.., Some(c)) => c,
             _ => &mut content,
         };
         let mut assets = crate::gunmodel::GunAssets {
@@ -644,7 +650,7 @@ fn death_anims(stance: Stance, m: Motion, downed: bool) -> &'static [&'static st
 /// ground; at least 0.1, at most 3 for slow animations, 2 for fast.
 fn move_rate(anim: &XAnim, speed: f32) -> f32 {
     let d = anim.delta_at(1.0);
-    let own = Vec2::new(d[0], d[1]).length() / anim.duration().max(1e-3);
+    let own = Vec2::new(d[0], d[1]).length() / anim.duration().max(1e-3) / stride_fix(&anim.name);
     if !anim.delta || own < 1.0 {
         return 1.0;
     }
@@ -658,12 +664,32 @@ fn move_rate(anim: &XAnim, speed: f32) -> f32 {
     (speed / crate::units::u(1.0) / own).clamp(0.1, max)
 }
 
+/// The standing run and sprint anims' feet cover less ground than their
+/// root motion says (measured with `COD4RW_TPANIM`: a planted foot goes
+/// back under the body at about 1/1.6 of it; walking and crouched they
+/// keep up), so played at the root's speed they skate. Played that much
+/// faster the feet would hold but the steps would patter, so this goes
+/// part of the way ([`STRIDE_SHARE`]): fewer skates, a brisker step.
+fn stride_fix(name: &str) -> f32 {
+    let name = name.to_ascii_lowercase();
+    let need = match () {
+        _ if name.contains("prone") || name.contains("crouch") || name.contains("walk") => 1.0,
+        _ if name.contains("run") || name.contains("sprint") => 1.6,
+        _ => 1.0,
+    };
+    1.0 + STRIDE_SHARE * (need - 1.0)
+}
+const STRIDE_SHARE: f32 = 0.6;
+
 /// Where a body's legs go, for [`turn_bodies`]: their offset from the view
 /// and whether they must follow it (moving) or may lag behind.
 #[derive(Clone, Copy, Default)]
 struct Gait {
     offset: f32,
     moving: bool,
+    /// How fast the legs were swinging round last frame (radians a second,
+    /// left positive), from [`turn_bodies`]: standing, they shuffle round.
+    swing: f32,
 }
 
 #[derive(Resource, Default)]
@@ -703,7 +729,7 @@ fn turn_bodies(
     parents: Query<(&ChildOf, &GlobalTransform)>,
     globals: Query<&GlobalTransform>,
     replay: Res<crate::killcam::ReplayPoses>,
-    gaits: Res<Gaits>,
+    mut gaits: ResMut<Gaits>,
     mut legs: Local<std::collections::HashMap<Entity, (f32, bool)>>,
     mut slopes: Local<std::collections::HashMap<Entity, (f32, f32)>>,
 ) {
@@ -729,11 +755,17 @@ fn turn_bodies(
                     if gait.moving || diff.abs() > LEGS_TOLERANCE.to_radians() {
                         *swinging = true;
                     }
+                    if let Some(g) = gaits.0.get_mut(&body.0) {
+                        g.swing = 0.0;
+                    }
                     if *swinging {
                         // Degrees per ms: the speed, faster the further.
                         let rate = (SWING_SPEED * (diff.abs().to_degrees() * 0.05).max(0.5) * 1000.0).to_radians();
                         let step = (rate * dt).min(diff.abs());
                         *yaw += step * diff.signum();
+                        if let Some(g) = gaits.0.get_mut(&body.0) {
+                            g.swing = step * diff.signum() / dt.max(1e-4);
+                        }
                         *swinging = gait.moving || wrap(target - *yaw).abs() > 0.01;
                     }
                     // Never trailing more than 150 degrees.
@@ -876,10 +908,28 @@ struct BodyState {
     hurt_from: Option<Dir>,
     stance: Stance,
     motion: Motion,
+    /// A different movetype, and since when: it takes over once it has
+    /// lasted [`MOTION_SETTLE`].
+    pending: Option<(Motion, f32)>,
+    /// Shuffling round on the spot: which way, until when, how fast the
+    /// legs swing (radians a second).
+    shuffle: Option<(Dir, f32, f32)>,
     /// Getting up from prone: the transition holds the legs until then.
     stance_until: f32,
     dead: bool,
 }
+
+/// A change of movetype waits this long (seconds), so a reversal or a
+/// turn passing through a standstill, or a sideways direction for a frame
+/// or two, doesn't start the body on an animation it leaves at once.
+/// Setting off from still is at once.
+const MOTION_SETTLE: f32 = 0.1;
+/// Legs swinging faster than this (degrees a second) shuffle; and the
+/// shuffle carries on this long after (seconds).
+const SHUFFLE_FROM: f32 = 60.0;
+const SHUFFLE_HOLD: f32 = 0.25;
+/// How far out the feet are from the turn's middle (units).
+const SHUFFLE_REACH: f32 = 10.0;
 
 /// Most of a landing is the recovery; cut back to running after this.
 const LAND_FOR: f32 = 0.35;
@@ -964,13 +1014,39 @@ fn drive_body_anims(
         let walking = ads || mover.lean.abs() > 0.1;
         // Headquarters walks when slow, at ease (`hq_anim`'s patrol walk).
         let (m, offset) = motion(mover, view.yaw, walking, state.motion);
+        let m = match state.pending {
+            _ if m == state.motion || state.motion == Motion::Idle => {
+                state.pending = None;
+                m
+            }
+            // (Stopping settles sooner: the feet are sliding meanwhile.)
+            Some((p, since)) if p == m && now - since >= if m == Motion::Idle { MOTION_SETTLE * 0.5 } else { MOTION_SETTLE } => {
+                state.pending = None;
+                m
+            }
+            Some((p, _)) if p == m => state.motion,
+            _ => {
+                state.pending = Some((m, now));
+                state.motion
+            }
+        };
         state.motion = m;
         // Debug, for comparing: `COD4RW_ANIMBLEND` mixes the forward (or
         // back) loop with the side one by the angle of travel, the legs
         // facing the view, instead of CoD4's switch at 60 degrees.
         let angled = angle_blend(mover, view.yaw, m);
         let offset = if angled.is_some() { 0.0 } else { offset };
-        gaits.0.insert(body.0, Gait { offset, moving: m != Motion::Idle });
+        let swing = gaits.0.get(&body.0).map_or(0.0, |g| g.swing);
+        gaits.0.insert(body.0, Gait { offset, moving: m != Motion::Idle, swing });
+        // Turning on the spot, the legs swinging round: a step or two that
+        // way (held a moment, so a swing in bursts reads as one shuffle).
+        if m == Motion::Idle && swing.abs() > SHUFFLE_FROM.to_radians() && mover.stance != Stance::Prone {
+            state.shuffle = Some((if swing > 0.0 { Dir::Left } else { Dir::Right }, now + SHUFFLE_HOLD, swing.abs()));
+        }
+        let shuffle = state.shuffle.filter(|s| m == Motion::Idle && now < s.1);
+        if shuffle.is_none() {
+            state.shuffle = None;
+        }
         let mut load = |name: &str| body_anim(&mut content, black_ops, name);
 
         if dead {
@@ -1131,7 +1207,10 @@ fn drive_body_anims(
             _ if cover_pose.is_some() => cover_pose.unwrap_or_default().to_owned(),
             // Headquarters: at ease, the gun lowered.
             _ if crate::hq::active() => hq_anim(mover.stance, m).map_or_else(|| base_anim(mover.stance, m, grip, ads), str::to_owned),
-            _ => base_anim(mover.stance, m, grip, ads),
+            _ => match shuffle {
+                Some((dir, ..)) => base_anim(mover.stance, Motion::Walk(dir), grip, ads),
+                None => base_anim(mover.stance, m, grip, ads),
+            },
         };
         // The angle blend's pair, instead of one direction's loop.
         let (name, side) = match angled {
@@ -1155,7 +1234,13 @@ fn drive_body_anims(
                 _ if was_moving => 0.25,
                 _ => 0.17,
             };
-            let rate = if m == Motion::Idle { 1.0 } else { move_rate(&a, mover.horizontal_speed()) };
+            // (A shuffle steps as fast as the legs come round: its feet
+            // cover about a hand's breadth of that turn a radian.)
+            let rate = match shuffle {
+                Some((.., swing)) if m == Motion::Idle => move_rate(&a, swing * crate::units::u(SHUFFLE_REACH)),
+                _ if m == Motion::Idle => 1.0,
+                _ => move_rate(&a, mover.horizontal_speed()),
+            };
             // Between moves the feet carry on where they were in the step;
             // setting off from still, each body at its own point of the
             // cycle (CoD4's by time and client number), not all in step.

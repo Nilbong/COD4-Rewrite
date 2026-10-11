@@ -51,6 +51,10 @@ struct SkyParams {
     // Seconds, for the stars' twinkle; the bolt's shape.
     time: f32,
     bolt_seed: f32,
+    // Live look knobs: x storm-cloud contrast, y lightning glow, z rain shafts.
+    look: vec4<f32>,
+    // The map's night sky: x stars, y zenith darkening, z warm city glow.
+    night_look: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> sky: SkyParams;
@@ -88,7 +92,9 @@ fn cube_dir(uv: vec2<f32>, face: u32) -> vec3<f32> {
 // The classic skybox, blurred, toward `d` (Bevy space), looked up as the
 // skybox does (see `cube_dir`).
 fn classic_sky(d: vec3<f32>) -> vec3<f32> {
-    let lod = max(f32(textureNumLevels(classic)) - 4.0, 0.0);
+    // (Not the last mips: they average a whole face, a dusk horizon's
+    // brown spreading overhead.)
+    let lod = max(f32(textureNumLevels(classic)) - 5.5, 0.0);
     return textureSampleLevel(classic, classic_sampler, vec3(d.x, d.z, d.y), lod).rgb;
 }
 
@@ -154,14 +160,21 @@ fn density(p: vec3<f32>, h: f32, cover: f32, detail: bool) -> f32 {
     // (fbm bunches round 0.5: spread first, or the fold is near 1 everywhere
     // and the deck goes flat.)
     let n = saturate((fbm(q * (1.0 / 1600.0), 5u) - 0.5) * 2.8 + 0.5);
-    let shape = 1.0 - abs(n * 2.0 - 1.0);
+    // (A smooth dome, not a crease: `abs` folded the noise into thin
+    // ridges that lit up as bright veins.)
+    let shape = 1.0 - (n * 2.0 - 1.0) * (n * 2.0 - 1.0);
     // (fbm bunches round 0.5: spread it over 0..1, so `cover` is about
     // the share of the sky covered.)
     let base = saturate((weather * 0.55 + shape * 0.45 - 0.5) * 3.5 + 0.5);
     let lo = 1.0 - cover;
     // Firm edges: cloud bodies against clear gaps.
-    var d = smoothstep(lo - 0.05, lo + 0.18, base);
+    // (Softer when overcast: firm edges at high cover left a web of thin
+    // bright cracks, the sky showing through.)
+    var d = smoothstep(lo - 0.05, lo + mix(0.18, 0.5, smoothstep(0.55, 0.85, cover)), base);
     // Flat bottoms, rounded tops (taller where the cloud is thicker).
+    // Overcast: a continuous deck under the masses (the gaps between them
+    // read as thin bright cracks, the sky showing through).
+    d = max(d, 0.35 * smoothstep(0.85, 0.95, cover) * (1.0 - h));
     d *= smoothstep(0.0, 0.12, h) * smoothstep(1.0, mix(0.35, 0.8, d), h);
     if (detail && d > 0.0) {
         // Wispy edges.
@@ -249,30 +262,36 @@ fn cloud_banks(d: vec3<f32>, behind: vec3<f32>, horizon: vec3<f32>) -> vec3<f32>
     var out = behind;
     for (var k = 0; k < 3; k += 1) {
         let kf = f32(k);
-        // Round the horizon (no seam): low-frequency noise on a circle (a
-        // few big masses), drifting; a finer octave makes cauliflower tops.
-        let r = 1.6 + 0.9 * kf;
+        // Broad cells round the horizon (no seam), drifting.
+        let r = 2.0 + 0.8 * kf;
         let drift = sky.time * 0.003 * (1.0 + kf * 0.5);
         let p = vec3(cos(az + drift) * r, kf * 7.3, sin(az + drift) * r);
-        let big = saturate((fbm(p, 3u) - 0.4) * 2.5);
-        let fine = fbm(p * 11.0, 3u);
-        let top = (0.015 + (0.10 + 0.05 * kf) * big * big * (3.0 - 2.0 * big) + 0.04 * (fine - 0.35) * sqrt(big)) * storm;
-        let edge = top - e;
-        if (edge <= 0.0 || big <= 0.0) {
+        let cell = saturate((fbm(p, 3u) - 0.45) * 5.0);
+        // Lifted off the sea (a band of horizon glow and rain haze beneath),
+        // flat-bottomed, low and wide.
+        let base = (0.012 + 0.006 * kf) * storm;
+        let top = base + (0.045 + 0.02 * kf) * cell * storm;
+        let soft = 0.012 + 0.006 * kf;
+        let inside = smoothstep(base - soft * 0.6, base + soft * 0.4, e) * (1.0 - smoothstep(top - soft, top + soft, e));
+        let alpha = inside * smoothstep(0.0, 0.25, cell);
+        if (alpha <= 0.0) {
             continue;
         }
-        let alpha = smoothstep(0.0, 0.006, edge);
-        // Up the mass: a dark flat base, the body, a bright rim at the top
-        // lit from above (the moon or the day through the deck).
-        let v = saturate(e / max(top, 1e-4));
-        let puffs = fbm(vec3(cos(az) * 9.0, e * 40.0 + kf * 3.1, sin(az) * 9.0), 3u);
-        // (Darker than the glowing horizon behind: masses against it.)
-        var col = horizon * mix(0.25, 0.8, smoothstep(0.0, 1.0, v)) * mix(0.6, 1.3, puffs);
-        col += horizon * 0.7 * exp(-edge / 0.008) * mix(0.3, 1.0, fine);
-        // The nearest bank darkest, the farthest into the horizon's haze.
-        col *= mix(1.0, 0.75, kf / 2.0);
-        col = mix(col, horizon, 0.35 * (1.0 - kf / 2.0));
+        // Gentle shading: a slightly darker base, a lighter top; close to
+        // the sky's own tone.
+        let v = saturate((e - base) / max(top - base, 1e-4));
+        var col = horizon * mix(0.3, 0.7, v) + horizon * 0.45 * smoothstep(0.6, 1.0, v);
+        // Far cells veiled by rain haze.
+        col = mix(col, horizon, 0.15 + 0.2 * kf);
         out = mix(out, col, alpha);
+        // Rain shafts hanging from the cell's base to the sea: soft grey
+        // streaks, slanted a little with the wind, fading to the horizon.
+        if (e < base && cell > 0.2) {
+            let slant = az + (base - e) * 0.6;
+            let streak = fbm(vec3(cos(slant) * 40.0, kf * 5.1 + sky.time * 0.05, sin(slant) * 40.0), 2u);
+            let shaft = smoothstep(0.45, 0.75, streak) * smoothstep(0.2, 0.6, cell) * smoothstep(-0.01, base, e);
+            out = mix(out, horizon * 0.55, saturate(shaft * 0.5 * storm * sky.look.z));
+        }
     }
     return out;
 }
@@ -355,16 +374,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // (The moon's glow only through clear air: none under storm cloud.)
         let moonlight = MOONLIGHT * (1.0 - storm_of());
         base = scale * (scatter(dir, sun) + moonlight * scatter(dir, moon) * vec3(0.7, 0.8, 1.0));
+        // A storm's sky behind its deck is dark, not daylight blue.
+        base *= mix(1.0, 0.35, storm_of());
         base += stars(d) * sky.night * smoothstep(0.0, 0.1, d.y) * zenith_lum;
         // By night: a glow toward the horizon (the clock's horizon colour,
         // shared with the fog and the ocean), darker overhead.
         base = max(base, night_sky(d) * sky.night);
+    }
+    // A map's own night sky made punchier (`climate::MapLook`): deeper
+    // overhead, stars, a warm glow of the city along the horizon.
+    if (!showcase && (sky.night_look.x > 0.0 || sky.night_look.y > 0.0 || sky.night_look.z > 0.0)) {
+        let up = saturate(d.y);
+        let high = smoothstep(0.05, 0.6, up);
+        base *= mix(1.0, 1.0 - sky.night_look.y, high);
+        // (Deep blue-black overhead, not the skybox's brown.)
+        let lum = dot(base, vec3(0.2126, 0.7152, 0.0722));
+        base = mix(base, lum * vec3(0.4, 0.62, 1.6), sky.night_look.y * mix(0.4, 0.9, high));
+        base += stars(d) * sky.night_look.x * smoothstep(0.05, 0.25, d.y) * max(zenith_lum, 0.03) * 3.0;
     }
     if (sky.fog > 0.5) {
         base = mix(base, horizon, 0.8 * exp(-max(d.y, 0.0) / 0.05));
         if (d.y < 0.0) {
             base = horizon;
         }
+    }
+    // (The city's glow over the fog's horizon: lit haze above the town.)
+    if (!showcase && sky.night_look.z > 0.0) {
+        let glow_col = vec3(1.0, 0.55, 0.25) * max(dot(horizon, vec3(0.2126, 0.7152, 0.0722)), 0.004) * 1.6;
+        base += glow_col * sky.night_look.z * exp(-abs(d.y) / 0.08);
     }
     // The sun's glow in the air round it.
     let glow = sky.sun_color * (0.04 * pow(max(cs, 0.0), 6.0) + 0.25 * pow(max(cs, 0.0), 120.0)) * (1.0 - sky.night);
@@ -377,19 +414,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let t0 = to_shell(d.y, CLOUD_BASE);
         let t1 = to_shell(d.y, top_height);
         // (Half the steps while a flash redraws the whole sky each frame.)
-        let steps = select(STEPS, STEPS / 2u, sky.flash > 0.0);
+        let steps = select(STEPS, STEPS / 2u, sky.flash > 0.0 || sky.look.w > 0.5);
         let dt = (t1 - t0) / f32(steps);
         let jitter = hash(vec3<i32>(vec2<i32>(id.xy), i32(face)));
         // Sigma per metre for a density of 1: thicker when overcast.
         let sigma = mix(0.012, 0.03, cover);
         // (By night a storm deck hides the moon: its light is the deck's glow,
         // which carries the masses and rifts, not a flat moonlit sheet.)
-        let key_light = sky.key_color * mix(6.0, 2.5, sky.darkness) * (1.0 - 0.6 * storm_of() * sky.night);
+        let key_light0 = sky.key_color * mix(6.0, 2.5, sky.darkness) * (1.0 - 0.6 * storm_of() * sky.night);
+        // A dark sky's sun is low or veiled (Bog's dusk, its smoke): its light
+        // on the clouds as weak as the sky is dark, or they glowed orange-brown.
+        let key_light = key_light0 * clamp(zenith_lum / 0.35, 0.12, 1.0);
         // The skybox's average hue (Crash's green-grey storm, Bog's brown)
         // on the clouds, so each map keeps its mood.
         let average = (zenith + classic_sky(vec3(1.0, 0.25, 0.0)) + classic_sky(vec3(-1.0, 0.25, 0.0))
             + classic_sky(vec3(0.0, 0.25, 1.0)) + classic_sky(vec3(0.0, 0.25, -1.0))) * 0.2;
-        let hue = mix(vec3(1.0), average / max(dot(average, vec3(0.2126, 0.7152, 0.0722)), 1e-3), select(0.85, 0.0, showcase));
+        // (Half from the zenith: a hazy horizon's tint, Bog's brown dusk,
+        // isn't the clouds' colour overhead.)
+        let tint_of = mix(average, zenith, 0.8);
+        let hue = mix(vec3(1.0), tint_of / max(dot(tint_of, vec3(0.2126, 0.7152, 0.0722)), 1e-3), select(0.85, 0.0, showcase));
         let phase = mix(hg(ck, 0.45), hg(ck, -0.2), 0.3);
         // Where the bolt leaves the cloud base: lightning lights the cloud
         // round it from inside.
@@ -440,7 +483,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let low = 1.0 - smoothstep(0.1, 0.5, d.y);
                 // Rifts: thin bright seams along the masses' edges.
                 let rift = 1.0 + 1.5 * low * (1.0 - smoothstep(0.0, 0.12, abs(mass - 0.5)));
-                let shade = mix(mix(1.8, 2.6, low), mix(0.25, 0.08, low), mass) * mix(0.6, 1.4, thin) * rift;
+                let shade = pow(mix(mix(2.2, 3.0, low), mix(0.2, 0.06, low), mass) * mix(0.55, 1.5, thin) * rift, sky.look.x);
                 sky_there = mix(sky_there, night_sky(d) * shade, sky.night);
             }
             // By night storm cloud still reads dark slate grey (CoD4's Wet
@@ -450,8 +493,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Thin wisps scatter evenly; only thick cloud gets the strong
             // forward lobe (no bright ribbon along edges near the sun).
             let ph = mix(1.0 / (4.0 * PI), phase, saturate(dens * 1.5));
-            let flash = sky.flash * 5.0 * exp(-distance(p, bolt_at) / 1200.0) * vec3(0.8, 0.85, 1.0) * zenith_lum;
-            let light = (key_light * lit * ph + ambient) * hue + flash;
+            let flash = sky.flash * 9.0 * sky.look.y * exp(-distance(p, bolt_at) / 1600.0) * vec3(0.8, 0.85, 1.0) * zenith_lum;
+            // (Thin cloud's edges take less of the key light: lit fully at a
+            // short light path, they shone as bright veins round the masses.)
+            // (Near the sun the forward lobe peaks: thin edges dimmer still there.)
+            let edge_dim = mix(mix(0.3, 0.12, smoothstep(0.7, 0.98, ck)), 1.0, smoothstep(0.05, 0.6, dens));
+            let light = (key_light * lit * ph * edge_dim + ambient) * hue + flash;
             let step_t = exp(-s * dt);
             color += transmittance * light * (1.0 - step_t);
             t_sum += t * transmittance * (1.0 - step_t);
@@ -464,13 +511,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (!showcase) {
             let lum = vec3(0.2126, 0.7152, 0.0722);
             let typical = (key_light * 0.3 / (4.0 * PI) + mix(average, zenith, 0.5) * 0.6 * (1.0 - 0.6 * sky.darkness)) * hue;
-            color *= clamp(dot(average, lum) / max(dot(typical, lum), 1e-4), 0.15, 3.0);
+            color *= clamp(dot(average, lum) / max(dot(typical, lum), 1e-4), 0.15, 2.0);
+            // No cloud brighter than the skybox's own brightest light: thin
+            // edges against a dark overcast deck shone as white veins.
+            let ceiling = max(average, zenith) * 1.25 * (1.0 - transmittance);
+            color = min(color, ceiling + glow);
         }
         // Far clouds fade into the horizon's haze.
         if (weight > 0.0) {
             // (A storm's low deck keeps its bands out to the horizon.)
             let far = 1.0 - exp(-(t_sum / weight) / mix(30000.0, 90000.0, storm_of()));
             color = mix(color, horizon * (1.0 - transmittance) + glow * (1.0 - transmittance), far * sky.fog);
+        }
+        // A storm deck's structure (showcase): big drifting masses darker,
+        // the thinner lanes between lighter, day and night.
+        if (showcase && storm_of() > 0.0) {
+            let at = d * to_shell(max(d.y, 0.02), CLOUD_BASE) + vec3(sky.wind.x, 0.0, sky.wind.y);
+            let m = smoothstep(0.35, 0.65, fbm(vec3(at.x, 0.0, at.z) * (1.0 / 5000.0), 4u));
+            let k = storm_of() * (1.0 - smoothstep(0.6, 1.0, d.y) * 0.3);
+            color *= mix(1.0, pow(mix(1.45, 0.45, m), sky.look.x), k);
         }
         // Clouds thin out toward the horizon, where the haze is.
         let fade = smoothstep(0.0, mix(0.15, 0.04, storm_of()), d.y);
@@ -482,7 +541,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let angle = acos(clamp(cs, -1.0, 1.0));
     let disc = 1.0 - smoothstep(sky.sun_size * 0.85, sky.sun_size, angle);
     let limb = sqrt(max(1.0 - (angle / sky.sun_size) * (angle / sky.sun_size), 0.0));
-    var discs = sky.sun_color * 60.0 * disc * mix(0.6, 1.0, limb) * step(-0.02, d.y) * (1.0 - sky.night);
+    // (Under an overcast deck no disc: its thin spots let a hard white dot through.)
+    var discs = sky.sun_color * 60.0 * disc * mix(0.6, 1.0, limb) * step(-0.02, d.y) * (1.0 - sky.night) * (1.0 - 0.95 * smoothstep(0.7, 0.9, cover));
     if (showcase) {
         // The moon: a pale disc with darker seas.
         let moon = normalize(sky.moon_dir);
@@ -491,7 +551,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let seas = 0.75 + 0.25 * value_noise(d * 900.0);
         discs += vec3(0.75, 0.8, 0.9) * 24.0 * moon_disc * seas * sky.night * zenith_lum * (1.0 - storm_of());
     }
-    var out = (base + glow + discs) * transmittance + color;
+    // (Overcast: what shows between clouds is more cloud, dimmer than open sky.)
+    let behind = mix(1.0, 0.65, smoothstep(0.6, 0.9, cover));
+    var out = (base * behind + glow + discs) * transmittance + color;
     // A storm's distant cloud: banks of big rounded masses along the
     // horizon, back to front, each darker at its base and lit at its top
     // edge, the nearer ones taller and darker, the farther fading into the

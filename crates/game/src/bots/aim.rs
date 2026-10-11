@@ -51,18 +51,24 @@ impl AimProfile {
         let s = skill.clamp(0.0, 1.0);
         let vary = |rng: &mut dyn rand::RngCore, v: f32| v * rng.random_range(0.85..1.15);
         let lerp = |a: f32, b: f32| a + (b - a) * s;
+        // The difficulty's spread (2026-10-10): the user found Recruit and
+        // Veteran played alike (hit rates 10.8% and 11.4% head to head), so
+        // the ends are further apart. `bots.aim_spread` scales the weak
+        // end's extra error (1 as set; 0 is the old curve).
+        let k = crate::tune::get("bots.aim_spread", 1.0);
+        let wide = |old_weak: f32, new_weak: f32, strong: f32| lerp(old_weak + (new_weak - old_weak) * k, strong);
         AimProfile {
-            fitts_a: vary(rng, lerp(0.09, 0.05)),
-            fitts_b: vary(rng, lerp(0.11, 0.06)),
+            fitts_a: vary(rng, wide(0.09, 0.12, 0.045)),
+            fitts_b: vary(rng, wide(0.11, 0.15, 0.055)),
             gain_bias: lerp(0.9, 0.97),
-            gain_sd: vary(rng, lerp(0.14, 0.05)),
-            dir_sd: vary(rng, lerp(0.09, 0.03)),
-            correction_delay: vary(rng, lerp(0.16, 0.08)),
-            pursuit_gain: lerp(0.65, 0.92),
-            motion_lag: vary(rng, lerp(0.25, 0.1)),
-            tremor: lerp(0.004, 0.0015),
-            recoil_comp: lerp(0.35, 0.85),
-            recoil_delay: vary(rng, lerp(0.2, 0.1)),
+            gain_sd: vary(rng, wide(0.14, 0.24, 0.04)),
+            dir_sd: vary(rng, wide(0.09, 0.16, 0.025)),
+            correction_delay: vary(rng, wide(0.16, 0.22, 0.07)),
+            pursuit_gain: wide(0.65, 0.5, 0.94),
+            motion_lag: vary(rng, wide(0.25, 0.35, 0.08)),
+            tremor: wide(0.004, 0.007, 0.0012),
+            recoil_comp: wide(0.35, 0.2, 0.9),
+            recoil_delay: vary(rng, wide(0.2, 0.28, 0.09)),
         }
     }
 }

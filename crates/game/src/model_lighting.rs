@@ -53,6 +53,16 @@ const LAYERS_ABOVE: u32 = 12;
 const LIGHT_GRID_INTENSITY: f32 = 1.3;
 const LIGHT_GRID_CONTRAST: f32 = 0.0;
 
+/// The light grid's tweaks: an MW2 map's own (its script sets them for its
+/// grid), else the ones above.
+fn light_grid_intensity() -> f32 {
+    crate::mw2::light_grid_tweaks().map_or(LIGHT_GRID_INTENSITY, |t| t.0)
+}
+
+fn light_grid_contrast() -> f32 {
+    crate::mw2::light_grid_tweaks().map_or(LIGHT_GRID_CONTRAST, |t| t.1)
+}
+
 /// `r_lightGridContrast`: each side of an ambient cube pushed away from the
 /// cube's mean (never below black).
 fn grid_contrast(cube: [[f32; 3]; 6], contrast: f32) -> [[f32; 3]; 6] {
@@ -124,7 +134,7 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
                 ks.iter().map(|&k| (colors.0[k][c] as f32 / 255.0).powf(2.2)).sum::<f32>() / ks.len() as f32
             })
         }) };
-        let cube = if crate::vision::disabled() { cube } else { grid_contrast(cube, LIGHT_GRID_CONTRAST) };
+        let cube = if crate::vision::disabled() { cube } else { grid_contrast(cube, light_grid_contrast()) };
         let q = [0, 1, 2].map(|i| (p[i] - lo[i]) as usize);
         cells[index(q)] = Some(cube);
         src[index(q)] = Some(pi as u32);
@@ -157,7 +167,7 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
             .iter()
             .map(|c| c.map_or([0.0; 3], |c| std::array::from_fn(|k| c.iter().map(|f| f[k]).sum::<f32>() / 6.0)))
             .collect();
-        let scale = LIGHTMAP_EXPOSURE * if crate::vision::disabled() { 1.0 } else { LIGHT_GRID_INTENSITY };
+        let scale = LIGHTMAP_EXPOSURE * if crate::vision::disabled() { 1.0 } else { light_grid_intensity() };
         // The open air's light: the brightest tenth of the sampled cells.
         let mut lit: Vec<f32> =
             points.iter().filter_map(|(p, _)| (0..3).all(|i| p[i] >= lo[i] && p[i] <= hi[i]).then(|| luma(mean[index([0, 1, 2].map(|i| (p[i] - lo[i]) as usize))]))).collect();
@@ -202,10 +212,10 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
         Name::new("light grid"),
         IrradianceVolume {
             voxels,
-            intensity: LIGHTMAP_EXPOSURE * if crate::vision::disabled() { 1.0 } else { LIGHT_GRID_INTENSITY },
+            intensity: LIGHTMAP_EXPOSURE * if crate::vision::disabled() { 1.0 } else { light_grid_intensity() },
             affects_lightmapped_meshes: false,
         },
-        GridIntensity(LIGHTMAP_EXPOSURE * if crate::vision::disabled() { 1.0 } else { LIGHT_GRID_INTENSITY }),
+        GridIntensity(LIGHTMAP_EXPOSURE * if crate::vision::disabled() { 1.0 } else { light_grid_intensity() }),
         Transform::from_translation((a + b) / 2.0).with_scale((b - a).abs()),
         // The viewmodel cameras only see their own layers.
         // (And the players' own first-person bodies, in splitscreen.)
@@ -296,7 +306,7 @@ impl GridVolume {
     pub fn data(&self, point_cube: impl Fn(usize) -> Option<[[f32; 3]; 6]>) -> Vec<u8> {
         volume_data(self.n, |cell| {
             let cube = point_cube(self.src[cell]? as usize)?;
-            Some(if crate::vision::disabled() { cube } else { grid_contrast(cube, LIGHT_GRID_CONTRAST) })
+            Some(if crate::vision::disabled() { cube } else { grid_contrast(cube, light_grid_contrast()) })
         })
     }
 }
@@ -399,6 +409,7 @@ fn viewmodel_reflections(
     mut level: Local<f32>,
 ) {
     let Some(grid) = grid else { return };
+    let light_share_dim = crate::atmos::climate::light_share().min(1.0).max(1e-3);
     let target = match cameras.iter().find(|c| c.1.0 == 0) {
         Some((eye, _)) if crate::first_person::world_lighting() => {
             let here = grid.at(eye.translation());
@@ -406,7 +417,7 @@ fn viewmodel_reflections(
         }
         _ => 1.0,
     // The probes hold CoD4's light: the showcase's night or storm dims them.
-    } * crate::atmos::climate::light_share().min(1.0);
+    } * light_share_dim;
     // Eyes adjust over a moment rather than snapping.
     let k = 1.0 - (-time.delta_secs() / 0.25).exp();
     let before = *level;
@@ -423,14 +434,16 @@ fn viewmodel_reflections(
             continue;
         }
         // Polished metal (gold, platinum: a fresnel minimum of 3 and up;
-        // ordinary gun metal's is at most 2) keeps its full shine
-        // (`camo.wgsl` floors its light).
-        if materials.get(&m.0).is_some_and(|mat| {
+        // ordinary gun metal's is at most 2) isn't dimmed by the night
+        // (`camo.wgsl` floors its light), but still by the shade round the
+        // eye, as the arms are: undimmed, a platinum gun glowed white in
+        // the shade.
+        let polished = materials.get(&m.0).is_some_and(|mat| {
             let (z, polished) = (mat.extension.scale.z, mat.extension.env.x > 2.9);
             polished || (z > 2.5 && z < 5.5)
-        }) {
-            continue;
-        }
+        });
+        let exposure = if polished { LIGHTMAP_EXPOSURE * *level / light_share_dim * soak_share() } else { exposure };
+        let exposure = if std::env::var_os("COD4RW_VM_NOSHINE").is_some() { 0.0 } else { exposure };
         // Only when it's moved (or for a new gun's materials).
         if materials.get(&m.0).is_some_and(|mat| (mat.extension.shine.w - exposure).abs() > 0.01 * LIGHTMAP_EXPOSURE || (before - *level).abs() > 0.01) {
             if let Some(mut mat) = materials.get_mut(&m.0) {

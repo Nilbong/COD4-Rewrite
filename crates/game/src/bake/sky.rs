@@ -38,15 +38,37 @@ impl Sky {
             })
             .collect::<Option<_>>()?;
         let mut faces: [Vec<Vec3>; 6] = faces.try_into().ok()?;
-        // Clip the painted sun and its glare: nothing above the 98th
-        // percentile's brightness.
+        // Clip the painted sun and its glare: nothing above the 90th
+        // percentile's brightness (at the 98th, an overcast sky's bright
+        // patch lit doorways like a lamp, with a hard edge: Farm's barn).
         let mut lum: Vec<f32> = faces.iter().flatten().map(|c| luma(*c)).collect();
         lum.sort_by(f32::total_cmp);
-        let cap = lum[lum.len() * 98 / 100].max(1e-4);
+        let cap = lum[lum.len() * 90 / 100].max(1e-4);
         for c in faces.iter_mut().flatten() {
             let l = luma(*c);
             if l > cap {
                 *c *= cap / l;
+            }
+        }
+        // Softened: each face blurred (the sky lights broadly, never in
+        // spots).
+        for f in faces.iter_mut() {
+            for _ in 0..2 {
+                let src = f.clone();
+                for y in 0..RES {
+                    for x in 0..RES {
+                        let mut s = Vec3::ZERO;
+                        let mut n = 0.0;
+                        for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1), (0, 0)] {
+                            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                            if nx >= 0 && ny >= 0 && (nx as usize) < RES && (ny as usize) < RES {
+                                s += src[ny as usize * RES + nx as usize];
+                                n += 1.0;
+                            }
+                        }
+                        f[y * RES + x] = s / n;
+                    }
+                }
             }
         }
         Some(Sky::from_faces(faces))

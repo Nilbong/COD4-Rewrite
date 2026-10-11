@@ -27,7 +27,7 @@ use std::collections::HashMap;
 pub(super) fn setup(app: &mut App) {
     app.add_message::<Award>().init_resource::<Progress>().add_systems(
         Update,
-        (assists, award, match_bonus, rank_up).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+        (assists, award, award_slots, match_bonus, rank_up).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
     )
     .add_systems(OnEnter(crate::state::GameState::InGame), |mut p: ResMut<Progress>| *p = Progress::default());
     if let Ok(dir) = std::env::var("COD4RW_CHALLENGETEST") {
@@ -229,6 +229,122 @@ fn award(
         debug!("progression: +{xp} XP");
         give_xp(fe, &mut hud, xp, now);
     }
+}
+
+/// Splitscreen players 2 to 4 playing as a profile: what `award` and
+/// `match_bonus` give player 1, in their own stats, and their rank kept up
+/// with it (no notices: player 1's HUD has those).
+#[derive(Default)]
+struct SlotProgress {
+    streak: [i32; 4],
+    counted_assists: [i32; 4],
+    bonus_given: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn award_slots(
+    mut fe: Option<ResMut<Frontend>>,
+    progress: Res<Progress>,
+    mut killed: MessageReader<Killed>,
+    mut awards: MessageReader<Award>,
+    pawns: Query<(Entity, &Pawn, &crate::splitscreen::LocalSlot)>,
+    all: Query<&Pawn>,
+    state: Option<Res<crate::tdm::MatchState>>,
+    mut slots: Local<SlotProgress>,
+) {
+    let Some(fe) = fe.as_deref_mut() else { return };
+    if !crate::splitscreen::active() {
+        killed.clear();
+        awards.clear();
+        return;
+    }
+    let (kill_xp, headshot_xp, assist_xp) = kill_values();
+    let kills: Vec<_> = killed.read().cloned().collect();
+    let given: Vec<_> = awards.read().copied().collect();
+    let ended = state.as_ref().and_then(|s| s.ended).is_some();
+    if !ended {
+        slots.bonus_given = false;
+    }
+    let give_bonus = ended && !slots.bonus_given;
+    slots.bonus_given |= ended;
+    for (me, pawn, slot) in &pawns {
+        let s = slot.0;
+        if s == 0 || s >= 4 {
+            continue;
+        }
+        let Some((stats, assets)) = fe.slot_stats(s) else { continue };
+        let mut xp = 0;
+        for k in &kills {
+            if k.victim == me {
+                stats.add(stat::DEATHS, 1);
+                slots.streak[s] = 0;
+            }
+            let hostile_victim = all.get(k.victim).is_ok_and(|v| hostile(pawn, v));
+            if k.attacker == Some(me) && k.victim != me && hostile_victim {
+                let head = progress.last_hit.get(&k.victim) == Some(&crate::combat::HitLocation::Head);
+                xp += if head { headshot_xp } else { kill_xp };
+                stats.add(stat::KILLS, 1);
+                if head {
+                    stats.add(stat::HEADSHOTS, 1);
+                }
+                slots.streak[s] += 1;
+                if slots.streak[s] > stats.get(stat::KILL_STREAK) {
+                    stats.set(stat::KILL_STREAK, slots.streak[s]);
+                }
+            }
+        }
+        let n = pawn.assists as i32 - slots.counted_assists[s];
+        if n > 0 {
+            xp += assist_xp * n;
+            stats.add(stat::ASSISTS, n);
+        }
+        slots.counted_assists[s] = pawn.assists as i32;
+        xp += given.iter().filter(|a| a.pawn == me).map(|a| a.kind.xp()).sum::<i32>();
+        xp *= lives_scale();
+        if give_bonus {
+            let outcome = state.as_ref().and_then(|st| st.outcome(pawn));
+            match outcome {
+                Some(true) => stats.add(stat::WINS, 1),
+                Some(false) => stats.add(stat::LOSSES, 1),
+                None => {}
+            }
+            let sd = state.as_ref().is_some_and(|st| st.mode == crate::modes::GameMode::Sd);
+            let scale = match outcome {
+                Some(true) => 1.0,
+                Some(false) => 0.5,
+                None => 0.75,
+            } * if sd { 2.0 } else { 1.0 };
+            let spm = 3.0 + (stats.get(stat::RANK) % 61 + 1) as f32 * 0.5;
+            xp += (scale * spm * progress.played / 60.0) as i32;
+        }
+        if xp > 0 {
+            stats.add(stat::RANKXP, xp);
+            stats.add(stat::SCORE, xp);
+            catch_up_rank(stats, assets);
+        }
+        if give_bonus {
+            info!("progression: player {}'s match bonus: their profile has {} XP", s + 1, stats.get(stat::RANKXP) + xp);
+        }
+        if xp > 0 || give_bonus {
+            stats.save_if_changed();
+        }
+    }
+}
+
+/// A profile's rank for its XP (and its unlocks with it), quietly.
+fn catch_up_rank(stats: &mut Stats, assets: &UiAssets) {
+    let xp = stats.get(stat::RANKXP);
+    let Some(table) = assets.table("mp/rankTable.csv") else { return };
+    let num = |r: usize, c: usize| table.get(r, c).and_then(|v| v.trim().parse::<i32>().ok());
+    let Some((rank, row)) = (0..table.rows).filter_map(|r| Some((num(r, 0)?, r)).filter(|&(_, r)| num(r, 2).is_some_and(|min| xp >= min))).max() else { return };
+    if rank == stats.get(stat::RANK) {
+        return;
+    }
+    stats.set(stat::RANK, rank);
+    stats.set(stat::MINXP, num(row, 2).unwrap_or(0));
+    stats.set(stat::MAXXP, num(row, 7).unwrap_or(0));
+    stats.set(stat::LASTXP, xp);
+    refresh_unlocks(stats, assets);
 }
 
 /// Add XP: to the stats, and the "+N" by the crosshair.
@@ -483,7 +599,8 @@ fn rank_unlocks(assets: &UiAssets) -> RankUnlocks {
 /// launcher and desert and woodland camos (unless a rank brings them
 /// later); its sights, silencer and other camos from its Marksman and
 /// Expert challenges. Black Ops' and World at War's guns, which CoD4's
-/// tables don't know, stay unlocked.
+/// tables don't know, at their levels ([`other_levels`]), with everything
+/// for them; one a custom class already uses stays unlocked.
 pub(super) fn apply_unlocks(stats: &mut Stats, assets: &UiAssets) {
     let rank = stats.get(stat::RANK);
     let ranks = rank_unlocks(assets);
@@ -498,6 +615,7 @@ pub(super) fn apply_unlocks(stats: &mut Stats, assets: &UiAssets) {
         .filter_map(|l| l.unlock)
         .collect();
     let reached = |at: Option<&i32>| at.is_none_or(|&r| r <= rank);
+    let others = other_levels(assets);
     let Some(t) = assets.table("mp/statsTable.csv") else { return };
     for r in 0..t.rows {
         let (Ok(index), kind, name) = (cell(t, r, 1).parse::<i32>(), cell(t, r, 2), cell(t, r, 4)) else { continue };
@@ -506,6 +624,16 @@ pub(super) fn apply_unlocks(stats: &mut Stats, assets: &UiAssets) {
         }
         let value = if kind.starts_with("weapon_") {
             if index >= 3000 + crate::bo1::FIRST_INDEX {
+                // Black Ops' and World at War's guns by level (`other_levels`);
+                // others' (MW2's) stay as they are.
+                let Some(&level) = others.get(name) else { continue };
+                let gun = index - 3000;
+                let in_class = (0..5).any(|c| [201, 203].iter().any(|k| stats.get(k + 10 * c) == gun));
+                let old = stats.get(index);
+                let v = if rank + 1 >= level || in_class { OTHER_GAME_UNLOCKED } else { 0 };
+                // Newly unlocked: the menus' "new" mark.
+                let new = if old & 1 == 0 && v & 1 != 0 && stats.get(stat::RANKXP) > 0 { 65536 } else { old & 65536 };
+                stats.set(index, v | new);
                 continue;
             }
             let mut v = 0;
@@ -534,6 +662,43 @@ pub(super) fn apply_unlocks(stats: &mut Stats, assets: &UiAssets) {
     }
 }
 
+/// A Black Ops or World at War gun, unlocked: every attachment and camo.
+const OTHER_GAME_UNLOCKED: i32 = 1 | 2 | 4 | 8 | 16 | 32 | 256 | 512 | 1024 | 2048 | 4096 | (((1 << 28) - (1 << 6)) & !65536);
+
+/// The level each Black Ops and World at War gun unlocks at (CoD4's tables
+/// don't know them). Each game's guns by class, in their own order: the
+/// first of a class from the start, the rest spread over levels 4 to 50
+/// (Black Ops' cap), each class a step apart so a level brings one or two.
+pub(super) fn other_levels(assets: &UiAssets) -> HashMap<String, i32> {
+    let mut out = HashMap::new();
+    let Some(t) = assets.table("mp/statsTable.csv") else { return out };
+    let mut groups: HashMap<(bool, String), Vec<(i32, String)>> = HashMap::new();
+    for r in 0..t.rows {
+        let (Ok(index), kind, name) = (cell(t, r, 0).parse::<i32>(), cell(t, r, 2), cell(t, r, 4)) else { continue };
+        let bo1 = crate::bo1::is_index(index);
+        if !kind.starts_with("weapon_") || name.is_empty() || !(bo1 || crate::waw::is_index(index)) {
+            continue;
+        }
+        groups.entry((bo1, kind.to_owned())).or_default().push((index, name.to_owned()));
+    }
+    const ORDER: [&str; 6] = ["weapon_assault", "weapon_smg", "weapon_lmg", "weapon_sniper", "weapon_shotgun", "weapon_pistol"];
+    for ((bo1, kind), mut guns) in groups {
+        guns.sort();
+        let step = ORDER.iter().position(|k| *k == kind).unwrap_or(6) as f32 + if bo1 { 0.0 } else { 0.5 };
+        let n = guns.len();
+        for (k, (_, name)) in guns.into_iter().enumerate() {
+            let level = if k == 0 {
+                1
+            } else {
+                let f = if n > 2 { (k - 1) as f32 / (n - 2) as f32 } else { 0.0 };
+                (4.0 + step + f * (46.0 - step)).round() as i32
+            };
+            out.insert(name, level);
+        }
+    }
+    out
+}
+
 /// What reaching `rank` unlocks, for the player: "New Weapon: M4 Carbine".
 fn unlock_lines(assets: &UiAssets, rank: i32) -> Vec<String> {
     let ranks = rank_unlocks(assets);
@@ -546,7 +711,8 @@ fn unlock_lines(assets: &UiAssets, rank: i32) -> Vec<String> {
             .map_or_else(|| item.to_owned(), |k| assets.localize(&format!("@{k}")))
     };
     let mut lines = Vec::new();
-    for (what, map) in [("Weapon", &ranks.weapons), ("Perk", &ranks.perks), ("Feature", &ranks.features)] {
+    let others: HashMap<String, i32> = other_levels(assets).into_iter().filter(|(_, l)| *l > 1).map(|(n, l)| (n, l - 1)).collect();
+    for (what, map) in [("Weapon", &ranks.weapons), ("Weapon", &others), ("Perk", &ranks.perks), ("Feature", &ranks.features)] {
         let mut names: Vec<_> = map.iter().filter(|(_, r)| **r == rank).map(|(n, _)| name_of(n)).collect();
         names.sort();
         lines.extend(names.into_iter().map(|n| format!("New {what}: {n}")));

@@ -145,6 +145,7 @@ pub struct GunMaker<'w, 's> {
     content: ResMut<'w, Content>,
     bo1: ResMut<'w, crate::bo1::MatchContent>,
     waw: ResMut<'w, crate::waw::MatchContent>,
+    mw2: ResMut<'w, crate::mw2guns::MatchContent>,
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
@@ -158,10 +159,10 @@ impl GunMaker<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     fn drop(&mut self, def: &'static WeaponDef, gun: Gun, clip: u32, reserve: u32, at: Transform, velocity: Vec3, dropper: Option<Entity>, now: f32, expires: Option<f32>) -> Option<Entity> {
         let name = crate::gunmodel::parse(&gun.spec).0;
-        let (bo1, waw) = (crate::bo1::is_bo1(name), crate::waw::is_waw(name));
-        let content: &mut Content = match (self.bo1.get().filter(|_| bo1), self.waw.get().filter(|_| waw)) {
-            (Some(c), _) | (_, Some(c)) => c,
-            _ if bo1 || waw => return None,
+        let (bo1, waw, mw2) = (crate::bo1::is_bo1(name), crate::waw::is_waw(name), crate::mw2guns::is_mw2(name));
+        let content: &mut Content = match (self.bo1.get().filter(|_| bo1), self.waw.get().filter(|_| waw), self.mw2.get().filter(|_| mw2)) {
+            (Some(c), ..) | (_, Some(c), _) | (.., Some(c)) => c,
+            _ if bo1 || waw || mw2 => return None,
             _ => &mut self.content,
         };
         let root = self.commands.spawn((Name::new("dropped weapon"), at, Visibility::default())).id();
@@ -226,7 +227,10 @@ fn drop_on_death(
         if !dead && !downed {
             dropped.remove(&e);
             if droppable(loadout) {
-                last.insert(e, (weapon.def, loadout.gun().clone()));
+                // The gun of the weapon in hand, not of the current slot:
+                // mid-switch those differ, and a bot killed switching from
+                // its AK-47 dropped an AK-47 that looked like its shotgun.
+                last.insert(e, (weapon.def, loadout.gun_for(weapon.def).unwrap_or(loadout.gun()).clone()));
             }
             continue;
         }
@@ -434,7 +438,7 @@ pub(crate) fn test(
         1 if t - step.1 > 2.5 => {
             let dropped: Vec<String> = items
                 .iter()
-                .map(|(p, it)| format!("{} {}+{} at {:.0} u from the eye, {:.0} u above the feet", p.def.name, p.clip, p.reserve, it.translation.distance(mover.eye(at.translation)) / u(1.0), (it.translation.y - at.translation.y) / u(1.0)))
+                .map(|(p, it)| format!("{} (model {}) {}+{} at {:.0} u from the eye, {:.0} u above the feet", p.def.name, p.gun.spec, p.clip, p.reserve, it.translation.distance(mover.eye(at.translation)) / u(1.0), (it.translation.y - at.translation.y) / u(1.0)))
                 .collect();
             info!("pickup test: dropped {dropped:?}, hint {:?}", hint.and_then(|h| h.0.clone()));
             shot("1_hint");

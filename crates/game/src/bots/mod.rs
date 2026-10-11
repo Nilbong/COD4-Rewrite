@@ -61,6 +61,7 @@ impl Plugin for BotsPlugin {
             .init_resource::<TeamIntel>()
             .init_resource::<NavTrouble>()
             .add_systems(Update, accuracy_by_range.run_if(crate::state::in_game).run_if(|| std::env::var_os("COD4RW_SIM").is_some()))
+            .add_systems(Update, look_sources.run_if(crate::state::in_game).run_if(|| std::env::var_os("COD4RW_LOOKSRC").is_some()))
             .add_systems(
                 Update,
                 (class::class_bots, floor_line, build_nav, build_tactics, check_objectives, hardpoints::hardpoints, grenade::plan_grenades, equipment::plan_gear, think, resupply::resupply, knife, objective::use_objectives, crate::cover::bots::cover_bots)
@@ -108,8 +109,10 @@ pub fn tier_name(skill: f32) -> &'static str {
 /// they're mixed: most play at the setting, some a difficulty or two
 /// better or worse.
 pub fn lobby_skills(skill: f32, n: usize, rng: &mut impl Rng) -> Vec<f32> {
-    // Difficulties away from the setting, and how often.
-    const MIX: [(f32, f32); 5] = [(-2.0, 0.06), (-1.0, 0.22), (0.0, 0.44), (1.0, 0.22), (2.0, 0.06)];
+    // Difficulties away from the setting, and how often: never more than
+    // one tier off (two let a Recruit lobby hold near-Hardened bots, and
+    // the setting barely showed).
+    const MIX: [(f32, f32); 3] = [(-1.0, 0.2), (0.0, 0.6), (1.0, 0.2)];
     let options: Vec<(f32, f32)> =
         MIX.iter().map(|&(d, w)| (skill + d * TIER_STEP, w)).filter(|&(s, _)| (0.04..=1.0).contains(&s)).collect();
     let total: f32 = options.iter().map(|o| o.1).sum();
@@ -601,7 +604,8 @@ impl Bot {
             sprinter: rng.random_range(0.4..1.0),
         };
         let mut aim_profile = AimProfile::for_skill(skill, &mut rng);
-        let mut reaction = (0.32 - 0.14 * skill) * rng.random_range(0.9..1.1);
+        // Recruit about 0.4 s to react, Veteran about 0.17 s.
+        let mut reaction = (0.42 - 0.28 * skill) * rng.random_range(0.9..1.1);
         let mut style = MoveStyle::default();
         if let Some(p) = profile {
             // Their timings, scaled by how far this bot's skill is from 0.5.
@@ -952,8 +956,13 @@ const PREAIM_AHEAD: f32 = 0.64;
 /// Seconds between checks of the angles along the way (before skill): real
 /// players walking look to the side 28% of the time, bots did 51% at 1.5-3.5.
 const CHECK_GAP: (f32, f32) = (3.0, 6.0);
-/// Out of sight this long on the way to cover, a bot turns to run.
-const COVER_TURN_AFTER: f32 = 0.35;
+/// Further than this from its cover, a bot turns and runs there, eyes on
+/// the way (real players do; bots backed or sidled 80% of the way).
+const COVER_TURN_DIST: f32 = u(220.0);
+/// Past this range, shooting at someone this long since the first shot is
+/// a stalemate: time to break off (see `decide`).
+const STALEMATE_RANGE: f32 = u(600.0);
+const STALEMATE_AFTER: f32 = 1.6;
 const DECIDE_INTERVAL: f32 = 0.25;
 
 /// With `COD4RW_SIM`: time spent thinking (all of `think`) and planning
@@ -1422,11 +1431,19 @@ fn decide(
         };
         options.push((Mode::Post, base + stick(Mode::Post)));
     }
+    // A long exchange at range going nowhere: real players duck out and come
+    // back (fights in the demos last a median 2.4 s; bots trading shots
+    // across Killhouse kept at it 4 s and more).
+    let stalemate = threat.is_some_and(|(e, c)| {
+        c.pos.distance(feet) > STALEMATE_RANGE
+            && bot.engagement.as_ref().is_some_and(|g| g.target == e && g.first_shot.is_some_and(|t| now - t > STALEMATE_AFTER))
+    });
     if threat.is_some() {
         let n = (visible_count as f32 - 1.0).max(0.0);
         options.push((
             Mode::Engage,
             1.0 + 0.4 * p.aggression - if hurt { 0.45 * sense } else { 0.0 } - if empty { 2.0 } else { 0.0 } - 0.25 * n
+                - if stalemate { 0.7 * sense } else { 0.0 }
                 + stick(Mode::Engage),
         ));
     }
@@ -1437,6 +1454,7 @@ fn decide(
         options.push((
             Mode::Cover,
             0.35 + if hurt { 0.8 * sense } else { 0.0 } + if empty { 1.6 } else { 0.0 } + 0.3 * n - 0.3 * p.aggression
+                + if stalemate { 0.5 } else { 0.0 }
                 + stick(Mode::Cover),
         ));
     }
@@ -1977,12 +1995,9 @@ fn act(
     // Breaking for cover with them out of sight: turn and run, eyes on the
     // way (bots backpedalled 80% of their way to cover; real players run).
     let running_for_cover = bot.mode == Mode::Cover
-        && bot.dest.is_some_and(|d| d.distance(feet) > u(150.0))
-        && bot.engagement.as_ref().is_none_or(|e| {
-            // (Its own record: `fight_aim`, which keeps `last_visible`, isn't
-            // run while turned away.)
-            bot.know.contacts.get(&e.target).is_none_or(|c| !c.noticed() && now - c.last_visible > COVER_TURN_AFTER)
-        });
+        && bot.dest.is_some_and(|d| d.distance(feet) > COVER_TURN_DIST)
+        // (Turning back to shoot only when just shot at.)
+        && !bot.know.contacts.values().any(|c| c.shot_us_at.is_some_and(|t| now - t < 0.4));
     let fight_dist = if matches!(bot.mode, Mode::Engage | Mode::Cover) && !running_for_cover {
         let moving = Vec2::new(mover.velocity.x, mover.velocity.z).length() > u(40.0);
         fight_aim(bot, view, eye, feet, moving, weapon, now, rng, &mut plan)
@@ -2053,7 +2068,7 @@ fn act(
         // A flag we want close by: fight our way onto it, as real players
         // take a flag under fire (Killhouse's B in the demos changed hands
         // all match; bots met there, fought, and nobody ever stood on it).
-        if let Some(to) = flag_under_fire(tc, feet).filter(|&to| walkable(spatial, nav, feet, to)) {
+        if let Some(to) = flag_under_fire(tc, feet, bot.goal).filter(|&to| walkable(spatial, nav, feet, to)) {
             let fwd = (rot * Vec3::NEG_Z).with_y(0.0).normalize_or_zero();
             let (f, r) = (to.dot(fwd), to.dot(right));
             plan.forward = if f.abs() > 0.38 { f.signum() } else { 0.0 };
@@ -2152,7 +2167,7 @@ fn act(
         // bots' 80 with the old 75-degree allowance: `COD4RW_LOOKSTAT`.)
         let behind = going.is_some_and(|g| level(c.pos - feet).dot(g) < PREAIM_AHEAD)
             && !(c.age(now) < 3.0 && dist < u(800.0));
-        dist < u(2500.0) && !flanking && !behind && now >= bot.no_preaim_until
+        dist < u(2500.0) && !flanking && !behind && !running_for_cover && now >= bot.no_preaim_until
     }) {
         Some((c, who)) if plan.look.is_none() => {
             if now >= bot.next_preaim || bot.preaim.is_none_or(|(e, _)| e != who) {
@@ -2204,7 +2219,7 @@ fn act(
     };
     if plan.look.is_some() {
         // Already aiming at someone we're fighting.
-    } else if let Some(point) = alarm_point {
+    } else if let Some(point) = alarm_point.filter(|_| !running_for_cover) {
         plan.look = Some(AimGoal { angles: angles_to(eye, point), width: 0.08, combat: true });
         bot.look_src = "alarm";
     } else if let (true, None) = (holding, fresh_focus) {
@@ -2567,7 +2582,8 @@ fn fight_aim(
     if reacted && c.noticed() && !weapon.reloading() {
         let err = AimState::error(view, goal).length();
         let start = width * (1.6 - 1.0 * skill) + 0.015 - 0.011 * skill;
-        let keep = width * 3.0 + 0.035;
+        // Weaker players spray on through bigger misses.
+        let keep = width * (4.0 - 2.0 * skill) + 0.045 - 0.02 * skill;
         if err > keep {
             bot.burst_until = bot.burst_until.min(now + 0.12);
         }
@@ -2673,10 +2689,19 @@ fn emergence_point(nav: &NavGraph, spatial: &SpatialQuery, feet: Vec3, eye: Vec3
 /// Whether a few steps in `dir` stay on walkable ground.
 /// In a fight, the way (flat, unit) onto a flag the team wants within
 /// [`FIGHT_FOR_FLAG`], if the bot isn't standing on it already.
-fn flag_under_fire(tc: &TacCtx, feet: Vec3) -> Option<Vec3> {
+fn flag_under_fire(tc: &TacCtx, feet: Vec3, goal: Option<objective::Goal>) -> Option<Vec3> {
     let o = tc.objectives?;
+    // The flag it was going for, if it was: not one it passes on the way
+    // (Vacant's attackers of the far flag were pulled onto the middle one).
+    let target = match goal {
+        Some(objective::Goal::Flag(i, _)) => Some(i),
+        _ => None,
+    };
     o.flags
         .iter()
+        .enumerate()
+        .filter(|(i, _)| target.is_none_or(|t| t == *i))
+        .map(|(_, f)| f)
         .filter(|f| f.owner != Some(tc.team) || f.contested || f.capture.is_some_and(|(t, _)| t != tc.team))
         .filter(|f| !f.contains(feet + Vec3::Y * u(1.0)))
         .map(|f| (f, (f.pos - feet).with_y(0.0)))
@@ -2686,7 +2711,7 @@ fn flag_under_fire(tc: &TacCtx, feet: Vec3) -> Option<Vec3> {
 }
 
 /// How near a wanted flag a bot in a fight keeps moving onto it.
-const FIGHT_FOR_FLAG: f32 = u(450.0);
+const FIGHT_FOR_FLAG: f32 = u(800.0);
 
 fn walkable(spatial: &SpatialQuery, nav: Option<&NavGraph>, feet: Vec3, dir: Vec3) -> bool {
     let probe = feet + dir.normalize_or_zero() * u(48.0);
@@ -3469,7 +3494,14 @@ mod tests {
                 tiers.extend(a.iter().chain(&b).map(|&s| tier_name(s)));
                 gap += (a.iter().sum::<f32>() + setting - b.iter().sum::<f32>()).abs() / 200.0;
             }
-            assert!(tiers.len() >= 3, "{setting}: only {tiers:?}");
+            // Mixed, but never more than one tier off the setting (so the
+            // ends, Recruit and Veteran, see two tiers).
+            assert!(tiers.len() >= 2, "{setting}: only {tiers:?}");
+            let at = TIERS.iter().position(|t| t.1 == setting).unwrap_or(0);
+            assert!(
+                tiers.iter().all(|n| TIERS.iter().position(|t| t.0 == *n).is_some_and(|i| i.abs_diff(at) <= 1)),
+                "{setting}: {tiers:?} strays more than a tier"
+            );
             assert!(gap < 0.25, "{setting}: sides {gap:.2} apart on average");
         }
     }
@@ -3508,5 +3540,36 @@ fn accuracy_by_range(
         *next = now + 10.0;
         let rate = |(s, h): (u32, u32)| if s > 0 { format!("{:.0}% of {s}", 100.0 * h as f32 / s as f32) } else { "-".into() };
         info!("accuracy by range: 0-15 m {}, 15-30 m {}, 30-45 m {}, 45+ m {}", rate(counts[0]), rate(counts[1]), rate(counts[2]), rate(counts[3]));
+    }
+}
+
+/// Debug (`COD4RW_LOOKSRC`, with `COD4RW_SIM`): while bots walk outside
+/// fights, how far the view is off the way they move, by what chose the
+/// look (`Bot::look_src`), logged every 30 s.
+pub(crate) fn look_sources(time: Res<Time>, bots: Query<(&Bot, &crate::movement::Mover, &crate::movement::ViewAngles)>, mut acc: Local<std::collections::BTreeMap<&'static str, (u32, f32, u32)>>, mut next: Local<f32>) {
+    for (b, m, v) in &bots {
+        let vel = Vec2::new(m.velocity.x, m.velocity.z);
+        if vel.length() < u(60.0) {
+            continue;
+        }
+        let key = match b.mode {
+            Mode::Engage => "ENGAGE",
+            Mode::Cover => "COVER",
+            _ => b.look_src,
+        };
+        let walk = vel.normalize();
+        let look = Vec2::new(-v.yaw.sin(), -v.yaw.cos());
+        let off = walk.dot(look).clamp(-1.0, 1.0).acos().to_degrees();
+        let e = acc.entry(key).or_default();
+        e.0 += 1;
+        e.1 += off;
+        e.2 += (off > 45.0) as u32;
+    }
+    let now = time.elapsed_secs();
+    if now >= *next {
+        *next = now + 30.0;
+        let total: u32 = acc.values().map(|e| e.0).sum();
+        let line: Vec<String> = acc.iter().map(|(k, e)| format!("{k} {:.0}% mean {:.0} deg, >45 {:.0}%", 100.0 * e.0 as f32 / total.max(1) as f32, e.1 / e.0.max(1) as f32, 100.0 * e.2 as f32 / e.0.max(1) as f32)).collect();
+        info!("look sources: {}", line.join(" | "));
     }
 }

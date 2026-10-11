@@ -68,7 +68,7 @@ impl Profile {
     fn from_env() -> Profile {
         match cache::profile().as_deref() {
             Some("safe") => Profile { sky_lift: 1.2, floor: 0.55, dark_floor: 0.85, lamp_scale: 0.85, saturation: 1.0, contact: 0.0 },
-            _ => Profile { sky_lift: 1.0, floor: 0.3, dark_floor: 0.5, lamp_scale: 1.0, saturation: 1.35, contact: 0.35 },
+            _ => Profile { sky_lift: 1.0, floor: 0.3, dark_floor: 0.5, lamp_scale: 1.0, saturation: 1.35, contact: 0.6 },
         }
     }
 }
@@ -171,6 +171,20 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
     scene.saturation = opts.profile.saturation;
     log::info!("bake: profile {:?} {:?}", cache::profile(), opts.profile);
     log::info!("bake: scene and BVH in {:.1}s", secs(t));
+    // Debug aid: `COD4RW_BAKE_RAY=x,y,z`: what's above a point (each
+    // surface straight up, through cut-outs and back faces).
+    if let Some(p) = std::env::var("COD4RW_BAKE_RAY").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == 3) {
+        let mut o = glam33::Vec3A::new(p[0], p[1], p[2]);
+        for _ in 0..6 {
+            let Some(h) = scene.closest(o, glam33::Vec3A::Z, 100_000.0) else {
+                log::info!("ray: open sky above {:.0?}", o);
+                break;
+            };
+            let info = &scene.info[h.tri];
+            log::info!("ray: {} at {:.0} up ({}, lightmap {})", scene.mats[info.mat as usize].name, h.t, if h.front { "front" } else { "back" }, info.lightmap);
+            o = scene.point(&h) + glam33::Vec3A::Z * 0.5;
+        }
+    }
     let sky_name = world.sky_image.and_then(|i| zones[0].image(i)).map(|i| i.name.clone()).unwrap_or_default();
     let own_sky;
     let sky = match ovr {
@@ -228,7 +242,7 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         let img = pair.secondary.and_then(|id| zones[0].image(id));
         let def = img.and_then(|img| img.load_def.as_ref().map(|d| (img, d)));
         let Some((img, def)) = def.filter(|(img, d)| d.format == 21 && d.data.len() >= img.width as usize * img.height as usize * 4) else {
-            atlases.push(AtlasLight::new(texels::Atlas { w: 0, h: 0, texels: Vec::new(), dropped: Vec::new() }));
+            atlases.push(AtlasLight::new(texels::Atlas { w: 0, h: 0, texels: Vec::new(), dropped: Vec::new(), other_side: Vec::new() }));
             originals.push(None);
             continue;
         };
@@ -274,6 +288,14 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         });
         let found = lamps::fit(&zones, &scene, &samples, opts.profile.lamp_scale);
         log::info!("bake: lamps fitted (round {}) in {:.1}s", round + 1, secs(t));
+        // Debug aid: `COD4RW_BAKE_LAMPS_NEAR=x,y,z`: the lamps fitted within
+        // 500 units of a point.
+        if let Some(p) = std::env::var("COD4RW_BAKE_LAMPS_NEAR").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == 3) {
+            let at = glam33::Vec3A::new(p[0], p[1], p[2]);
+            for l in found.iter().filter(|l| l.origin.distance(at) < 500.0) {
+                log::info!("lamp near: {:.0?} colour {:.3?} radius {} quadratic {}", l.origin, l.colour, l.radius, l.quadratic);
+            }
+        }
         lights.spots.truncate(primary_count);
         lights.spots.extend(found);
         let baker = Baker { scene: &scene, sky, lights: &lights };
@@ -301,6 +323,34 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
     // CoD4's lightmap is one time of day: other keyframes take no floor
     // from it.
     let (floor, dark_floor) = if ovr.is_some() { (0.0, 0.0) } else { (opts.floor, opts.profile.dark_floor) };
+    // How much of CoD4's light the bake's own sky, sun and lamps explain.
+    // On lamp-lit and night maps (Carentan) the lamp fit finds a third of
+    // it or so, and the bold floor left the rest dark: there the floor
+    // rises towards the safe profile's as less is explained.
+    let explained = {
+        let (mut ours, mut theirs) = (0.0f64, 0.0f64);
+        for (a, orig) in atlases.iter().zip(&originals) {
+            let Some(orig) = orig else { continue };
+            let (w, h) = (a.atlas.w, a.atlas.h);
+            for (i, t) in a.atlas.texels.iter().enumerate() {
+                if t.is_none() {
+                    continue;
+                }
+                let uv = Vec2::new((i % w) as f32 + 0.5, (i / w) as f32 + 0.5) / Vec2::new(w as f32, h as f32);
+                let g = a.gathered[i];
+                ours += sky::luma(g.sky * k_out + g.sun + a.lamps[i]) as f64;
+                theirs += sky::luma(original_at(orig, uv)) as f64;
+            }
+        }
+        (ours / theirs.max(1e-9)) as f32
+    };
+    let (floor, dark_floor) = if ovr.is_some() || explained >= EXPLAINED_WELL {
+        (floor, dark_floor)
+    } else {
+        let t = ((explained - EXPLAINED_POORLY) / (EXPLAINED_WELL - EXPLAINED_POORLY)).clamp(0.0, 1.0);
+        (floor.max(SAFE_FLOOR + (floor - SAFE_FLOOR) * t), dark_floor.max(SAFE_DARK_FLOOR + (dark_floor - SAFE_DARK_FLOOR) * t))
+    };
+    log::info!("bake: the bake explains {:.0}% of CoD4's light; floor {floor:.2} (dim {dark_floor:.2})", explained * 100.0);
 
     let t = Instant::now();
     let mut out_atlases = Vec::new();
@@ -312,24 +362,61 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         let mut light = baker.gather_final(&atlases, &grid, opts.samples, k_out, ai, opts.profile.contact);
         denoise::atrous(&a.atlas, &mut light, &[1, 2, 4]);
         if let Some(orig) = originals[ai].as_ref().filter(|_| ovr.is_none()) {
-            let raised = floor_texels(&a.atlas, &mut light, orig, floor, dark_floor);
+            let sky_light: Vec<f32> = a.gathered.iter().map(|g| sky::luma(g.sky * k_out)).collect();
+            let raised = floor_texels(&a.atlas, &mut light, orig, floor, dark_floor, &sky_light);
             log::info!("bake: {raised} texels raised to the visibility floor ({:.0}% of CoD4's)", opts.floor * 100.0);
             log_directionality(&a.atlas, &light, orig);
-            if let Some(at) = std::env::var("COD4RW_BAKE_PROBE").ok().and_then(|v| {
-                let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-                (v.len() == 3).then(|| glam33::Vec3A::new(v[0], v[1], v[2]))
-            }) {
-                probe(&a.atlas, &light, orig, at);
-            }
+            log_materials(&a.atlas, &light, orig, world, &zones[0]);
             // Texels dropped as inside walls take CoD4's light (some
             // were only near one-sided props), not their neighbours'.
-            let mut atlas = texels::Atlas { w: a.atlas.w, h: a.atlas.h, texels: a.atlas.texels.clone(), dropped: Vec::new() };
+            // A thin wall's two sides under one texel: the side whose light
+            // is nearer CoD4's there (the side CoD4 lit it for; the other
+            // left the visible side dark, Carentan's shop wall).
+            let mut flipped = 0;
+            for (i, t) in &a.atlas.other_side {
+                let i = *i;
+                if a.atlas.texels[i].is_none() {
+                    continue;
+                }
+                let uv = Vec2::new((i % a.atlas.w) as f32 + 0.5, (i / a.atlas.w) as f32 + 0.5) / Vec2::new(a.atlas.w as f32, a.atlas.h as f32);
+                let want = sky::luma(original_at(orig, uv));
+                let other = baker.gather_texel(&atlases, &grid, t, i, opts.samples / 2, k_out, opts.profile.contact, (Vec3::ZERO, Vec3::Z));
+                if (sky::luma(other.e) - want).abs() < (sky::luma(light[i].e) - want).abs() {
+                    light[i] = other;
+                    flipped += 1;
+                }
+            }
+            if !a.atlas.other_side.is_empty() {
+                log::info!("bake: {} texels shared by a thin wall's sides; {flipped} take the other side", a.atlas.other_side.len());
+            }
+            let mut atlas = texels::Atlas { w: a.atlas.w, h: a.atlas.h, texels: a.atlas.texels.clone(), dropped: Vec::new(), other_side: Vec::new() };
             for &(i, t) in &a.atlas.dropped {
                 let uv = Vec2::new((i % atlas.w) as f32 + 0.5, (i / atlas.w) as f32 + 0.5) / Vec2::new(atlas.w as f32, atlas.h as f32);
                 let (e, l) = original_dir_at(orig, uv);
                 light[i] = Directional::default();
                 light[i].add(e, l);
                 atlas.texels[i] = Some(t);
+            }
+            if let Some(at) = std::env::var("COD4RW_BAKE_PROBE").ok().and_then(|v| {
+                let v: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (v.len() == 3).then(|| glam33::Vec3A::new(v[0], v[1], v[2]))
+            }) {
+                probe(&atlas, &light, orig, at, world, &zones[0]);
+            }
+            // Debug aid: `COD4RW_BAKE_MARK=x,y,z,r` paints texels within `r`
+            // of a point bright magenta, to see where they show in game.
+            if let Some(m) = std::env::var("COD4RW_BAKE_MARK").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<_>>()).filter(|v| v.len() == 4 || v.len() == 7) {
+                let at = glam33::Vec3A::new(m[0], m[1], m[2]);
+                // (Optionally only texels facing `nx,ny,nz`.)
+                let facing = (m.len() == 7).then(|| glam33::Vec3A::new(m[4], m[5], m[6]));
+                for (i, t) in atlas.texels.iter().enumerate() {
+                    if t.is_some_and(|t| t.pos.distance(at) < m[3] && facing.is_none_or(|f| t.nf.dot(f) > 0.5)) {
+                        light[i] = Directional::default();
+                        // (`COD4RW_BAKE_MARK_DIR`: from a tilted direction, tangent space.)
+                        let dir = if std::env::var_os("COD4RW_BAKE_MARK_DIR").is_some() { Vec3::new(-0.78, 0.18, 0.6).normalize() } else { Vec3::Z };
+                        light[i].add(Vec3::new(4.0, 0.0, 4.0), dir);
+                    }
+                }
             }
             out_atlases.push(Some(pack(&atlas, &light)));
             continue;
@@ -616,7 +703,12 @@ fn floor_at(lum: f32, floor: f32, dark: f32) -> f32 {
 /// Raise texels lit less than the floor ([`floor_at`]) of CoD4's light to it,
 /// the extra coming from CoD4's direction: darker shade than CoD4's, but
 /// never so dark that a player can't be made out. Returns how many.
-fn floor_texels(atlas: &texels::Atlas, light: &mut [Directional], orig: &(usize, usize, Vec<u8>), floor: f32, dark: f32) -> usize {
+///
+/// Indoors (the bake's own sky light is a small share of CoD4's light
+/// there) and lit, the shortfall is a lamp the fit didn't find, not shade:
+/// there the floor is [`LAMP_MISS_FLOOR`] (Carentan's lamp-lit rooms went
+/// near black at the shade's floor).
+fn floor_texels(atlas: &texels::Atlas, light: &mut [Directional], orig: &(usize, usize, Vec<u8>), floor: f32, dark: f32, sky_light: &[f32]) -> usize {
     let (w, h) = (atlas.w, atlas.h);
     let mut raised = 0;
     for (i, t) in atlas.texels.iter().enumerate() {
@@ -625,7 +717,10 @@ fn floor_texels(atlas: &texels::Atlas, light: &mut [Directional], orig: &(usize,
         }
         let uv = Vec2::new((i % w) as f32 + 0.5, (i / w) as f32 + 0.5) / Vec2::new(w as f32, h as f32);
         let (e, l) = original_dir_at(orig, uv);
-        let target = e * floor_at(sky::luma(e), floor, dark);
+        let lum = sky::luma(e);
+        let indoors = sky_light.get(i).is_some_and(|&s| s < 0.2 * lum);
+        let share = if indoors && lum > 0.03 && floor > 0.0 { floor_at(lum, floor, dark).max(LAMP_MISS_FLOOR) } else { floor_at(lum, floor, dark) };
+        let target = e * share;
         if sky::luma(light[i].e) < sky::luma(target) {
             light[i].add((target - light[i].e).max(Vec3::ZERO), l);
             raised += 1;
@@ -634,24 +729,79 @@ fn floor_texels(atlas: &texels::Atlas, light: &mut [Directional], orig: &(usize,
     raised
 }
 
+/// Below this share of CoD4's light explained by the bake, the floor
+/// rises towards the safe profile's ([`SAFE_FLOOR`], [`SAFE_DARK_FLOOR`]).
+const EXPLAINED_WELL: f32 = 0.6;
+/// ...and at or below this, it is the safe profile's.
+const EXPLAINED_POORLY: f32 = 0.3;
+const SAFE_FLOOR: f32 = 0.55;
+const SAFE_DARK_FLOOR: f32 = 0.85;
+
+/// The floor where a lamp the fit missed lights a room (see
+/// [`floor_texels`]).
+const LAMP_MISS_FLOOR: f32 = 0.7;
+
+/// The materials the bake lights least against CoD4 (texel-weighted mean
+/// light, bake / CoD4), for finding where it went wrong.
+fn log_materials(atlas: &texels::Atlas, light: &[Directional], orig: &(usize, usize, Vec<u8>), world: &iw3::zone::GfxWorld, zone: &Zone) {
+    let (w, h) = (atlas.w, atlas.h);
+    let mut by: std::collections::HashMap<String, (f32, f32, usize)> = Default::default();
+    for (i, t) in atlas.texels.iter().enumerate() {
+        let Some(t) = t else { continue };
+        let uv = Vec2::new((i % w) as f32 + 0.5, (i / w) as f32 + 0.5) / Vec2::new(w as f32, h as f32);
+        let ours = sky::luma(light[i].e);
+        let theirs = sky::luma(original_dir_at(orig, uv).0);
+        let name = world.surfaces[t.surf as usize].material.and_then(|m| zone.material(m)).map_or("?".into(), |m| m.name.clone());
+        let e = by.entry(name).or_default();
+        e.0 += ours;
+        e.1 += theirs;
+        e.2 += 1;
+    }
+    let mut rows: Vec<_> = by.into_iter().filter(|(_, v)| v.2 > 200 && v.1 / v.2 as f32 > 0.02).map(|(n, v)| (v.0 / v.1.max(1e-6), n, v.2)).collect();
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let worst: Vec<String> = rows.iter().take(6).map(|(r, n, c)| format!("{n} {r:.2} ({c})")).collect();
+    log::info!("bake: darkest materials against CoD4 (bake/CoD4, texels): {}", worst.join(", "));
+}
+
 /// Debug aid (`COD4RW_BAKE_PROBE=x,y,z`): texels within 80 units of a
 /// point, CoD4's light and the bake's.
-fn probe(atlas: &texels::Atlas, light: &[Directional], orig: &(usize, usize, Vec<u8>), at: glam33::Vec3A) {
+fn probe(atlas: &texels::Atlas, light: &[Directional], orig: &(usize, usize, Vec<u8>), at: glam33::Vec3A, world: &iw3::zone::GfxWorld, zone: &Zone) {
     let (w, h) = (atlas.w, atlas.h);
     let mut shown = 0;
     for (i, t) in atlas.texels.iter().enumerate() {
         let Some(t) = t else { continue };
-        if t.pos.distance(at) > 80.0 || i % 7 != 0 {
+        if t.pos.distance(at) > 40.0 || i % 3 != 0 {
             continue;
         }
         let uv = Vec2::new((i % w) as f32 + 0.5, (i / w) as f32 + 0.5) / Vec2::new(w as f32, h as f32);
-        let (e, l) = original_dir_at(orig, uv);
+        let (e, _l) = original_dir_at(orig, uv);
         let (a, b, bl) = light[i].fit();
-        log::info!("probe {:.0?} n {:.2?}: cod4 {:.3} dir {:.2?} | bake e {:.3} A {:.3} B {:.3} L {:.2?}", t.pos, t.n, sky::luma(e), l, sky::luma(light[i].e), sky::luma(a), sky::luma(b), bl);
+        let mat = world.surfaces[t.surf as usize].material.and_then(|m| zone.material(m)).map_or("?".into(), |m| m.name.clone());
+        log::info!("probe {mat} {:.0?} n {:.2?} nf {:.2?} uv {:.4?} ({w}x{h}): cod4 {:.3} | bake e {:.3} A {:.3} B {:.3} L {:.2?}", t.pos, t.n, t.nf, uv, sky::luma(e), sky::luma(light[i].e), sky::luma(a), sky::luma(b), bl);
         shown += 1;
         if shown > 40 {
             break;
         }
+    }
+    // Every texel facing -y within 60: CoD4's and the bake's light, and A/B.
+    let (mut n, mut c, mut b_, mut aa, mut bb, mut lz) = (0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (i, t) in atlas.texels.iter().enumerate() {
+        let Some(t) = t else { continue };
+        if t.pos.distance(at) > 60.0 || t.nf.dot(glam33::Vec3A::NEG_Y) < 0.5 {
+            continue;
+        }
+        let uv = Vec2::new((i % w) as f32 + 0.5, (i / w) as f32 + 0.5) / Vec2::new(w as f32, h as f32);
+        let (a, b, l) = light[i].fit();
+        n += 1;
+        c += sky::luma(original_at(orig, uv));
+        b_ += sky::luma(light[i].e);
+        aa += sky::luma(a);
+        bb += sky::luma(b);
+        lz += l.z;
+    }
+    if n > 0 {
+        let k = 1.0 / n as f32;
+        log::info!("probe: {n} texels facing -y: cod4 {:.3} bake {:.3} A {:.3} B {:.3} Lz {:.2}", c * k, b_ * k, aa * k, bb * k, lz * k);
     }
     let dropped = atlas.dropped.iter().filter(|(_, t)| t.pos.distance(at) < 80.0).count();
     log::info!("probe: {dropped} dropped texels near");

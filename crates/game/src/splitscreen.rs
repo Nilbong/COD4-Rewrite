@@ -229,7 +229,8 @@ fn begin(players: Res<LocalPlayers>, spectate: Option<Res<crate::bots::SpectateA
 fn lighter_shadows(
     mut commands: Commands,
     time: Res<Time>,
-    suns: Query<(Entity, &DirectionalLight, &bevy::light::CascadeShadowConfig)>,
+    // (Not the guns' own suns: one small cascade each, `model_lighting`.)
+    suns: Query<(Entity, &DirectionalLight, &bevy::light::CascadeShadowConfig), Without<crate::model_lighting::ViewModelSun>>,
     names: Query<(Entity, &Name)>,
     children: Query<&Children>,
     casting: Query<(), (With<Mesh3d>, Without<bevy::light::NotShadowCaster>)>,

@@ -66,8 +66,9 @@ pub(super) fn start(
     let team = if pawn.team == crate::combat::Team::Axis { "opfor" } else { "marines" };
     fe.locals.insert("ui_team".into(), team.into());
     fe.menu_slot = 0;
-    // Headquarters has no class to pick (its Escape menu edits them).
-    if crate::hq::active() {
+    // Headquarters has no class to pick (its Escape menu edits them), nor
+    // has a campaign mission (its weapons are the mission's).
+    if crate::hq::active() || crate::campaign::active() {
         return;
     }
     // Splitscreen: everyone picks at once, each in their own part of the
@@ -250,7 +251,12 @@ pub(super) fn paint(
     devices: Res<crate::splitscreen::LocalPlayers>,
 ) {
     list.0.clear();
-    let ops = std::mem::take(&mut hud.ops);
+    let mut ops = std::mem::take(&mut hud.ops);
+    // The new HUD's mock-up in place of CoD4's.
+    if super::next::hud_replaced() {
+        ops.clear();
+        fe.paint_next_hud(window.width(), window.height(), hud.minimap_rect(), &mut ops);
+    }
     fe.emit(ops, &mut images, &mut list.0);
     if !fe.stack.is_empty() {
         super::draw_menus(&mut fe, &mut list.0, &mut images, &window);
@@ -267,7 +273,11 @@ impl Frontend {
     pub(super) fn class_loadout(&self, class: &str) -> Option<ClassLoadout> {
         let custom = class.strip_prefix("custom").and_then(|n| n.parse::<i32>().ok()).filter(|n| (1..=5).contains(n));
         let (base, name) = match custom {
-            Some(n) => (200 + 10 * (n - 1), self.localize(&self.dvar(&format!("customclass{n}")))),
+            // (A splitscreen player's own profile: its stats keep its names.)
+            Some(n) => {
+                let key = format!("customclass{n}");
+                (200 + 10 * (n - 1), self.localize(&self.stats.dvars.get(&key).cloned().unwrap_or_else(|| self.dvar(&key))))
+            }
             None => {
                 let i = DEFAULT_CLASSES.iter().position(|c| c.eq_ignore_ascii_case(class))? as i32;
                 (200 + 10 * i, self.localize(&format!("@CLASS_CLASS{}", i + 1)))
@@ -296,7 +306,7 @@ impl Frontend {
             // class picks one.
             let variant = custom.and_then(|_| crate::supply::inventory().equipped(base + k, &weapon));
             Some(Gun {
-                spec: format!("{weapon}:{}", attachments::names(set).join("+")),
+                spec: format!("{weapon}:{}", attachments::names_of(set, &weapon).join("+")),
                 // The red dot's reticle rides on the camo number.
                 camo: crate::reticles::with_camo(
                     variant.filter(|_| camo == 0).map_or(camo, |v| v.camo),

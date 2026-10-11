@@ -10,6 +10,9 @@
 //! - the median angle between the view and the way they walk.
 //!
 //! So real players and bots are measured the same way, on the same map.
+//! With `COD4RW_LOOKSTAT_NOFIGHT=1`, bot rows in Engage or Cover mode (the
+//! `mode` column) are left out too, as real tracks have no such column and
+//! only drop their firing.
 
 use super::tactical::TacticalMap;
 use crate::collision;
@@ -32,6 +35,10 @@ struct Sample {
     feet: Vec3,
 }
 
+fn skip_fights() -> bool {
+    std::env::var_os("COD4RW_LOOKSTAT_NOFIGHT").is_some_and(|v| v != "0")
+}
+
 fn read(path: &std::path::Path) -> Vec<Sample> {
     let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
     let mut lines = text.lines();
@@ -43,6 +50,7 @@ fn read(path: &std::path::Path) -> Vec<Sample> {
         return Vec::new();
     };
     let dead = col("dead");
+    let mode = col("mode").filter(|_| skip_fights());
     lines
         .filter_map(|l| {
             let f: Vec<&str> = l.split(',').collect();
@@ -50,11 +58,12 @@ fn read(path: &std::path::Path) -> Vec<Sample> {
             if dead.and_then(n).is_some_and(|d| d > 0.0) {
                 return None;
             }
+            let fight = mode.and_then(|i| f.get(i)).is_some_and(|m| matches!(m.trim(), "Engage" | "Cover"));
             Some(Sample {
                 t: n(t)?,
                 yaw: n(yaw)?.to_radians(),
                 pitch: n(pitch)?.to_radians(),
-                fire: n(fire)? > 0.0,
+                fire: n(fire)? > 0.0 || fight,
                 feet: pos([n(x)?, n(y)?, n(z)?]),
             })
         })
@@ -125,9 +134,10 @@ fn measure(tactics: Option<Res<TacticalMap>>, spatial: SpatialQuery, mut done: L
         let median = offsets.get(offsets.len() / 2).copied().unwrap_or(0.0);
         let pct = |n: u32| 100.0 * n as f32 / walking.max(1) as f32;
         info!(
-            "lookstat {dir}: {walking} walking looks; at a lane in sight {:.1}%, checking one to the side {:.1}%, view off the way walked p50 {median:.0} deg",
+            "lookstat {dir}: {walking} walking looks; at a lane in sight {:.1}%, checking one to the side {:.1}%, view off the way walked p50 {median:.0} deg{}",
             pct(at_lane),
-            pct(side_check)
+            pct(side_check),
+            if skip_fights() { " (Engage/Cover left out)" } else { "" }
         );
     }
 }

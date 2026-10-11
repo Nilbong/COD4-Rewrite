@@ -319,7 +319,7 @@ pub fn play_events(
     camera: Single<Entity, With<MainCamera>>,
     mut content: ResMut<Content>,
     mut bo1_content: ResMut<crate::bo1::MatchContent>,
-    mut waw_content: ResMut<crate::waw::MatchContent>,
+    (mut waw_content, mut mw2_content): (ResMut<crate::waw::MatchContent>, ResMut<crate::mw2guns::MatchContent>),
     mut assets: (
         ResMut<Assets<Mesh>>,
         ResMut<Assets<StandardMaterial>>,
@@ -399,6 +399,11 @@ pub fn play_events(
                 }
             } else if crate::waw::is_waw(gun) {
                 match waw_content.get() {
+                    Some(c) => c,
+                    None => return,
+                }
+            } else if crate::mw2guns::is_mw2(gun) {
+                match mw2_content.get() {
                     Some(c) => c,
                     None => return,
                 }

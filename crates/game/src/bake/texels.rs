@@ -22,6 +22,8 @@ pub struct Texel {
     pub outside: f32,
     /// World size of a texel (units), for spacing samples.
     pub size: f32,
+    /// The world surface (index in `GfxWorld::surfaces`).
+    pub surf: u32,
 }
 
 pub struct Atlas {
@@ -32,6 +34,9 @@ pub struct Atlas {
     /// Texels dropped from the bake as inside walls (they take CoD4's
     /// light): index and texel.
     pub dropped: Vec<(usize, Texel)>,
+    /// Texels a thin wall's two sides share (CoD4 lit them for one): the
+    /// side not kept in `texels`, to bake too and choose between.
+    pub other_side: Vec<(usize, Texel)>,
 }
 
 impl Atlas {
@@ -69,8 +74,12 @@ fn closest_on_segment(p: Vec2, a: Vec2, b: Vec2) -> Vec2 {
 /// `w` x `h` atlas layer (its lightmap coordinates span 0..1 whatever the
 /// size).
 pub fn rasterise(world: &GfxWorld, index: u8, w: usize, h: usize) -> Atlas {
-    let mut atlas = Atlas { w, h, texels: vec![None; w * h], dropped: Vec::new() };
-    for s in world.surfaces.iter().filter(|s| s.lightmap_index == index && s.material.is_some()) {
+    let mut atlas = Atlas { w, h, texels: vec![None; w * h], dropped: Vec::new(), other_side: Vec::new() };
+    // Texels two surfaces both lie over (inside both): facing apart, CoD4
+    // shared them between a thin wall's sides.
+    let mut shared = 0usize;
+    let mut shared_facing_apart = 0usize;
+    for (si, s) in world.surfaces.iter().enumerate().filter(|(_, s)| s.lightmap_index == index && s.material.is_some()) {
         let first = s.first_vertex.max(0) as usize;
         let start = s.base_index.max(0) as usize;
         let end = start + s.tri_count as usize * 3;
@@ -117,7 +126,25 @@ pub fn rasterise(world: &GfxWorld, index: u8, w: usize, h: usize) -> Atlas {
                         b = bary(q, px[0], px[1], px[2]).unwrap_or([1.0 / 3.0; 3]).map(|v| v.clamp(0.0, 1.0));
                     }
                     let slot = &mut atlas.texels[y * w + x];
-                    if slot.is_some_and(|t| t.outside <= outside) {
+                    if let Some(t) = slot.as_ref().filter(|t| t.outside == 0.0 && outside == 0.0 && t.surf != si as u32) {
+                        shared += 1;
+                        if t.nf.dot(nf) < -0.5 {
+                            shared_facing_apart += 1;
+                        }
+                    }
+                    let new = Texel { pos: Vec3A::ZERO, n: nf, nf, t: nf, b: nf, outside, size, surf: si as u32 };
+                    if let Some(t) = slot.filter(|t| t.outside <= outside) {
+                        // A side facing the other way under the same texel:
+                        // kept to choose between once both are lit.
+                        if outside == 0.0 && t.nf.dot(nf) < -0.5 && t.surf != si as u32 {
+                            let p = pos[0] * b[0] + pos[1] * b[1] + pos[2] * b[2];
+                            let n = (ns[0] * b[0] + ns[1] * b[1] + ns[2] * b[2]).normalize_or(nf);
+                            let tg = vs.map(|v| unit(v.tangent));
+                            let tan = tg[0] * b[0] + tg[1] * b[1] + tg[2] * b[2];
+                            let tan = (tan - n * n.dot(tan)).normalize_or(n.any_orthonormal_vector());
+                            let sign = if vs[0].binormal_sign < 0.0 { -1.0 } else { 1.0 };
+                            atlas.other_side.push((y * w + x, Texel { pos: p, n, nf, t: tan, b: n.cross(tan) * sign, ..new }));
+                        }
                         continue;
                     }
                     let p = pos[0] * b[0] + pos[1] * b[1] + pos[2] * b[2];
@@ -126,10 +153,13 @@ pub fn rasterise(world: &GfxWorld, index: u8, w: usize, h: usize) -> Atlas {
                     let tan = tg[0] * b[0] + tg[1] * b[1] + tg[2] * b[2];
                     let tan = (tan - n * n.dot(tan)).normalize_or(n.any_orthonormal_vector());
                     let sign = if vs[0].binormal_sign < 0.0 { -1.0 } else { 1.0 };
-                    *slot = Some(Texel { pos: p, n, nf, t: tan, b: n.cross(tan) * sign, outside, size });
+                    *slot = Some(Texel { pos: p, n, nf, t: tan, b: n.cross(tan) * sign, outside, size, surf: si as u32 });
                 }
             }
         }
+    }
+    if shared > 0 {
+        log::info!("bake: atlas {index}: {shared} texels lie under two surfaces ({shared_facing_apart} facing apart)");
     }
     atlas
 }

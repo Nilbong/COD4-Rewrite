@@ -13,7 +13,7 @@
 use super::Frontend;
 use super::attachments;
 use super::expr::Env;
-use super::bo1::{Row, highlighted_name, str_exp, with_rows};
+use super::bo1::{Row, highlighted_name, str_exp, with_gun_rows, with_rows};
 use crate::waw::{self, Group};
 use iw3::menu::{Menu, StringTable};
 use std::collections::HashMap;
@@ -203,7 +203,8 @@ impl Frontend {
                         rename: from.clone().map(|f| (f, g.id())),
                     })
                     .collect();
-                let mut m = with_rows(&t, key, &rows)?;
+                let stats: Vec<i32> = data.guns.iter().filter(|g| g.group == group).map(|g| 3000 + g.index).collect();
+                let mut m = with_gun_rows(&t, key, &rows, &stats)?;
                 // The popup's own preview shows the gun under the mouse.
                 let first = rows.first().and_then(|r| r.rename.as_ref()).map_or("", |r| r.1.as_str());
                 m.on_open = format!("\"execnow\" \"set ui_primary_highlighted {first}; set ui_sidearm_highlighted {first}\" ; ");

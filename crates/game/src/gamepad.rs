@@ -431,10 +431,14 @@ fn binding(ctx: Context, b: GamepadButton, lean: bool, view: bool) -> Option<Bou
         // Grenades (`crate::grenades`): RB frag, LB special.
         (Context::Game, P::RightTrigger) => Key(KeyCode::KeyG),
         (Context::Game, P::LeftTrigger) => Key(KeyCode::Digit4),
-        // CoD4's console action slots: left equipment or the grenade
-        // launcher (PC 5), right kill streaks (PC 6).
-        (Context::Game, P::DPadLeft) => Key(KeyCode::Digit5),
-        (Context::Game, P::DPadRight) => Key(KeyCode::Digit6),
+        // The kill streak picker (`crate::killstreaks`): right opens it and
+        // calls in the one picked, up and down choose, left closes it.
+        (Context::Game, P::DPadRight) => Key(crate::killstreaks::PAD_PICK),
+        (Context::Game, P::DPadLeft) if crate::killstreaks::picker_open() => Key(crate::killstreaks::PAD_CLOSE),
+        (Context::Game, P::DPadUp) if crate::killstreaks::picker_open() => Key(crate::killstreaks::PAD_UP),
+        (Context::Game, P::DPadDown) if crate::killstreaks::picker_open() => Key(crate::killstreaks::PAD_DOWN),
+        // Left: equipment or the grenade launcher (PC 3).
+        (Context::Game, P::DPadLeft) => Key(KeyCode::Digit3),
         // Lean (Bodycam gunplay) while aiming, as Rainbow Six does: L3 left,
         // R3 right. Otherwise L3 sprints (`read_pad`) and R3 knifes
         // (`crate::melee`, CoD4's console layout), or with View held
@@ -814,7 +818,7 @@ mod tests {
         assert_eq!(b(Context::GameMenus, GamepadButton::East), Some(Bound::Key(KeyCode::Escape)));
         assert_eq!(b(Context::Game, GamepadButton::Start), Some(Bound::Key(KeyCode::Escape)));
         assert_eq!(b(Context::Game, GamepadButton::RightTrigger), Some(Bound::Key(KeyCode::KeyG)));
-        assert_eq!(b(Context::Game, GamepadButton::DPadRight), Some(Bound::Key(KeyCode::Digit6)));
+        assert_eq!(b(Context::Game, GamepadButton::DPadRight), Some(Bound::Key(crate::killstreaks::PAD_PICK)));
         assert_eq!(b(Context::Game, GamepadButton::DPadUp), Some(Bound::Key(KeyCode::KeyN)));
         assert_eq!(b(Context::Game, GamepadButton::DPadDown), Some(Bound::Key(KeyCode::KeyI)));
         assert_eq!(binding(Context::Game, GamepadButton::DPadDown, false, true), Some(Bound::Key(KeyCode::KeyB)));

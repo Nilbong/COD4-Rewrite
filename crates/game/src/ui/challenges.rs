@@ -368,6 +368,8 @@ fn life(
             Hardpoint::Uav => ("ch_uav", "ch_nosecrets", 3),
             Hardpoint::Airstrike => ("ch_airstrike", "ch_afterburner", 2),
             Hardpoint::Helicopter => ("ch_chopper", "ch_airsuperiority", 2),
+            // (CoD4 has no challenges for MW2's two.)
+            Hardpoint::CarePackage | Hardpoint::Sentry => continue,
         };
         counts.add(streak, 1);
         if *calls == times {

@@ -30,6 +30,13 @@ pub struct AudioPlugin;
 /// would come back, so every volume also goes through [`audible`].
 static MUTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether this is a silent debug run (`COD4RW_*` other than the real-play
+/// settings): it doesn't open the sound device at all (main.rs leaves
+/// Bevy's audio plugin out), so other programs' sound isn't disturbed.
+pub fn silent_run() -> bool {
+    std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !crate::net::setting(&k))
+}
+
 /// 0 in a silent debug run, else 1: a factor for every volume set.
 pub fn audible() -> f32 {
     if MUTED.load(std::sync::atomic::Ordering::Relaxed) { 0.0 } else { 1.0 }
@@ -37,15 +44,22 @@ pub fn audible() -> f32 {
 
 impl Plugin for AudioPlugin {
     fn build(&self, app: &mut App) {
-        // Debug runs (`COD4RW_*`) stay quiet.
-        if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !crate::net::setting(&k)) {
-            app.insert_resource(GlobalVolume::new(Volume::SILENT));
+        // Debug runs (`COD4RW_*`) stay quiet, without a sound device: the
+        // sound types are there for the game's code, nothing plays them.
+        if silent_run() {
+            app.insert_resource(GlobalVolume::new(Volume::SILENT))
+                .insert_resource(bevy::audio::DefaultSpatialScale(bevy::audio::SpatialScale::new(1.0)))
+                .init_asset::<AudioSource>()
+                .init_asset_loader::<bevy::audio::AudioLoader>()
+                .init_asset::<spatial::SpatialSound>();
             MUTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            app.add_audio_source::<spatial::SpatialSound>();
         }
-        app.add_audio_source::<spatial::SpatialSound>()
+        app
             .init_resource::<Sfx>()
             .add_systems(OnEnter(crate::state::GameState::InGame), load_bank.after(crate::world::load_map).in_set(crate::state::Setup::Content))
-            .add_systems(Update, add_listener.run_if(crate::state::in_game))
+            .add_systems(Update, (add_listener, expire_silent).run_if(crate::state::in_game))
             .init_resource::<Ducking>()
             // A new sound's place only exists once transforms are
             // propagated: its ears are set after (before, they took the
@@ -228,15 +242,40 @@ fn load_bank(mut commands: Commands, content: Res<Content>) {
                 Err(e) => warn!("audio: no World at War sounds: {e:#}"),
             }
         }
+        // Modern Warfare 2 guns' own sounds, when it's installed.
+        if let Some(mw2) = crate::mw2guns::data() {
+            match mw2.sound_aliases() {
+                Ok(l) => list.extend(l),
+                Err(e) => warn!("audio: no Modern Warfare 2 sounds: {e:#}"),
+            }
+        }
         Ok(list)
     }));
     commands.insert_resource(bank);
 }
 
-fn add_listener(mut commands: Commands, cameras: Query<Entity, (With<MainCamera>, Without<SpatialListener>)>) {
+fn add_listener(
+    mut commands: Commands,
+    cameras: Query<Entity, (With<MainCamera>, Without<SpatialListener>)>,
+    slots: Query<Entity, (Or<(With<MainCamera>, With<crate::splitscreen::SlotCamera>)>, Without<Ear>)>,
+) {
     for e in &cameras {
         commands.entity(e).insert(SpatialListener::new(EAR_GAP));
     }
+    for e in &slots {
+        commands.entity(e).insert(Ear);
+    }
+}
+
+/// A local player's ears: on the main camera and each splitscreen player's.
+/// Every positioned sound is heard from the nearest of them, so a second
+/// player's fight is heard, not judged from player 1's far-off camera.
+#[derive(Component)]
+pub struct Ear;
+
+/// The ears nearest `at` (the first, failing any).
+pub fn nearest_ear(ears: &Query<&GlobalTransform, With<Ear>>, at: Vec3) -> GlobalTransform {
+    ears.iter().min_by(|a, b| a.translation().distance_squared(at).total_cmp(&b.translation().distance_squared(at))).copied().unwrap_or_default()
 }
 
 fn play_queued(
@@ -247,6 +286,7 @@ fn play_queued(
     mut audio: ResMut<Assets<AudioSource>>,
     mut spatial_sounds: ResMut<Assets<spatial::SpatialSound>>,
     listener: Query<&GlobalTransform, With<SpatialListener>>,
+    ears: Query<&GlobalTransform, With<Ear>>,
     carriers: Query<&GlobalTransform>,
 ) {
     let Some(mut bank) = bank else {
@@ -294,6 +334,9 @@ fn play_queued(
         let v = &v;
         let two_d = v.two_d || req.flat || req.at.is_none() && carrier.is_none();
         let at = carrier.map(|c| c.1).or(req.at).unwrap_or(ear);
+        // Heard by the nearest local player (splitscreen).
+        let listener = if two_d { listener } else { nearest_ear(&ears, at) };
+        let ear = if two_d { ear } else { listener.translation() };
         let falloff = if two_d { 1.0 } else { v.falloff(ear.distance(at) / INCH) };
         // A loop on something moving may come into earshot.
         if falloff <= 0.001 && !(v.looping && carrier.is_some()) {
@@ -331,6 +374,11 @@ fn play_queued(
         if let Some(parent) = place.1 {
             e.insert(parent);
         }
+        // Silent runs have no player to finish sounds and remove them: they
+        // go after a while instead, so they don't pile up.
+        if silent_run_cached() && !v.looping {
+            e.insert(SilentUntil(time.elapsed_secs() + SILENT_LIFE));
+        }
         if v.master {
             e.insert(Master);
         }
@@ -339,6 +387,27 @@ fn play_queued(
         }
         if let Some(layer) = v.secondary.as_ref().filter(|_| depth < 2) {
             queue.push((Request { alias: layer.clone(), ..req.clone() }, depth + 1));
+        }
+    }
+}
+
+/// How long a sound lasts in a silent run ([`SilentUntil`]).
+const SILENT_LIFE: f32 = 3.0;
+
+/// A sound in a silent run, removed at this time.
+#[derive(Component)]
+struct SilentUntil(f32);
+
+fn silent_run_cached() -> bool {
+    static SILENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SILENT.get_or_init(silent_run)
+}
+
+fn expire_silent(mut commands: Commands, time: Res<Time>, sounds: Query<(Entity, &SilentUntil)>) {
+    let now = time.elapsed_secs();
+    for (e, s) in &sounds {
+        if now >= s.0 {
+            commands.entity(e).despawn();
         }
     }
 }

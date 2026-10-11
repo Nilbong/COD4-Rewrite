@@ -116,7 +116,11 @@ pub enum Action {
     Frag,
     Special,
     Equipment,
-    Killstreak,
+    Killstreak1,
+    Killstreak2,
+    Killstreak3,
+    Killstreak4,
+    Killstreak5,
     Inspect,
     Use,
     NightVision,
@@ -125,7 +129,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 29] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -145,7 +149,11 @@ impl Action {
         Action::Frag,
         Action::Special,
         Action::Equipment,
-        Action::Killstreak,
+        Action::Killstreak1,
+        Action::Killstreak2,
+        Action::Killstreak3,
+        Action::Killstreak4,
+        Action::Killstreak5,
         Action::Inspect,
         Action::Use,
         Action::NightVision,
@@ -175,8 +183,14 @@ impl Action {
             Action::Weapon2 => Digit2,
             Action::Frag => KeyG,
             Action::Special => Digit4,
-            Action::Equipment => Digit5,
-            Action::Killstreak => Digit6,
+            // Equipment on 3, the kill streaks on 5 to 9 (one each: UAV,
+            // airstrike, helicopter, then the care package and the sentry).
+            Action::Equipment => Digit3,
+            Action::Killstreak1 => Digit5,
+            Action::Killstreak2 => Digit6,
+            Action::Killstreak3 => Digit7,
+            Action::Killstreak4 => Digit8,
+            Action::Killstreak5 => Digit9,
             Action::Inspect => KeyI,
             Action::Use => KeyF,
             Action::NightVision => KeyN,
@@ -207,7 +221,11 @@ impl Action {
             Action::Frag => "bind_frag",
             Action::Special => "bind_smoke",
             Action::Equipment => "bind_actionslot3",
-            Action::Killstreak => "bind_actionslot4",
+            Action::Killstreak1 => "bind_killstreak1",
+            Action::Killstreak2 => "bind_killstreak2",
+            Action::Killstreak3 => "bind_killstreak3",
+            Action::Killstreak4 => "bind_killstreak4",
+            Action::Killstreak5 => "bind_killstreak5",
             Action::Inspect => "bind_inspect",
             Action::Use => "bind_activate",
             Action::NightVision => "bind_nightvision",
@@ -252,6 +270,27 @@ pub fn bind(values: &mut HashMap<&'static str, String>, action: Action, input: I
     }
     slots.push(input);
     *v = slots.iter().map(|i| i.name()).collect::<Vec<_>>().join(" ");
+}
+
+/// The first key bound to each action, by name (`G`, `4`), for the HUD's
+/// hints; kept up to date by [`publish_key_names`].
+static KEY_NAMES: std::sync::Mutex<Vec<(Action, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The name of the key bound to `action`, for a hint (its default before
+/// the bindings are read).
+pub fn key_name(action: Action) -> String {
+    KEY_NAMES
+        .lock()
+        .ok()
+        .and_then(|k| k.iter().find(|(a, _)| *a == action).map(|(_, n)| n.clone()))
+        .unwrap_or_else(|| action.default_input().display())
+}
+
+/// Note the bound keys' names when the bindings change.
+pub fn publish_key_names(bindings: &Bindings) {
+    if let Ok(mut k) = KEY_NAMES.lock() {
+        *k = Action::ALL.into_iter().map(|a| (a, bindings.key_name(a))).collect();
+    }
 }
 
 /// Hold or toggle, for the actions that have both.

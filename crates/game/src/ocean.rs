@@ -137,7 +137,7 @@ fn spawn_ocean(
     mut materials: ResMut<Assets<OceanMaterial>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    if waters.is_empty() || !oceans.is_empty() {
+    if waters.is_empty() || !oceans.is_empty() || !crate::atmos::climate::profile().is_some_and(|p| p.ocean) {
         return;
     }
     let Some(content) = content else { return };
@@ -191,7 +191,7 @@ fn rain() -> f32 {
 
 /// The sea is at least this rough (0..1) whatever the local weather: Wet
 /// Work is out in a storm, and a swell doesn't drop with the rain.
-const SEA_STATE: f32 = 0.75;
+const SEA_STATE: f32 = 0.85;
 
 /// A wind this strong (m/s) is a full storm's waves: the climate's wind in
 /// hard rain (`3.2 m/s × (1 + 3 × rain)`), so Wet Work's rain is a storm.

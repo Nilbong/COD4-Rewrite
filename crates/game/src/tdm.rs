@@ -291,8 +291,9 @@ fn start_match(
         .enumerate()
         .map(|(side, &team)| {
             let mut names = config.bots[side].clone();
-            // Spectating: a bot takes the player's place.
-            if spectating.is_some() && team == config.player_team {
+            // Spectating: a bot takes the player's place (not in photo
+            // mode, whose lobby's bots are all there should be).
+            if spectating.is_some() && team == config.player_team && !crate::photo::active() {
                 let taken: Vec<&String> = config.bots.iter().flatten().collect();
                 if let Some(free) = (0..).map(bot_name).find(|n| !taken.contains(&n)) {
                     names.push(free);
@@ -325,7 +326,12 @@ fn start_match(
             debug!("bot spawn ({team:?}) at CoD {:?} ({:?})", crate::units::to_cod(spawn.pos), spawn.kind);
             let name = names.next().unwrap_or_else(|| "Bot".into());
             let bot = spawn_pawn(&mut commands, &assets, &name, team, &spawn);
-            let skill = skills.next().unwrap_or(config.bot_skill);
+            let mut skill = skills.next().unwrap_or(config.bot_skill);
+            // Debug (sims): `COD4RW_SIDE_SKILLS=<allies>,<axis>` sets each
+            // side's skill exactly (no lobby mix), to measure what skill does.
+            if let Some(v) = std::env::var("COD4RW_SIDE_SKILLS").ok().and_then(|s| s.split(',').nth(side).and_then(|x| x.trim().parse::<f32>().ok())) {
+                skill = v;
+            }
             commands.entity(bot).insert((Bot::new(skill, profile.as_deref()).with_lane(lane), WeaponInput::default()));
         }
     }
@@ -369,7 +375,8 @@ fn check_end(
             let top = ranked.first().map_or(0, |r| r.0);
             let leader = (ranked.len() == 1 || ranked.get(1).is_some_and(|r| r.0 < top)).then(|| ranked[0].1.to_owned());
             let over = if state.mode.teams() { state.allies >= limit || state.axis >= limit } else { top >= limit };
-            if over || state.time_left(now) <= 0.0 {
+            // (Target practice never ends.)
+            if (over || state.time_left(now) <= 0.0) && !crate::target_practice::active() {
                 let winner = match state.allies.cmp(&state.axis) {
                     _ if !state.mode.teams() => None,
                     std::cmp::Ordering::Greater => Some(Team::Allies),

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/iw3", "crates/t4", "crates/t5", "crates/game", "crates/net", "crates/multiplayer", "crates/launcher"]
+members = ["crates/iw3", "crates/iw4", "crates/gsc", "crates/t4", "crates/t5", "crates/game", "crates/net", "crates/multiplayer", "crates/launcher"]
 
 [workspace.package]
 edition = "2024"
@@ -24,3 +24,12 @@ opt-level = 3
 
 [profile.dev.package.iw3]
 opt-level = 3
+
+# Quick iteration builds for testing (`cargo build --profile fast`, output in
+# target/fast): optimised like release, but incremental and split into many
+# codegen units, so a small change rebuilds in about a minute instead of five.
+# Release builds (what players and the GitHub release get) are unchanged.
+[profile.fast]
+inherits = "release"
+incremental = true
+codegen-units = 256

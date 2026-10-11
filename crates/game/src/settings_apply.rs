@@ -104,9 +104,17 @@ pub fn invert_mouse() -> bool {
     INVERT.load(Ordering::Relaxed)
 }
 
+/// The mix's headroom: every sound plays at this share, so that sounds
+/// stacking up (the player's gunshot and its layers over everything else,
+/// a sound panned hard into one ear) stay under full scale instead of
+/// clipping into a crackle. Nothing limits the sum of the sounds after
+/// they're mixed. `audio.headroom` in `tuning.txt` adjusts it.
+const HEADROOM: f32 = 0.6;
+
 /// A sound's volume scale by what it is (and the master).
 pub fn volume(category: Sound) -> f32 {
     crate::audio::audible()
+        * crate::tune::get("audio.headroom", HEADROOM).clamp(0.05, 1.0)
         * MASTER_VOLUME.get()
         * match category {
             Sound::Effects => EFFECTS_VOLUME.get(),
@@ -397,8 +405,9 @@ fn sun(
         "low" => (true, 1, 30.0, 1024),
         "medium" => (true, 2, 60.0, 1024),
         // Ultra at 2048: 4096 cost ~7 ms on open maps (Bloc) for no visible
-        // difference (perf, 2026-10-08); its 4 cascades and 120 m stay.
-        "ultra" => (true, 4, 120.0, 2048),
+        // difference (perf, 2026-10-08); 3 cascades over 120 m look the same
+        // as 4 (A/B on four maps) and save ~1 ms.
+        "ultra" => (true, 3, 120.0, 2048),
         _ => (true, 2, 80.0, 2048),
     };
     if settings.is_changed() && map_size.size != size {
@@ -481,7 +490,8 @@ fn models(
 /// Brightness: the frame's exposure, on every camera that grades colour.
 fn brightness(settings: Res<Settings>, mut grading: Query<&mut ColorGrading>) {
     // (Plus Headquarters' outdoor darkening, `crate::hq`.)
-    let exposure = settings.num("r_gamma").clamp(0.3, 3.0).log2() + crate::hq::exposure_offset();
+    // (And the showcase's per-map offset, `crate::atmos::climate`.)
+    let exposure = settings.num("r_gamma").clamp(0.3, 3.0).log2() + crate::hq::exposure_offset() + crate::atmos::climate::exposure_offset();
     for mut g in &mut grading {
         if (g.global.exposure - exposure).abs() > 1e-4 {
             g.global.exposure = exposure;

@@ -380,7 +380,10 @@ def parse_rules(directory):
             m = re.match(r"reorder\s*(\w*)\s*:(.*)", stmt)
             if m:
                 target = m.group(1) or cur
-                rules.setdefault(target, {"type": {}, "members": {}})["type"]["reorder"] = m.group(2).split()
+                # Several `reorder:` statements for one type: kept as groups
+                # separated by "|" (a later one used to replace the first).
+                ty = rules.setdefault(target, {"type": {}, "members": {}})["type"]
+                ty["reorder"] = (ty["reorder"] + ["|"] if "reorder" in ty else []) + m.group(2).split()
                 continue
             if not stmt.startswith("set "):
                 continue

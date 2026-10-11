@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 #[path = "style.rs"]
 mod style;
+#[path = "next_view.rs"]
+mod next_view;
 
 const RECORD: &str = "combat_record";
 const EDITOR: &str = "combat_emblem";
@@ -234,17 +236,22 @@ fn challenge_progress(state: i32, stage: usize, saved: i32, target: i32) -> (i32
     (if done { target.max(0) } else { saved.clamp(0, target.max(0)) }, done)
 }
 
-struct Rank {
-    name: String,
-    level: i32,
-    icon: String,
-    xp: i32,
-    min: i32,
-    next: Option<i32>,
+pub(in crate::ui) struct Rank {
+    pub name: String,
+    pub level: i32,
+    pub icon: String,
+    pub xp: i32,
+    pub min: i32,
+    pub next: Option<i32>,
 }
 
-fn rank(fe: &Frontend) -> Rank {
-    let xp = fe.stats.get(stat::RANKXP).max(0);
+pub(in crate::ui) fn rank(fe: &Frontend) -> Rank {
+    rank_at(fe, fe.stats.get(stat::RANKXP))
+}
+
+/// The rank for `xp` rank XP.
+pub(in crate::ui) fn rank_at(fe: &Frontend, xp: i32) -> Rank {
+    let xp = xp.max(0);
     let mut rank = Rank { name: "Private".into(), level: 1, icon: String::new(), xp, min: 0, next: None };
     if let Some(t) = fe.assets.table("mp/ranktable.csv") {
         let num = |r: usize, c: usize| t.get(r, c).and_then(|v| v.trim().parse::<i32>().ok());
@@ -420,7 +427,7 @@ impl Frontend {
             }
             _ => {}
         }
-        m
+        if crate::ui::modern::wanted(self) { next_view::restyle(m, false, tab) } else { m }
     }
 
     fn emblem_menu(&self) -> Menu {
@@ -460,7 +467,7 @@ impl Frontend {
                 &format!("combatColor {color}"),
             ));
         }
-        m
+        if crate::ui::modern::wanted(self) { next_view::restyle(m, true, 0) } else { m }
     }
 
     fn record_page(&self, count: usize, size: usize) -> usize {
@@ -604,6 +611,10 @@ impl Frontend {
 
     pub(in crate::ui) fn paint_combat_record(&self, om: &OpenMenu, pl: &Placement, ops: &mut Vec<Op>) {
         if om.name != RECORD && om.name != EDITOR {
+            return;
+        }
+        if om.menu.window.name == next_view::RECORD_VIEW || om.menu.window.name == next_view::EMBLEM_VIEW {
+            next_view::paint(self, om, pl, ops);
             return;
         }
         let mut p = Painter { fe: self, pl, ops };

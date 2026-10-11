@@ -172,6 +172,12 @@ fn height_size() -> vec2<f32> {
 
 // IW3's packing of a tangent-space vector's x and y (z = 1): normal maps use
 // alpha and green, lightmap directions the two halves' alpha.
+// Modern Warfare 2's: a unit normal's x and y in alpha and green.
+fn mw2_normal(x: f32, y: f32) -> vec3<f32> {
+    let xy = vec2(x, y) * 2.0 - 1.0;
+    return vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+}
+
 fn iw3_slope(x: f32, y: f32) -> vec3<f32> {
     return vec3(x * 4.08 - 2.08, y * 4.0645161 - 2.0645161, 1.0);
 }
@@ -205,13 +211,26 @@ fn lit_rolloff(colour: vec3<f32>, albedo: vec3<f32>, unit: f32) -> vec3<f32> {
     // The brightest channel's light, so the hue stays.
     let e = max(max(colour.r / a.r, colour.g / a.g), colour.b / a.b);
     let g = pow(max(e, 0.0), 1.0 / 2.2);
-    if (g <= LIT_KNEE) {
-        return colour;
+    var c = colour;
+    if (g > LIT_KNEE) {
+        let room = LIT_CEILING - LIT_KNEE;
+        let eased = LIT_KNEE + room * (1.0 - exp(-(g - LIT_KNEE) / room));
+        c = colour * pow(eased / g, 2.2);
     }
-    let room = LIT_CEILING - LIT_KNEE;
-    let eased = LIT_KNEE + room * (1.0 - exp(-(g - LIT_KNEE) / room));
-    return colour * pow(eased / g, 2.2);
+    // And what comes back off it: bright plaster in full sun (Broadcast's
+    // dappled walls) reached white on screen. The reflected light (light
+    // times the surface's own brightness, gamma space) eases off above
+    // `SHEEN_KNEE` towards `SHEEN_CEILING`; darker surfaces never get there.
+    let r = pow(max(max(max(c.r, c.g), c.b) / unit, 0.0), 1.0 / 2.2);
+    if (r > SHEEN_KNEE) {
+        let room = SHEEN_CEILING - SHEEN_KNEE;
+        let eased = SHEEN_KNEE + room * (1.0 - exp(-(r - SHEEN_KNEE) / room));
+        c = c * pow(eased / r, 2.2);
+    }
+    return c;
 }
+const SHEEN_KNEE: f32 = 0.7;
+const SHEEN_CEILING: f32 = 0.85;
 
 // Three octaves of the water texture, as `water_l_sun` sums them.
 fn water_octaves(p: vec2<f32>, t: f32) -> f32 {
@@ -242,7 +261,19 @@ fn water(in: VertexOutput) -> vec4<f32> {
     let hc = water_octaves(p, t);
     let hx = water_octaves(p + vec2(0.00390625, 0.0), t);
     let hy = water_octaves(p + vec2(0.0, 0.00390625), t);
-    let n = normalize(vec3(hx - hc, hy - hc, 1.0));
+    var n = normalize(vec3(hx - hc, hy - hc, 1.0));
+    // The showcase's rain (`crate::wet`'s tag): CoD4's sheets of water
+    // become shallow, muddy, rain-struck water: calm (no waves), rings
+    // from the drops, darker, reflecting more.
+    let tag = mesh[in.instance_index].tag;
+    let muddy = max(select(0.0, saturate(f32((tag >> 8u) & 0xffu) / 255.0 * 2.0), (tag & 0x10000u) != 0u), saturate(params.water_color.w - 1.0));
+    if (muddy > 0.0) {
+        // (Rings only where it rains: calm mud otherwise.)
+        let rain_now = select(0.0, saturate(f32((tag >> 8u) & 0xffu) / 255.0 * 2.0), (tag & 0x10000u) != 0u);
+        let g = rain_ripples(in.world_position.xz, t) * rain_now;
+        // (World x, z is CoD x, -y.)
+        n = normalize(vec3(n.xy * (1.0 - 0.85 * muddy) + vec2(g.x, -g.y) * 0.35 * muddy, 1.0));
+    }
     let r = v - 2.0 * dot(v, n) * n;
     var reflected = params.water_color.rgb * 2.0;
     if (params.probe.x > 0.5) {
@@ -250,8 +281,10 @@ fn water(in: VertexOutput) -> vec4<f32> {
         reflected = saturate(pr.rgb * pr.a * 4.0);
     }
     let env = params.water_env;
-    let fresnel = saturate(mix(env.x, env.y, pow(1.0 - abs(dot(v, n)), env.z)));
-    let base = params.water_color.rgb * n.z;
+    // (Muddy: the sky reflects dimmer off brown water under rain.)
+    reflected *= 1.0 - 0.45 * muddy;
+    let fresnel = saturate(mix(env.x, env.y, pow(1.0 - abs(dot(v, n)), env.z)) + 0.15 * muddy);
+    let base = params.water_color.rgb * n.z * (1.0 - 0.55 * muddy);
     var colour = mix(base, reflected, fresnel);
     let s = vec3(params.sun_dir.x, -params.sun_dir.z, params.sun_dir.y);
     let glint = pow(fresnel * max(dot(r, s) + 0.00075, 0.0), 64.0);
@@ -321,19 +354,51 @@ fn rain_ripples(p: vec2<f32>, t: f32) -> vec2<f32> {
     return g * 0.6;
 }
 
+// Snow lying on what faces up (the showcase's snowy maps, `crate::wet`):
+// tops and ledges whitened towards soft, rough snow, none under cover.
+// The mesh tag's bits 17-23 say how much lies.
+fn snow_surface(in: VertexOutput, pbr: ptr<function, PbrInput>) {
+    let tag = mesh[in.instance_index].tag;
+    let cover = f32((tag >> 17u) & 0x7fu) / 127.0;
+    if ((tag & 0x10000u) == 0u || cover <= 0.0) {
+        return;
+    }
+    let ng = normalize((*pbr).world_normal);
+    // Models (no lightmap) only on their flattest tops, alpha-tested
+    // foliage hardly at all: leaves face every way, and a tree went white.
+    let model = params.flags.z < 0.5;
+    var up = select(smoothstep(0.6, 0.9, ng.y), smoothstep(0.85, 0.98, ng.y), model);
+    let alpha_mode = (*pbr).material.flags & STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;
+    if (alpha_mode == STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK) {
+        up *= 0.3;
+    }
+    if (up <= 0.0) {
+        return;
+    }
+    let p = in.world_position.xyz;
+    // Drifts: patchy at the edge of the cover, never quite full.
+    let drift = smoothstep(0.25, 0.75, wet_noise(p.xz * 0.6) * 0.6 + wet_noise(p.xz * 2.3) * 0.4 + cover * 0.5 - 0.2);
+    let s = up * cover * drift * wet_exposure(p + ng * 0.6) * 0.85;
+    let snow = vec3(0.82, 0.85, 0.9);
+    (*pbr).material.base_color = vec4(mix((*pbr).material.base_color.rgb, snow, s), (*pbr).material.base_color.a);
+    (*pbr).material.perceptual_roughness = mix((*pbr).material.perceptual_roughness, 0.85, s);
+    (*pbr).material.reflectance = mix((*pbr).material.reflectance, vec3(0.3), s);
+    (*pbr).N = normalize(mix((*pbr).N, ng, s));
+}
+
 // Makes the surface wet; returns how much of a water film it has (0 dry).
 fn wet_surface(in: VertexOutput, pbr: ptr<function, PbrInput>) -> f32 {
     let tag = mesh[in.instance_index].tag;
     if ((tag & 0x10000u) == 0u) {
         return 0.0;
     }
-    // Opaque and alpha-tested surfaces only: glass and other blended ones
-    // stay as they are (a porthole's glass took the sky's and the screen's
-    // reflections as a flat, flickering colour).
+    // Blended surfaces: ground decals (mud, gravel, grass layers, most of
+    // Downpour's ground) get wet as the ground does; upright ones (glass,
+    // wall stains) only darken, without the water's reflections (a
+    // porthole's glass took the sky's and the screen's as a flat,
+    // flickering colour).
     let alpha_mode = (*pbr).material.flags & STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;
-    if (alpha_mode != STANDARD_MATERIAL_FLAGS_ALPHA_MODE_OPAQUE && alpha_mode != STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK) {
-        return 0.0;
-    }
+    let blended = alpha_mode != STANDARD_MATERIAL_FLAGS_ALPHA_MODE_OPAQUE && alpha_mode != STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK;
     let wetness = f32(tag & 0xffu) / 255.0;
     let rain = f32((tag >> 8u) & 0xffu) / 255.0;
     if (wetness <= 0.0) {
@@ -353,7 +418,7 @@ fn wet_surface(in: VertexOutput, pbr: ptr<function, PbrInput>) -> f32 {
     let porosity = smoothstep(0.3, 0.9, rough);
     // Puddles where the ground is flat, spreading as it gets wetter.
     let n = wet_noise(p.xz * 0.35) * 0.65 + wet_noise(p.xz * 1.3) * 0.35;
-    let puddle = up * smoothstep(0.98 - w * 0.5, 1.06 - w * 0.5, n + 0.25);
+    let puddle = up * smoothstep(0.98 - w * 0.62, 1.06 - w * 0.62, n + 0.25);
     // Water running down walls, in streaks.
     var streak = 0.0;
     if (vertical > 0.0 && rain > 0.0) {
@@ -361,10 +426,18 @@ fn wet_surface(in: VertexOutput, pbr: ptr<function, PbrInput>) -> f32 {
         let s = wet_noise(vec2(along, p.y * 0.8 + globals.time * 0.6 + wet_hash(vec2(floor(along), 3.0)) * 10.0));
         streak = vertical * smoothstep(0.55, 0.8, s) * rain * w;
     }
-    let soak = w * mix(0.25, 0.55, porosity) + streak * 0.15;
+    let soak = w * mix(0.3, 0.6, porosity) * mix(1.0, 1.15, up) + streak * 0.15;
     // Standing water hides the surface under it: mostly reflection there.
     let under_water = 1.0 - 0.65 * puddle;
     (*pbr).material.base_color = vec4((*pbr).material.base_color.rgb * (1.0 - soak) * under_water, (*pbr).material.base_color.a);
+    if (blended && up < 0.5) {
+        return 0.0;
+    }
+    // Alpha-tested cards (leaves, grass, bushes) darken but take no film:
+    // their up-facing cards caught the sky as a white frost on the trees.
+    if (alpha_mode == STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK) {
+        return 0.0;
+    }
     // The film: smoother, with water's reflectance (F0 0.02).
     let film = clamp(w * mix(0.5, 0.8, up) + streak * 0.5, 0.0, 1.0);
     let water = max(film, puddle);
@@ -444,7 +517,11 @@ fn screen_reflection(origin: vec3<f32>, r: vec3<f32>, roughness: f32, frag: vec2
                 let hit = mix(s_uv, e_uv, b);
                 let edge = min(min(hit.x, 1.0 - hit.x), min(hit.y, 1.0 - hit.y));
                 let fade = smoothstep(0.0, 0.08, edge) * (1.0 - smoothstep(0.7, 1.0, b)) * smooth_enough;
-                return vec4(sample_ssr_history(hit), fade);
+                // (A few taps round the hit: single samples sparkled as
+                // dots on rippled water.)
+                let px = 1.5 / size;
+                let c = (sample_ssr_history(hit) * 2.0 + sample_ssr_history(hit + vec2(px.x, 0.0)) + sample_ssr_history(hit - vec2(px.x, 0.0)) + sample_ssr_history(hit + vec2(0.0, px.y)) + sample_ssr_history(hit - vec2(0.0, px.y))) / 6.0;
+                return vec4(c, fade);
             }
         }
         lo = t;
@@ -482,12 +559,14 @@ fn relief_uv(v: VertexOutput) -> vec2<f32> {
     let t = normalize(v.world_tangent.xyz);
     let b = v.world_tangent.w * cross(n, t);
     let ts = vec3(dot(e, t), dot(e, b), dot(e, n));
-    if (ts.z < 0.08) {
+    // (Grazing views stretched the texture far along the surface: none
+    // below ~17 degrees, eased in to ~35.)
+    if (ts.z < 0.3) {
         return v.uv;
     }
     let layers = mix(24.0, 6.0, ts.z);
     let layer = 1.0 / layers;
-    let delta = RELIEF_DEPTH * fade * layer * vec2(-ts.x, ts.y) / ts.z;
+    let delta = RELIEF_DEPTH * fade * smoothstep(0.3, 0.6, ts.z) * layer * vec2(-ts.x, ts.y) / max(ts.z, 0.45);
     var uv = v.uv;
     var depth = 0.0;
     var surface = 1.0 - sample_height(uv, lod);
@@ -524,6 +603,9 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
         out.color = main_pass_post_lighting_processing(pbr_input, out.color);
         return out;
     }
+    // (Alpha-tested cards keep their cover at a distance: `world_prepass`'s
+    // `distant_cutoff`.)
+    pbr_input.material.alpha_cutoff *= mix(1.0, 0.45, smoothstep(8.0, 40.0, distance(in.world_position.xyz, view.world_position)));
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
 #ifdef VERTEX_UVS_A
     if (params.detail.z > 0.5) {
@@ -545,7 +627,7 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
 #ifdef VERTEX_TANGENTS
     if (params.flags.x > 0.5) {
         let s = sample_normal(in.uv);
-        n_t = normalize(iw3_slope(s.a, s.g));
+        n_t = select(normalize(iw3_slope(s.a, s.g)), mw2_normal(s.a, s.g), params.probe.w > 0.5);
         let n = pbr_input.world_normal;
         let t = normalize(in.world_tangent.xyz);
         let b = in.world_tangent.w * cross(n, t);
@@ -564,6 +646,7 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
 #endif
 
     // Showcase rain.
+    snow_surface(in, &pbr_input);
     let wet = wet_surface(in, &pbr_input);
     if (wet > 0.0) {
         probe_lod = min(probe_lod, pbr_input.material.perceptual_roughness * params.probe.y);
@@ -573,6 +656,14 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
     // bind groups the render thread rebuilt every frame) or, with it
     // (`LIGHTMAP`), through Bevy's lightmap path.
     var baked = vec3(0.0);
+    // Occlusion fades into the fog (Bog: dark corners showed through the
+    // haze of far buildings). CoD4's fog (`crate::fog`, "linear" mode).
+    if (bevy_pbr::mesh_view_bindings::fog.mode == 1u) {
+        let fog_d = length(in.world_position.xyz - view.world_position);
+        let fog_k = 1.0 - exp2(-max(fog_d - bevy_pbr::mesh_view_bindings::fog.be.x, 0.0) / max(bevy_pbr::mesh_view_bindings::fog.be.y, 1e-4));
+        pbr_input.diffuse_occlusion = mix(pbr_input.diffuse_occlusion, vec3(1.0), fog_k);
+        pbr_input.specular_occlusion = mix(pbr_input.specular_occlusion, 1.0, fog_k);
+    }
     let ao = pbr_input.diffuse_occlusion;
 #ifdef VERTEX_UVS_B
     if (params.flags.z > 0.5) {

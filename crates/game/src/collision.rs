@@ -40,6 +40,13 @@ pub mod contents {
 /// Surface flag of `mantle_over` sides: the climb carries on over the top.
 const SURF_MANTLE_OVER: i32 = 0x4000000;
 
+/// Surface flag of ladder sides (`clip_ladder`, MW2's `ladder`).
+const SURF_LADDER: i32 = 0x8;
+
+/// A ladder's brush: players facing it climb (see `movement`'s ladders).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Ladder;
+
 /// A mantle volume: players climb what it's on (see `movement::mantle`).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct MantleSurface {
@@ -168,7 +175,13 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
             }
             continue;
         }
-        let layer = if brush.contents & (contents::SOLID | contents::GLASS) != 0 {
+        // (MW2's window glass is its glass system's, `crate::glass`: the
+        // panes stop players until they break, and bullets break them.)
+        let mw2_glass = crate::mw2::active() && brush.contents & contents::GLASS != 0 && brush.contents & contents::SOLID == 0 && crate::mw2::pane_in(brush.mins, brush.maxs);
+        let layer = if mw2_glass {
+            skipped += 1;
+            continue;
+        } else if brush.contents & (contents::SOLID | contents::GLASS) != 0 {
             solid += 1;
             Layer::World
         } else if brush.contents & contents::PLAYERCLIP != 0 {
@@ -199,6 +212,10 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
         let e = commands
             .spawn((collider, Surfaces(surfaces), CollisionLayers::new(layer, LayerMask::NONE), Transform::default(), static_body()))
             .id();
+        let materials = brush.side_materials.iter().copied().chain(brush.axial_materials.iter().flatten().filter(|&&m| m >= 0).map(|&m| m as u32));
+        if materials.filter_map(|m| clip.materials.get(m as usize)).any(|m| m.surface_flags & SURF_LADDER != 0) {
+            commands.entity(e).insert(Ladder);
+        }
         let planes = brush_planes(clip, brush).into_iter().map(|(n, d)| (units::dir(n.to_array()), units::u(d))).collect();
         faces.0.insert(e, planes);
     }
@@ -220,12 +237,48 @@ pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
             .filter(|t| t.iter().all(|&i| (i as usize) < verts.len()))
             .map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
             .collect();
-        commands.spawn((
-            Collider::trimesh(verts, tris),
-            CollisionLayers::new(Layer::World, LayerMask::NONE),
-            Transform::default(),
-            static_body(),
-        ));
+        // MW2's maps: each triangle as its material's contents say (the
+        // collision trees' leaves name them), as brushes are. Trim and
+        // fittings there are bullet-only (a 727's door frame closed its
+        // doorway to anyone standing). CoD4's are all solid, as before.
+        if crate::mw2::active() {
+            let mut contents = vec![contents::SOLID; clip.tri_indices.len() / 3];
+            for node in clip.aabb_trees.iter().filter(|n| n.child_count == 0) {
+                let Some(p) = usize::try_from(node.index).ok().and_then(|p| clip.partitions.get(p)) else { continue };
+                let c = clip.materials.get(node.material_index as usize).map_or(contents::SOLID, |m| m.content_flags);
+                let f = p.first_tri.max(0) as usize;
+                for t in f..(f + p.tri_count as usize).min(contents.len()) {
+                    contents[t] = c;
+                }
+            }
+            let mut by_layer: [(Layer, Vec<[u32; 3]>); 3] = [(Layer::World, Vec::new()), (Layer::PlayerClip, Vec::new()), (Layer::ShotClip, Vec::new())];
+            for (i, t) in clip.tri_indices.chunks_exact(3).enumerate() {
+                if entity_tris.contains(&i) || !t.iter().all(|&v| (v as usize) < verts.len()) {
+                    continue;
+                }
+                let c = contents[i];
+                let k = if c & (contents::SOLID | contents::GLASS) != 0 {
+                    0
+                } else if c & contents::PLAYERCLIP != 0 {
+                    1
+                } else if c & contents::CLIPSHOT != 0 {
+                    2
+                } else {
+                    continue;
+                };
+                by_layer[k].1.push([t[0] as u32, t[1] as u32, t[2] as u32]);
+            }
+            for (layer, tris) in by_layer.into_iter().filter(|l| !l.1.is_empty()) {
+                commands.spawn((Collider::trimesh(verts.clone(), tris), CollisionLayers::new(layer, LayerMask::NONE), Transform::default(), static_body()));
+            }
+        } else {
+            commands.spawn((
+                Collider::trimesh(verts, tris),
+                CollisionLayers::new(Layer::World, LayerMask::NONE),
+                Transform::default(),
+                static_body(),
+            ));
+        }
     }
     info!("collision: {solid} solid brushes, {player_clip} player clip, {shot_clip} shot clip, {no_sight} sight-blocking, {skipped} other skipped");
 }
@@ -280,6 +333,10 @@ pub fn spawn_static_model_collision(commands: &mut Commands, zone: &iw3::zone::Z
         let rotation = Quat::from_mat3(&Mat3::from_cols(fx, fy, fz));
         for b in &model.coll_boxes {
             let Some((layer, surface)) = kind(if b.contents != 0 { b.contents } else { model.contents }) else { continue };
+            // The surface's own type (a canvas roof is cloth, which bullets
+            // go through: with "default" they stopped on it in a cloud of dust).
+            let typed = ((b.surf_flags >> 20) & 31) as usize;
+            let surface = SURFACE_NAMES.get(typed).copied().filter(|_| typed != 0).unwrap_or(surface);
             // The surface's triangles, as CoD4 traces them.
             if !b.tris.is_empty() {
                 let place = |v: [f32; 3]| units::pos((origin + axes[0] * v[0] + axes[1] * v[1] + axes[2] * v[2]).to_array());

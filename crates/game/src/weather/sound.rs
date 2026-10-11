@@ -59,7 +59,8 @@ fn bed(
     let open = map.as_ref().map_or(1.0, |m| m.openness(eye, 3.0));
     let k = 1.0 - (-time.delta_secs() / 0.6).exp();
     for mut b in &mut beds {
-        let target = storm.rain * if b.open { open } else { 1.0 - open };
+        // (A heavier storm is louder, `climate`'s downpour past 1.)
+        let target = storm.rain.min(1.6) * if b.open { open } else { 1.0 - open };
         b.level += (target - b.level) * k;
     }
     let effects = crate::settings_apply::volume(crate::settings_apply::Sound::Effects);

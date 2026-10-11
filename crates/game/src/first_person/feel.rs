@@ -164,7 +164,10 @@ fn update(time: Res<Time>, mut players: Query<(&Mover, &ViewAngles, &WeaponState
         if sway_on && !scoped {
             // The gun trails the turn: turned back against it, held back a
             // little off-centre, rolled into it. Heavier guns trail more.
-            let lag = (turn * 0.012 * m).clamp(Vec2::splat(-7.0), Vec2::splat(7.0));
+            // None at all aimed in: the sights stay on the camera (the user
+            // didn't want them dragging behind it).
+            let hip = (1.0 - ads).powi(2);
+            let lag = (turn * 0.012 * m * hip).clamp(Vec2::splat(-7.0), Vec2::splat(7.0));
             rot_target += Vec3::new(-lag.x, -lag.y, lag.y * 0.35);
             pos_target += Vec3::new(0.0, -lag.y * 0.12, lag.x * 0.1);
         }

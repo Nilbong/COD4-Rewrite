@@ -167,7 +167,7 @@ fn renumber(exp: &mut [Token], from: i32, to: i32) {
 }
 
 /// Make a row's value item a setting's.
-fn value_item(it: &mut Item, s: &Setting, index: i32) {
+pub(super) fn value_item(it: &mut Item, s: &Setting, index: i32) {
     it.dvar = settings::dvar_of(s).into();
     it.on_focus = format!("\"play\" \"mouse_over\" ; \"setLocalVarInt\" \"ui_highlight\" \"{index}\" ; \"setLocalVarString\" \"ui_choicegroup\" \"\"");
     it.action = "\"play\" \"mouse_click\"".into();
@@ -364,7 +364,11 @@ impl Frontend {
     /// A slider's bar, in screen x.
     fn slider_bar(&self, item: &Item, pl: &super::Placement) -> (f32, f32) {
         let r = self.item_rect(item);
-        let (pos, _) = pl.rect(&r);
+        let (pos, size) = pl.rect(&r);
+        // The new UI's rows: their own bar.
+        if let Some((a, b)) = super::next::settings::slider_span(item) {
+            return (pos.x + size.x * a, pos.x + size.x * b);
+        }
         let sx = pl.sx(r.horz_align);
         let start = pos.x + (item.text_align_x + BAR_AFTER) * sx;
         (start, start + BAR_LENGTH * sx)
@@ -374,6 +378,9 @@ impl Frontend {
     pub(super) fn paint_slider(&self, item: &Item, pl: &super::Placement, fore: [f32; 4], ops: &mut Vec<super::Op>) {
         let Some(s) = Self::setting_of(item) else { return };
         let Kind::Slider { min, max, .. } = s.kind else { return };
+        if super::next::settings::slider_span(item).is_some() {
+            return;
+        }
         let r = self.item_rect(item);
         let (pos, size) = pl.rect(&r);
         let (x0, x1) = self.slider_bar(item, pl);

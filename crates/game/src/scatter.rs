@@ -9,6 +9,10 @@
 //! - never within a few metres of a spawn, nothing taller than an ankle,
 //!   and no collision: nothing reads as cover or trips anyone.
 //!
+//! On Downpour (mp_farm) only puddles: in the dips of open ground, bigger
+//! and more of them, the ground round about giving them their edges (no
+//! ship's debris on a farm).
+//!
 //! Each kind of thing is one mesh and material, so the renderer instances
 //! them; tiny things stop drawing past 30 m.
 
@@ -68,17 +72,22 @@ const DEBRIS: &[(&str, u32, bool)] = &[
     ("com_clipboard_wpaper", 1, false),
 ];
 
+/// The level's models loading (none wanted: `Farm`).
 #[derive(Resource)]
-struct Loading(Option<JoinHandle<anyhow::Result<crate::wardrobe::load::Loaded>>>);
+enum Loading {
+    Ship(Option<JoinHandle<anyhow::Result<crate::wardrobe::load::Loaded>>>),
+    Farm,
+}
 
 #[derive(Component)]
 struct Puddle;
 
 fn start(mut commands: Commands, map: Res<crate::world::MapName>) {
-    if map.0 != "mp_cargoship" {
-        return;
+    match map.0.as_str() {
+        "mp_cargoship" => commands.insert_resource(Loading::Ship(Some(load(Source::zone(Game::Cod4, ZONE))))),
+        "mp_farm" => commands.insert_resource(Loading::Farm),
+        _ => {}
     }
-    commands.insert_resource(Loading(Some(load(Source::zone(Game::Cod4, ZONE)))));
 }
 
 /// Deterministic noise from a spot (so the same deck looks the same).
@@ -99,25 +108,29 @@ fn place(
     mut images: ResMut<Assets<Image>>,
 ) {
     let Some(mut loading) = loading else { return };
-    if !loading.0.as_ref().is_some_and(|h| h.is_finished()) {
-        return;
-    }
-    let handle = loading.0.take().expect("checked");
+    let handle = match &mut *loading {
+        Loading::Ship(h) if !h.as_ref().is_some_and(|h| h.is_finished()) => return,
+        Loading::Ship(h) => h.take(),
+        Loading::Farm => None,
+    };
     commands.remove_resource::<Loading>();
+    let farm = handle.is_none();
     let Some(map) = map else { return };
     let t0 = std::time::Instant::now();
-    let (zones, vfs) = match handle.join() {
-        Ok(Ok(z)) => z,
-        _ => {
+    let debris: Vec<(Vec<(Handle<StandardMaterial>, Handle<Mesh>)>, u32, bool)> = match handle.map(|h| h.join()) {
+        None => Vec::new(),
+        Some(Ok(Ok((zones, vfs)))) => {
+            let mut theirs = Content::new(zones, vfs.unwrap_or_else(|| content.vfs.clone()));
+            DEBRIS
+                .iter()
+                .filter_map(|&(name, n, tumble)| crate::props::static_parts(&mut theirs, name, &mut meshes, &mut materials, &mut images).map(|p| (p, n, tumble)))
+                .collect()
+        }
+        Some(_) => {
             warn!("scatter: {ZONE} didn't load");
             return;
         }
     };
-    let mut theirs = Content::new(zones, vfs.unwrap_or_else(|| content.vfs.clone()));
-    let debris: Vec<(Vec<(Handle<StandardMaterial>, Handle<Mesh>)>, u32, bool)> = DEBRIS
-        .iter()
-        .filter_map(|&(name, n, tumble)| crate::props::static_parts(&mut theirs, name, &mut meshes, &mut materials, &mut images).map(|p| (p, n, tumble)))
-        .collect();
     let quad = meshes.add(Plane3d::default().mesh().size(1.0, 1.0));
     let decal = |images: &mut Assets<Image>, materials: &mut Assets<StandardMaterial>, kind: Decal| {
         let image = images.add(decal_image(kind));
@@ -164,6 +177,8 @@ fn place(
     let root = commands.spawn((Name::new("scatter"), Transform::default(), Visibility::default())).id();
     let near = VisibilityRange { start_margin: 0.0..0.0, end_margin: 28.0..32.0, use_aabb: false };
     let mut counts = [0u32; 4];
+    // Farm puddles placed (one to a dip: overlapping ones would flicker).
+    let mut pools: Vec<Vec3> = Vec::new();
     let mut x = lo.x;
     while x < hi.x {
         let mut z = lo.z;
@@ -177,7 +192,7 @@ fn place(
             let floors: Vec<(Vec3, Vec3)> = spatial
                 .ray_hits(from, Dir3::NEG_Y, (hi.y - lo.y) + 30.0, 8, true, &filter)
                 .into_iter()
-                .filter(|h| h.normal.y >= 0.96)
+                .filter(|h| h.normal.y >= if farm { 0.9 } else { 0.96 })
                 .map(|h| (from - Vec3::Y * h.distance, h.normal))
                 .filter(|(g, _)| (walk.0..walk.1).contains(&g.y))
                 .filter(|(g, _)| spatial.cast_ray(*g + Vec3::Y * 0.1, Dir3::Y, 1.8, true, &filter).is_none())
@@ -215,6 +230,26 @@ fn place(
             let roll = hash(at, 3);
             let up = Quat::from_rotation_arc(Vec3::Y, normal);
             let spin = Quat::from_rotation_y(hash(at, 4) * std::f32::consts::TAU);
+            if farm {
+                // A dip in open ground: higher all round, a metre or so off.
+                if covered || roll > 0.35 {
+                    continue;
+                }
+                let rim = (0..6).all(|k| {
+                    let a = k as f32 * std::f32::consts::TAU / 6.0 + hash(at, 14);
+                    let p = ground + Vec3::new(a.cos(), 0.0, a.sin()) * 1.1 + Vec3::Y * 1.0;
+                    spatial.cast_ray(p, Dir3::NEG_Y, 1.5, true, &filter).is_some_and(|h| (1.0 - h.distance) > 0.02)
+                });
+                if !rim || pools.iter().any(|p| p.distance(ground) < 2.2) {
+                    continue;
+                }
+                pools.push(ground);
+                let size = 1.2 + hash(at, 8) * 1.8;
+                let tf = Transform::from_translation(ground + Vec3::Y * 0.012).with_rotation(up * spin).with_scale(Vec3::new(size, 1.0, size * (0.6 + 0.4 * hash(at, 9))));
+                commands.spawn((Puddle, Mesh3d(quad.clone()), MeshMaterial3d(puddle_mat.clone()), tf, NotShadowCaster, ChildOf(root)));
+                counts[2] += 1;
+                continue;
+            }
             if corner && roll < 0.25 && !debris.is_empty() {
                 if !room(ground, 0.3) {
                     continue;

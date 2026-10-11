@@ -33,8 +33,12 @@ pub struct MapProp {
 
 /// Is this map entity a prop that's always there?
 fn is_prop(e: &iw3::ents::Entity) -> bool {
+    // (Not `misc_turret`: CoD4's multiplayer zones don't ship the mounted
+    // guns' models, Downpour's two SAWs included; the game deletes them.)
     e.classname() == "script_model"
-        && e.get("model").is_some_and(|m| !m.is_empty() && !m.starts_with('*'))
+        // (`fx` is the editor's marker for an effect's origin, which the
+        // single-player levels leave in as `script_model`s.)
+        && e.get("model").is_some_and(|m| !m.is_empty() && !m.starts_with('*') && m != "fx")
         && e.get("script_gameobjectname").is_none()
         && !matches!(e.get("targetname"), Some("oldschool_pickup" | "exploder"))
 }
@@ -85,7 +89,7 @@ fn spawn_props(
     for ((material, _), parts) in batches {
         match crate::world::merge_meshes(&parts, &meshes) {
             Some(mesh) => {
-                commands.spawn((Name::new("map props batch"), Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), Transform::default(), ChildOf(root)));
+                commands.spawn((Name::new("map props batch"), Mesh3d(crate::mesh_bounds::add(&mut meshes, mesh)), MeshMaterial3d(material), Transform::default(), ChildOf(root)));
                 draws += 1;
             }
             // Meshes already handed to the renderer (shared with the static

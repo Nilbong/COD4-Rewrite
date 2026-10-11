@@ -9,7 +9,8 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(crate::state::GameState::InGame), setup_hud.in_set(crate::state::Setup::Spawn))
+        app.add_systems(Startup, load_hint_font)
+            .add_systems(OnEnter(crate::state::GameState::InGame), setup_hud.in_set(crate::state::Setup::Spawn))
             .add_systems(Update, (update_hint, update_mantle_hint, update_cover_hint).run_if(crate::state::in_game));
     }
 }
@@ -25,10 +26,26 @@ struct MantleHint;
 #[derive(Component)]
 struct CoverHint;
 
+/// The menus' typeface (Bahnschrift) for the hints, made before the match
+/// starts; Bevy's own font where the PC lacks it.
+fn load_hint_font(mut fonts: ResMut<Assets<Font>>) {
+    if HINT_FONT.get().is_none()
+        && let Some(bytes) = crate::ui::next::font::face_bytes()
+    {
+        HINT_FONT.set(fonts.add(Font::from_bytes(bytes.to_vec()))).ok();
+        debug!("hud: hints in Bahnschrift");
+    }
+}
+
+static HINT_FONT: std::sync::OnceLock<Handle<Font>> = std::sync::OnceLock::new();
+
 fn text(s: &str, size: f32) -> (Text, TextFont, TextColor, TextShadow) {
     (
         Text::new(s),
-        TextFont { font_size: FontSize::Px(size), ..default() },
+        match HINT_FONT.get() {
+            Some(font) => TextFont { font: bevy::text::FontSource::Handle(font.clone()), font_size: FontSize::Px(size), ..default() },
+            None => TextFont { font_size: FontSize::Px(size), ..default() },
+        },
         TextColor(Color::WHITE),
         TextShadow::default(),
     )

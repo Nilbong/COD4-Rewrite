@@ -31,6 +31,21 @@ pub(in crate::ui) fn picture(name: &str) -> Option<&'static [u8]> {
     match name {
         ELEMENTS => Some(include_bytes!("../../../assets/ui/hud/hud-elements.png")),
         GLYPHS => Some(include_bytes!("../../../assets/ui/hud/hud-numeric-glyphs.png")),
+        // The user's kill streak icons (white on clear, 256 square).
+        "ks:uav" => Some(include_bytes!("../../../assets/ui/killstreaks/uav.png")),
+        "ks:airstrike" => Some(include_bytes!("../../../assets/ui/killstreaks/airstrike.png")),
+        "ks:helicopter" => Some(include_bytes!("../../../assets/ui/killstreaks/helicopter.png")),
+        "ks:care_package" => Some(include_bytes!("../../../assets/ui/killstreaks/care_package.png")),
+        "ks:sentry_gun" => Some(include_bytes!("../../../assets/ui/killstreaks/sentry_gun.png")),
+        // The user's grenade and equipment icons.
+        "oh:frag" => Some(include_bytes!("../../../assets/ui/offhand/frag.png")),
+        "oh:flash" => Some(include_bytes!("../../../assets/ui/offhand/flash.png")),
+        "oh:stun" => Some(include_bytes!("../../../assets/ui/offhand/stun.png")),
+        "oh:smoke" => Some(include_bytes!("../../../assets/ui/offhand/smoke.png")),
+        "oh:claymore" => Some(include_bytes!("../../../assets/ui/offhand/claymore.png")),
+        "oh:c4" => Some(include_bytes!("../../../assets/ui/offhand/c4.png")),
+        "oh:rpg" => Some(include_bytes!("../../../assets/ui/offhand/rpg.png")),
+        "oh:gl" => Some(include_bytes!("../../../assets/ui/offhand/gl.png")),
         _ => None,
     }
 }
@@ -268,15 +283,7 @@ pub(super) fn ammo(p: &mut Painter, w: &WeaponState, name: &str, grenades: &[(&'
     }
 }
 
-// --- crosshair and hit marker
-
-/// The art's crosshair, spread with the weapon's spread (`out` from the
-/// centre to the ticks, virtual units).
-pub(super) fn crosshair(p: &mut Painter, out: f32, color: [f32; 4]) {
-    // The ticks sit at the sprite's edges: its half size is how far out.
-    let size = (out + 4.0) * 2.0;
-    sprite(p, "crosshair", vr(-size * 0.5, -size * 0.5, size, size, 2, 2), color, 0.0, 1);
-}
+// --- hit marker
 
 pub(super) fn hit_marker(p: &mut Painter, alpha: f32) {
     let size = 26.0;

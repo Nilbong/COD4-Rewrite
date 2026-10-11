@@ -348,6 +348,66 @@ pub fn waw_aliases(
     out
 }
 
+/// Modern Warfare 2's aliases `names` (and the layers they name) from its
+/// zones as the game's, under [`crate::mw2guns::sound_alias`] names. Its
+/// loaded sounds are plain PCM, made WAV files here; a zone may only refer
+/// to one another zone holds (`,name`), so each is looked up in every zone
+/// given. Falloff curves are looked up by name across the zones too.
+pub fn mw2_aliases(
+    zones: &[iw4::zone::Zone],
+    channels: Option<&[iw4::sound::Channel]>,
+    names: &std::collections::HashSet<String>,
+) -> Vec<(String, Vec<Variant>)> {
+    use iw4::sound::SoundFile as F;
+    let all: Vec<iw4::sound::Alias> = zones.iter().flat_map(|z| iw4::sound::aliases(z, channels)).collect();
+    let curves: HashMap<String, Vec<[f32; 2]>> = zones.iter().flat_map(iw4::sound::curves).map(|(n, c)| (n.to_ascii_lowercase(), c.knots)).filter(|(_, k)| !k.is_empty()).collect();
+    let by_name: HashMap<String, &iw4::sound::Alias> = all.iter().map(|a| (a.name.to_ascii_lowercase(), a)).collect();
+    let loaded: HashMap<String, &iw4::sound::LoadedSound> = all
+        .iter()
+        .flat_map(|a| &a.variants)
+        .filter_map(|v| match &v.file {
+            F::Loaded { name, sound: Some(s) } => Some((name.to_ascii_lowercase(), s)),
+            _ => None,
+        })
+        .collect();
+    let mut wanted: Vec<String> = names.iter().map(|n| n.to_ascii_lowercase()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    while let Some(name) = wanted.pop() {
+        let Some(alias) = by_name.get(&name).filter(|_| seen.insert(name.clone())) else { continue };
+        let variants = alias
+            .variants
+            .iter()
+            .filter_map(|v| {
+                let sound = match &v.file {
+                    F::Loaded { sound: Some(s), .. } => s,
+                    F::Loaded { name, sound: None } => *loaded.get(&name.to_ascii_lowercase())?,
+                    // (No gun sound is streamed.)
+                    F::Streamed(_) => return None,
+                };
+                let wav = iw4::sound::decode(sound).map_err(|e| warn!("audio: MW2 sound {name}: {e:#}")).ok()?;
+                let secondary = v.secondary.as_ref().map(|s| s.to_ascii_lowercase()).filter(|s| !s.is_empty());
+                wanted.extend(secondary.clone());
+                Some(Variant {
+                    file: SoundFile::Loaded(wav.into()),
+                    volume: v.volume,
+                    pitch: v.pitch,
+                    dist: v.dist,
+                    probability: v.probability,
+                    looping: v.looping,
+                    two_d: !v.spatial,
+                    curve: v.curve.as_ref().and_then(|c| curves.get(&c.to_ascii_lowercase())).cloned().unwrap_or_default(),
+                    secondary: secondary.map(|s| crate::mw2guns::sound_alias(&s)),
+                    master: false,
+                    slave: None,
+                })
+            })
+            .collect();
+        out.push((crate::mw2guns::sound_alias(&name), variants));
+    }
+    out
+}
+
 /// Pick a variation by probability.
 pub fn pick(variants: &[Variant]) -> Option<&Variant> {
     let total: f32 = variants.iter().map(|v| v.probability.max(0.0)).sum();

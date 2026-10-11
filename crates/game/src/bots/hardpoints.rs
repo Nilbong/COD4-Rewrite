@@ -1,5 +1,8 @@
-//! Bots and kill streaks: a UAV or helicopter called in once they're out of
-//! a fight, an airstrike on where they know enemies are bunched up; and
+//! Bots and kill streaks: a UAV, helicopter, care package or sentry gun
+//! called in once they're out of a fight (the sentry planted in front of
+//! them, the care package's crate opened once it's down:
+//! [`crate::killstreaks::carepackage`] sends them to it), an airstrike on
+//! where they know enemies are bunched up; and
 //! while their team's UAV is up, knowing where every enemy was at each
 //! sweep, as players see them on the compass.
 
@@ -7,6 +10,7 @@ use super::perception;
 use super::Bot;
 use crate::combat::{Dead, Pawn};
 use crate::killstreaks::uav::Radar;
+use crate::killstreaks::carepackage::UseCrate;
 use crate::killstreaks::{Hardpoint, HardpointInput, Killstreak};
 use crate::units::u;
 use bevy::prelude::*;
@@ -22,9 +26,10 @@ const WAIT_FOR_TWO: f32 = 15.0;
 
 #[allow(clippy::type_complexity)]
 pub(super) fn hardpoints(
+    mut commands: Commands,
     time: Res<Time>,
     radar: Option<Res<Radar>>,
-    mut bots: Query<(Entity, &mut Bot, &Pawn, &Transform, &Killstreak, &mut HardpointInput), Without<Dead>>,
+    mut bots: Query<(Entity, &mut Bot, &Pawn, &Transform, &Killstreak, &mut HardpointInput, Option<&mut UseCrate>), Without<Dead>>,
     pawns: Query<(Entity, &Pawn, &Transform, Option<&crate::loadout::Loadout>), Without<Dead>>,
     mut swept: Local<HashMap<Entity, (u32, f32)>>,
     mut ready: Local<HashMap<Entity, f32>>,
@@ -38,7 +43,20 @@ pub(super) fn hardpoints(
         .map(|(e, p, tf, _)| (e, p.clone(), tf.translation))
         .collect();
     let sim = std::env::var_os("COD4RW_SIM").is_some();
-    for (me, mut bot, pawn, tf, streak, mut input) in &mut bots {
+    for (me, mut bot, pawn, tf, streak, mut input, use_crate) in &mut bots {
+        // At a crate it's after, and calm: hold Use on it.
+        let calm = !bot.know.contacts.values().any(|c| c.noticed());
+        let at_crate = calm && crate::killstreaks::carepackage::bot_goal(me).is_some_and(|p| (p - tf.translation).with_y(0.0).length() < u(70.0));
+        match use_crate {
+            Some(mut c) => {
+                if c.0 != at_crate {
+                    c.0 = at_crate;
+                }
+            }
+            None => {
+                commands.entity(me).insert(UseCrate(at_crate));
+            }
+        }
         // A new sweep of a UAV this bot sees (its team's; its own in
         // free-for-all).
         let sweep = radar.as_ref().and_then(|r| r.sweep_for(pawn.team, me, now));
@@ -54,7 +72,7 @@ pub(super) fn hardpoints(
                 }
             }
         }
-        let Some(item) = streak.held else {
+        let Some(item) = streak.held.best() else {
             *input = HardpointInput::default();
             ready.remove(&me);
             continue;
@@ -74,6 +92,7 @@ pub(super) fn hardpoints(
             continue;
         }
         input.target = None;
+        input.item = Some(item);
         if item == Hardpoint::Airstrike {
             input.target = airstrike_target(&bot, tf.translation, now, now - at > WAIT_FOR_TWO);
         }

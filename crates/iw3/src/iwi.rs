@@ -1,14 +1,17 @@
-//! `.iwi` textures (CoD4 uses version 6, Black Ops version 13).
+//! `.iwi` textures (CoD4 uses version 6, Modern Warfare 2 version 8, Black
+//! Ops version 13).
 //!
 //! Layout: `"IWi"`, version, format, flags, width, height, depth (u16 each),
 //! four u32 file offsets, then mip levels stored smallest first. Black Ops
-//! adds a float after the depth and has eight offsets.
+//! adds a float after the depth and has eight offsets. Modern Warfare 2
+//! widens the flags to a u32 before the format (and a spare byte after it).
 
 pub const HEADER_SIZE_T5: usize = 48;
 
 use anyhow::{Result, bail};
 
 pub const HEADER_SIZE: usize = 28;
+pub const HEADER_SIZE_IW4: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -66,6 +69,24 @@ pub const FLAG_CUBEMAP: u8 = 0x04;
 pub const FLAG_VOLMAP: u8 = 0x08;
 pub const FLAG_NORMALMAP: u8 = 0x20;
 
+/// MW2's (u32) image flags as CoD4's: no mip maps 0x2, cube 0x10000,
+/// volume 0x20000, normal map 0x40000.
+fn iw4_flags(f: u32) -> u8 {
+    let mut out = 0;
+    if f & 0x2 != 0 {
+        out |= 0x02;
+    }
+    match f & 0x30000 {
+        0x10000 => out |= FLAG_CUBEMAP,
+        0x20000 => out |= FLAG_VOLMAP,
+        _ => {}
+    }
+    if f & 0x40000 != 0 {
+        out |= FLAG_NORMALMAP;
+    }
+    out
+}
+
 #[derive(Debug)]
 pub struct Iwi {
     pub format: Format,
@@ -87,15 +108,17 @@ impl Iwi {
             bail!("not an iwi file");
         }
         let version = data[3];
-        let header = match version {
-            6 => HEADER_SIZE,
-            13 if data.len() >= HEADER_SIZE_T5 => HEADER_SIZE_T5,
-            _ => bail!("unsupported iwi version {version} (CoD4 uses 6, Black Ops 13)"),
+        // Where the format, flags and dimensions are, and the header's size.
+        let (header, format_at, flags, dims_at) = match version {
+            6 => (HEADER_SIZE, 4, data[5], 6),
+            8 if data.len() >= HEADER_SIZE_IW4 => (HEADER_SIZE_IW4, 8, iw4_flags(u32::from_le_bytes([data[4], data[5], data[6], data[7]])), 10),
+            13 if data.len() >= HEADER_SIZE_T5 => (HEADER_SIZE_T5, 4, data[5], 6),
+            _ => bail!("unsupported iwi version {version} (CoD4 uses 6, MW2 8, Black Ops 13)"),
         };
-        let flags = data[5];
+        let format_byte = data[format_at];
         let rd16 = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]) as u32;
-        let (width, height, depth) = (rd16(6), rd16(8), rd16(10).max(1));
-        if let Some(wf) = crate::wavelet::WaveletFormat::from_u8(data[4]) {
+        let (width, height, depth) = (rd16(dims_at), rd16(dims_at + 2), rd16(dims_at + 4).max(1));
+        if let Some(wf) = crate::wavelet::WaveletFormat::from_u8(format_byte) {
             if flags & FLAG_CUBEMAP != 0 || depth > 1 {
                 bail!("wavelet cube and volume textures are unsupported");
             }
@@ -104,8 +127,8 @@ impl Iwi {
             };
             return Ok(Iwi { format: Format::Rgba8, flags, width, height, depth, levels });
         }
-        let Some(format) = Format::from_u8(data[4]) else {
-            bail!("unsupported iwi format {:#x}", data[4]);
+        let Some(format) = Format::from_u8(format_byte) else {
+            bail!("unsupported iwi format {format_byte:#x}");
         };
         let faces = if flags & FLAG_CUBEMAP != 0 { 6 } else { 1 };
 

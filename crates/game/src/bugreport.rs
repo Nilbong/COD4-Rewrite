@@ -162,6 +162,12 @@ fn start(
 
     // What was going on, for whoever reads the report.
     let mut c = format!("Map: {map}\nGame time: {:.1} s\n", time.elapsed_secs());
+    // Which game this is (its file, when it was built) and the game type:
+    // what a report was made with.
+    if let Ok(exe) = std::env::current_exe() {
+        let built = std::fs::metadata(&exe).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        c += &format!("Game: {} (file modified at unix time {built}, version {})\nGame type: {}\n", exe.display(), env!("CARGO_PKG_VERSION"), crate::modes::current().name());
+    }
     if let Some(s) = state.as_deref() {
         let left = s.time_left(time.elapsed_secs());
         c += &format!(

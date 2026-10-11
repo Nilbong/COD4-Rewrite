@@ -402,6 +402,9 @@ pub fn setting(key: &str) -> bool {
             | "COD4RW_TOD"
             | "COD4RW_TOD_SPEED"
             | "COD4RW_RAIN"
+            | "COD4RW_TESTFEATURES"
+            | "COD4RW_TARGETS"
+            | "COD4RW_PHOTO"
     ) || key.starts_with("COD4RW_FP_")
 }
 

@@ -46,6 +46,15 @@ impl Plugin for SkyPlugin {
 
 /// Cube map face size: the sun's disc is a few texels across.
 const SIZE: u32 = 1024;
+/// The showcase's storm sky: smaller, but redrawn whole every frame at half
+/// the steps so drifting clouds move smoothly (strips redrawn in turn moved
+/// in steps, like low fps). ~0.4 ms.
+const STORM_SIZE: u32 = 384;
+
+/// The cube map's size for this map.
+fn size() -> u32 {
+    if super::climate::showcase() { STORM_SIZE } else { SIZE }
+}
 /// A face is redrawn in this many strips, one a frame (96 frames for the
 /// whole sky: clouds drift a few metres in that time).
 const STRIPS: u32 = 16;
@@ -89,17 +98,36 @@ struct SkyParams {
     cloud_extra: f32,
     time: f32,
     bolt_seed: f32,
+    /// Live look knobs (`crate::tune`): x storm-cloud contrast, y lightning
+    /// glow in the clouds, z rain shafts.
+    look: Vec4,
+    /// The map's night sky (`climate::MapLook`): x stars, y zenith
+    /// darkening, z warm city glow at the horizon (0: the classic sky's).
+    night_look: Vec4,
 }
 
 /// How cloudy each map is (cover 0..1, how dark the undersides): CoD4's
 /// skies for them, overcast or clear. `None`: guessed from the skybox.
 fn cloud_cover(map: &str) -> Option<(f32, f32)> {
+    // MW2's maps (`mw2_<zone>`) by their own skies: mostly clear days.
+    if let Some(zone) = map.strip_prefix("mw2_") {
+        return Some(match zone {
+            "mp_derail" | "mp_compact" | "mp_brecourt" => (0.85, 0.5),
+            "mp_underpass" | "mp_storm" | "mp_invasion" => (0.9, 0.6),
+            "mp_subbase" | "mp_nightshift" | "mp_abandon" | "mp_vacant" => (0.45, 0.4),
+            "mp_highrise" | "mp_rust" | "mp_complex" | "mp_overgrown" | "mp_checkpoint" => (0.3, 0.15),
+            _ => (0.2, 0.1),
+        });
+    }
     Some(match map {
         "mp_crash" | "mp_crash_snow" => (0.72, 0.85),
-        "mp_overgrown" => (0.72, 0.7),
-        "mp_bloc" | "mp_farm" | "mp_cargoship" => (0.85, 0.6),
+        // Overcast decks: near full (at ~0.7 the noise's thresholds made a
+        // web of thin bright cracks, the sky behind showing through).
+        "mp_overgrown" | "mp_pipeline" | "mp_shipment" => (0.92, 0.6),
+        "mp_bloc" | "mp_farm" | "mp_cargoship" => (0.92, 0.6),
         "mp_backlot" | "mp_strike" | "mp_citystreets" | "mp_convoy" | "mp_showdown" => (0.3, 0.0),
-        "mp_bog" => (0.55, 0.4),
+        // Bog's dusk sky is mostly clear haze with a few soft banks.
+        "mp_bog" => (0.25, 0.8),
         // Night maps: broken cloud, so their night sky shows between.
         "mp_carentan" | "mp_vacant" => (0.45, 0.5),
         _ => return None,
@@ -109,7 +137,7 @@ fn cloud_cover(map: &str) -> Option<(f32, f32)> {
 /// Whether the dynamic sky is chosen.
 fn dynamic(settings: &crate::settings::Settings) -> bool {
     // (The showcase's day and night need ours.)
-    super::climate::showcase() || setting(settings, "r_sky", "COD4RW_SKY") == "dynamic"
+    super::climate::profile().is_some_and(|p| p.physical_sky) || setting(settings, "r_sky", "COD4RW_SKY") == "dynamic"
 }
 
 fn create(mut commands: Commands, classic: Option<Res<crate::world::MapSky>>, sky: Option<Res<DynamicSky>>, mut images: ResMut<Assets<Image>>) {
@@ -118,7 +146,7 @@ fn create(mut commands: Commands, classic: Option<Res<crate::world::MapSky>>, sk
         return;
     }
     let mut image = Image::new_fill(
-        Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 6 },
+        Extent3d { width: size(), height: size(), depth_or_array_layers: 6 },
         TextureDimension::D2,
         &[0; 8],
         TextureFormat::Rgba16Float,
@@ -133,7 +161,7 @@ fn create(mut commands: Commands, classic: Option<Res<crate::world::MapSky>>, sk
         params: SkyParams::default(),
         on: false,
         faces: 6,
-        rows: SIZE,
+        rows: size(),
         frames: 0,
     });
 }
@@ -201,6 +229,7 @@ fn update(
     tod: Res<super::climate::TimeOfDay>,
     weather: Res<super::climate::Weather>,
     mut bolts: Local<u32>,
+    mut cycle: Local<(u32, f32)>,
 ) {
     let Some(sky) = sky.as_mut() else { return };
     let on = dynamic(&settings);
@@ -221,15 +250,30 @@ fn update(
     let scale = skybox.brightness * exposure.copied().unwrap_or_default().exposure();
     let (horizon, has_fog) = super::map_fog(fog.as_deref()).map_or((Vec3::ZERO, 0.0), |(c, _)| (c / scale.max(1e-6), 1.0));
     // The showcase's horizon is the clock's (the fog's, the ocean's).
-    let (horizon, has_fog) = if tod.enabled { (tod.horizon / scale.max(1e-6), 1.0) } else { (horizon, has_fog) };
+    let clocked = super::climate::profile().is_some_and(|p| p.clock);
+    let (horizon, has_fog) = if tod.enabled && clocked { (tod.horizon / scale.max(1e-6), 1.0) } else { (horizon, has_fog) };
     let (mut coverage, mut darkness) = map.as_ref().and_then(|m| cloud_cover(&m.0)).unwrap_or((-1.0, 0.3));
+    // (Per map, live: `sky.cover.<map>`; the map's look first.)
+    let look_cover = super::climate::look().map(|l| l.cloud_cover);
+    if let Some(c) = look_cover.or((coverage >= 0.0).then_some(coverage)) {
+        coverage = super::climate::look_knob("sky.cover", |_| c, c);
+    }
+    let night_look = super::climate::look().map_or([0.0; 3], |l| l.night_sky);
+    let night_look = Vec4::new(
+        super::climate::look_knob("sky.stars", |_| night_look[0], night_look[0]),
+        super::climate::look_knob("sky.night_dark", |_| night_look[1], night_look[1]),
+        super::climate::look_knob("sky.city_glow", |_| night_look[2], night_look[2]),
+        0.0,
+    );
     // The showcase: the clock's sun and moon light the sky and clouds, the
     // weather sets the cover; storms tower and darken; lightning flashes.
     let showcase = tod.enabled;
     let storm = if weather.enabled { (weather.rain / 0.8).clamp(0.0, 1.0) } else { 0.0 };
     if weather.enabled {
         coverage = weather.cloud_cover;
-        darkness = darkness.max(0.3 + 0.6 * storm);
+        // (Heavier, darker undersides the more severe the storm.)
+        let severity = super::climate::profile().map_or(1.0, |p| p.severity);
+        darkness = darkness.max((0.3 + 0.6 * storm * severity).min(crate::tune::get("sky.storm_darkness", 0.85)));
     }
     let (key_dir, key_color) = if !showcase {
         (-sun_tf.forward().as_vec3(), sun_color / sun_color.max_element().max(1e-3))
@@ -247,23 +291,32 @@ fn update(
     // Clouds drift at ~5 m/s.
     // (Faster in the showcase's storm wind.)
     let speed = if weather.enabled { 5.0 + weather.wind.length() } else { 5.0 };
-    let drift = time.elapsed_secs() * speed;
-    let slice = sky.frames % (6 * STRIPS);
+    // Every strip of a redraw cycle takes the same moment (strips drawn at
+    // different moments tore against each other: clouds jumping side to
+    // side); in a fast storm wind the cycle is shorter (more strips a frame).
+    let strips = if speed > 12.0 { (crate::tune::get("sky.storm_strips", 4.0) as u32).clamp(1, STRIPS) } else { STRIPS };
+    let slice = sky.frames % (6 * strips);
+    if slice == 0 || cycle.0 != strips {
+        *cycle = (strips, time.elapsed_secs() * speed);
+    }
+    let drift = cycle.1;
     // A lightning flash is quick: the whole sky every frame while it lasts
     // (and the frame after, to clear it).
     let flashing = flash > 0.0 || sky.params.flash > 0.0;
     // (A flash redraws the face the bolt is on, whole, each frame.)
     let bolt = weather.lightning.map_or(Vec3::Y, |l| l.dir);
-    let (faces, rows, face_base, row_base) = if sky.frames == 0 {
-        (6, SIZE, 0, 0)
+    let smooth = super::climate::showcase();
+    let drift = if smooth { time.elapsed_secs() * speed } else { drift };
+    let (faces, rows, face_base, row_base) = if sky.frames == 0 || smooth {
+        (6, size(), 0, 0)
     } else if flashing {
         // (All of it, at half the steps: a flash lights the clouds every
         // way, and one face alone left a hard-edged square in the sky.)
         // Half the faces a frame (a flash is ~0.6 s: 2 frames behind is unseen).
         let _ = bolt;
-        (3, SIZE, (sky.frames % 2) * 3, 0)
+        (3, size(), (sky.frames % 2) * 3, 0)
     } else {
-        (1, SIZE / STRIPS, slice / STRIPS, slice % STRIPS * SIZE / STRIPS)
+        (1, SIZE / strips, slice / strips, slice % strips * SIZE / strips)
     };
     sky.faces = faces;
     sky.rows = rows;
@@ -284,11 +337,13 @@ fn update(
         bolt_dir: weather.lightning.map_or(Vec3::Y, |l| l.dir),
         flash,
         key_dir,
-        physical: if showcase { 1.0 } else { 0.0 },
+        physical: if showcase && super::climate::profile().is_some_and(|p| p.physical_sky) { 1.0 } else { 0.0 },
         key_color,
         cloud_extra: 3400.0 * storm,
         time: time.elapsed_secs(),
         bolt_seed: *bolts as f32,
+        night_look,
+        look: Vec4::new(crate::tune::get("sky.storm_contrast", 1.0), crate::tune::get("sky.flash_glow", 1.0), crate::tune::get("sky.rain_shafts", 1.0), if smooth { 1.0 } else { 0.0 }),
     };
     sky.frames += 1;
 }
@@ -337,6 +392,7 @@ struct SkyBindGroup {
     group: BindGroup,
     faces: u32,
     rows: u32,
+    size: u32,
 }
 
 fn init_pipeline(mut commands: Commands, asset_server: Res<AssetServer>, pipeline_cache: Res<PipelineCache>, device: Res<RenderDevice>) {
@@ -396,7 +452,7 @@ fn prepare(
         &pipeline_cache.get_bind_group_layout(&pipeline.layout),
         &BindGroupEntries::sequential((&uniform, &classic.texture_view, &pipeline.sampler, out_view, &noise.texture_view, &noise.sampler)),
     );
-    commands.insert_resource(SkyBindGroup { group, faces: sky.faces, rows: sky.rows });
+    commands.insert_resource(SkyBindGroup { group, faces: sky.faces, rows: sky.rows, size: out.texture.width() });
 }
 
 fn draw(mut ctx: RenderContext, group: Option<Res<SkyBindGroup>>, pipeline: Res<SkyPipeline>, pipeline_cache: Res<PipelineCache>) {
@@ -410,7 +466,7 @@ fn draw(mut ctx: RenderContext, group: Option<Res<SkyBindGroup>>, pipeline: Res<
         let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor { label: Some("dynamic_sky"), timestamp_writes: None });
         pass.set_pipeline(compute);
         pass.set_bind_group(0, &group.group, &[]);
-        pass.dispatch_workgroups(SIZE.div_ceil(8), group.rows.div_ceil(8), group.faces);
+        pass.dispatch_workgroups(group.size.div_ceil(8), group.rows.div_ceil(8), group.faces);
     }
     span.end(ctx.command_encoder());
 }

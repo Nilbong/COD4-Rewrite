@@ -39,12 +39,83 @@ impl TextureCache {
 impl TextureCache {
     /// Load `images/<name>.iwi` as a cube map (sRGB colour), e.g. a sky.
     pub fn get_cube(&mut self, name: &str, vfs: &Vfs, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+        self.get_cube_mirrored(name, false, vfs, images)
+    }
+
+    /// [`Self::get_cube`], mirrored north to south (`mirror_y`: CoD's y
+    /// flipped) when asked: MW2's skies are drawn that way round (their
+    /// painted sun stood mirrored from the real one).
+    pub fn get_cube_mirrored(&mut self, name: &str, mirror_y: bool, vfs: &Vfs, images: &mut Assets<Image>) -> Option<Handle<Image>> {
         let name = name.trim_start_matches(',');
         let bytes = vfs.read(&format!("images/{name}.iwi")).ok()??;
-        let iwi = Iwi::parse(&bytes).inspect_err(|e| warn!("bad iwi {name}: {e}")).ok()?;
+        let mut iwi = Iwi::parse(&bytes).inspect_err(|e| warn!("bad iwi {name}: {e}")).ok()?;
+        if mirror_y {
+            mirror_cube_y(&mut iwi);
+        }
         let image = cube_image(&iwi)?;
         Some(images.add(image))
     }
+}
+
+/// Mirror a block-compressed cube iwi across CoD's y. The skybox shows the
+/// cube turned so its faces' y is CoD's -y: every face flips top to bottom,
+/// and the +y and -y faces trade places.
+fn mirror_cube_y(iwi: &mut Iwi) {
+    let block = match iwi.format {
+        Format::Dxt1 => 8,
+        Format::Dxt3 | Format::Dxt5 => 16,
+        _ => return,
+    };
+    for (level, data) in iwi.levels.iter_mut().enumerate() {
+        let size = (iwi.width >> level).max(1) as usize;
+        let blocks = size.div_ceil(4);
+        let face = blocks * blocks * block;
+        if data.len() < face * 6 {
+            continue;
+        }
+        let mut faces: Vec<Vec<u8>> = data.chunks_exact(face).take(6).map(|f| flip_blocks_vertically(f, blocks, block, iwi.format)).collect();
+        faces.swap(2, 3);
+        data[..face * 6].copy_from_slice(&faces.concat());
+    }
+}
+
+/// One face of 4x4 blocks turned upside down: rows of blocks reversed, and
+/// each block's own rows.
+fn flip_blocks_vertically(face: &[u8], blocks: usize, block: usize, format: Format) -> Vec<u8> {
+    let row = blocks * block;
+    let mut out = Vec::with_capacity(face.len());
+    for r in (0..blocks).rev() {
+        for b in face[r * row..(r + 1) * row].chunks_exact(block) {
+            let mut b = b.to_vec();
+            let colour = block - 8;
+            // Colour: 4 bytes of endpoints, then a byte of indices per row.
+            b[colour + 4..colour + 8].reverse();
+            match format {
+                // Explicit alpha: two bytes per row.
+                Format::Dxt3 => {
+                    let rows: Vec<[u8; 2]> = b[..8].chunks_exact(2).rev().map(|c| [c[0], c[1]]).collect();
+                    b[..8].copy_from_slice(&rows.concat());
+                }
+                // Interpolated alpha: two endpoints, then 12 bits per row.
+                Format::Dxt5 => {
+                    let mut bits = 0u64;
+                    for (i, v) in b[2..8].iter().enumerate() {
+                        bits |= (*v as u64) << (8 * i);
+                    }
+                    let mut flipped = 0u64;
+                    for r in 0..4 {
+                        flipped |= ((bits >> (12 * r)) & 0xfff) << (12 * (3 - r));
+                    }
+                    for i in 0..6 {
+                        b[2 + i] = (flipped >> (8 * i)) as u8;
+                    }
+                }
+                _ => {}
+            }
+            out.extend_from_slice(&b);
+        }
+    }
+    out
 }
 
 /// A cube iwi (six faces per mip level) as a Bevy cube texture.

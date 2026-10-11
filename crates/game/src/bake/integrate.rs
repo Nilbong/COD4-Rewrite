@@ -27,7 +27,7 @@ use std::f32::consts::{PI, TAU};
 /// Rays start this far off the surface (CoD units, inches).
 const OFFSET: f32 = 0.1;
 /// Surfaces this near (units) count for contact occlusion.
-pub const CONTACT_RANGE: f32 = 40.0;
+pub const CONTACT_RANGE: f32 = 32.0;
 /// Rays travel at most this far.
 const FAR: f32 = 100_000.0;
 
@@ -485,37 +485,44 @@ impl Baker<'_> {
             .map(|i| {
                 progress.tick();
                 let Some(t) = texels[i] else { return Directional::default() };
-                let (t1, t2) = basis(t.n);
-                let o = t.pos + t.nf * OFFSET;
-                let rot = rand2(hash(i as u32) ^ 0xfeed_beef);
-                let to_tangent = |d: Vec3A| Vec3::new(d.dot(t.t), d.dot(t.b), d.dot(t.n));
-                let mut out = Directional::default();
-                let mut near = 0u32;
-                for j in 0..samples {
-                    let s = sample2(j, samples, rot);
-                    let l = cosine_dir(s.x, s.y);
-                    let d = (t1 * l.x + t2 * l.y + t.n * l.z).normalize();
-                    if d.dot(t.nf) <= 0.0 {
-                        continue;
-                    }
-                    match self.trace(atlases, grid, o, d) {
-                        Seen::Light(l, t) => {
-                            out.add(l.sky * k + l.sun, to_tangent(d));
-                            near += (t < CONTACT_RANGE) as u32;
-                        }
-                        Seen::Back(t) => near += (t < CONTACT_RANGE) as u32,
-                    }
-                }
-                out.scale((1.0 - contact * near as f32 / samples as f32).max(0.0) / samples as f32);
-                let (local, dir) = a.local[i];
-                out.add(local, dir);
-                self.lights.lamps(self.scene, t.pos, t.nf, hash(i as u32 ^ 0x51ed), |e, l| {
-                    let c = t.n.dot(l).max(0.0);
-                    out.add(e * c, to_tangent(l));
-                });
-                out
+                self.gather_texel(atlases, grid, &t, i, samples, k, contact, a.local[i])
             })
             .collect()
+    }
+
+    /// The final light arriving at one texel (see [`Self::gather_final`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_texel(&self, atlases: &[AtlasLight], grid: &Grid, t: &super::texels::Texel, i: usize, samples: u32, k: f32, contact: f32, local: (Vec3, Vec3)) -> Directional {
+        let (t1, t2) = basis(t.n);
+        let o = t.pos + t.nf * OFFSET;
+        let rot = rand2(hash(i as u32) ^ 0xfeed_beef);
+        let to_tangent = |d: Vec3A| Vec3::new(d.dot(t.t), d.dot(t.b), d.dot(t.n));
+        let mut out = Directional::default();
+        let mut near = 0.0f32;
+        for j in 0..samples {
+            let s = sample2(j, samples, rot);
+            let l = cosine_dir(s.x, s.y);
+            let d = (t1 * l.x + t2 * l.y + t.n * l.z).normalize();
+            if d.dot(t.nf) <= 0.0 {
+                continue;
+            }
+            match self.trace(atlases, grid, o, d) {
+                // Nearer surfaces count for more (a recess's walls darken
+                // it; an eave further off only softly, not as a smear).
+                Seen::Light(l, t) => {
+                    out.add(l.sky * k + l.sun, to_tangent(d));
+                    near += (1.0 - t / CONTACT_RANGE).max(0.0);
+                }
+                Seen::Back(t) => near += (1.0 - t / CONTACT_RANGE).max(0.0),
+            }
+        }
+        out.scale((1.0 - contact * near / samples as f32).max(0.0) / samples as f32);
+        out.add(local.0, local.1);
+        self.lights.lamps(self.scene, t.pos, t.nf, hash(i as u32 ^ 0x51ed), |e, l| {
+            let c = t.n.dot(l).max(0.0);
+            out.add(e * c, to_tangent(l));
+        });
+        out
     }
 
     /// One pass over the light grid's points.

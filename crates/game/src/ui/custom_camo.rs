@@ -31,6 +31,15 @@ const ACTIVE: &str = "ccamo_active";
 const PATTERN: &str = "ccamo_pattern";
 const COUNT: &str = "ccamo_count";
 const COLOR: &str = "ccamo_color";
+/// A colour picked freely (`rrggbb`), over the palette's for that row.
+const RGB: &str = "ccamo_rgb";
+/// The colour picker (`next::color`): the row it sets, its hue (degrees),
+/// saturation and value (percent), and the row's colour before it opened.
+const PICK_ROW: &str = "ccamo_pick_row";
+const PICK_H: &str = "ccamo_pick_h";
+const PICK_S: &str = "ccamo_pick_s";
+const PICK_V: &str = "ccamo_pick_v";
+const PICK_WAS: &str = "ccamo_pick_was";
 const SCALE: &str = "ccamo_scale";
 const ROTATION: &str = "ccamo_rotation";
 const FINISH: &str = "ccamo_finish";
@@ -60,6 +69,52 @@ fn rect(x: f32, y: f32, w: f32, h: f32) -> VRect {
 
 fn left_rect(y: f32) -> VRect {
     VRect { x: 0.0, y, w: 220.0, h: 22.0, horz_align: 1, vert_align: 1 }
+}
+
+/// `rrggbb` as a colour.
+fn hex(s: &str) -> Option<[u8; 3]> {
+    let s = s.trim();
+    if s.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(s, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+
+fn to_hex(c: [u8; 3]) -> String {
+    format!("{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+/// sRGB as hue (degrees), saturation and value (0..1).
+pub(super) fn to_hsv(c: [u8; 3]) -> (f32, f32, f32) {
+    let [r, g, b] = c.map(|v| v as f32 / 255.0);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let d = max - min;
+    let h = if d <= 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h, if max <= 0.0 { 0.0 } else { d / max }, max)
+}
+
+pub(super) fn from_hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h.rem_euclid(360.0) / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [r, g, b].map(|v| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8)
 }
 
 /// The swatch material of custom camo `camo` (see [`super::assets`]).
@@ -112,7 +167,7 @@ impl Frontend {
         let n = |d: &str| self.dvar(d).parse::<usize>().unwrap_or(0);
         let mut colors = [[0; 3]; 4];
         for (i, c) in colors.iter_mut().enumerate() {
-            *c = PALETTE[n(&format!("{COLOR}{}", i + 1)).min(PALETTE.len() - 1)];
+            *c = hex(&self.dvar(&format!("{RGB}{}", i + 1))).unwrap_or(PALETTE[n(&format!("{COLOR}{}", i + 1)).min(PALETTE.len() - 1)]);
         }
         let name = custom_camos::clean_name(&self.dvar(NAME));
         CustomCamo {
@@ -131,6 +186,7 @@ impl Frontend {
         self.set_dvar(COUNT, &(def.count.clamp(2, 4) - 2).to_string());
         for (i, c) in def.colors.iter().enumerate() {
             self.set_dvar(&format!("{COLOR}{}", i + 1), &nearest(*c).to_string());
+            self.set_dvar(&format!("{RGB}{}", i + 1), &to_hex(*c));
         }
         self.set_dvar(SCALE, &def.scale.to_string());
         self.set_dvar(ROTATION, &(def.rotation / ROTATION_STEP).to_string());
@@ -258,7 +314,7 @@ impl Frontend {
             .stack
             .iter()
             .find(|om| om.name == EDITOR)
-            .map(|om| om.menu.items.iter().filter(|it| it.dvar.starts_with(COLOR) && it.ty == item_type::MULTI).count());
+            .map(|om| om.menu.items.iter().filter(|it| it.dvar.starts_with(COLOR)).count());
         let solid = self.dvar(PATTERN).parse::<usize>().ok() == Some(PATTERNS.len() - 1);
         let wanted = if solid { 1 } else { self.dvar(COUNT).parse::<usize>().unwrap_or(1) + 2 };
         if colour_rows.is_some_and(|n| n != wanted) {
@@ -305,6 +361,8 @@ impl Frontend {
         self.set_dvar(&item.dvar, &next);
         if let Some(c) = item.dvar.strip_prefix(COLOR) {
             self.set_dvar(ACTIVE, c);
+            // The palette's colour again.
+            self.set_dvar(&format!("{RGB}{c}"), "");
         }
         // (The reticle screen's rows step the same way: `reticle_menu`.)
         if !super::reticle_menu::is_row(&item.dvar) {
@@ -368,12 +426,53 @@ impl Frontend {
                 self.reopen_picker();
             }
             "ccamodraft" => self.draft_changed(),
+            // The colour picker, for colour row `a(1)`.
+            "ccamocolor" => {
+                let Ok(row) = a(1).parse::<usize>() else { return };
+                let c = self.draft().colors[(row.clamp(1, 4)) - 1];
+                let (h, s, v) = to_hsv(c);
+                self.set_dvar(PICK_ROW, &row.clamp(1, 4).to_string());
+                self.set_dvar(PICK_WAS, &to_hex(c));
+                self.set_dvar(PICK_H, &(((h / 10.0).round() as i32 * 10) % 360).to_string());
+                self.set_dvar(PICK_S, &((s * 10.0).round() as i32 * 10).to_string());
+                self.set_dvar(PICK_V, &((v * 10.0).round() as i32 * 10).to_string());
+                self.open(super::next::color::MENU);
+                // Focus on the colour's own shade.
+                let cell = |x: f32| ((x * 10.0).round() as i32 * 10).clamp(0, 100);
+                let name = format!("sv_{}_{}", cell(s), cell(v));
+                let key = super::next::color::MENU.to_ascii_lowercase();
+                let at = self.stack.last().and_then(|m| m.menu.items.iter().position(|it| it.window.name == name));
+                if let Some(i) = at {
+                    self.set_focus(Some((key, i)));
+                }
+            }
+            "ccamocolorhue" | "ccamocolorsv" => {
+                if a(0).eq_ignore_ascii_case("ccamocolorhue") {
+                    self.set_dvar(PICK_H, a(1));
+                } else {
+                    self.set_dvar(PICK_S, a(1));
+                    self.set_dvar(PICK_V, a(2));
+                }
+                let (_, h, s, v, _) = self.colour_pick();
+                let row = self.dvar(PICK_ROW);
+                self.set_dvar(&format!("{RGB}{row}"), &to_hex(from_hsv(h, s, v)));
+                self.draft_changed();
+            }
+            "ccamocolordone" => self.close(super::next::color::MENU),
+            "ccamocolorcancel" => {
+                let row = self.dvar(PICK_ROW);
+                let was = self.dvar(PICK_WAS);
+                self.set_dvar(&format!("{RGB}{row}"), &was);
+                self.draft_changed();
+                self.close(super::next::color::MENU);
+            }
             "ccamoswatch" => {
                 if let Ok(i) = a(1).parse::<usize>()
                     && i < PALETTE.len()
                 {
                     let row = self.dvar(ACTIVE).parse::<usize>().unwrap_or(1).clamp(1, 4);
                     self.set_dvar(&format!("{COLOR}{row}"), &i.to_string());
+                    self.set_dvar(&format!("{RGB}{row}"), "");
                     self.draft_changed();
                 }
             }
@@ -395,8 +494,47 @@ impl Frontend {
         }
     }
 
+    /// The new UI's preview of the slot picked: the class gun and the camo
+    /// to show on it, its title, and (when designed) its swatch and two
+    /// lines about it.
+    pub(in crate::ui) fn custom_camo_preview(&self) -> (String, i32, usize, String, Option<(String, String, String)>, &'static str) {
+        let stat = self.class_stat();
+        let gun = self.gun_for(stat).map_or_else(|| "ak47:".to_owned(), |(g, _)| g);
+        let camo = custom_camos::FIRST + self.slot();
+        match custom_camos::get(camo) {
+            Some(d) => {
+                let equipped = self.class_camo(stat) as usize == camo;
+                let lines = (
+                    swatch(camo),
+                    format!("{} - {}", PATTERNS[d.pattern].name, FINISHES[d.finish]),
+                    format!("{} colours, scale {:.0}%, {} deg", d.used().len(), SCALES[d.scale] * 100.0, d.rotation),
+                );
+                (gun, PICKER_PREVIEW, camo, d.name.clone(), Some(lines), if equipped { "Equipped on this weapon." } else { "Select the slot to equip it." })
+            }
+            None => (gun, PICKER_PREVIEW, 0, format!("Slot {} - Empty", self.slot() + 1), None, "Select it to design a new camo."),
+        }
+    }
+
+    /// The colour picker's state: the row (1..4), hue (degrees),
+    /// saturation and value (0..1), and the colour they make.
+    pub(in crate::ui) fn colour_pick(&self) -> (usize, f32, f32, f32, [u8; 3]) {
+        let f = |d: &str| self.dvar(d).parse::<f32>().unwrap_or(0.0);
+        let (h, s, v) = (f(PICK_H).rem_euclid(360.0), (f(PICK_S) / 100.0).clamp(0.0, 1.0), (f(PICK_V) / 100.0).clamp(0.0, 1.0));
+        (self.dvar(PICK_ROW).parse().unwrap_or(1), h, s, v, from_hsv(h, s, v))
+    }
+
+    /// The new UI's editor view: the class gun, its preview key and the
+    /// draft's camo id, the draft's swatch material and name, the colour row
+    /// the palette sets (1..4), the palette, and the draft's colours.
+    pub(in crate::ui) fn custom_camo_editor_view(&self) -> (String, i32, usize, String, String, usize, &'static [[u8; 3]], Vec<[u8; 3]>) {
+        let gun = self.gun_for(self.class_stat()).map_or_else(|| "ak47:".to_owned(), |(g, _)| g);
+        let draft = self.draft();
+        let active = self.dvar(ACTIVE).parse::<usize>().unwrap_or(1).clamp(1, 4);
+        (gun, EDITOR_PREVIEW, custom_camos::DRAFT, swatch(custom_camos::DRAFT), draft.name.clone(), active, &PALETTE, draft.colors[..draft.count.max(1)].to_vec())
+    }
+
     pub(super) fn paint_custom_camo(&self, om: &OpenMenu, pl: &Placement, ops: &mut Vec<Op>) {
-        if om.name != PICKER && om.name != EDITOR {
+        if om.name != PICKER && om.name != EDITOR || om.menu.window.name.starts_with(super::next::picker::PREFIX) || om.menu.window.name == super::next::camo_edit::MENU {
             return;
         }
         let mut p = Painter { fe: self, pl, ops };

@@ -433,7 +433,7 @@ impl<'a> Loader<'a> {
                         }
                     }
                 }
-                coll_boxes.push(CollBox { mins: v(8), maxs: v(20), contents: c.i32(36), tris });
+                coll_boxes.push(CollBox { mins: v(8), maxs: v(20), contents: c.i32(36), surf_flags: c.i32(40), tris });
             }
         }
         self.fixed_array(s.ptr(164), 4, 40, num_bones)?; // boneInfo

@@ -103,7 +103,7 @@ fn gunfire(
     time: Res<Time>,
     mut sfx: ResMut<Sfx>,
     mut shots: MessageReader<ShotFired>,
-    shooters: Query<(&WeaponState, Has<LocalPlayer>)>,
+    shooters: Query<(&WeaponState, Has<crate::splitscreen::LocalSlot>)>,
     spatial: SpatialQuery,
     surfaces: Query<&Surfaces>,
     listener: Query<&GlobalTransform, With<SpatialListener>>,
@@ -366,6 +366,7 @@ fn viewmodel_notes(
     // Player 1's gun: theirs is the sound heard.
     let (Some(bank), Some((player, _))) = (bank, vm.iter().find(|v| v.1.0 == 0)) else { return };
     let waw = weapon.single().is_ok_and(|w| crate::waw::is_waw(&w.def.name));
+    let mw2 = weapon.single().is_ok_and(|w| crate::mw2guns::is_mw2(&w.def.name));
     let Some(anim) = &player.anim else { return };
     let key = Arc::as_ptr(anim) as usize;
     let duration = anim.duration().max(1e-3);
@@ -378,7 +379,13 @@ fn viewmodel_notes(
         let at = n.time * duration;
         // Black Ops marks its sound notes `sndnt#<alias>`.
         let name = n.name.strip_prefix("sndnt#").unwrap_or(&n.name);
-        let name: std::borrow::Cow<str> = if waw { crate::waw::sound_alias(name).into() } else { name.into() };
+        let name: std::borrow::Cow<str> = if waw {
+            crate::waw::sound_alias(name).into()
+        } else if mw2 {
+            crate::mw2guns::sound_alias(name).into()
+        } else {
+            name.into()
+        };
         if at > from && at <= player.time {
             if bank.has(&name) {
                 sfx.play(name.into_owned(), None);

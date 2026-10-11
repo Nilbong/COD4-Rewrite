@@ -14,6 +14,9 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var view_sampler: sampler;
 // xyz: the scope's axis, away from the eye.
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<uniform> axis: vec4<f32>;
+// The lens as the eye sees it, off the axis (tangents): xy its middle, z its
+// radius; w how much of it the clear view fills (0 when not known).
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<uniform> lens: vec4<f32>;
 
 fn bar(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>, w: f32, px: f32) -> f32 {
     let ab = b - a;
@@ -28,14 +31,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let right = normalize(view.world_from_view[0].xyz);
     let up = normalize(view.world_from_view[1].xyz);
     let forward = -normalize(view.world_from_view[2].xyz);
-    let along = max(dot(v, forward), 1e-3);
-    // The eye's direction off the view's middle (tangents).
-    let d = vec2<f32>(dot(v, right), dot(v, up)) / along;
+    // The scope's axis (the gun's forward): the scope camera looks along
+    // it, its up the view's up as near as can be (`scope3d.rs`).
+    let n = normalize(axis.xyz);
+    let sr = normalize(cross(n, up));
+    let su = cross(sr, n);
+    // The eye's direction off the scope's axis (tangents): the scope's
+    // picture is centred on its own axis, wherever the gun points.
+    let d = vec2<f32>(dot(v, sr), dot(v, su)) / max(dot(v, n), 1e-3);
     let uv = vec2<f32>(0.5, 0.5) + vec2<f32>(d.x, -d.y) * params.z;
     var c = textureSampleLevel(view_texture, view_sampler, uv, 0.0).rgb;
-
-    // The scope's axis (the gun's forward).
-    let n = normalize(axis.xyz);
     // The eye's direction off the scope's axis, in the axis's frame (as
     // the camera's, so the reticle stands upright), over the lens's reach.
     let t = normalize(cross(n, up));
@@ -63,9 +68,17 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // The eye's reach: dark beyond it, the dark closing in from the side
     // the axis is off to.
-    let r = length(p + off * 0.9);
+    var r = length(p + off * 0.9);
+    var e = length(p);
+    if lens.w > 0.5 {
+        // Fitted to the lens itself: a black rim inside its edge, wider on
+        // the side the eye is off the axis.
+        let q = (p * params.w - lens.xy) / lens.z;
+        r = length(q + off * 0.35) / lens.w;
+        e = length(q);
+    }
     let reach = 1.0 - smoothstep(0.82, 1.0, r);
-    let edge = 1.0 - 0.3 * smoothstep(0.55, 0.95, length(p));
+    let edge = 1.0 - 0.3 * smoothstep(0.55, 0.95, e);
     c *= reach * edge;
     // Coming in: dark glass until the view's there.
     c = mix(vec3<f32>(0.004, 0.005, 0.006), c, params.x);

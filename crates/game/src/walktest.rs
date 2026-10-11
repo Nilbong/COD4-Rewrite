@@ -79,7 +79,7 @@ fn walk(
         let p = crate::units::to_cod(tf.translation);
         let v = mover.velocity / crate::units::u(1.0);
         info!(
-            "walk {t:.1}: at ({:.1}, {:.1}, {:.1}) speed {:.0} up {:.0} ground {} normal {:.2} yaw {:.0}",
+            "walk {t:.1}: at ({:.1}, {:.1}, {:.1}) speed {:.0} up {:.0} ground {} normal {:.2} yaw {:.0}{}{}",
             p[0],
             p[1],
             p[2],
@@ -87,7 +87,9 @@ fn walk(
             v.y,
             mover.on_ground,
             mover.ground_normal,
-            view.yaw.to_degrees() + 90.0
+            view.yaw.to_degrees() + 90.0,
+            if mover.ladder.is_some() { " ladder" } else { "" },
+            if mover.mantle.is_some() { " mantle" } else { "" }
         );
     }
     if t > test.secs {

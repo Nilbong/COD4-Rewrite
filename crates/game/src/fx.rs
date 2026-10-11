@@ -1832,13 +1832,8 @@ impl Effects {
 
 /// A mesh with nothing to draw (one degenerate triangle).
 fn empty_mesh() -> Mesh {
-    // The render world's only: rebuilt every frame, so moved there, not copied.
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; 3]);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; 3]);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.0f32; 4]; 3]);
-    mesh.insert_indices(Indices::U32(vec![0, 1, 2]));
-    mesh
+    // As a batch's, with nothing in it (the same layout and size).
+    quads_mesh(&[], &[], Vec3::ZERO)
 }
 
 fn quads_mesh(quads: &[Quad], order: &[(f32, u32)], center: Vec3) -> Mesh {
@@ -1865,6 +1860,22 @@ fn quads_mesh(quads: &[Quad], order: &[(f32, u32)], center: Vec3) -> Mesh {
         }
         idx.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
     }
+    // Padded with empty quads to a power of two (16 at least): a batch's
+    // mesh keeps its size from frame to frame, so the render world's mesh
+    // allocator reuses its room rather than growing (and copying) slabs
+    // every frame as the particle count changes.
+    let padded = n.max(16).next_power_of_two();
+    for i in n..padded {
+        let base = (i * 4) as u32;
+        for _ in 0..4 {
+            pos.push([0.0; 3]);
+            uv.push([0.0; 2]);
+            color.push([0.0; 4]);
+            corner.push([0.0; 2]);
+            ball.push([1.0, 0.0, 0.0, 0.0]);
+        }
+        idx.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 3, base]);
+    }
     // The render world's only: rebuilt every frame, so moved there, not copied.
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
@@ -1886,7 +1897,16 @@ fn place_lights(
         (With<FxLight>, Without<FxBatch>, Without<FxModel>),
     >,
 ) {
-    wanted.retain(|w| w.radius > 1.0);
+    // (A light with a NaN colour or place blacks out everything it
+    // reaches: Black Ops' CZ75 flash blacked out the frame of each shot.)
+    let bad = wanted.iter().filter(|w| !(w.radius.is_finite() && w.pos.is_finite() && w.color.is_finite())).count();
+    if bad > 0 {
+        warn_once!("fx: {bad} light(s) with a non-finite colour, place or radius left out");
+    }
+    wanted.retain(|w| w.radius > 1.0 && w.radius.is_finite() && w.pos.is_finite() && w.color.is_finite());
+    for w in &mut wanted {
+        w.color = w.color.max(Vec3::ZERO);
+    }
     wanted.sort_by(|a, b| a.dist.total_cmp(&b.dist));
     wanted.truncate(MAX_LIGHTS);
     while fx.lights.len() < wanted.len() {

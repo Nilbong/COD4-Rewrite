@@ -48,6 +48,12 @@ impl GameMode {
     /// The game types the lobby offers, in its order.
     pub const ALL: [GameMode; 7] = [GameMode::Tdm, GameMode::Ffa, GameMode::Dom, GameMode::Sd, GameMode::Koth, GameMode::Sab, GameMode::Tdm3];
 
+    /// Whether the lobby offers this mode: work-in-progress ones (3rd Person
+    /// TDM) only in test builds ([`test_features`]).
+    pub fn offered(self) -> bool {
+        self != GameMode::Tdm3 || test_features()
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             GameMode::Tdm => "Team Deathmatch",
@@ -360,4 +366,11 @@ mod tests {
         assert!(!f.contains(Vec3::new(0.0, u(200.0), 0.0)));
         assert_eq!(f.letter(), 'a');
     }
+}
+
+/// Work-in-progress features (3rd Person TDM, the campaign) are only offered
+/// with `COD4RW_TESTFEATURES=1` ("Play Test Build.bat").
+pub fn test_features() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COD4RW_TESTFEATURES").is_ok_and(|v| v == "1"))
 }

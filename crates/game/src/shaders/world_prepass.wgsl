@@ -37,6 +37,14 @@ fn slot_of(in: prepass_io::VertexOutput) -> u32 {
 #endif
 }
 
+// An alpha-tested card's cutoff lowered with distance: its texture's small
+// mips average the cutouts' alpha down, and grass, leaves and bushes thinned
+// to see-through ghosts far off. (Same in `world.wgsl`.)
+fn distant_cutoff(cutoff: f32, p: vec3<f32>) -> f32 {
+    let d = distance(p, bevy_pbr::mesh_view_bindings::view.world_position);
+    return cutoff * mix(1.0, 0.45, smoothstep(8.0, 40.0, d));
+}
+
 // `pbr_prepass_functions::prepass_alpha_discard` with the vertex alpha.
 fn world_alpha_discard(in: prepass_io::VertexOutput, slot: u32) {
 #ifdef MAY_DISCARD
@@ -72,7 +80,8 @@ fn world_alpha_discard(in: prepass_io::VertexOutput, slot: u32) {
 #endif
     let alpha_mode = flags & pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS;
     if alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK {
-        if alpha < cutoff {
+        // (Matching `world.wgsl`: cards keep their cover at a distance.)
+        if alpha < distant_cutoff(cutoff, in.world_position.xyz) {
             discard;
         }
     } else if (alpha_mode == pbr_types::STANDARD_MATERIAL_FLAGS_ALPHA_MODE_BLEND

@@ -272,7 +272,8 @@ fn show(
         let viewing = !gunplay.is_bodycam() && !third_person.as_ref().is_some_and(|t| t.on(slot)) && fe.stack.is_empty();
         let held = players.iter().find(|p| p.0.0 == slot).map(|p| p.1).filter(|_| viewing);
         let scoped = held.and_then(|w| Some((w.ads, w.def.ads_fov, w.def.ads_overlay.clone()?)));
-        let cod4_gun = held.is_some_and(|w| !crate::waw::is_waw(&w.def.name) && !crate::bo1::is_bo1(&w.def.name));
+        let cod4_gun =
+            held.is_some_and(|w| !crate::waw::is_waw(&w.def.name) && !crate::bo1::is_bo1(&w.def.name) && !crate::mw2guns::is_mw2(&w.def.name));
 
         // Classic: the scope's picture over the player's view.
         let classic = scoped.as_ref().filter(|(ads, ..)| !lens_style && !three_d && *ads >= SHOWN_AT);

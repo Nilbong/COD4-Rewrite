@@ -56,6 +56,39 @@ pub const MAPS: [(&str, &str); 21] = [
     ("mp_cargoship", "Wet Work"),
     ("mp_crash_snow", "Winter Crash"),
 ];
+/// The maps to choose from: CoD4's ([`MAPS`]), then the custom maps
+/// installed in its `usermaps/` folder (named from their folder:
+/// `mp_4t4scrap_s` is "4t4scrap S"), then Modern Warfare 2's.
+pub fn maps() -> &'static [(&'static str, &'static str)] {
+    static ALL: std::sync::OnceLock<Vec<(&'static str, &'static str)>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut all = MAPS.to_vec();
+        if let Ok(install) = iw3::Install::locate() {
+            for map in install.usermaps() {
+                if all.iter().any(|(m, _)| *m == map) {
+                    continue;
+                }
+                let words: Vec<String> = map
+                    .trim_start_matches("mp_")
+                    .split('_')
+                    .filter(|w| !w.is_empty())
+                    .map(|w| {
+                        let mut c = w.chars();
+                        c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
+                    })
+                    .collect();
+                let name = words.join(" ");
+                all.push((Box::leak(map.into_boxed_str()), Box::leak(name.into_boxed_str())));
+            }
+        }
+        // Modern Warfare 2's, when it's installed (see `crate::mw2`).
+        for (map, name) in crate::mw2::maps() {
+            all.push((Box::leak(map.into_boxed_str()), Box::leak(name.into_boxed_str())));
+        }
+        all
+    })
+}
+
 /// Minutes.
 const TIMES: [u32; 6] = [5, 10, 15, 20, 30, 60];
 const DIFFICULTY: [(&str, f32); 4] = [("Recruit", 0.25), ("Regular", 0.5), ("Hardened", 0.7), ("Veteran", 0.9)];
@@ -83,6 +116,45 @@ const SWITCH_ARROW: [&str; 2] = [">>", "<<"];
 const ONLINE_TOP: f32 = PANEL_TOP + TEAM_SIZE as f32 * ROW_H + 96.0;
 
 /// The lobby's settings.
+/// A lobby row (see [`Frontend::lobby_view`]).
+pub(in crate::ui) enum LobbyRow {
+    You { name: String, rank: i32, prestige: i32 },
+    /// `profile`: the name of the profile they play as (players 2 to 4;
+    /// `None` a guest, whose progress isn't kept).
+    Local { player: usize, device: String, profile: Option<String> },
+    Friend { name: String, rank: i32, prestige: i32, host: bool },
+    Bot { name: String },
+}
+
+pub(in crate::ui) struct LobbyView {
+    pub map: (&'static str, &'static str),
+    pub teams: [Vec<LobbyRow>; 2],
+    pub team_names: [&'static str; 2],
+    pub team_icons: [&'static str; 2],
+    pub team_size: usize,
+    pub guest: bool,
+    /// The game types: (index, name, can be picked now), and the one set.
+    pub modes: Vec<(usize, &'static str, bool)>,
+    pub mode: usize,
+    pub hardcore: bool,
+    /// The side Player 1 is on.
+    pub my_side: usize,
+    pub code: Option<String>,
+    pub host_name: Option<String>,
+    pub note: String,
+    pub split: bool,
+}
+
+/// The classic screen's team rows: where row `row` of side `s` is, so the
+/// new UI can tell its buttons' places.
+pub(in crate::ui) fn lobby_slot(x: f32, y: f32) -> Option<(usize, usize)> {
+    let s = PANEL_X.iter().position(|&px| x >= px - 1.0 && x < px + PANEL_W)?;
+    if y < PANEL_TOP + 20.0 || y > PANEL_TOP + 26.0 + ROW_H * (TEAM_SIZE as f32 + 1.0) {
+        return None;
+    }
+    Some((s, ((y - PANEL_TOP - 26.0) / ROW_H).round().max(0.0) as usize))
+}
+
 pub(super) struct Lobby {
     map: usize,
     mode: usize,
@@ -94,6 +166,8 @@ pub(super) struct Lobby {
     players: usize,
     devices: [Device; MAX_PLAYERS],
     teams: [Team; MAX_PLAYERS],
+    /// Players 2 to 4's profiles (ids, [`super::profiles`]); `None` a guest.
+    profiles: [Option<String>; MAX_PLAYERS],
     /// Bot names per side: Allies, Axis.
     bots: [Vec<String>; 2],
     /// Start Match was pressed: the next match is this lobby's.
@@ -105,7 +179,7 @@ pub(super) struct Lobby {
 impl Default for Lobby {
     fn default() -> Self {
         Lobby {
-            map: MAPS.iter().position(|m| m.0 == "mp_killhouse").unwrap_or(0),
+            map: maps().iter().position(|m| m.0 == "mp_killhouse").unwrap_or(0),
             mode: 0,
             time: 1,
             score: 2,
@@ -114,6 +188,7 @@ impl Default for Lobby {
             players: 1,
             devices: [Device::KeyboardMouse, Device::NextPad, Device::NextPad, Device::NextPad],
             teams: [Team::Allies; MAX_PLAYERS],
+            profiles: Default::default(),
             bots: [Vec::new(), Vec::new()],
             starting: false,
             online: OnlineLobby::default(),
@@ -127,7 +202,8 @@ fn side(team: Team) -> usize {
 
 impl Lobby {
     fn mode(&self) -> GameMode {
-        GameMode::ALL[self.mode]
+        // (A test-only mode never sticks outside a test build.)
+        Some(GameMode::ALL[self.mode]).filter(|m| m.offered()).unwrap_or_default()
     }
 
     /// Kills to win: a team's, or in free-for-all a player's.
@@ -137,7 +213,7 @@ impl Lobby {
     }
 
     pub(super) fn map_id(&self) -> &'static str {
-        MAPS[self.map].0
+        maps()[self.map].0
     }
 
     pub(super) fn config(&self) -> MatchConfig {
@@ -164,6 +240,25 @@ impl Lobby {
             return LocalPlayers::default();
         }
         LocalPlayers { devices: self.devices[..self.players].to_vec(), teams: self.teams[..self.players].to_vec() }
+    }
+
+    /// Splitscreen player `i`'s profile (an id), if not a guest.
+    pub(super) fn slot_profile(&self, i: usize) -> Option<String> {
+        (i > 0 && i < self.players).then(|| self.profiles[i].clone()).flatten()
+    }
+
+    /// Player `i`'s next profile: guest, then each profile nobody else
+    /// here uses (player 1 has the one in use).
+    fn next_profile(&mut self, i: usize) {
+        if i == 0 || i >= MAX_PLAYERS {
+            return;
+        }
+        let active = super::profiles::active();
+        let taken = |id: &str, l: &Lobby| id == active || (1..l.players).any(|j| j != i && l.profiles[j].as_deref() == Some(id));
+        let mut choices: Vec<Option<String>> = vec![None];
+        choices.extend(super::profiles::list().into_iter().filter(|p| !taken(&p.id, self)).map(|p| Some(p.id)));
+        let at = choices.iter().position(|c| *c == self.profiles[i]).map_or(0, |p| p + 1) % choices.len();
+        self.profiles[i] = choices[at].clone();
     }
 
     /// The local players on `s`.
@@ -330,6 +425,10 @@ fn with_private_match(menu: &Menu) -> Option<Menu> {
     let template: Vec<Item> = out.items.iter().filter(|it| left_column(it) && (it.window.rect.y - y).abs() < 0.5).cloned().collect();
     let row = out.items.iter().flat_map(|it| highlight_rows(&it.visible_exp)).max().unwrap_or(0) + 1;
     out.items.extend(place_row(&template, y - 2.0 * HQ_PITCH, row, str_exp("Headquarters"), &script(&[&ui_script("startHeadquarters")])));
+    // The campaign ([`crate::campaign`]) above it, in test builds only.
+    if crate::modes::test_features() {
+        out.items.extend(place_row(&template, y - 3.0 * HQ_PITCH, row + 1, str_exp("Campaign"), &script(&[&ui_script("startCampaign")])));
+    }
     Some(out)
 }
 
@@ -360,7 +459,7 @@ impl Frontend {
     fn sync_lobby(&mut self) {
         let l = &self.lobby;
         let labels = [
-            ("ui_pm_map", format!("Map: {}", MAPS[l.map].1)),
+            ("ui_pm_map", format!("Map: {}", maps()[l.map].1)),
             ("ui_pm_mode", format!("Game Type: {}", l.mode().name())),
             ("ui_pm_time", format!("Time Limit: {} Minutes", TIMES[l.time])),
             ("ui_pm_score", format!("Score Limit: {}", l.score_limit())),
@@ -368,7 +467,7 @@ impl Frontend {
             ("ui_pm_team", format!("{}Join {}", if l.players > 1 { "All " } else { "" }, if l.teams[0] == Team::Allies { "OpFor" } else { "Marines" })),
             ("ui_pm_hardcore", format!("Hardcore: {}", if l.hardcore { "On" } else { "Off" })),
             ("ui_pm_split", if l.players > 1 { format!("Splitscreen: {} Players", l.players) } else { "Splitscreen: Off".into() }),
-            ("ui_mapname", MAPS[l.map].0.to_string()),
+            ("ui_mapname", maps()[l.map].0.to_string()),
         ];
         for (k, v) in labels {
             self.set_dvar(k, &v);
@@ -399,13 +498,23 @@ impl Frontend {
         let online = self.lobby.online.active();
         let l = &mut self.lobby;
         match cmd.as_str() {
-            "lobbymap" => l.map = n(1).min(MAPS.len() - 1),
+            "lobbymap" => l.map = n(1).min(maps().len() - 1),
+            // A game type picked (the new UI's mode screen).
+            "lobbymode" => {
+                let m = n(1).min(GameMode::ALL.len() - 1);
+                if GameMode::ALL[m].offered() && (!online || matches!(GameMode::ALL[m], GameMode::Tdm | GameMode::Ffa | GameMode::Tdm3)) {
+                    l.mode = m;
+                    l.score = l.mode().score_limits().1;
+                    let minutes = l.mode().default_time_limit();
+                    l.time = TIMES.iter().position(|&t| t == minutes).unwrap_or(l.time);
+                }
+            }
             "lobbynext" => match a(1) {
                 "mode" => {
                     // Each game type starts on its own default limit. Online,
                     // only the modes friends can play yet (no objectives).
                     l.mode = (l.mode + 1) % GameMode::ALL.len();
-                    while online && !matches!(l.mode(), GameMode::Tdm | GameMode::Ffa) {
+                    while !l.mode().offered() || online && !matches!(l.mode(), GameMode::Tdm | GameMode::Ffa | GameMode::Tdm3) {
                         l.mode = (l.mode + 1) % GameMode::ALL.len();
                     }
                     l.score = l.mode().score_limits().1;
@@ -424,6 +533,10 @@ impl Frontend {
             },
             "lobbydevice" => {
                 l.next_device(n(1), &self.devices);
+                roster_changed = true;
+            }
+            "lobbyprofile" => {
+                l.next_profile(n(1));
                 roster_changed = true;
             }
             "lobbyteam" => {
@@ -516,7 +629,13 @@ impl Frontend {
                     let y = PANEL_TOP + 26.0 + ROW_H * locals as f32;
                     let label = format!("Player {} - {}", i + 1, self.device_name(self.lobby.devices[i]));
                     let action = script(&[&ui_script(&format!("lobbyDevice {i}"))]);
-                    m.items.push(side_button(x + 6.0, y, PANEL_W - 6.0 - SWITCH_W, &label, &action, GOLD));
+                    // Players 2 to 4 pick a profile too ("P").
+                    let profile_w = if i > 0 { SWITCH_W } else { 0.0 };
+                    m.items.push(side_button(x + 6.0, y, PANEL_W - 6.0 - SWITCH_W - profile_w, &label, &action, GOLD));
+                    if i > 0 {
+                        let action = script(&[&ui_script(&format!("lobbyProfile {i}"))]);
+                        m.items.push(side_button(x + PANEL_W - 2.0 * SWITCH_W, y, SWITCH_W - 2.0, "P", &action, GOLD));
+                    }
                     let action = script(&[&ui_script(&format!("lobbySwitch {i}"))]);
                     let mut switch = side_button(x + PANEL_W - SWITCH_W, y, SWITCH_W - 2.0, SWITCH_ARROW[s], &action, GOLD);
                     switch.text_align_mode = 9;
@@ -588,14 +707,16 @@ impl Frontend {
 
     fn maps_screen(&self) -> Option<Menu> {
         let (mut m, template) = self.frame(MAPS_MENU, "CHOOSE MAP")?;
-        for (i, (_, name)) in MAPS.iter().enumerate() {
+        // Custom maps after CoD4's: rows close up to fit them on screen.
+        let step = (406.0 / maps().len() as f32).min(19.0);
+        for (i, (_, name)) in maps().iter().enumerate() {
             let action = script(&[&ui_script(&format!("lobbyMap {i}")), "\"close\" \"self\""]);
-            for mut it in place_row(&template, 34.0 + i as f32 * 19.0, i as i32 + 1, str_exp(name), &action) {
+            for mut it in place_row(&template, 34.0 + i as f32 * step, i as i32 + 1, str_exp(name), &action) {
                 if it.ty == item_type::BUTTON {
-                    it.text_scale = 0.3;
+                    it.text_scale = 0.3 * (step / 19.0).max(0.8);
                     it.on_focus += &format!(" ; \"setdvar\" \"{HOVER_DVAR}\" \"{i}\" ; ");
                 }
-                it.window.rect.h = it.window.rect.h.min(19.0);
+                it.window.rect.h = it.window.rect.h.min(step);
                 m.items.push(it);
             }
         }
@@ -633,18 +754,18 @@ impl Frontend {
     /// panels; on the map list, the picture of the map under the mouse.
     pub(super) fn paint_lobby(&self, om: &OpenMenu, pl: &Placement, ops: &mut Vec<Op>) {
         let mut p = Paint { fe: self, pl, ops, horz_align: 1 };
-        if om.name == MAPS_MENU {
-            let i = self.dvar(HOVER_DVAR).parse::<usize>().unwrap_or(self.lobby.map).min(MAPS.len() - 1);
+        if om.name == MAPS_MENU && !om.menu.window.name.starts_with(super::next::maps::MENU) {
+            let i = self.dvar(HOVER_DVAR).parse::<usize>().unwrap_or(self.lobby.map).min(maps().len() - 1);
             p.horz_align = 3;
-            p.map_card(-420.0, 34.0, 404.0, MAPS[i]);
+            p.map_card(-420.0, 34.0, 404.0, maps()[i]);
             return;
         }
-        if om.name != LOBBY_MENU {
+        if om.name != LOBBY_MENU || om.name == MAPS_MENU || om.menu.window.name == super::next::lobby::MENU {
             return;
         }
         let l = &self.lobby;
         // The map, under the settings.
-        p.map_card(6.0, 264.0, 212.0, MAPS[l.map]);
+        p.map_card(6.0, 264.0, 212.0, maps()[l.map]);
 
         // The right side's focused button (a pad's, or the mouse's): a bar
         // like the left column's highlight, not just its text turning white.
@@ -719,6 +840,62 @@ impl Frontend {
         }
         if !o.note.is_empty() {
             p.text(x + 8.0, ONLINE_TOP + 44.0 + 4.0 * o.code.is_some() as u8 as f32, 0, 0.22, &o.note, GOLD);
+        }
+    }
+
+    /// What the new UI's lobby (`next::lobby`) draws: each side's rows in
+    /// the classic screen's order (local players, friends, bots), and the
+    /// rest of the lobby.
+    pub(in crate::ui) fn lobby_view(&self) -> LobbyView {
+        let l = &self.lobby;
+        let (rank, prestige) = self.my_rank();
+        let teams = [0, 1].map(|s| {
+            let mut rows = Vec::new();
+            for i in l.locals_on(s) {
+                rows.push(if l.players > 1 {
+                    LobbyRow::Local {
+                        player: i,
+                        device: self.device_name(l.devices[i]),
+                        profile: l.slot_profile(i).and_then(|id| super::profiles::list().into_iter().find(|p| p.id == id)).map(|p| p.name),
+                    }
+                } else {
+                    LobbyRow::You { name: self.profile_name(), rank, prestige }
+                });
+            }
+            for m in l.online.others_on(s) {
+                rows.push(LobbyRow::Friend {
+                    name: m.profile.name.clone(),
+                    rank: m.profile.rank as i32,
+                    prestige: m.profile.prestige as i32,
+                    host: m.peer == crate::online::HOST,
+                });
+            }
+            for b in &l.bots[s] {
+                rows.push(LobbyRow::Bot { name: b.clone() });
+            }
+            rows
+        });
+        let o = &l.online;
+        LobbyView {
+            map: maps()[l.map],
+            teams,
+            team_names: TEAM_NAMES,
+            team_icons: TEAM_ICONS,
+            team_size: TEAM_SIZE,
+            guest: o.guest(),
+            modes: GameMode::ALL
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.offered())
+                .map(|(i, m)| (i, m.name(), !o.active() || matches!(m, GameMode::Tdm | GameMode::Ffa | GameMode::Tdm3)))
+                .collect(),
+            mode: l.mode,
+            hardcore: l.hardcore,
+            my_side: side(l.teams[0]),
+            code: o.code.clone(),
+            host_name: o.members.iter().find(|m| m.peer == crate::online::HOST).map(|m| m.profile.name.clone()),
+            note: o.note.clone(),
+            split: l.players > 1,
         }
     }
 

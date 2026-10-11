@@ -161,7 +161,8 @@ fn flow(
     let pad_pressed = pad_use && !*pad_was;
     *pad_was = pad_use;
     // None in Hardcore, nor in splitscreen (the views are the players').
-    if crate::tdm::hardcore() || crate::splitscreen::active() {
+    // (Nor in the campaign: a death there fails the mission.)
+    if crate::tdm::hardcore() || crate::splitscreen::active() || crate::campaign::active() {
         killed.clear();
         return;
     }

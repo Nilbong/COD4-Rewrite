@@ -29,9 +29,19 @@ impl Plugin for CoverPlugin {
             .add_systems(Update, (force_third_person, update_view).chain().run_if(crate::state::in_game))
             .add_systems(
                 Update,
-                (test::run, cover_control)
+                (
+                    cover_remotes.after(crate::netplay::drive_remotes).before(crate::movement::MovementSet),
+                    remote_aim.after(cover_remotes).before(crate::weapons::WeaponSet),
+                    guest_hold.after(crate::netplay::send_inputs).before(crate::movement::MovementSet),
+                )
+                    .run_if(crate::state::in_game),
+            )
+            .add_systems(
+                Update,
+                (test::run, test::bugs, limit_pitch, block_prone, cover_control)
                     .chain()
                     .after(crate::player::InputSet)
+                    .before(crate::netplay::send_inputs)
                     .before(crate::movement::MovementSet)
                     .run_if(crate::state::in_game),
             )
@@ -53,12 +63,18 @@ pub fn active() -> bool {
 }
 
 /// The camera's place relative to the eye, in CoD units: right, up, behind.
-const HIP: Vec3 = Vec3::new(26.0, 8.0, 64.0);
-const ADS: Vec3 = Vec3::new(18.0, 5.0, 34.0);
+fn hip() -> Vec3 {
+    Vec3::new(crate::tune::get("cover.cam_right", 26.0), crate::tune::get("cover.cam_up", 8.0), crate::tune::get("cover.cam_back", 64.0))
+}
+fn ads_cam() -> Vec3 {
+    Vec3::new(crate::tune::get("cover.ads_cam_right", 18.0), crate::tune::get("cover.ads_cam_up", 5.0), crate::tune::get("cover.ads_cam_back", 34.0))
+}
 /// How far it keeps from walls.
 const WALL_MARGIN: f32 = 5.0;
 /// The field of view while aiming, as a fraction of the hip view's.
-const ADS_FOV: f32 = 0.82;
+fn ads_fov() -> f32 {
+    crate::tune::get("cover.ads_fov", 0.82)
+}
 /// How fast the camera changes shoulder, per second.
 const SWAP_RATE: f32 = 10.0;
 
@@ -88,11 +104,14 @@ pub struct CoverView {
     pub ads: [f32; MAX_PLAYERS],
     /// The last shot is blocked at the muzzle, for the indicator.
     pub blocked: [bool; MAX_PLAYERS],
+    /// The camera has taken the other shoulder, a wall crowding the chosen
+    /// one (kept until that side clears, so it doesn't flicker).
+    pub flipped: [bool; MAX_PLAYERS],
 }
 
 impl Default for CoverView {
     fn default() -> Self {
-        CoverView { left: [false; MAX_PLAYERS], side: [1.0; MAX_PLAYERS], ads: [0.0; MAX_PLAYERS], blocked: [false; MAX_PLAYERS] }
+        CoverView { left: [false; MAX_PLAYERS], side: [1.0; MAX_PLAYERS], ads: [0.0; MAX_PLAYERS], blocked: [false; MAX_PLAYERS], flipped: [false; MAX_PLAYERS] }
     }
 }
 
@@ -101,6 +120,9 @@ fn force_third_person(mut view: ResMut<crate::wardrobe::ThirdPerson>) {
     if !active() {
         return;
     }
+    // (The game type is only known once the match has set it up: the
+    // cover animations are read from then on, once.)
+    library::start();
     if view.0.iter().any(|on| !*on) {
         view.0 = [true; MAX_PLAYERS];
     }
@@ -132,10 +154,17 @@ fn update_view(
             // shoulder when it has the room.
             let eye = mover.eye(tf.translation);
             let right = view.rotation() * Vec3::X;
-            let want = u(HIP.x) + u(WALL_MARGIN);
+            let want = u(hip().x) + u(WALL_MARGIN);
             let room = |dir: Vec3| probe(&spatial, eye, dir, want).map_or(1.0, |(d, _)| d / want);
             let (mine, other) = (room(right * target), room(-right * target));
-            if mine < 0.6 && other > mine + 0.25 {
+            if cover.flipped[s] {
+                if mine > 0.9 {
+                    cover.flipped[s] = false;
+                }
+            } else if mine < 0.5 && other > mine + 0.3 {
+                cover.flipped[s] = true;
+            }
+            if cover.flipped[s] {
                 target = -target;
             }
         }
@@ -149,7 +178,7 @@ fn update_view(
 pub fn camera_position(eye: Vec3, rot: Quat, slot: usize, cover: &CoverView, spatial: &SpatialQuery) -> Vec3 {
     let s = slot.min(MAX_PLAYERS - 1);
     let ads = cover.ads[s].clamp(0.0, 1.0);
-    let at = HIP.lerp(ADS, ads);
+    let at = hip().lerp(ads_cam(), ads);
     let filter = crate::collision::sight_filter();
     let cast = |from: Vec3, to: Vec3| -> Vec3 {
         let d = to - from;
@@ -179,7 +208,7 @@ fn shoulder_fov(cover: Res<CoverView>, mut cameras: Query<(&SlotCamera, &mut Pro
     for (camera, mut proj) in &mut cameras {
         let ads = cover.ads[camera.0.min(MAX_PLAYERS - 1)].clamp(0.0, 1.0);
         if let Projection::Perspective(p) = proj.as_mut() {
-            p.fov = crate::player::hip_fov().to_radians() * (1.0 - (1.0 - ADS_FOV) * ads);
+            p.fov = crate::player::hip_fov().to_radians() * (1.0 - (1.0 - ads_fov()) * ads);
         }
     }
 }
@@ -277,13 +306,38 @@ fn third_person_aim(
 /// How far from a wall a cover point is looked for, and where its player
 /// stands (CoD units).
 const REACH: f32 = 46.0;
-const STAND_OFF: f32 = 17.0;
+fn stand_off() -> f32 {
+    crate::tune::get("cover.stand_off", 16.0)
+}
+/// How near an end of a wall a player in cover stands (CoD units): a body
+/// is 30 wide, so its head stays behind the corner.
+fn edge_margin() -> f32 {
+    crate::tune::get("cover.edge_margin", 20.0)
+}
+/// The third-person view looks up or down no further than this (degrees).
+fn pitch_up() -> f32 {
+    crate::tune::get("cover.pitch_up_deg", 60.0)
+}
+/// Looking down is limited further: the camera is over the shoulder, so a
+/// steep look down is a view of the top of the head.
+fn pitch_down() -> f32 {
+    crate::tune::get("cover.pitch_down_deg", 40.0)
+}
+/// Prone needs this much clear room ahead and behind (a body lying down is
+/// long, and its model has no collision of its own).
+fn prone_room() -> f32 {
+    crate::tune::get("cover.prone_room", 70.0)
+}
 /// Probe heights above the feet: a crouched body, and a standing one.
 const LOW_PROBE: [f32; 2] = [24.0, 40.0];
 const HIGH_PROBE: f32 = 62.0;
 /// Sliding along cover, units per second (crouched, standing).
-const SLIDE_LOW: f32 = 85.0;
-const SLIDE_HIGH: f32 = 120.0;
+fn slide_low() -> f32 {
+    crate::tune::get("cover.slide_low", 85.0)
+}
+fn slide_high() -> f32 {
+    crate::tune::get("cover.slide_high", 120.0)
+}
 /// The wall ends this far ahead: an open end, where the body can lean out.
 const END_LOOK: f32 = 26.0;
 /// Moving away from the wall this long leaves cover.
@@ -299,6 +353,22 @@ static IN_COVER: AtomicBool = AtomicBool::new(false);
 /// B's tap is the cover button now (a place to take cover, or leaving it).
 pub fn button_is_cover() -> bool {
     active() && (AVAILABLE.load(Ordering::Relaxed) || IN_COVER.load(Ordering::Relaxed))
+}
+
+/// Test aid (`COD4RW_COVER_AUTOKEY`): presses the cover button by itself,
+/// every few seconds, whenever cover is within reach and not yet taken.
+pub fn autokey() -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("COD4RW_COVER_AUTOKEY").is_some()) || !available() {
+        return false;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed().as_secs_f32() < 3.0) {
+        return false;
+    }
+    *last = Some(std::time::Instant::now());
+    true
 }
 
 /// Cover is within reach (for the hint).
@@ -325,6 +395,14 @@ pub struct InCover {
     pub since: f32,
 }
 
+impl InCover {
+    /// A pawn seen in cover on another game ([`crate::netplay`]): only the
+    /// pose matters, not the wall.
+    pub fn replicated(high: bool, now: f32) -> InCover {
+        InCover { normal: Vec3::Z, tangent: Vec3::X, high, open: [false; 2], leaving: 0.0, snap: None, since: now }
+    }
+}
+
 /// Just out of cover (for a moment): the pose for leaving it plays.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct LeavingCover {
@@ -337,8 +415,8 @@ const LEAVING_FOR: f32 = 0.8;
 
 /// The pose for leaving low cover: standing up from behind it. (None while
 /// moving, crouching still, or behind a high wall: the usual loops.)
-pub fn exit_anim_name(l: &LeavingCover, moving: bool, standing: bool, age: f32) -> Option<&'static str> {
-    (!moving && standing && !l.high && age < 0.6).then_some("covercrouch_hide_2_stand")
+pub fn exit_anim_name(_l: &LeavingCover, _moving: bool, _standing: bool, _age: f32) -> Option<&'static str> {
+    None
 }
 
 fn expire_leaving(mut commands: Commands, time: Res<Time>, leaving: Query<(Entity, &LeavingCover, Has<InCover>)>) {
@@ -353,7 +431,7 @@ fn expire_leaving(mut commands: Commands, time: Res<Time>, leaving: Query<(Entit
 /// A place to take cover.
 #[derive(Clone, Copy, Debug)]
 pub struct CoverPoint {
-    /// Feet position, [`STAND_OFF`] from the wall.
+    /// Feet position, [`stand_off()`] from the wall.
     pub pos: Vec3,
     pub normal: Vec3,
     pub high: bool,
@@ -396,7 +474,7 @@ pub fn find_cover(spatial: &SpatialQuery, feet: Vec3, facing: Vec3) -> Option<Co
         let high = probe(spatial, feet + Vec3::Y * u(HIGH_PROBE), dir, u(REACH + 12.0)).is_some_and(|(_, n)| n.y.abs() < 0.35);
         let score = dir.dot(facing) - dist / u(REACH) * 0.3;
         let wall = feet + dir * dist;
-        let point = CoverPoint { pos: Vec3::new(wall.x, feet.y, wall.z) + normal * u(STAND_OFF), normal, high };
+        let point = CoverPoint { pos: Vec3::new(wall.x, feet.y, wall.z) + normal * u(stand_off()), normal, high };
         if best.as_ref().is_none_or(|b| score > b.0) {
             best = Some((score, point));
         }
@@ -408,7 +486,7 @@ pub fn find_cover(spatial: &SpatialQuery, feet: Vec3, facing: Vec3) -> Option<Co
 /// An open end reads as no.
 fn wall_at(spatial: &SpatialQuery, pos: Vec3, normal: Vec3, along: Vec3) -> bool {
     let from = pos + along + Vec3::Y * u(32.0);
-    probe(spatial, from, -normal, u(STAND_OFF + 14.0)).is_some_and(|(_, n)| n.dot(normal) > 0.9)
+    probe(spatial, from, -normal, u(stand_off() + 14.0)).is_some_and(|(_, n)| n.dot(normal) > 0.9)
 }
 
 /// Cover points around `center`, a grid sweep at the player's level: for
@@ -458,7 +536,7 @@ fn aim_cover(spatial: &SpatialQuery, cam: &Transform, feet: Vec3) -> Option<Cove
     }
     let hit = cam.translation + fwd * d;
     let n = horizontal(n);
-    let at = hit + n * u(STAND_OFF) + Vec3::Y * u(50.0);
+    let at = hit + n * u(stand_off()) + Vec3::Y * u(50.0);
     let (down, _) = probe(spatial, at, Vec3::NEG_Y, u(120.0))?;
     let ground = at - Vec3::Y * down;
     let found = find_cover(spatial, ground, -n)?;
@@ -466,10 +544,181 @@ fn aim_cover(spatial: &SpatialQuery, cam: &Transform, feet: Vec3) -> Option<Cove
     (far > u(DASH_MIN) && far < u(DASH_MAX)).then_some(found)
 }
 
-/// The cover key, and moving along cover while in it: the pawn's move
-/// input is replaced by sliding along the wall, an open end plus aim leans
-/// out, and a low wall is looked over by standing up to aim or fire.
-/// Pointing at other cover when pressing it sprints there instead.
+/// A pawn the cover logic acts on, from a player's or a friend's controls.
+struct CoverPawn<'a> {
+    me: Entity,
+    view: &'a ViewAngles,
+    tf: &'a mut Transform,
+    mover: &'a mut Mover,
+    mi: &'a mut MoveInput,
+    weapon_input: &'a WeaponInput,
+    in_cover: Option<Mut<'a, InCover>>,
+    dash: Option<&'a CoverDash>,
+}
+
+/// The cover key's press (`want`), and moving along cover while in it: the
+/// pawn's move input is replaced by sliding along the wall, an open end plus
+/// aim leans out, and a low wall is looked over by standing up to aim or
+/// fire. Pointing at other cover when pressing it sprints there instead.
+/// `cam` is where it looks from (the camera, or a friend's eye).
+fn step(commands: &mut Commands, spatial: &SpatialQuery, dt: f32, now: f32, want: bool, cam: Option<Transform>, p: CoverPawn) {
+    let CoverPawn { me, view, tf, mover, mi, weapon_input, in_cover, dash } = p;
+    let spatial = spatial;
+    let fwd = horizontal(view.forward());
+    let right = Vec3::new(-fwd.z, 0.0, fwd.x);
+    // Running to another cover.
+    if let Some(d) = dash {
+        let to = d.to;
+        let delta = Vec3::new(to.pos.x - tf.translation.x, 0.0, to.pos.z - tf.translation.z);
+        if want || mi.jump || now > d.until {
+            commands.entity(me).remove::<CoverDash>();
+        } else if delta.length() < u(16.0) {
+            commands.entity(me).remove::<CoverDash>().insert(InCover { normal: to.normal, tangent: to.normal.cross(Vec3::Y), high: to.high, open: [false; 2], leaving: 0.0, since: now, snap: Some(to.pos) });
+        } else {
+            let dir = delta.normalize();
+            mi.forward = dir.dot(fwd);
+            mi.right = dir.dot(right);
+            mi.sprint = true;
+            mi.stance = Stance::Stand;
+        }
+        return;
+    }
+    let Some(mut c) = in_cover else {
+        if want && !mover.sprinting {
+            if let Some(p) = find_cover(&spatial, tf.translation, view.forward()) {
+                // Drawn in to the wall's side of the room.
+                commands.entity(me).insert(InCover { normal: p.normal, tangent: p.normal.cross(Vec3::Y), high: p.high, open: [false; 2], leaving: 0.0, since: now, snap: Some(p.pos) });
+            } else if let Some(p) = cam.and_then(|c| aim_cover(&spatial, &c, tf.translation)) {
+                commands.entity(me).insert(CoverDash { to: p, until: now + 4.0 });
+            }
+        }
+        return;
+    };
+    // The key again: to the cover pointed at, else out. A jump or a
+    // sprint leave too.
+    if want {
+        commands.entity(me).remove::<InCover>().insert(LeavingCover { since: now, high: c.high });
+        mover.lean = 0.0;
+        if let Some(p) = cam.and_then(|c| aim_cover(&spatial, &c, tf.translation)) {
+            commands.entity(me).insert(CoverDash { to: p, until: now + 4.0 });
+        }
+        return;
+    }
+    if mi.jump || mi.sprint {
+        commands.entity(me).remove::<InCover>().insert(LeavingCover { since: now, high: c.high });
+        mover.lean = 0.0;
+        return;
+    }
+    let pos = tf.translation;
+    let wish = right * mi.right + fwd * mi.forward;
+    // Pushing away from the wall for a while is leaving it.
+    c.leaving = if wish.dot(c.normal) > 0.8 && !weapon_input.ads { c.leaving + dt } else { 0.0 };
+    if c.leaving > LEAVE_AFTER {
+        commands.entity(me).remove::<InCover>().insert(LeavingCover { since: now, high: c.high });
+        return;
+    }
+    let mut next = pos;
+    if let Some(t) = c.snap {
+        // Still being drawn in: no sliding yet.
+        let d = Vec3::new(t.x - pos.x, 0.0, t.z - pos.z);
+        let step = u(SNAP_SPEED) * dt;
+        if d.length() <= step {
+            next.x = t.x;
+            next.z = t.z;
+            c.snap = None;
+        } else {
+            next += d.normalize() * step;
+        }
+    } else {
+        // Slide along the wall as far as it goes.
+        let mut along = if wish.length() > 0.2 { wish.dot(c.tangent).clamp(-1.0, 1.0) } else { 0.0 };
+        if along.abs() < 0.25 {
+            along = 0.0;
+        }
+        let speed = if c.high { slide_high() } else { slide_low() };
+        let step = c.tangent * along.signum() * u(speed) * along.abs() * dt;
+        if along != 0.0 && wall_at(&spatial, pos, c.normal, step * 2.0 + c.tangent * along.signum() * u(edge_margin())) {
+            // Not into a corner either, nor off the edge of the floor.
+            let ahead = pos + Vec3::Y * u(32.0);
+            let floor_ahead = probe(&spatial, pos + step * 3.0 + Vec3::Y * u(20.0), Vec3::NEG_Y, u(44.0)).is_some();
+            if probe(&spatial, ahead, c.tangent * along.signum(), u(18.0)).is_none() && floor_ahead {
+                next += step;
+            }
+        }
+        // Keep the distance from the wall.
+        if let Some((d, n)) = probe(&spatial, next + Vec3::Y * u(32.0), -c.normal, u(stand_off() + 14.0))
+            && n.dot(c.normal) > 0.9
+        {
+            next += c.normal * (u(stand_off()) - d).clamp(-u(2.0), u(2.0));
+        }
+        // Taken too near an end of the wall (or it ended): ease inward.
+        let near = [!wall_at(&spatial, next, c.normal, -c.tangent * u(edge_margin() - 5.0)), !wall_at(&spatial, next, c.normal, c.tangent * u(edge_margin() - 5.0))];
+        if near[0] != near[1] {
+            next += c.tangent * if near[0] { 1.0 } else { -1.0 } * u(slide_low()) * 0.5 * dt;
+        }
+        c.open = [!wall_at(&spatial, next, c.normal, -c.tangent * u(END_LOOK)), !wall_at(&spatial, next, c.normal, c.tangent * u(END_LOOK))];
+        let lean_side = along;
+        // The player's own move input is spent; what is left is the pose.
+        mi.lean = 0.0;
+        if weapon_input.ads {
+            let side = if c.open[1] && (!c.open[0] || lean_side >= 0.0) {
+                Some(1.0)
+            } else if c.open[0] {
+                Some(-1.0)
+            } else {
+                None
+            };
+            if let Some(side) = side {
+                // Lean is along the view's right; the open side as seen from it.
+                mi.lean = (c.tangent * side).dot(right).signum();
+            }
+        }
+    }
+    tf.translation = next;
+    mover.velocity = Vec3::ZERO;
+    mi.forward = 0.0;
+    mi.right = 0.0;
+    mi.sprint = false;
+    // Standing up to look over low cover, only to aim; firing without
+    // aiming is blind, the gun held up over it.
+    mi.stance = if c.high || weapon_input.ads { Stance::Stand } else { Stance::Crouch };
+
+}
+
+/// Players looking through the shoulder camera can't look straight down
+/// (the camera ends up over a roof looking at the top of a head).
+fn limit_pitch(mut players: Query<&mut ViewAngles, (With<LocalSlot>, Without<Dead>)>) {
+    if !active() {
+        return;
+    }
+    let (up, down) = (pitch_up().to_radians(), pitch_down().to_radians());
+    for mut view in &mut players {
+        if view.pitch > up || view.pitch < -down {
+            view.pitch = view.pitch.clamp(-down, up);
+        }
+    }
+}
+
+/// A body lying down is a long shape the collision hull doesn't know: not
+/// prone with a wall that near ahead or behind (crouch instead).
+fn block_prone(spatial: SpatialQuery, mut players: Query<(&Transform, &ViewAngles, &mut MoveInput), (With<LocalSlot>, Without<Dead>)>) {
+    if !active() {
+        return;
+    }
+    for (tf, view, mut mi) in &mut players {
+        if mi.stance != Stance::Prone {
+            continue;
+        }
+        let along = horizontal(view.forward());
+        let from = tf.translation + Vec3::Y * u(8.0);
+        let blocked = probe(&spatial, from, along, u(prone_room())).is_some() || probe(&spatial, from, -along, u(prone_room())).is_some();
+        if blocked {
+            mi.stance = Stance::Crouch;
+        }
+    }
+}
+
+/// The local players' cover key, and their cover.
 #[allow(clippy::type_complexity)]
 fn cover_control(
     mut commands: Commands,
@@ -488,6 +737,7 @@ fn cover_control(
     }
     let dt = time.delta_secs().min(0.1);
     let now = time.elapsed_secs();
+    let hosting = crate::netplay::authority();
     for (me, slot, input, view, mut tf, mut mover, mut mi, weapon_input, in_cover, dash) in &mut players {
         let want = input.live && input.keys.just_pressed(COVER_KEY);
         let cam = cameras.iter().find(|c| c.0.0 == slot.0).map(|c| *c.1);
@@ -496,119 +746,92 @@ fn cover_control(
             let near = in_cover.is_none() && dash.is_none() && !mover.sprinting && find_cover(&spatial, tf.translation, view.forward()).is_some();
             AVAILABLE.store(near, Ordering::Relaxed);
         }
-        let fwd = horizontal(view.forward());
-        let right = Vec3::new(-fwd.z, 0.0, fwd.x);
-        // Running to another cover.
-        if let Some(d) = dash {
-            let to = d.to;
-            let delta = Vec3::new(to.pos.x - tf.translation.x, 0.0, to.pos.z - tf.translation.z);
-            if want || mi.jump || now > d.until {
-                commands.entity(me).remove::<CoverDash>();
-            } else if delta.length() < u(16.0) {
-                commands.entity(me).remove::<CoverDash>().insert(InCover { normal: to.normal, tangent: to.normal.cross(Vec3::Y), high: to.high, open: [false; 2], leaving: 0.0, since: now, snap: Some(to.pos) });
-            } else {
-                let dir = delta.normalize();
-                mi.forward = dir.dot(fwd);
-                mi.right = dir.dot(right);
-                mi.sprint = true;
-                mi.stance = Stance::Stand;
-            }
+        // An online guest only asks (its button goes to the host with its
+        // other controls); the host decides ([`cover_remotes`]).
+        if !hosting {
             continue;
         }
-        let Some(mut c) = in_cover else {
-            if want && !mover.sprinting {
-                if let Some(p) = find_cover(&spatial, tf.translation, view.forward()) {
-                    // Drawn in to the wall's side of the room.
-                    commands.entity(me).insert(InCover { normal: p.normal, tangent: p.normal.cross(Vec3::Y), high: p.high, open: [false; 2], leaving: 0.0, since: now, snap: Some(p.pos) });
-                } else if let Some(p) = cam.and_then(|c| aim_cover(&spatial, &c, tf.translation)) {
-                    commands.entity(me).insert(CoverDash { to: p, until: now + 4.0 });
-                }
+        step(&mut commands, &spatial, dt, now, want, cam, CoverPawn { me, view, tf: &mut tf, mover: &mut mover, mi: &mut mi, weapon_input, in_cover, dash });
+    }
+}
+
+/// A friend's cover on the host: the same logic, from the controls they send
+/// (their cover button's taps, their view and weapon buttons).
+#[derive(Component, Default, Clone, Copy, Debug)]
+pub struct CoverTap {
+    /// The button went down since the last frame.
+    pub want: bool,
+    /// It was down in the newest controls.
+    pub held: bool,
+}
+
+#[allow(clippy::type_complexity)]
+pub fn cover_remotes(
+    mut commands: Commands,
+    time: Res<Time>,
+    spatial: SpatialQuery,
+    mut remotes: Query<
+        (Entity, &CoverTap, &ViewAngles, &mut Transform, &mut Mover, &mut MoveInput, &WeaponInput, Option<&mut InCover>, Option<&CoverDash>),
+        (With<crate::netplay::RemotePlayer>, Without<Dead>),
+    >,
+) {
+    if !active() || !crate::netplay::authority() {
+        return;
+    }
+    let dt = time.delta_secs().min(0.1);
+    let now = time.elapsed_secs();
+    for (me, tap, view, mut tf, mut mover, mut mi, weapon_input, in_cover, dash) in &mut remotes {
+        let eye = mover.eye(tf.translation);
+        let cam = Some(Transform { translation: eye, rotation: view.rotation(), ..default() });
+        step(&mut commands, &spatial, dt, now, tap.want, cam, CoverPawn { me, view, tf: &mut tf, mover: &mut mover, mi: &mut mi, weapon_input, in_cover, dash });
+    }
+}
+
+/// A friend in cover fires from where the gun is held (the blind-fire
+/// spot) the way they look; out of cover nothing changes.
+#[allow(clippy::type_complexity)]
+pub fn remote_aim(
+    mut commands: Commands,
+    mut remotes: Query<(Entity, &Transform, &Mover, &ViewAngles, &WeaponState, &WeaponInput, Option<&InCover>, Option<&mut FreeAim>), (With<crate::netplay::RemotePlayer>, Without<Dead>)>,
+) {
+    if !active() || !crate::netplay::authority() {
+        return;
+    }
+    for (me, tf, mover, view, weapon, wi, in_cover, free_aim) in &mut remotes {
+        let Some(c) = in_cover.filter(|_| !wi.ads) else {
+            if free_aim.is_some() {
+                commands.entity(me).remove::<FreeAim>();
             }
             continue;
         };
-        // The key again: to the cover pointed at, else out. A jump or a
-        // sprint leave too.
-        if want {
-            commands.entity(me).remove::<InCover>().insert(LeavingCover { since: now, high: c.high });
-            mover.lean = 0.0;
-            if let Some(p) = cam.and_then(|c| aim_cover(&spatial, &c, tf.translation)) {
-                commands.entity(me).insert(CoverDash { to: p, until: now + 4.0 });
-            }
-            continue;
-        }
-        if mi.jump || mi.sprint {
-            commands.entity(me).remove::<InCover>().insert(LeavingCover { since: now, high: c.high });
-            mover.lean = 0.0;
-            continue;
-        }
-        let pos = tf.translation;
-        let wish = right * mi.right + fwd * mi.forward;
-        // Pushing away from the wall for a while is leaving it.
-        c.leaving = if wish.dot(c.normal) > 0.8 && !weapon_input.ads { c.leaving + dt } else { 0.0 };
-        if c.leaving > LEAVE_AFTER {
-            commands.entity(me).remove::<InCover>().insert(LeavingCover { since: now, high: c.high });
-            continue;
-        }
-        let mut next = pos;
-        if let Some(t) = c.snap {
-            // Still being drawn in: no sliding yet.
-            let d = Vec3::new(t.x - pos.x, 0.0, t.z - pos.z);
-            let step = u(SNAP_SPEED) * dt;
-            if d.length() <= step {
-                next.x = t.x;
-                next.z = t.z;
-                c.snap = None;
-            } else {
-                next += d.normalize() * step;
-            }
-        } else {
-            // Slide along the wall as far as it goes.
-            let mut along = if wish.length() > 0.2 { wish.dot(c.tangent).clamp(-1.0, 1.0) } else { 0.0 };
-            if along.abs() < 0.25 {
-                along = 0.0;
-            }
-            let speed = if c.high { SLIDE_HIGH } else { SLIDE_LOW };
-            let step = c.tangent * along.signum() * u(speed) * along.abs() * dt;
-            if along != 0.0 && wall_at(&spatial, pos, c.normal, step * 2.0 + c.tangent * along.signum() * u(6.0)) {
-                // Not into a corner either, nor off the edge of the floor.
-                let ahead = pos + Vec3::Y * u(32.0);
-                let floor_ahead = probe(&spatial, pos + step * 3.0 + Vec3::Y * u(20.0), Vec3::NEG_Y, u(44.0)).is_some();
-                if probe(&spatial, ahead, c.tangent * along.signum(), u(18.0)).is_none() && floor_ahead {
-                    next += step;
-                }
-            }
-            // Keep the distance from the wall.
-            if let Some((d, n)) = probe(&spatial, next + Vec3::Y * u(32.0), -c.normal, u(STAND_OFF + 14.0))
-                && n.dot(c.normal) > 0.9
-            {
-                next += c.normal * (u(STAND_OFF) - d).clamp(-u(2.0), u(2.0));
-            }
-            c.open = [!wall_at(&spatial, next, c.normal, -c.tangent * u(END_LOOK)), !wall_at(&spatial, next, c.normal, c.tangent * u(END_LOOK))];
-            let lean_side = along;
-            // The player's own move input is spent; what is left is the pose.
-            mi.lean = 0.0;
-            if weapon_input.ads {
-                let side = if c.open[1] && (!c.open[0] || lean_side >= 0.0) {
-                    Some(1.0)
-                } else if c.open[0] {
-                    Some(-1.0)
-                } else {
-                    None
-                };
-                if let Some(side) = side {
-                    // Lean is along the view's right; the open side as seen from it.
-                    mi.lean = (c.tangent * side).dot(right).signum();
-                }
+        let eye = mover.eye(tf.translation);
+        let side = if c.open[1] { Some(1.0) } else if c.open[0] { Some(-1.0) } else { None };
+        let out = if c.high { side.map(|s| eye + c.tangent * s * u(24.0)) } else { Some(eye + Vec3::Y * u(30.0) - c.normal * u(2.0)) };
+        let aim = FreeAim { origin: out.unwrap_or(eye), rotation: view.rotation(), spread: weapon.spread(mover) * 3.0 + 5.0, view_kick: 1.0, blocked: out.is_none() };
+        match free_aim {
+            Some(mut a) => *a = aim,
+            None => {
+                commands.entity(me).insert(aim);
             }
         }
-        tf.translation = next;
-        mover.velocity = Vec3::ZERO;
-        mi.forward = 0.0;
-        mi.right = 0.0;
-        mi.sprint = false;
-        // Standing up to look over low cover, only to aim; firing without
-        // aiming is blind, the gun held up over it.
-        mi.stance = if c.high || weapon_input.ads { Stance::Stand } else { Stance::Crouch };
+    }
+}
+
+/// An online guest in cover (the host has it there): its own controls are
+/// sent as they are, then spent, so it doesn't walk away on its side; the
+/// host's position pulls it back into line ([`crate::netplay`]).
+#[allow(clippy::type_complexity)]
+pub fn guest_hold(mut me: Query<(&mut MoveInput, Has<InCover>), (With<crate::player::LocalPlayer>, Without<Dead>)>) {
+    if !active() || crate::netplay::authority() {
+        return;
+    }
+    for (mut mi, in_cover) in &mut me {
+        if in_cover {
+            mi.forward = 0.0;
+            mi.right = 0.0;
+            mi.sprint = false;
+            mi.jump = false;
+        }
     }
 }
 
@@ -636,6 +859,118 @@ mod test {
         format!("{:.0},{:.0},{:.0}", c[0], c[1], c[2] + 1.0)
     }
 
+    /// Test aid (`COD4RW_COVER_BUGS=<dir>`, mp_killhouse): the spots of the
+    /// 2026-10-09 bug reports, a shot at each: looking straight down, a
+    /// corner's head, the gun's way, aiming back out (four frames), prone at
+    /// a wall.
+    #[allow(clippy::type_complexity)]
+    pub fn bugs(
+        mut commands: Commands,
+        time: Res<Time>,
+        spatial: SpatialQuery,
+        mut st: Local<(f32, u32, f32)>,
+        mut players: Query<(Entity, &mut Transform, &mut ViewAngles, &mut MoveInput, &mut WeaponInput, Option<&InCover>), (With<LocalSlot>, Without<Dead>)>,
+        mut exit: MessageWriter<AppExit>,
+    ) {
+        use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+        let Ok(dir) = std::env::var("COD4RW_COVER_BUGS") else { return };
+        let Ok((me, mut tf, mut view, mut mi, mut wi, in_cover)) = players.single_mut() else { return };
+        st.0 += time.delta_secs();
+        if st.0 < 6.0 || (!ready() && st.0 < 40.0) {
+            return;
+        }
+        let at = st.0 - 6.0;
+        let shot = |commands: &mut Commands, n: &str| {
+            let _ = std::fs::create_dir_all(&dir);
+            commands.spawn(Screenshot::primary_window()).observe(save_to_disk(format!("{dir}/{n}.png")));
+        };
+        let spot = |c: [f32; 3]| crate::units::pos(c);
+        let n = st.1;
+        // Looking straight down at the first spot.
+        if n == 0 && at > 0.0 {
+            tf.translation = spot([254.0, 455.0, 28.0]);
+            st.1 = 1;
+        }
+        if st.1 == 1 {
+            view.pitch = 85f32.to_radians();
+            if at > 1.5 {
+                shot(&mut commands, "1_pitch85");
+                st.1 = 2;
+            }
+        }
+        // At the wall of the second: in cover, slid to the end of it.
+        if st.1 == 2 && at > 2.0 {
+            let feet = spot([325.0, 455.0, 28.0]);
+            tf.translation = feet;
+            if let Some(p) = find_cover(&spatial, feet, Vec3::ZERO) {
+                view.yaw = p.normal.x.atan2(p.normal.z);
+                view.pitch = 0.0;
+                tf.translation = p.pos;
+                let tangent = p.normal.cross(Vec3::Y);
+                let solid = |k: i32| wall_at(&spatial, p.pos, p.normal, tangent * u(12.0 * k as f32));
+                let plus = (1..12).find(|&k| !solid(k)).unwrap_or(99);
+                let minus = (1..12).find(|&k| !solid(-k)).unwrap_or(99);
+                st.2 = if plus <= minus { 1.0 } else { -1.0 };
+                commands.entity(me).insert(InCover { normal: p.normal, tangent, high: p.high, open: [false; 2], leaving: 0.0, since: time.elapsed_secs(), snap: None });
+                info!("cover bugs: cover at {:?} ({}), end {:+}", p.pos, if p.high { "high" } else { "low" }, st.2);
+            } else {
+                warn!("cover bugs: no cover at the second spot");
+            }
+            st.1 = 3;
+            st.0 = 6.0 + 2.0;
+        }
+        let at = st.0 - 6.0;
+        if st.1 == 3 {
+            if let Some(c) = in_cover {
+                let fwd = horizontal(view.forward());
+                let screen_right = Vec3::new(-fwd.z, 0.0, fwd.x);
+                if at < 6.0 {
+                    mi.right = screen_right.dot(c.tangent * st.2).signum();
+                }
+            }
+            if at > 6.5 {
+                shot(&mut commands, "2_corner");
+                wi.ads = true;
+                st.1 = 4;
+            }
+        }
+        if st.1 == 4 && at > 7.8 {
+            shot(&mut commands, "3_aim");
+            wi.ads = false;
+            st.1 = 5;
+            st.2 = 0.0;
+        }
+        // Aiming back out: four frames in a row.
+        if (5..9).contains(&st.1) && at > 7.8 + 0.12 * (st.1 - 4) as f32 {
+            shot(&mut commands, &format!("4_out_{}", st.1 - 5));
+            st.1 += 1;
+        }
+        // Prone at a wall.
+        if st.1 == 9 && at > 9.0 {
+            let feet = spot([497.0, 937.0, 28.0]);
+            tf.translation = feet;
+            if let Some(p) = find_cover(&spatial, feet, Vec3::ZERO) {
+                view.yaw = p.normal.x.atan2(p.normal.z);
+                view.pitch = 0.1;
+                tf.translation = p.pos + p.normal * u(30.0);
+            }
+            commands.entity(me).remove::<InCover>();
+            st.1 = 10;
+            st.0 = 6.0 + 10.0;
+        }
+        let at = st.0 - 6.0;
+        if st.1 == 10 {
+            mi.stance = Stance::Prone;
+            if at > 12.5 {
+                shot(&mut commands, "5_prone");
+                st.1 = 11;
+            }
+        }
+        if st.1 == 11 && at > 14.0 {
+            exit.write(AppExit::Success);
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     pub fn run(
         mut commands: Commands,
@@ -643,6 +978,7 @@ mod test {
         spatial: SpatialQuery,
         mut script: Local<Script>,
         mut players: Query<(Entity, &mut Transform, &mut ViewAngles, &mut MoveInput, &mut WeaponInput, Option<&InCover>), (With<LocalSlot>, Without<Dead>)>,
+        mut friends: Query<&mut Transform, (With<crate::netplay::RemotePlayer>, Without<LocalSlot>)>,
         mut exit: MessageWriter<AppExit>,
     ) {
         let Ok(dir) = std::env::var("COD4RW_COVER_TEST") else { return };
@@ -651,7 +987,9 @@ mod test {
         script.t += time.delta_secs();
         let t = script.t;
         // Wait out the spawn and the animations, then look for a wall with an end to it.
-        if t < 4.0 || (!script.searched && !ready() && t < 60.0) {
+        // (`COD4RW_COVER_TEST_WAIT`: longer, for a friend to load in.)
+        let wait = std::env::var("COD4RW_COVER_TEST_WAIT").ok().and_then(|w| w.parse::<f32>().ok()).unwrap_or(0.0);
+        if !script.searched && (t < 4.0 + wait || (!ready() && t < 60.0 + wait)) {
             return;
         }
         if !script.searched {
@@ -725,6 +1063,10 @@ mod test {
             shot(&mut commands, "0_before");
         }
         if step(1, 1.0, &mut script) {
+            // A friend's soldier goes to the wall too (it takes cover itself).
+            for mut f in &mut friends {
+                f.translation = spot.pos + Vec3::Y * u(0.1);
+            }
             // The key press, simulated.
             commands.entity(me).insert(InCover { normal: spot.normal, tangent: spot.normal.cross(Vec3::Y), high: spot.high, open: [false; 2], leaving: 0.0, since: time.elapsed_secs(), snap: Some(spot.pos) });
         }
@@ -767,7 +1109,7 @@ mod test {
             mi.lean = 0.0;
             match pick {
                 Some(o) => {
-                    let wall = o.pos - o.normal * u(STAND_OFF) + Vec3::Y * u(30.0);
+                    let wall = o.pos - o.normal * u(stand_off()) + Vec3::Y * u(30.0);
                     let d = wall - from;
                     view.yaw = (-d.x).atan2(-d.z);
                     view.pitch = d.y.atan2(Vec3::new(d.x, 0.0, d.z).length());
@@ -870,26 +1212,15 @@ fn load_anims() {
 }
 
 /// The animation for a pawn in cover (None: the usual crouch or stand
-/// loop, which is what sliding along the wall uses).
-pub fn anim_name(c: &InCover, lean: f32, aiming: bool, firing: bool, moving: bool, age: f32) -> Option<&'static str> {
-    if moving {
+/// loops, which keep the gun where the player aims). The campaign's cover
+/// idles and aims are posed for their own body direction and gun hold, so
+/// only the blind fire is used.
+pub fn anim_name(c: &InCover, _lean: f32, aiming: bool, firing: bool, moving: bool, _age: f32) -> Option<&'static str> {
+    if moving || aiming || !firing {
         return None;
     }
-    // Just taken: the low wall's stand-to-hide.
-    if !c.high && age < 0.9 && !aiming && !firing {
-        return Some("covercrouch_stand_2_hide");
-    }
-    Some(match (c.high, lean, aiming) {
-        (true, l, true) if l != 0.0 => if l > 0.0 { "cornerstndr_lean_aim_5" } else { "cornerstndl_lean_aim_5" },
-        (true, l, false) if l != 0.0 => if l > 0.0 { "cornerstndr_lean_idle" } else { "cornerstndl_lean_idle" },
-        (true, _, false) if firing => "coverstand_blindfire_1",
-        (true, _, _) => "coverstand_hide_idle",
-        (false, _, true) => "covercrouch_aim5",
-        (false, _, false) if firing => "covercrouch_blindfire_1",
-        (false, _, false) => "covercrouch_hide_idle",
-    })
+    Some(if c.high { "coverstand_blindfire_1" } else { "covercrouch_blindfire_1" })
 }
-
 
 // ---------------------------------------------------------------------
 // Bots in cover (3rd Person TDM only): shot at, a bot runs to cover that

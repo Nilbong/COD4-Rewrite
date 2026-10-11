@@ -379,7 +379,7 @@ fn spawn_model_of(
     // (another player's) shows none.
     let custom = crate::custom_camos::get(camo);
     let camo = match &custom {
-        Some(_) => custom::model_camo(crate::bo1::is_bo1(weapon), crate::waw::is_waw(weapon)),
+        Some(_) => custom::model_camo(crate::bo1::is_bo1(weapon), crate::waw::is_waw(weapon) || crate::mw2guns::is_mw2(weapon)),
         None if crate::custom_camos::is_custom(camo) => 0,
         None => camo,
     };
@@ -388,7 +388,10 @@ fn spawn_model_of(
     // Keep the native gold models and materials where CoD4 supplies them.
     let finish = finish.filter(|f| *f != platinum::Finish::Gold || !platinum::Finish::native_gold(weapon));
     let bo1 = crate::bo1::is_bo1(weapon);
-    let waw = crate::waw::is_waw(weapon);
+    let mw2 = crate::mw2guns::is_mw2(weapon);
+    // (MW2's guns are drawn like World at War's: a model per attachment
+    // pair; their camos are models of their own, with CoD4's camo layer.)
+    let waw = crate::waw::is_waw(weapon) || mw2;
     let gl = !bo1 && !waw && attachments.contains(&"gl");
 
     // The base model with the variant's hidden tags; each sight or grip
@@ -396,6 +399,10 @@ fn spawn_model_of(
     // hides, like the iron sight under a red dot).
     let (model_name, hide) = if bo1 {
         bo1_model(weapon, &attachments, field == WORLD_MODEL)?
+    } else if mw2 {
+        let camo = crate::mw2guns::camo_model(camo).unwrap_or(0);
+        let (name, hide) = crate::mw2guns::data()?.model(weapon, &attachments, field == WORLD_MODEL, camo)?;
+        (crate::waw::model_name(content, &name)?, hide)
     } else if waw {
         let (name, hide) = crate::waw::data()?.model(weapon, &attachments, field == WORLD_MODEL)?;
         (crate::waw::model_name(content, &name)?, hide)
@@ -420,9 +427,10 @@ fn spawn_model_of(
     let mut worn = camos.dress(content, &model_name, &prepared, meshes, materials, images);
     let camo_surfaces = if bo1 {
         bo1_camo_surfaces(content, &model_name, weapon, camo, materials, images)
-    } else if waw {
+    } else if waw && !mw2 {
         HashMap::new()
     } else {
+        // (MW2's camo models carry CoD4's camo layer: a `detailMap`.)
         camo_surfaces(content, &model_name, materials, images)
     };
     let paint_surfaces = match &custom {
@@ -439,7 +447,12 @@ fn spawn_model_of(
             diamond_model(content, &model_name, &prepared, &worn, &finish_surfaces, meshes, &mut camos.diamond_meshes);
     }
     let reflex_surfaces = reflex_surfaces(content, &model_name, materials, images);
-    let lens_surfaces = lens_surfaces(content, &model_name, materials, images);
+    // (First person only: a held gun's lens is just glass.)
+    let (lens_surfaces, crosshair_surfaces) = if field == GUN_MODEL {
+        (lens_surfaces(content, &model_name, materials, images, false), lens_surfaces(content, &model_name, materials, images, true))
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
     let mut shine_surfaces = shine_surfaces(content, &model_name, materials, images);
     if waw {
         // World at War's guns give negative fresnel powers (`envMapParms.z`,
@@ -473,6 +486,7 @@ fn spawn_model_of(
     }
 
     let GunTarget { owner, attach_to, layers } = target;
+    let disc_layers = layers.clone();
     // Held guns cast the sun's shadow with their holder (the viewmodel's
     // layer has no shadowing sun, so first-person guns are unaffected).
     let surfaces = spawn_model(
@@ -488,16 +502,21 @@ fn spawn_model_of(
             if !keep.contains(&material.id()) {
                 commands.entity(entity).despawn();
             } else {
+                commands.entity(entity).insert(GunSurface);
                 spawned.push(entity);
             }
         }
     }
     let vfs = content.vfs.clone();
     for (entity, ((_, material), (_, worn))) in surfaces.into_iter().zip(prepared.surfaces.iter().zip(&worn.surfaces)) {
+        commands.entity(entity).insert(GunSurface);
         // A magnifying scope's eyepiece: a 3D scope draws its view there.
+        if crosshair_surfaces.contains_key(&material.id()) {
+            commands.entity(entity).insert(ScopeCrosshair);
+        }
         // (Kept as it is meanwhile: no camo or shine of its own.)
-        if lens_surfaces.contains(&material.id()) {
-            commands.entity(entity).insert(ScopeLens);
+        if let Some(geom) = lens_surfaces.get(&material.id()) {
+            commands.entity(entity).insert((ScopeLens, *geom));
             continue;
         }
         if let Some(info) = reflex_surfaces.get(&material.id()) {
@@ -585,6 +604,38 @@ fn spawn_model_of(
             }
         };
         commands.entity(entity).remove::<MeshMaterial3d<StandardMaterial>>().insert(MeshMaterial3d(camo));
+    }
+    // A scope whose eyepiece isn't a surface of its own: a lens disc there.
+    // (Its ACOG's lens, a hidden part, doesn't count.)
+    if field == GUN_MODEL
+        && let Some(&(_, joint, at, radius)) = LENS_DISCS.iter().find(|d| model_name.starts_with(d.0))
+        && let Some(j) = skeleton.joint(joint)
+    {
+        let mesh = meshes.add(Circle::new(crate::units::u(radius)));
+        let debug = std::env::var_os("COD4RW_LENSDEBUG").is_some();
+        let glass = materials.add(StandardMaterial {
+            base_color: if debug { Color::srgb(1.0, 0.0, 0.0) } else { Color::srgb(0.02, 0.025, 0.03) },
+            unlit: debug,
+            perceptual_roughness: 0.1,
+            cull_mode: None,
+            double_sided: true,
+            ..default()
+        });
+        let mut disc = commands.spawn((
+            Name::new("lens disc"),
+            Mesh3d(mesh),
+            MeshMaterial3d(glass),
+            ScopeLens,
+            LensGeom { bone: None, centre: Vec3::ZERO, radius: crate::units::u(radius) },
+            bevy::light::NotShadowCaster,
+            // Facing the eye (CoD models face +X).
+            Transform::from_translation(crate::units::pos(at)).with_rotation(Quat::from_rotation_y(-std::f32::consts::FRAC_PI_2)),
+            ChildOf(j),
+        ));
+        if let Some(l) = disc_layers {
+            disc.insert(l);
+        }
+        spawned.push(disc.id());
     }
     // Scaled to nothing: now for still models, and by the animation player
     // for animated ones.
@@ -734,7 +785,7 @@ fn shine_surfaces(
             .and_then(|t| t.image)
             .and_then(|i| zone.image(i))
             .map(|i| i.name.clone())
-            .filter(|n| !n.starts_with('$'));
+            .filter(|n| !n.trim_start_matches(',').starts_with('$'));
         let env =
             mat.constants.iter().find(|c| c.name == "envMapParms").map_or(DEFAULT_ENV, |c| Vec4::from_array(c.literal));
         if let Some(spec) = spec {
@@ -863,34 +914,91 @@ fn bo1_camo_surfaces(
     out
 }
 
+/// Scopes with no eyepiece surface of their own (it's part of the scope's):
+/// a lens disc goes there: model name prefix, joint, place (CoD units, in
+/// the joint's frame) and radius.
+const LENS_DISCS: [(&str, &str, [f32; 3], f32); 1] = [("viewmodel_dragunov", "j_gun", [-3.05, 0.0, 4.35], 0.5)];
+
+/// A scope's own reticle surface, hidden with 3D scopes (`ui::scope3d`).
+#[derive(Component)]
+pub struct ScopeCrosshair;
+
+/// One of a gun's surfaces (not the arms holding it).
+#[derive(Component)]
+pub struct GunSurface;
+
 /// A magnifying scope's eyepiece lens (a sniper scope's, an ACOG's): what
 /// `ui::scope3d` draws the scope's view on.
 #[derive(Component)]
 pub struct ScopeLens;
 
-/// The surfaces of a model that are a scope's eyepiece: CoD4's
-/// `mtl_weapon_*_scope_lens` and `mtl_weapon_acog_lens` (not red dots'
-/// `reflex_lens`, nor the front lenses).
+/// Where a scope lens is and how big (`ui::scope3d` fits the scope's view
+/// to it): its centre in the frame of the bone it's skinned to (`bone`, an
+/// index into its `SkinnedMesh`'s joints; none for a lens disc, centred on
+/// its own transform), and its radius, in metres.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct LensGeom {
+    pub bone: Option<usize>,
+    pub centre: Vec3,
+    pub radius: f32,
+}
+
+/// The surfaces of a model that are a magnifying scope's lens: CoD4's
+/// `mtl_weapon_*_scope_lens` and `mtl_weapon_acog_lens`, Black Ops' ACOG,
+/// long scope, Redfield sniper scope and night-vision scope lenses, World
+/// at War's sniper scopes' (not red dots' or aperture sights' glass).
 fn lens_surfaces(
     content: &mut Content,
     model: &str,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
-) -> HashSet<AssetId<StandardMaterial>> {
-    let Some((zi, id)) = content.find(model) else { return HashSet::new() };
+    crosshairs: bool,
+) -> HashMap<AssetId<StandardMaterial>, LensGeom> {
+    let Some((zi, id)) = content.find(model) else { return HashMap::new() };
     let zone = &content.zones[zi];
-    let Some(xm) = zone.xmodel(id) else { return HashSet::new() };
-    let Some(lod) = xm.lods.first() else { return HashSet::new() };
+    let Some(xm) = zone.xmodel(id) else { return HashMap::new() };
+    let Some(lod) = xm.lods.first() else { return HashMap::new() };
     let ids: Vec<_> = (lod.surf_index as usize..(lod.surf_index + lod.num_surfs) as usize)
-        .filter_map(|i| xm.materials.get(i).copied().flatten())
-        .filter(|&i| {
+        .filter_map(|s| xm.materials.get(s).copied().flatten().map(|m| (s, m)))
+        .filter(|&(_, i)| {
             zone.material(i).is_some_and(|m| {
                 let name = m.name.trim_start_matches(',').to_ascii_lowercase();
-                name.ends_with("scope_lens") || name.ends_with("acog_lens")
+                if std::env::var_os("COD4RW_LENSDEBUG").is_some() && (name.contains("lens") || name.contains("scope") || name.contains("acog") || name.contains("glass")) {
+                    info!("lensdebug {model}: {name}");
+                }
+                if crosshairs {
+                    // A scope's own reticle surface (Black Ops' PK-A's and
+                    // Colt 3x20's): a 3D scope draws its own.
+                    return name.ends_with("_crosshair") && (name.contains("pka") || name.contains("colt3x20"));
+                }
+                name.ends_with("scope_lens")
+                    || name.ends_with("acog_lens")
+                    || ["redfield_lens_interior", "nsp3a_lens", "pka_lens", "springfield_lens", "rus_scope_glass", "jap_lens_scope", "telescopic_lens", "telescopic_glass"]
+                        .iter()
+                        .any(|p| name.contains(p))
             })
         })
+        .map(|(s, m)| (m, lens_geom(xm, s)))
         .collect();
-    ids.into_iter().filter_map(|id| content.material(zi, id, materials, images)).map(|m| m.handle.id()).collect()
+    ids.into_iter()
+        .filter_map(|(id, geom)| Some((content.material(zi, id, materials, images)?.handle.id(), geom)))
+        .collect()
+}
+
+/// A lens surface's centre (in its bone's bind frame, model space) and
+/// radius: the middle of its vertices and the larger of its extents across
+/// the gun's axis (CoD models face +X).
+fn lens_geom(xm: &iw3::zone::XModel, surf: usize) -> LensGeom {
+    let Some(s) = xm.surfs.get(surf) else { return LensGeom { bone: Some(0), centre: Vec3::ZERO, radius: 0.0 } };
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for v in &s.verts {
+        let p = crate::units::pos(v.xyz);
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    let half = (hi - lo) * 0.5;
+    let bone = s.vert_lists.first().map_or(0, |l| l.bone_offset as usize / 64);
+    LensGeom { bone: Some(bone), centre: (lo + hi) * 0.5, radius: half.y.max(half.z) }
 }
 
 /// The surfaces of a model drawn with `mc_reflexsight` (a red dot sight's

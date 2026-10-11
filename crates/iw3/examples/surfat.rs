@@ -18,6 +18,10 @@ fn main() -> anyhow::Result<()> {
             let t = m.technique_set.and_then(|t| zone.technique_set(t)).map_or("", |t| t.name.as_str());
             format!("{} [{t}]", m.name)
         });
+        // (`SURFAT_LM=1`: each surface on its own line with its lightmap.)
+        if std::env::var_os("SURFAT_LM").is_some() {
+            println!("{name} lm {} first_vertex {} tris {} bounds {:?}..{:?}", s.lightmap_index, s.first_vertex, s.tri_count, lo.map(f32::round), hi.map(f32::round));
+        }
         let e = found.entry(name).or_insert((0, 0, s.bounds));
         e.0 += 1;
         e.1 += s.tri_count as u32;

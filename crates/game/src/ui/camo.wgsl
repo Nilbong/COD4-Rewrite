@@ -20,7 +20,14 @@
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
     forward_io::{VertexOutput, FragmentOutput},
+    ambient,
+    clustered_forward as clustering,
+    lighting::{EnvBRDFApprox, F_AB},
+    pbr_functions::calculate_F0,
 }
+#ifdef IRRADIANCE_VOLUME
+#import bevy_pbr::irradiance_volume
+#endif
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> detail_scale: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var detail_map: texture_2d<f32>;
@@ -93,6 +100,10 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             color = detail * mix(1.0, relief, 0.7);
             if (detail_scale.z > 3.5) {
                 color = color * vec3(0.78, 0.40, 0.065);
+            } else {
+                // Platinum reflects about 60% of the light (its F0), not
+                // all of it: near white, it outshone everything around.
+                color = color * vec3(0.62, 0.60, 0.57);
             }
         } else if (detail_scale.z > 1.5) {
             // Black Ops' own colour map is nearly black (its gold is all
@@ -125,6 +136,26 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);
+#ifdef IRRADIANCE_VOLUME
+    if (detail_scale.z > 2.5 && detail_scale.z < 5.5) {
+        // Polished metal (platinum, gold, diamond's gold) has no diffuse
+        // colour, so Bevy's flat ambient reflection was nearly all its
+        // light, the same in shade as in the open: the gun glowed white in
+        // the shade while the arms (lit by the light grid) went dark. Its
+        // reflection is taken from the light grid instead, round the
+        // reflected direction, like the arms' light.
+        let m = pbr_input.material;
+        let f0 = calculate_F0(m.base_color.rgb, m.metallic, m.reflectance);
+        let n_dot_v = max(dot(pbr_input.N, pbr_input.V), 1e-4);
+        let flat = ambient::ambient_light(pbr_input.world_position, pbr_input.N, pbr_input.V, n_dot_v, m.base_color.rgb * (1.0 - m.metallic), f0, m.perceptual_roughness, pbr_input.diffuse_occlusion);
+        let view_z = dot(vec4(view.view_from_world[0].z, view.view_from_world[1].z, view.view_from_world[2].z, view.view_from_world[3].z), pbr_input.world_position);
+        var ranges = clustering::unpack_clusterable_object_index_ranges(clustering::view_fragment_cluster_index(pbr_input.frag_coord.xy, view_z, false));
+        let r = reflect(-pbr_input.V, pbr_input.N);
+        let grid = irradiance_volume::irradiance_volume_light(pbr_input.world_position.xyz, r, &ranges);
+        let reflected = EnvBRDFApprox(f0, F_AB(m.perceptual_roughness, n_dot_v)) * grid * pbr_input.diffuse_occlusion;
+        out.color = vec4(max(out.color.rgb + (reflected - flat) * view.exposure, vec3(0.0)), out.color.a);
+    }
+#endif
 #ifdef VERTEX_UVS_A
     if (shine.x > 0.5) {
         var s = textureSample(specular_map, specular_sampler, in.uv);

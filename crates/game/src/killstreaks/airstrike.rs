@@ -111,15 +111,39 @@ impl Airstrikes {
             .sum()
     }
 
-    /// Call one on `target` (a ground point, Bevy space).
+    /// Call one on `target` (a ground point, Bevy space). One called while
+    /// another is under way waits for it to finish (CoD4 refuses it, which
+    /// players took for the pick not working).
     pub fn call(&mut self, owner: Entity, target: Vec3, now: f32) {
         let yaw = rand::random::<f32>() * std::f32::consts::TAU;
         let dir = units::dir([yaw.cos(), yaw.sin(), 0.0]);
+        let start = self.strikes.iter().map(|s| s.called + IN_PROGRESS).fold(now, f32::max);
+        info!("airstrike: called at CoD {:?}, starting in {:.1} s", units::to_cod(target).map(f32::round), start - now);
+        let now = start;
         let first = now + DELAY;
         let second = first + rand::random_range(1.5..2.5);
         let third = second + rand::random_range(1.5..2.5);
         self.strikes.push(Strike { owner, target, dir, called: now, plane_times: [first, second, third], planes: Vec::new() });
     }
+}
+
+/// The ground under `at` (Bevy space; only its x and z count) for a strike
+/// picked on the map: the highest floor below the sky there, near where
+/// players are (`near_y`, the caller's feet): a ray from far above meets the
+/// map's sky and ceiling brushes first. Missing everything, the spot at the
+/// caller's height: a strike always has somewhere to go.
+pub fn ground_below(spatial: &SpatialQuery, at: Vec3, near_y: f32) -> Vec3 {
+    let top = Vec3::new(at.x, u(20000.0), at.z);
+    let filter = crate::collision::sight_filter();
+    let mut hits = spatial.ray_hits(top, Dir3::NEG_Y, u(60000.0), 32, true, &filter);
+    hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    let points: Vec<(Vec3, Vec3)> = hits.iter().map(|h| (top - Vec3::Y * h.distance, h.normal)).collect();
+    let ceiling = near_y + u(2500.0);
+    points
+        .iter()
+        .find(|(p, n)| n.y > 0.5 && p.y <= ceiling)
+        .or_else(|| points.iter().rev().find(|(_, n)| n.y > 0.5))
+        .map_or(Vec3::new(at.x, near_y, at.z), |(p, _)| *p)
 }
 
 /// `doPlaneStrike`'s path, with its randomness: up to 100 units sideways at

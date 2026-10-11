@@ -281,6 +281,11 @@ pub struct Mover {
     pub mantle_hint: bool,
     /// A melee lunge under way: its horizontal velocity ([`crate::melee`]).
     pub charge: Option<Vec3>,
+    /// On a ladder: the way its face looks (`PMF_LADDER`, `vLadderVec`).
+    pub ladder: Option<Vec3>,
+    /// Came off a ladder in the air: not caught again until on the ground
+    /// (`PMF_LADDER_FALL`).
+    ladder_fall: bool,
 }
 
 impl Default for Mover {
@@ -310,6 +315,8 @@ impl Default for Mover {
             mantle: None,
             mantle_hint: false,
             charge: None,
+            ladder: None,
+            ladder_fall: false,
         }
     }
 }
@@ -430,6 +437,8 @@ struct Ctx<'a, 'w, 's> {
     tuning: MoveTuning,
     /// The brushes' faces ([`collision::BrushFaces`]).
     faces: Option<&'a collision::BrushFaces>,
+    /// Ladder brushes ([`collision::Ladder`]).
+    ladders: &'a [Entity],
 }
 
 impl Ctx<'_, '_, '_> {
@@ -498,7 +507,7 @@ impl Ctx<'_, '_, '_> {
 /// `mantle_over` surfaces.
 pub fn mantle_landing(spatial: &SpatialQuery, feet: Vec3, yaw: f32, over: &[Entity]) -> Option<(Vec3, Vec3)> {
     let filter = collision::movement_filter();
-    let ctx = Ctx { mantle: None, mantle_over: over, spatial, filter: &filter, tuning: MoveTuning::COD4, faces: None };
+    let ctx = Ctx { mantle: None, mantle_over: over, spatial, filter: &filter, tuning: MoveTuning::COD4, faces: None, ladders: &[] };
     mantle::landing(&ctx, feet, yaw, over)
 }
 
@@ -527,18 +536,20 @@ fn move_pawns(
     mantle_anims: Option<Res<MantleAnims>>,
     mantle_surfaces: Query<(Entity, &collision::MantleSurface)>,
     faces: Option<Res<collision::BrushFaces>>,
+    ladders: Query<Entity, With<collision::Ladder>>,
 ) {
     let dt = time.delta_secs().min(0.1);
     let steps = (dt / MAX_SUBSTEP).ceil().max(1.0);
     let step_dt = dt / steps;
     let filter = collision::movement_filter();
     let over: Vec<Entity> = mantle_surfaces.iter().filter(|(_, s)| s.over).map(|(e, _)| e).collect();
-    let ctx = Ctx { mantle: mantle_anims.as_deref(), mantle_over: &over, spatial: &spatial, filter: &filter, tuning: *tuning, faces: faces.as_deref() };
+    let ladders: Vec<Entity> = ladders.iter().collect();
+    let ctx = Ctx { mantle: mantle_anims.as_deref(), mantle_over: &over, spatial: &spatial, filter: &filter, tuning: *tuning, faces: faces.as_deref(), ladders: &ladders };
     for (entity, mut tf, mut mover, input, view, local) in &mut pawns {
         tf.rotation = Quat::from_rotation_y(view.yaw);
         let mut pos = tf.translation;
         for _ in 0..steps as u32 {
-            if let Some(h) = pmove(&ctx, &mut pos, &mut mover, input, view.yaw, step_dt) {
+            if let Some(h) = pmove(&ctx, &mut pos, &mut mover, input, view, step_dt) {
                 landed.write(Landed { entity, fall_height: h });
             }
         }
@@ -552,7 +563,8 @@ fn move_pawns(
 }
 
 /// One `PmoveSingle`. Returns the fall height when landing.
-fn pmove(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, input: &MoveInput, yaw: f32, dt: f32) -> Option<f32> {
+fn pmove(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, input: &MoveInput, view: &ViewAngles, dt: f32) -> Option<f32> {
+    let yaw = view.yaw;
     let msec = dt * 1000.0;
     m.clock_ms += msec;
 
@@ -613,7 +625,18 @@ fn pmove(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, input: &MoveInput, yaw: f32, 
         return None;
     }
 
-    if m.on_ground {
+    check_ladder(ctx, *pos, m, fmove, yaw);
+    if let Some(ladder) = m.ladder {
+        m.sprinting = false;
+        if jump_check(m, input, *pos) {
+            push_off_ladder(m, ladder, yaw);
+            air_move(ctx, pos, m, fmove, smove, yaw, dt);
+        } else {
+            ladder_move(ctx, pos, m, ladder, fmove, smove, view, dt);
+            // (Climbing down is no fall.)
+            m.fall_start_y = pos.y;
+        }
+    } else if m.on_ground {
         if m.sprinting {
             smove *= SPRINT_STRAFE_SPEED_SCALE;
         }
@@ -825,6 +848,123 @@ fn jump_check(m: &mut Mover, input: &MoveInput, pos: Vec3) -> bool {
     m.jumping = true;
     m.land_ms = 0.0;
     true
+}
+
+/// How far ahead a ladder is looked for, walking and in the air.
+const LADDER_REACH_WALKING: f32 = u(8.0);
+const LADDER_REACH_AIR: f32 = u(30.0);
+/// `jump_ladderPushVel`: jumping off a ladder.
+const LADDER_PUSH_SPEED: f32 = u(128.0);
+
+/// Whether a ladder is right in front, as `PM_CheckLadderMove`: a slimmer
+/// hull (6 units in at each side, from 8 up) traced the way the player
+/// faces, or back at the ladder they're on while in the air. Its face's
+/// normal when it's a ladder brush.
+fn ladder_ahead(ctx: &Ctx, feet: Vec3, stance: Stance, dir: Vec3, reach: f32) -> Option<Vec3> {
+    let dir = Dir3::new(dir).ok()?;
+    let half = HULL_RADIUS - u(6.0);
+    let (bottom, top) = (u(8.0), stance.hull_height().max(u(9.0)));
+    let shape = Collider::cuboid(half * 2.0, top - bottom, half * 2.0);
+    let origin = feet + Vec3::Y * (bottom + top) * 0.5;
+    let config = ShapeCastConfig { max_distance: reach, target_distance: 0.0, ignore_origin_penetration: true, ..ShapeCastConfig::DEFAULT };
+    let hit = ctx.spatial.cast_shape(&shape, origin, Quat::IDENTITY, dir, &config, ctx.filter)?;
+    if !ctx.ladders.contains(&hit.entity) {
+        return None;
+    }
+    let mut n = hit.normal1.normalize_or(-*dir);
+    if n.dot(*dir) > 0.0 {
+        n = -n;
+    }
+    Vec3::new(n.x, 0.0, n.z).try_normalize()
+}
+
+/// `PM_CheckLadderMove`: on or off a ladder this frame.
+fn check_ladder(ctx: &Ctx, pos: Vec3, m: &mut Mover, fmove: f32, yaw: f32) {
+    if m.on_ground {
+        m.ladder_fall = false;
+    }
+    let off = |m: &mut Mover| {
+        if m.ladder.take().is_some() {
+            m.ladder_fall = true;
+        }
+    };
+    if ctx.ladders.is_empty() || m.ladder_fall || m.stance == Stance::Prone || m.clock_ms - m.last_jump_ms < 300.0 {
+        off(m);
+        return;
+    }
+    let reach = if m.on_ground { LADDER_REACH_WALKING } else { LADDER_REACH_AIR };
+    let dir = match m.ladder {
+        Some(l) if !m.on_ground => -l,
+        _ => yaw_vectors(yaw).0,
+    };
+    let Some(normal) = ladder_ahead(ctx, pos, m.stance, dir, reach).filter(|_| !(m.on_ground && fmove <= 0.0)) else {
+        off(m);
+        return;
+    };
+    if m.ladder.is_some() {
+        return;
+    }
+    // Then straight at its face: it's a ladder there too.
+    if ladder_ahead(ctx, pos, m.stance, -normal, reach).is_some() {
+        m.ladder = Some(normal);
+    } else {
+        off(m);
+    }
+}
+
+/// `Jump_PushOffLadder`: away from the ladder (mirrored off it when facing
+/// into it).
+fn push_off_ladder(m: &mut Mover, ladder: Vec3, yaw: f32) {
+    m.velocity.y *= 0.75;
+    let flat = yaw_vectors(yaw).0;
+    let dir = if ladder.dot(flat) >= 0.0 { flat } else { (flat - ladder * 2.0 * flat.dot(ladder)).normalize_or_zero() };
+    m.velocity.x = dir.x * LADDER_PUSH_SPEED;
+    m.velocity.z = dir.z * LADDER_PUSH_SPEED;
+    m.ladder = None;
+}
+
+/// `PM_LadderMove`: forward climbs (up when looking up or level, down when
+/// looking well down), strafing moves along the rungs a little; let go and
+/// you hang there.
+#[allow(clippy::too_many_arguments)]
+fn ladder_move(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, ladder: Vec3, fmove: f32, smove: f32, view: &ViewAngles, dt: f32) {
+    let up = ((view.forward().y + 0.25) * 2.5).clamp(-1.0, 1.0);
+    let (_, right) = yaw_vectors(view.yaw);
+    let right = (right - ladder * right.dot(ladder)).normalize_or_zero();
+    let max = fmove.abs().max(smove.abs());
+    let total = (fmove * fmove + smove * smove).sqrt();
+    let scale = if max > 0.0 { RUN_SPEED * ctx.tuning.speed_scale * max / (127.0 * total) * m.stance_speed_scale() } else { 0.0 };
+    let wish = Vec3::Y * (0.5 * up * scale * fmove) + right * (0.2 * scale * smove);
+    accelerate(&mut m.velocity, wish.normalize_or_zero(), wish.length(), 9.0, dt);
+    if fmove == 0.0 {
+        // Coming to a stop on the rungs, at gravity's rate.
+        m.velocity.y = if m.velocity.y <= 0.0 { (m.velocity.y + GRAVITY * dt).min(0.0) } else { (m.velocity.y - GRAVITY * dt).max(0.0) };
+    }
+    if smove == 0.0 {
+        let side = Vec3::new(right.x, 0.0, right.z).normalize_or_zero();
+        let speed = m.velocity.dot(side);
+        if speed != 0.0 {
+            let mut drop = speed * dt * 16.0;
+            if drop.abs() < u(1.0) {
+                drop = u(1.0).copysign(drop);
+            }
+            let left = if drop.abs() < speed.abs() { speed - drop } else { 0.0 };
+            m.velocity += side * (left - speed);
+        }
+    }
+    if !m.on_ground {
+        // Held to the ladder: nothing to or from its face. (CoD4's box
+        // also presses into it while climbing; the rounded hull pressed
+        // there caught on the ladder's top edge and hung.)
+        let away = m.velocity.x * ladder.x + m.velocity.z * ladder.z;
+        m.velocity.x -= ladder.x * away;
+        m.velocity.z -= ladder.z * away;
+    }
+    // Climbing off the floor: no longer held to it.
+    if m.velocity.y > 0.0 {
+        m.on_ground = false;
+    }
+    step_slide_move(ctx, pos, m, false, dt);
 }
 
 /// `Jump_ApplySlowdown`: scale velocity on landing and start the friction

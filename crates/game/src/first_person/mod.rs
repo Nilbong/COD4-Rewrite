@@ -120,6 +120,18 @@ fn test_move(
     }
     // `course`: sprint forward (2.6-3.6 s), stop, strafe right (4.3-5.3 s),
     // then jump and land: the gun's weight in one strip.
+    // `adscourse`: run (2.6-4.0 s), sprint (4.0-5.0), stop, aim (5.6-7.0),
+    // aim walking (7.0-8.2). (Before `course` and `ads`, which it contains.)
+    if how.contains("adscourse") {
+        let fwd = (t >= 2.6 && t < 5.0) || (t >= 7.0 && t < 8.2);
+        let sprint = t >= 4.0 && t < 5.0;
+        let ads = t >= 5.6 && t < 8.2;
+        for (key, on) in [(KeyCode::KeyW, fwd), (KeyCode::ShiftLeft, sprint)] {
+            if on { keys.press(key) } else { keys.release(key) }
+        }
+        if ads { mouse.press(MouseButton::Right) } else { mouse.release(MouseButton::Right) }
+        return;
+    }
     if how.contains("course") {
         let (fwd, right, sprint, jump) = (t >= 2.6 && t < 3.6, t >= 4.3 && t < 5.3, t >= 2.6 && t < 3.6, t >= 5.3 && t < 5.35);
         for (key, on) in [(KeyCode::KeyW, fwd), (KeyCode::KeyD, right), (KeyCode::ShiftLeft, sprint), (KeyCode::Space, jump)] {
@@ -144,6 +156,10 @@ fn test_move(
     let ads_at = std::env::var("COD4RW_FP_ADS_AT").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(2.5);
     if how.contains("ads") && t >= ads_at {
         mouse.press(MouseButton::Right);
+    }
+    // `fire`: hold the trigger from then too.
+    if how.contains("fire") && t >= ads_at {
+        mouse.press(MouseButton::Left);
     }
     // `crouch`, `prone`: down first; `still`: then stand there.
     if how.contains("crouch") && t < 2.1 {

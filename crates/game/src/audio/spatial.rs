@@ -315,7 +315,7 @@ impl Emitter {
 /// sounds in turn.
 pub fn spatialize(
     time: Res<Time>,
-    listener: Query<&GlobalTransform, With<SpatialListener>>,
+    ears: Query<&GlobalTransform, With<super::Ear>>,
     mut emitters: Query<(&GlobalTransform, &mut Emitter)>,
     spatial: avian3d::prelude::SpatialQuery,
     mut next_ray: Local<usize>,
@@ -326,13 +326,17 @@ pub fn spatialize(
     if log {
         *next_log = time.elapsed_secs() + 5.0;
     }
-    let Some(ear) = listener.iter().next() else { return };
-    let (eye, to_listener) = (ear.translation(), ear.affine().inverse());
+    if ears.is_empty() {
+        return;
+    }
     let filter = crate::collision::sight_filter();
     let count = emitters.iter().len().max(1);
     let (first, k) = (*next_ray % count, 1.0 - (-time.delta_secs() / 0.15).exp());
     for (i, (tf, mut e)) in emitters.iter_mut().enumerate() {
         let at = tf.translation();
+        // Heard by the nearest local player (splitscreen).
+        let ear = super::nearest_ear(&ears, at);
+        let (eye, to_listener) = (ear.translation(), ear.affine().inverse());
         let distance = eye.distance(at) / INCH;
         // Rays for a few sounds a frame, the rest keep their last answer.
         if (i + count - first) % count < RAYS_PER_FRAME

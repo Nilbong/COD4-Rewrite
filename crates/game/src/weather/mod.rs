@@ -46,6 +46,8 @@ pub fn showcase() -> bool {
 pub struct Storm {
     /// How hard it rains, 0..1.
     pub rain: f32,
+    /// How hard it snows, 0..1.
+    pub snow: f32,
     /// The wind over the ground, m/s (Bevy x, z), gusts included.
     pub wind: Vec2,
     /// Lightning's light now, 0..1, and where the last strike was.
@@ -59,7 +61,7 @@ pub struct Storm {
 
 impl Default for Storm {
     fn default() -> Self {
-        Storm { rain: 0.85, wind: Vec2::new(3.0, 1.0), flash: 0.0, strike: None, strikes: 0, next_strike: 6.0 }
+        Storm { rain: 0.85, snow: 0.0, wind: Vec2::new(3.0, 1.0), flash: 0.0, strike: None, strikes: 0, next_strike: 6.0 }
     }
 }
 
@@ -82,7 +84,9 @@ fn update_storm(
         (h % 10000) as f32 / 10000.0
     };
     if let Some(w) = weather.filter(|w| w.enabled) {
-        storm.rain = w.rain;
+        // (How hard it comes down now: severity and gusts, `climate`.)
+        storm.rain = w.downpour.max(w.rain);
+        storm.snow = w.snow;
         storm.wind = Vec2::new(w.wind.x, w.wind.z);
         storm.flash = w.lightning.as_ref().map_or(0.0, |l| l.flash);
         // Each new strike (atmos counts them): where it hit, for the thunder.

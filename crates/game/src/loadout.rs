@@ -324,6 +324,9 @@ fn weapon_def(content: &Content, gun: &Gun, perks: &[String]) -> Option<&'static
     } else if crate::waw::is_waw(weapon) {
         let waw = crate::waw::data()?;
         Some((waw.weapon_def(weapon, &attachments)?, waw.sound_standin(weapon)))
+    } else if crate::mw2guns::is_mw2(weapon) {
+        let mw2 = crate::mw2guns::data()?;
+        Some((mw2.weapon_def(weapon, &attachments)?, mw2.sound_standin(weapon)))
     } else {
         None
     };
@@ -500,7 +503,7 @@ fn equip(
         if !has(&class.perks, "specialty_twoprimaries") {
             if let Some(second) = class.guns.get_mut(1) {
                 let gun = crate::gunmodel::parse(&second.spec).0;
-                let cod4 = !crate::bo1::is_bo1(gun) && !crate::waw::is_waw(gun);
+                let cod4 = !crate::bo1::is_bo1(gun) && !crate::waw::is_waw(gun) && !crate::mw2guns::is_mw2(gun);
                 if cod4 && weapon_def(&content, second, &class.perks).is_some_and(|d| d.class != 4) {
                     *second = Gun { spec: "beretta:".into(), camo: 0, name: "M9".into(), variant: None };
                 }
@@ -535,7 +538,9 @@ fn equip(
         let class = ClassLoadout { guns: guns.clone(), ..class };
         let launcher = || {
             let (weapon, attachments) = crate::gunmodel::parse(&guns[0].spec);
-            if !attachments.contains(&"gl") || crate::bo1::is_bo1(weapon) {
+            // (MW2's launcher isn't wired up: its grenade launcher is only
+            // the part on the gun.)
+            if !attachments.contains(&"gl") || crate::bo1::is_bo1(weapon) || crate::mw2guns::is_mw2(weapon) {
                 return None;
             }
             // World at War's rifle grenades, from its weapon files.
@@ -591,7 +596,7 @@ fn local_switch_keys(mut players: Query<(&crate::splitscreen::PlayerInput, &Load
             // quick double tap goes back to the one you had).
             let from = loadout.switching.map_or(loadout.current, |s| s.to);
             Some(if on_extra { loadout.previous } else { (from + 1) % count })
-        } else if keys.just_pressed(KeyCode::Digit5) {
+        } else if keys.just_pressed(KeyCode::Digit3) {
             loadout.extra_slot().map(|x| if on_extra { loadout.previous } else { x })
         } else {
             None

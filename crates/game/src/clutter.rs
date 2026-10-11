@@ -180,7 +180,7 @@ struct BrokenPiece;
 
 /// A CoD-space quaternion (x, y, z, w) as the model's forward, left and up
 /// axes in CoD space.
-fn quat_axes([x, y, z, w]: [f32; 4]) -> [[f32; 3]; 3] {
+pub(crate) fn quat_axes([x, y, z, w]: [f32; 4]) -> [[f32; 3]; 3] {
     [
         [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y)],
         [2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x)],

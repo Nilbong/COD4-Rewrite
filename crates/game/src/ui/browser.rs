@@ -264,7 +264,7 @@ fn gametype_name(g: &str, hardcore: bool) -> String {
 
 /// A map's name (`mp_crash` → "Crash").
 fn map_name(map: &str) -> String {
-    super::lobby::MAPS.iter().find(|(m, _)| *m == map).map_or_else(|| map.trim_start_matches("mp_").to_owned(), |(_, n)| (*n).to_owned())
+    super::lobby::maps().iter().find(|(m, _)| *m == map).map_or_else(|| map.trim_start_matches("mp_").to_owned(), |(_, n)| (*n).to_owned())
 }
 
 /// Carry out the menu's requests and show what the browser has found.

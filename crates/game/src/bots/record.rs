@@ -45,7 +45,7 @@ pub struct Recorder {
 }
 
 const HEADER: &str = "t,yaw,pitch,fire,ads,fwd,right,enemy,eyaw,epitch,edist,\
-x,y,z,stance,sprint,jump,ground,health,dead,reloading,shots,hits,heads,kills,team";
+x,y,z,stance,sprint,jump,ground,health,dead,reloading,shots,hits,heads,kills,team,mode";
 
 pub fn setup(app: &mut App) {
     let flag = app.world().get_resource::<RecordArg>().is_some_and(|a| a.0);
@@ -158,7 +158,8 @@ fn record(
         let mine = damage.iter().filter(|d| d.0 == me_entity && d.1 != me_entity);
         let (hits, heads) = mine.fold((0, 0), |(h, hd), d| (h + 1, hd + d.2 as u32));
         let kills = killed.iter().filter(|k| k.0 == me_entity && k.1 != me_entity).count();
-        write_row(file, &time, &spatial, &pawns, &state, me, (shots_fired, hits, heads, kills));
+        let mode = bots.get(me_entity).map_or(String::new(), |b| format!("{:?}", b.mode));
+        write_row(file, &time, &spatial, &pawns, &state, me, (shots_fired, hits, heads, kills), &mode);
     }
 }
 
@@ -193,6 +194,7 @@ fn write_row(
     state: &Query<(&Health, &WeaponState)>,
     me: PawnItem,
     (shots_fired, hits, heads, kills): (usize, u32, u32, usize),
+    mode: &str,
 ) {
     let (me_entity, pawn, tf, mover, view, wi, mi, _, dead) = me;
 
@@ -236,7 +238,7 @@ fn write_row(
     let (health, reloading) = state.get(me_entity).map_or((0.0, false), |(h, w)| (h.current, w.reloading()));
     writeln!(
         file,
-        "{:.4},{:.3},{:.3},{},{},{},{},{},{:.0},{:.0},{:.0},{},{},{},{},{:.0},{},{},{},{},{},{},{}",
+        "{:.4},{:.3},{:.3},{},{},{},{},{},{:.0},{:.0},{:.0},{},{},{},{},{:.0},{},{},{},{},{},{},{},{}",
         time.elapsed_secs(),
         view.yaw.to_degrees(),
         view.pitch.to_degrees(),
@@ -263,6 +265,7 @@ fn write_row(
             crate::combat::Team::Axis => 1,
             crate::combat::Team::Allies => 2,
         },
+        mode,
     )
     .ok();
 }

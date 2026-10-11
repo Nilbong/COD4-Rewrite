@@ -84,7 +84,7 @@ impl Lobby {
 
     /// The host's settings, where this build has them.
     fn apply(&mut self, s: &Settings) {
-        if let Some(map) = MAPS.iter().position(|m| m.0 == s.map) {
+        if let Some(map) = maps().iter().position(|m| m.0 == s.map) {
             self.map = map;
         }
         if (s.mode as usize) < GameMode::ALL.len() {
@@ -165,7 +165,7 @@ impl Frontend {
                 l.players = 1;
                 if peer == HOST {
                     // Objective modes aren't online yet.
-                    if !matches!(l.mode(), GameMode::Tdm | GameMode::Ffa) {
+                    if !matches!(l.mode(), GameMode::Tdm | GameMode::Ffa | GameMode::Tdm3) {
                         l.mode = 0;
                         l.score = l.mode().score_limits().1;
                     }

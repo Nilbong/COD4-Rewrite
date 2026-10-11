@@ -416,6 +416,9 @@ pub fn strip(input: &mut PlayerInput) {
         KeyCode::Digit3,
         KeyCode::Digit4,
         KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        crate::killstreaks::PAD_PICK,
     ] {
         input.keys.reset(key);
     }

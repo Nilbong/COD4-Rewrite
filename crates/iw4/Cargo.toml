@@ -1,0 +1,13 @@
+[package]
+name = "iw4"
+description = "Readers for Call of Duty: Modern Warfare 2 (IW4) data: signed fastfiles, the zone asset stream, and conversion of its maps, models, materials and images to the iw3 asset types."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+iw3 = { path = "../iw3" }
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flate2.workspace = true

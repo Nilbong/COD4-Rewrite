@@ -3,7 +3,8 @@
 //!
 //! - Each world mesh's `MeshTag` carries the weather: bits 0-7 how wet
 //!   (`Weather::wetness`), 8-15 how hard it rains, bit 16 the showcase is
-//!   on, 24-31 the sky's light against CoD4's hour
+//!   on, 17-23 snow cover (`Weather::snow_cover`, 0..127), 24-31 the sky's
+//!   light against CoD4's hour
 //!   (`climate::light_share`, for the reflection probes). Only the tags change as the weather does, never the materials.
 //! - [`WetMap`]: where rain reaches, from above, around the camera, for
 //!   the shader (dry under roofs and cover): `crate::weather::occlusion`'s
@@ -11,7 +12,8 @@
 //!   material binds. The image keeps its GPU texture as it updates, so the
 //!   materials' bind groups stay as they are.
 //!
-//! `COD4RW_WETNESS=<0..1>` sets how wet (for test shots).
+//! `COD4RW_WETNESS=<0..1>` sets how wet, `COD4RW_SNOWCOVER=<0..1>` how much
+//! snow lies (for test shots).
 
 use crate::atmos::climate::Weather;
 use crate::weather::occlusion::{CELLS, RainMap, UNKNOWN};
@@ -77,6 +79,10 @@ fn blank_map() -> Image {
 /// The rain map's heights into ours, as they change.
 fn copy_rain_map(rain: Option<Res<RainMap>>, mut images: ResMut<Assets<Image>>) {
     let Some(rain) = rain else { return };
+    // Debug aid: `COD4RW_WETOPEN=1` treats everywhere as out in the rain.
+    if std::env::var_os("COD4RW_WETOPEN").is_some() {
+        return;
+    }
     let Some(target) = WET_MAP.get() else { return };
     if !rain.is_changed() {
         return;
@@ -101,6 +107,10 @@ fn tag_world(
     meshes: Query<(Entity, Option<&MeshTag>), With<MeshMaterial3d<WorldMaterial>>>,
 ) {
     let (mut wet, mut rain) = weather.as_deref().filter(|w| w.enabled).map_or((0.0, 0.0), |w| (w.wetness, w.rain));
+    let mut snow = weather.as_deref().filter(|w| w.enabled).map_or(0.0, |w| w.snow_cover);
+    if let Some(v) = std::env::var("COD4RW_SNOWCOVER").ok().and_then(|v| v.parse::<f32>().ok()) {
+        snow = v;
+    }
     if let Some(v) = std::env::var("COD4RW_WETNESS").ok().and_then(|v| v.parse::<f32>().ok()) {
         wet = v;
         rain = rain.max(v);
@@ -108,10 +118,17 @@ fn tag_world(
     let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
     // Bits 24-31: the sky's light now against CoD4's own hour, which the
     // reflection probes were baked at (dim at night).
-    let tag = byte(wet) | byte(rain) << 8 | 1 << 16 | byte(crate::atmos::climate::light_share()) << 24;
+    // Bits 17-23: snow lying on what faces up (0..127).
+    let snow_bits = (snow.clamp(0.0, 1.0) * 127.0).round() as u32;
+    let tag = byte(wet) | byte(rain) << 8 | 1 << 16 | snow_bits << 17 | byte(crate::atmos::climate::light_share()) << 24;
+    let mut changed = 0;
     for (e, current) in &meshes {
         if current.map(|t| t.0) != Some(tag) {
             commands.entity(e).insert(MeshTag(tag));
+            changed += 1;
         }
+    }
+    if changed > 0 {
+        debug!("wet: {changed} of {} world meshes retagged {tag:#x}", meshes.iter().count());
     }
 }

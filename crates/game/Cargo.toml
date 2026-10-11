@@ -15,8 +15,11 @@ ab_glyph = "0.2"
 # Cuts the controller button art out of its atlases (gamepad/glyphs.rs).
 image = { version = "0.25", default-features = false, features = ["png"] }
 iw3 = { path = "../iw3" }
+gsc = { path = "../gsc" }
 t5 = { path = "../t5" }
 t4 = { path = "../t4" }
+# Modern Warfare 2 maps (mw2.rs).
+iw4 = { path = "../iw4" }
 anyhow.workspace = true
 flate2.workspace = true
 log.workspace = true

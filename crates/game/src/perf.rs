@@ -8,7 +8,8 @@
 //! measure what they cost: `novsync`, `noshadows` (the sun's), `nossao`,
 //! `noviewmodel` (its camera, which also finishes the frame), `vmpost`
 //! (no viewmodel camera, its post-processing on the world one),
-//! `offscreen` (drawn into an image: no presenting, no outside cap), `nofx`
+//! `offscreen` (drawn into an image: no presenting, no outside cap),
+//! `noclutshadows` (map clutter casts no shadows), `nofx`
 //! (effects aren't drawn, though still run), `cascades2` (the sun's shadows
 //! in two cascades), `nopropshadows` (static models cast none), `noprops`
 //! (static models hidden), `nohud` (the HUD and in-game menus aren't
@@ -65,6 +66,19 @@ pub fn no_hud() -> bool {
 pub struct PerfPlugin;
 
 impl Plugin for PerfPlugin {
+    /// Bevy's CPU light clustering in place of its GPU clustering: GPU
+    /// clustering builds every view's cluster buffers anew each frame (~2-4
+    /// ms of render thread at 1440p with 6v6), and our cameras use one
+    /// cluster, so the CPU path is next to free. The same lights either way.
+    /// `COD4RW_GPUCLUSTER=1` keeps Bevy's GPU clustering (to compare).
+    fn finish(&self, app: &mut App) {
+        if !std::env::var("COD4RW_GPUCLUSTER").is_ok_and(|v| v == "1") {
+            if let Some(mut s) = app.world_mut().get_resource_mut::<bevy::light::cluster::GlobalClusterSettings>() {
+                s.gpu_clustering = None;
+            }
+        }
+    }
+
     fn build(&self, app: &mut App) {
         if let Ok(dir) = std::env::var("COD4RW_SHADOWTEST") {
             app.insert_resource(ShadowTest(dir.into())).add_systems(Update, shadow_test.run_if(crate::state::in_game));
@@ -78,6 +92,7 @@ impl Plugin for PerfPlugin {
                 viewmodel: off("noviewmodel") || off("vmpost"),
                 vm_post: off("vmpost"),
                 offscreen: off("offscreen"),
+                clutter_shadows: off("noclutshadows"),
                 fx: off("nofx"),
                 cascades2: off("cascades2"),
                 prop_shadows: off("nopropshadows"),
@@ -85,6 +100,9 @@ impl Plugin for PerfPlugin {
                 ads: off("ads"),
             };
             NO_HUD.store(off("nohud"), Ordering::Relaxed);
+            if off("meshlog") {
+                app.add_systems(Last, mesh_log);
+            }
             // Bevy updates an unfocused window (a test run's) at 60 Hz,
             // which capped every timing run: always run flat out.
             app.insert_resource(bevy::winit::WinitSettings::continuous());
@@ -131,6 +149,8 @@ struct Without {
     /// size, so nothing is presented and no outside frame cap applies: the
     /// frame times are the game's own.
     offscreen: bool,
+    /// `noclutshadows`: map clutter casts no shadows.
+    clutter_shadows: bool,
     fx: bool,
     cascades2: bool,
     prop_shadows: bool,
@@ -148,11 +168,12 @@ fn leave_out(
     mut viewmodel: Query<&mut Camera, With<crate::player::ViewModelCamera>>,
     mut main_camera: Query<&mut Camera, (With<crate::player::MainCamera>, bevy::ecs::query::Without<crate::player::ViewModelCamera>)>,
     mut fx: Query<&mut Visibility, With<crate::fx::FxBatch>>,
-    (main_entity, vm_post, vm_entity, mut images, mut offscreen_done): (
+    (main_entity, vm_post, vm_entity, mut images, mut offscreen_done, mut clutter_done): (
         Query<Entity, With<crate::player::MainCamera>>,
         Query<&bevy::post_process::auto_exposure::AutoExposure, With<crate::player::ViewModelCamera>>,
         Query<Entity, With<crate::player::ViewModelCamera>>,
         ResMut<Assets<bevy::image::Image>>,
+        Local<bool>,
         Local<bool>,
     ),
     mut map_size: ResMut<bevy::light::DirectionalLightShadowMap>,
@@ -272,6 +293,17 @@ fn leave_out(
             }
             commands.entity(vm).insert(bevy::ui::IsDefaultUiCamera);
             info!("perf: drawing offscreen at {w}x{h}");
+        }
+    }
+    if without.clutter_shadows && !*clutter_done {
+        if let Some((root, _)) = names.iter().find(|(_, n)| n.as_str() == "map clutter") {
+            *clutter_done = true;
+            let mut count = 0;
+            for e in children.iter_descendants(root) {
+                commands.entity(e).insert(bevy::light::NotShadowCaster);
+                count += 1;
+            }
+            info!("perf: {count} clutter entities cast no shadows");
         }
     }
     if without.fx {
@@ -428,7 +460,7 @@ fn log_frames(
     };
     if now - started >= WARMUP {
         let ms = time.delta_secs() * 1000.0;
-        if ms > 100.0 {
+        if ms > hitch_ms() {
             info!("perf: {ms:.0} ms frame at {:.1} s into the match", now - started);
         }
         frames.window.push(ms);
@@ -475,7 +507,10 @@ fn log_frames(
             .filter_map(|d| Some((d.path().as_str().trim_start_matches("render/").trim_end_matches("/elapsed_gpu").to_owned(), d.average()?)))
             .collect();
         gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let list: Vec<String> = gpu.iter().take(14).map(|(p, ms)| format!("{p} {ms:.2}")).collect();
+        let list: Vec<String> = gpu.iter().take(24).map(|(p, ms)| format!("{p} {ms:.2}")).collect();
+        // The top-level passes' sum (nested ones are inside theirs).
+        let total: f64 = gpu.iter().filter(|(p, _)| !p.contains('/')).map(|(_, ms)| ms).sum();
+        info!("perf: gpu {total:.2} ms in timed passes ({} timed)", gpu.len());
         info!("perf: gpu ms: {}", list.join(", "));
     }
     if exit.read().next().is_some() && !frames.all.is_empty() {
@@ -666,6 +701,10 @@ fn draw_census(
     transparent: Res<bevy::render::render_phase::ViewSortedRenderPhases<bevy::core_pipeline::core_3d::Transparent3d>>,
     views: Query<&bevy::render::view::ExtractedView>,
     mut next: Local<Option<std::time::Instant>>,
+    (all_views, mut listed): (
+        Query<(Entity, &bevy::render::view::ExtractedView, Option<&bevy::render::camera::ExtractedCamera>, Has<bevy::pbr::ShadowView>)>,
+        Local<u32>,
+    ),
 ) {
     use bevy::render::render_phase::{BinnedPhaseItem, ViewBinnedRenderPhases};
     let now = std::time::Instant::now();
@@ -673,6 +712,20 @@ fn draw_census(
         return;
     }
     *next = Some(now + std::time::Duration::from_secs(5));
+    // Once (the third time round, all in place): what each view is.
+    *listed += 1;
+    if *listed == 3 {
+        for (e, v, camera, shadow) in &all_views {
+            info!(
+                "perf: view {e:?} {}x{} format {:?} camera order {:?} shadow {shadow} layers {:?}",
+                v.viewport.z,
+                v.viewport.w,
+                v.target_format,
+                camera.map(|c| c.order),
+                v.retained_view_entity
+            );
+        }
+    }
     fn binned<B: BinnedPhaseItem>(name: &str, phases: &ViewBinnedRenderPhases<B>) -> String {
         let parts: Vec<String> = phases
             .0
@@ -719,4 +772,52 @@ fn shadow_try() -> Option<(usize, f32, usize)> {
         let p: Vec<&str> = v.split(',').collect();
         Some((p.first()?.trim().parse().ok()?, p.get(1)?.trim().parse().ok()?, p.get(2)?.trim().parse().ok()?))
     })
+}
+
+/// Frames longer than this are logged as hitches (`COD4RW_HITCH=<ms>`,
+/// default 100).
+fn hitch_ms() -> f32 {
+    static MS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("COD4RW_HITCH").ok().and_then(|v| v.parse().ok()).unwrap_or(100.0))
+}
+
+/// `COD4RW_PERF=meshlog`: every five seconds, which entities' meshes were
+/// added or changed in that time (their owner's name, and vertices).
+fn mesh_log(
+    time: Res<Time<Real>>,
+    mut events: MessageReader<AssetEvent<Mesh>>,
+    meshes: Res<Assets<Mesh>>,
+    users: Query<(Entity, &Mesh3d)>,
+    parents: Query<&ChildOf>,
+    names: Query<&Name>,
+    mut seen: Local<std::collections::HashMap<AssetId<Mesh>, u32>>,
+    mut next: Local<f32>,
+) {
+    for e in events.read() {
+        if let AssetEvent::Added { id } | AssetEvent::Modified { id } = e {
+            *seen.entry(*id).or_default() += 1;
+        }
+    }
+    let now = time.elapsed_secs();
+    if now < *next {
+        return;
+    }
+    *next = now + 5.0;
+    let mut rows: Vec<(u32, String, usize)> = Vec::new();
+    for (id, n) in seen.drain() {
+        let verts = meshes.get(id).map_or(0, |m| m.count_vertices());
+        let owner = users.iter().find(|(_, m)| m.id() == id).map_or("(no entity)".to_string(), |(e, _)| {
+            let mut top = e;
+            while let Ok(p) = parents.get(top) {
+                top = p.parent();
+            }
+            let own = names.get(e).map_or("?".into(), |n| n.as_str().to_string());
+            format!("{own} / {}", names.get(top).map_or("?".into(), |n| n.as_str().to_string()))
+        });
+        rows.push((n, owner, verts));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    for (n, owner, verts) in rows.iter().take(12) {
+        info!("perf: mesh changed {n}x in 5 s: {owner} ({verts} vertices)");
+    }
 }

@@ -22,8 +22,10 @@ mod ingame;
 mod hq;
 mod lobby;
 mod modern;
+pub(crate) mod next;
 mod mastery;
 mod pad;
+mod profiles;
 mod preview;
 pub(crate) mod challenges;
 pub(crate) mod progression;
@@ -40,6 +42,7 @@ mod sound;
 mod stats;
 mod supply;
 mod waw;
+mod mw2;
 
 use crate::state::{GameState, in_game};
 use crate::world::MapName;
@@ -94,6 +97,9 @@ impl Plugin for UiPlugin {
                     .chain()
                     .run_if(in_game.and_then(resource_exists::<Frontend>).and_then(|| !crate::perf::no_hud())),
             )
+            // The load screen stays over the match while it settles
+            // (`crate::settle`).
+            .add_systems(Update, settling_screen.after(ingame::paint).run_if(in_game.and_then(crate::settle::settling)))
             .add_systems(PostUpdate, draw::sync_nodes.run_if(in_game))
             // Headquarters' supply drop cards' 3D pictures.
             .add_systems(Update, update_previews.after(MenuInput).run_if(in_game.and_then(|| crate::hq::active()).and_then(resource_exists::<Frontend>)))
@@ -105,6 +111,7 @@ impl Plugin for UiPlugin {
         challenges::setup(app);
         combat_record::setup(app);
         modern::build(app);
+        next::build(app);
         mastery::setup(app);
         hud::build(app);
         pad::build(app);
@@ -188,6 +195,8 @@ pub struct Frontend {
     start: Option<String>,
     /// Set by `uiScript startHeadquarters`: that map is Headquarters.
     start_hq: bool,
+    /// Set by `uiScript startCampaign`: that map is a campaign mission.
+    start_campaign: bool,
     quit: bool,
     /// `disconnect` ran (Leave Game): back to the main menu.
     pub(super) leave: bool,
@@ -389,6 +398,9 @@ fn worn_character() -> &'static str {
 
 
 /// Can the mouse focus and click this item?
+/// `ITEM_TYPE_VALIDFILEFIELD`: a text field for a file name.
+const VALIDFILEFIELD: i32 = 16;
+
 fn interactive(item: &Item) -> bool {
     item.window.static_flags & flags::DECORATION == 0 && !(item.ty == item_type::TEXT && item.action.is_empty())
 }
@@ -426,7 +438,8 @@ impl Frontend {
         // unlocks) don't keep stats: tests earn XP and kills that aren't
         // the player's.
         let debug = std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && k != "COD4RW_UNLOCKS" && !crate::net::setting(&k));
-        let stats = Stats::load(&assets, !debug);
+        // (`COD4RW_PROFILEDIR`: a sandbox for profile tests, kept.)
+        let stats = Stats::load(&assets, !debug || std::env::var_os("COD4RW_PROFILEDIR").is_some());
         custom_camo::sync(&stats);
         let fe = Frontend {
             combat_record: combat_record::Editor::default(),
@@ -447,6 +460,7 @@ impl Frontend {
             start: None,
             quit: false,
             start_hq: false,
+            start_campaign: false,
             leave: false,
             team_change: None,
             back_to_lobby: false,
@@ -655,10 +669,23 @@ impl Frontend {
                     self.open(a(3));
                 }
             }
+            // (Select Profile closes itself once a profile has been chosen.)
+            "closemenuondvar" | "closemenuondvarnot" => {
+                let matches = self.dvar(a(1)).eq_ignore_ascii_case(a(2));
+                if matches == a(0).eq_ignore_ascii_case("closemenuondvar") {
+                    self.close(a(3));
+                }
+            }
             "startserver" => self.start = Some(self.dvar("ui_mapname")),
             "startheadquarters" => {
                 self.start = Some(crate::hq::MAP.into());
                 self.start_hq = true;
+            }
+            // (CoD4's Single Player switched to its other exe: our campaign.)
+            // (The test build's only: `crate::modes::test_features`.)
+            "startcampaign" | "startsingleplayer" if crate::modes::test_features() => {
+                self.start = Some(crate::campaign::MISSIONS[0].map.into());
+                self.start_campaign = true;
             }
             "quit" => self.quit = true,
             s if s.starts_with("supply") => self.supply_script(args),
@@ -668,7 +695,9 @@ impl Frontend {
             s if s.starts_with("camo") => self.camo_script(args),
             s if s.starts_with("t5") => self.bo1_script(args),
             s if s.starts_with("t4") => self.waw_script(args),
+            s if s.starts_with("iw4") => self.mw2_script(args),
             s if s.starts_with("lobby") => self.lobby_script(args),
+            _ if self.profile_script(args) => {}
             _ if self.browser_script(args) => {}
             _ => debug!("ui: unhandled uiScript {args:?}"),
         }
@@ -690,9 +719,16 @@ impl Frontend {
         if let Some(choice) = self.bo1_redirect(&key) {
             return self.open(&choice);
         }
-        let base = self.supply_menu(&key, self.assets.menu(&key).or_else(|| self.bo1_menu(&key)).or_else(|| self.waw_menu(&key)));
+        // The new UI's settings: the Options and Controls lists are their
+        // first pages' list.
+        if let Some(first) = next::settings::redirect(&key).filter(|_| modern::wanted(self)) {
+            return self.open(first);
+        }
+        let base = self.supply_menu(&key, self.assets.menu(&key).or_else(|| self.bo1_menu(&key)).or_else(|| self.waw_menu(&key)).or_else(|| self.mw2_menu(&key)));
         let base = self.combat_record_menu(&key, base);
         let base = self.custom_camo_menu(&key).or_else(|| self.reticle_menu(&key)).or(base);
+        let base = if key == next::color::MENU { Some(Arc::new(next::color::menu(self))) } else { base };
+        let base = if key == next::modes::MENU { Some(Arc::new(next::modes::menu(self))) } else { base };
         let base = if key == hq::PAUSE_MENU { self.assets.menu("class").and_then(|m| hq::pause_menu(&m)).map(Arc::new) } else { base };
         let base = match key.as_str() {
             "class" => base.map(|m| hq::match_pause_menu(&m).map_or(m, Arc::new)),
@@ -703,12 +739,31 @@ impl Frontend {
             warn!("ui: no menu {name}");
             return;
         };
+        // CoD4's file name fields (a new profile's name) are text fields.
+        if menu.items.iter().any(|it| it.ty == VALIDFILEFIELD) {
+            for it in Arc::make_mut(&mut menu).items.iter_mut().filter(|it| it.ty == VALIDFILEFIELD) {
+                it.ty = item_type::EDITFIELD;
+            }
+        }
         // The modern main menu stands in for the classic one's buttons
         // (still opened, closed and found as `main_text` by its scripts).
         if key == "main_text" && modern::wanted(self) {
             if let Some(m) = modern::menu(self, &menu) {
                 menu = Arc::new(m);
                 modern::opened(self);
+            }
+        }
+        // Create a Class in the new style: the class select and the editor.
+        if modern::wanted(self) && key == "pc_cac_popup" {
+            if let Some(m) = next::cac::select_menu(self, &menu) {
+                menu = Arc::new(m);
+                next::cac::select_opened(self);
+            }
+        }
+        if modern::wanted(self) && key.starts_with("menu_cac_") {
+            if let Some(m) = next::cac::editor_menu(self, &menu) {
+                menu = Arc::new(m);
+                next::cac::editor_opened(self);
             }
         }
         // Attachment rows toggle (several per weapon), so the list needs a
@@ -718,6 +773,63 @@ impl Frontend {
                 menu = Arc::new(m);
             }
         }
+        // The Private Match lobby in the new style.
+        if modern::wanted(self) && key == lobby::LOBBY_MENU {
+            if let Some(m) = next::lobby::menu(self, &menu) {
+                menu = Arc::new(m);
+                next::lobby::opened(self);
+            }
+        }
+        if modern::wanted(self) && key == "private_match_maps" {
+            if let Some(m) = next::maps::menu(self, &menu) {
+                menu = Arc::new(m);
+            }
+        }
+        // Supply Drops in the new style.
+        if modern::wanted(self) && key == supply::DROPS_MENU {
+            if let Some(m) = next::drops::menu(&menu) {
+                menu = Arc::new(m);
+            }
+        }
+        // The Character screen in the new style.
+        if modern::wanted(self) && key == "supply_character" {
+            if let Some(m) = next::character::menu(&menu) {
+                menu = Arc::new(m);
+                next::character::opened(self);
+            }
+        }
+        // The camo editor in the new style.
+        if modern::wanted(self) && key == custom_camo::EDITOR {
+            if let Some(m) = next::camo_edit::menu(&menu) {
+                menu = Arc::new(m);
+                next::camo_edit::opened(self);
+            }
+        }
+        // The class editor's popups in the new style: full-screen pickers.
+        if modern::wanted(self) && next::picker::wanted(self, &key) {
+            if let Some(m) = next::picker::menu(self, &menu, &key) {
+                menu = Arc::new(m);
+                next::picker::opened(self);
+            }
+        }
+        // The match's menus in the new style.
+        if modern::wanted(self) && next::match_menus::wanted(&key) {
+            if let Some(m) = next::match_menus::menu(self, &menu, &key) {
+                menu = Arc::new(m);
+            }
+        }
+        // Select Profile in the new style.
+        if modern::wanted(self) && key == "player_profile" {
+            menu = Arc::new(next::profiles::menu(&menu));
+        }
+        // The settings pages in the new style.
+        if modern::wanted(self) && next::settings::wanted(&key) {
+            menu = Arc::new(next::settings::menu(&menu, &key));
+        }
+        // CoD4's small centred popups: the new UI's dialog.
+        if modern::wanted(self) && next::popup::wanted(&menu) {
+            menu = Arc::new(next::popup::menu(self, &menu));
+        }
         let shown = menu.items.iter().map(|it| it.window.dynamic_flags & flags::VISIBLE != 0).collect();
         let rows = menu
             .items
@@ -725,6 +837,9 @@ impl Frontend {
             .map(|it| if it.ty == item_type::BUTTON { attachments::row_selects(&it.action) } else { None })
             .collect();
         self.stack.push(OpenMenu { name: key.clone(), menu: menu.clone(), shown, rows });
+        if let Some(i) = next::settings::first_focus(&menu).or_else(|| next::profiles::first_focus(&menu)) {
+            self.focus = Some((key.clone(), i));
+        }
         // A menu's music plays on until another menu brings its own.
         if !menu.sound_name.is_empty() {
             self.audio.music = Some(menu.sound_name.clone());
@@ -848,6 +963,7 @@ impl Frontend {
                 let set = attachments::set_of(self, weapon);
                 let set = match bo1 {
                     true if crate::waw::is_index(self.stat(weapon)) => waw::toggle(set, &name),
+                    true if crate::mw2guns::is_index(self.stat(weapon)) => mw2::toggle(set, &name),
                     true => bo1::toggle(set, &name),
                     false => attachments::toggle(set, &name),
                 };
@@ -923,13 +1039,17 @@ impl Frontend {
     fn attachment_list(&self, weapon: i32) -> String {
         let bo1 = crate::bo1::is_index(self.stat(weapon)).then(crate::bo1::data).flatten();
         let waw = crate::waw::is_index(self.stat(weapon)).then(crate::waw::data).flatten();
-        let names: Vec<String> = attachments::names(attachments::set_of(self, weapon))
+        let mw2 = crate::mw2guns::is_index(self.stat(weapon)).then(crate::mw2guns::data).flatten();
+        let set = attachments::set_of(self, weapon);
+        let names = if mw2.is_some() { attachments::mw2_names(set) } else { attachments::names(set) };
+        let names: Vec<String> = names
             .into_iter()
-            .map(|n| match (bo1.and_then(|d| d.attachment(n)), waw.and_then(|d| d.attachment(n))) {
-                // Black Ops' and World at War's own names (Black Ops'
+            .map(|n| match (bo1.and_then(|d| d.attachment(n)), waw.and_then(|d| d.attachment(n)), mw2.and_then(|d| d.attachment(n))) {
+                // Black Ops', World at War's and MW2's own names (Black Ops'
                 // `reflex` is CoD4's red dot's, WaW's `gl` a rifle grenade).
-                (Some(a), _) => a.display.clone(),
-                (_, Some(a)) => a.display.clone(),
+                (Some(a), ..) => a.display.clone(),
+                (_, Some(a), _) => a.display.clone(),
+                (.., Some(a)) => a.display.clone(),
                 _ => self.assets.localize(&format!("@{}", self.table_lookup(attachments::TABLE, 4, n, 3))),
             })
             .collect();
@@ -1083,6 +1203,7 @@ impl Frontend {
             self.paint_reticle(om, pl, ops);
             self.paint_modern(om, pl, ops);
         }
+        self.paint_next(pl.w, pl.h, ops);
     }
 
     /// One menu, if visible (returns whether it was), with the class figure
@@ -1121,7 +1242,7 @@ impl Frontend {
             if item.ty == item_type::LISTBOX && item.special == browser::FEEDER_SERVERS {
                 self.paint_servers(item, pl, ops);
             }
-            if let Some((stat, name)) = om.rows[i].as_ref().filter(|(_, n)| n != "none") {
+            if let Some((stat, name)) = om.rows[i].as_ref().filter(|(_, n)| n != "none" && !menu.window.name.starts_with(next::picker::PREFIX)) {
                 let on = attachments::has(attachments::set_of(self, stat - 1), name);
                 let box_size = Vec2::splat(12.0 * pl.scale);
                 ops.push(Op::Pic {
@@ -1255,6 +1376,8 @@ impl Frontend {
                             bo1::toggle(set, &a)
                         } else if crate::waw::is_waw(&weapon) {
                             waw::toggle(set, &a)
+                        } else if crate::mw2guns::is_mw2(&weapon) {
+                            mw2::toggle(set, &a)
                         } else {
                             attachments::toggle(set, &a)
                         };
@@ -1274,7 +1397,7 @@ impl Frontend {
         let camo = self.variant_camo(key, &weapon, camo);
         // Its red dot's reticle rides on the camo number, as in a match.
         let reticle = if key % 10 == 5 { Default::default() } else { self.class_reticle(key) };
-        Some((format!("{weapon}:{}", attachments::names(set).join("+")), crate::reticles::with_camo(camo.max(0) as usize, reticle)))
+        Some((format!("{weapon}:{}", attachments::names_of(set, &weapon).join("+")), crate::reticles::with_camo(camo.max(0) as usize, reticle)))
     }
 
     /// Is the open popup for the class's second weapon (Overkill's or the
@@ -1282,7 +1405,7 @@ impl Frontend {
     /// `secondary` for the sidearm; Black Ops' and ours name their stat.
     fn editing_secondary(&self) -> bool {
         let Some(top) = self.stack.last().map(|m| m.name.as_str()) else { return false };
-        match camos::key_stat(top).or_else(|| bo1::key_stat(top)).or_else(|| waw::key_stat(top)) {
+        match camos::key_stat(top).or_else(|| bo1::key_stat(top)).or_else(|| waw::key_stat(top)).or_else(|| mw2::key_stat(top)) {
             Some(stat) => stat % 10 == 3,
             None => top.ends_with('2') || top.ends_with("secondary") || top.ends_with("pistol"),
         }
@@ -1400,6 +1523,7 @@ fn leave_frontend(
     mut pool: ResMut<SpritePool>,
     mut list: ResMut<DrawList>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    spectating: Option<Res<crate::bots::Spectate>>,
 ) {
     for e in &cameras {
         commands.entity(e).despawn();
@@ -1407,6 +1531,12 @@ fn leave_frontend(
     if let Some(mut fe) = fe {
         fe.previews.clear(&mut commands);
         fe.stats.save_if_changed();
+        // Spectating (photo mode's, from the menus) has no player to choose
+        // a class and close them: the menus go now.
+        if spectating.is_some() {
+            fe.stack.clear();
+            fe.focus = None;
+        }
     }
     for e in pool.0.drain(..) {
         commands.entity(e).despawn();
@@ -1517,6 +1647,11 @@ fn menu_input(
         commands.insert_resource(players);
     }
     // Headquarters: a match of its own kind ([`crate::hq`]).
+    // A campaign mission ([`crate::campaign`]).
+    if std::mem::take(&mut fe.start_campaign) {
+        commands.insert_resource(crate::campaign::config());
+        commands.insert_resource(crate::campaign::Campaign::new(&crate::campaign::MISSIONS[0]));
+    }
     if std::mem::take(&mut fe.start_hq) {
         commands.insert_resource(crate::hq::config());
         commands.insert_resource(crate::hq::Headquarters);
@@ -1579,11 +1714,39 @@ fn draw_menus(fe: &mut Frontend, out: &mut Vec<Quad>, images: &mut Assets<Image>
     let mut ops = Vec::new();
     fe.paint(&pl, &mut ops);
     if let Some(p) = window.cursor_position().filter(|_| !fe.pad) {
+        if next::cursor(fe, p, pl.h, &mut ops) {
+            fe.emit(ops, images, out);
+            return;
+        }
         // The arrow's tip is at the centre of CoD's cursor image.
         let size = Vec2::splat(32.0 * pl.scale);
         ops.push(Op::Pic { pos: p - size * 0.5, size, material: "ui_cursor".into(), color: [1.0; 4] });
     }
     fe.emit(ops, images, out);
+}
+
+/// The map's load screen picture over the whole window.
+fn load_screen_ops(map: &str, window: &Window) -> Vec<Op> {
+    let size = Vec2::new(window.width(), window.height());
+    vec![
+        Op::Fill { pos: Vec2::ZERO, size, color: [0.0, 0.0, 0.0, 1.0] },
+        Op::Pic { pos: Vec2::ZERO, size, material: format!("loadscreen_{map}"), color: [1.0; 4] },
+    ]
+}
+
+/// The load screen in place of the match's HUD while it settles
+/// (`crate::settle`): the match is drawn under it but not seen.
+fn settling_screen(
+    fe: Option<ResMut<Frontend>>,
+    map: Res<MapName>,
+    mut list: ResMut<DrawList>,
+    mut images: ResMut<Assets<Image>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+) {
+    list.0.clear();
+    if let Some(mut fe) = fe {
+        fe.emit(load_screen_ops(&map.0, &window), &mut images, &mut list.0);
+    }
 }
 
 /// The map's load screen; the match starts (and the map loads) once it has
@@ -1599,12 +1762,7 @@ fn loading_screen(
 ) {
     list.0.clear();
     if let Some(mut fe) = fe {
-        let size = Vec2::new(window.width(), window.height());
-        let ops = vec![
-            Op::Fill { pos: Vec2::ZERO, size, color: [0.0, 0.0, 0.0, 1.0] },
-            Op::Pic { pos: Vec2::ZERO, size, material: format!("loadscreen_{}", map.0), color: [1.0; 4] },
-        ];
-        fe.emit(ops, &mut images, &mut list.0);
+        fe.emit(load_screen_ops(&map.0, &window), &mut images, &mut list.0);
     }
     *frames += 1;
     if *frames >= 3 {
@@ -1697,7 +1855,7 @@ fn ui_shots(
                     *step -= 1;
                     return;
                 }
-                shot(&mut commands, &format!("{}_{}", k + 2, extra[k].replace(['@', '=', ':', '#', ' ', '<', '>'], "_")));
+                shot(&mut commands, &format!("{}_{}", k + 2, extra[k].replace(['@', '=', ':', '#', ' ', '<', '>', '|'], "_")));
             } else {
                 fe.set_focus(None);
                 if !menu.is_empty() && !menu.starts_with('~') {
@@ -1741,8 +1899,13 @@ fn ui_shots(
             let key = |s: &str| match s.strip_prefix("key:").or_else(|| s.strip_prefix("hold:"))? {
                 "Digit1" => Some(KeyCode::Digit1),
                 "Digit2" => Some(KeyCode::Digit2),
+                "Digit3" => Some(KeyCode::Digit3),
                 "Digit4" => Some(KeyCode::Digit4),
                 "Digit5" => Some(KeyCode::Digit5),
+                "Digit6" => Some(KeyCode::Digit6),
+                "Digit7" => Some(KeyCode::Digit7),
+                "Digit8" => Some(KeyCode::Digit8),
+                "Digit9" => Some(KeyCode::Digit9),
                 "KeyG" => Some(KeyCode::KeyG),
                 "Escape" => Some(KeyCode::Escape),
                 "Enter" => Some(KeyCode::Enter),

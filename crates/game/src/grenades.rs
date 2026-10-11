@@ -275,6 +275,25 @@ pub struct Offhand {
     /// When a cooked one goes off.
     pub explode_at: Option<f32>,
     thrown: bool,
+    /// A care package's marker, not one of the pawn's grenades.
+    marker: bool,
+}
+
+/// Throw a care package's marker ([`How::Marker`]): the smoke grenade's
+/// throw, without holding it, from no grenade of the pawn's. None while
+/// there's no smoke grenade to throw it as.
+pub fn marker_throw(defs: &GrenadeDefs, weapon: &WeaponState, now: f32) -> Option<Offhand> {
+    let stats = defs.get(Kind::Smoke)?;
+    Some(Offhand {
+        kind: Kind::Smoke,
+        def: stats.def,
+        phase: Phase::Drop,
+        started: now,
+        until: now + weapon.def.quick_drop_time.max(0.05),
+        explode_at: None,
+        thrown: false,
+        marker: true,
+    })
 }
 
 impl Offhand {
@@ -305,6 +324,9 @@ pub enum How {
     Dropped,
     /// Held until it went off.
     InHand,
+    /// A care package's marker ([`crate::killstreaks::carepackage`]): a
+    /// smoke canister whose smoke calls the drop in, and hides no one.
+    Marker,
 }
 
 /// How long the pin must be out for a throw to count as cooked.
@@ -519,6 +541,7 @@ fn throw(
                 until: now + drop,
                 explode_at: None,
                 thrown: false,
+                marker: false,
             });
             continue;
         };
@@ -557,7 +580,13 @@ fn throw(
             let carried = forward * mover.velocity.dot(forward).max(0.0);
             let velocity = forward * u(stats.speed) + Vec3::Y * u(stats.speed_up) + carried;
             let explode_at = o.explode_at.unwrap_or(now + stats.fuse);
-            let how = if explode_at - now <= stats.fuse - COOKED { How::Cooked } else { How::Thrown };
+            let how = if o.marker {
+                How::Marker
+            } else if explode_at - now <= stats.fuse - COOKED {
+                How::Cooked
+            } else {
+                How::Thrown
+            };
             pending.throws.push((o.kind, e, eye + forward * reach, velocity, explode_at, how));
         }
         if now < o.until {
@@ -570,7 +599,7 @@ fn throw(
                 }
                 set_phase(&mut o, Phase::Pullback, now, stats.pullback);
             }
-            Phase::Pullback | Phase::Hold if (input.frag && o.kind == Kind::Frag) || (input.special && o.kind != Kind::Frag) => {
+            Phase::Pullback | Phase::Hold if !o.marker && ((input.frag && o.kind == Kind::Frag) || (input.special && o.kind != Kind::Frag)) => {
                 o.phase = Phase::Hold;
                 o.until = now;
             }
@@ -773,6 +802,12 @@ fn explode(
                 }
                 _ => {}
             }
+        }
+        // A marker's smoke only marks the spot.
+        if how == How::Marker {
+            effects.play(&stats.effect, Anchor::Fixed(Frame::facing(at, Vec3::Y, 0.0)), FxLayer::World);
+            sfx.play(stats.sound.clone(), Some(at));
+            continue;
         }
         if kind == Kind::Smoke {
             commands.spawn((Name::new("smoke"), SmokeCloud { radius: u(SMOKE_RADIUS), until: now + SMOKE_TIME }, Transform::from_translation(at)));

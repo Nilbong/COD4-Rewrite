@@ -35,6 +35,9 @@ pub(super) struct SlotMenu {
     /// comes back to it).
     last_top: Option<String>,
     left_from: HashMap<String, usize>,
+    /// Their profile's stats (players 2 to 4 with a profile picked in the
+    /// lobby): their classes in their menus, and their XP.
+    pub(super) stats: Option<super::stats::Stats>,
 }
 
 impl Frontend {
@@ -42,7 +45,14 @@ impl Frontend {
     fn swap_slot(&mut self, slot: usize) {
         while self.slot_menus.len() <= slot {
             let (locals, team, mine) = (self.locals.clone(), self.player_team, self.game.mine);
-            self.slot_menus.push(SlotMenu { locals, team, mine, ..default() });
+            let n = self.slot_menus.len();
+            let stats = self.lobby.slot_profile(n).and_then(|id| {
+                let path = super::profiles::stats_path(&id)?;
+                let stats = self.stats.load_from(&self.assets, path);
+                info!("ui: player {} plays as profile {id:?}", n + 1);
+                stats
+            });
+            self.slot_menus.push(SlotMenu { locals, team, mine, stats, ..default() });
         }
         let m = &mut self.slot_menus[slot];
         std::mem::swap(&mut self.stack, &mut m.stack);
@@ -52,6 +62,22 @@ impl Frontend {
         std::mem::swap(&mut self.player_team, &mut m.team);
         std::mem::swap(&mut self.game.mine, &mut m.mine);
         std::mem::swap(&mut self.responses, &mut m.responses);
+        if let Some(stats) = m.stats.as_mut() {
+            std::mem::swap(&mut self.stats, stats);
+        }
+    }
+
+    /// Splitscreen player `slot`'s own profile stats, if they have one.
+    pub(super) fn slot_stats(&mut self, slot: usize) -> Option<(&mut super::stats::Stats, &super::assets::UiAssets)> {
+        if slot == 0 {
+            return None;
+        }
+        // (Made with their menus: their profile is loaded then.)
+        if self.slot_menus.len() <= slot && crate::splitscreen::active() {
+            self.swap_slot(slot);
+            self.swap_slot(slot);
+        }
+        Some((self.slot_menus.get_mut(slot)?.stats.as_mut()?, &self.assets))
     }
 
     /// Run `f` on `slot`'s menus.
@@ -85,6 +111,11 @@ impl Frontend {
 
     /// Forget every player's menus (the match is over).
     pub(super) fn clear_slot_menus(&mut self) {
+        for m in &mut self.slot_menus {
+            if let Some(stats) = m.stats.as_mut() {
+                stats.save_if_changed();
+            }
+        }
         self.slot_menus.clear();
         self.kbm_menu = false;
     }

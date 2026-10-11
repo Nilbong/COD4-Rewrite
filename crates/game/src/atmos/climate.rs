@@ -36,10 +36,70 @@ pub struct ClimateSet;
 /// The showcase's rain without `COD4RW_RAIN`: Wet Work's own storm.
 const SHOWCASE_RAIN: f32 = 0.85;
 
-/// The maps the showcase is tuned for; elsewhere it stays off.
-const SHOWCASE_MAPS: &[&str] = &["mp_cargoship"];
+/// How the showcase runs on a map it's tuned for.
+#[derive(Clone, Copy, Debug)]
+pub struct Profile {
+    pub map: &'static str,
+    /// The clock runs (`COD4RW_TOD`, `COD4RW_TOD_SPEED`); otherwise it holds
+    /// at the map's own hour, as CoD4 lit it.
+    pub clock: bool,
+    /// The rain without `COD4RW_RAIN` (which only clocked maps take).
+    pub rain: f32,
+    /// The physical sky (Rayleigh/Mie, stars, moon) in place of the map's
+    /// skybox colours (Wet Work's own skybox is night).
+    pub physical_sky: bool,
+    /// The showcase ocean replaces the map's sea.
+    pub ocean: bool,
+    /// How much storm cloud dims the light (0: the map's own lighting is
+    /// already the storm's, Downpour's).
+    pub storm_dims: f32,
+    /// Snow instead of rain (Winter Crash): `Weather::snow` takes the
+    /// precipitation, `rain` stays 0.
+    pub snow: bool,
+    /// The frame's exposure offset (stops): a downpour's light is dimmer.
+    pub exposure_ev: f32,
+    /// The map fog's halfway distance scaled (clearer air than CoD4's:
+    /// Downpour's treeline keeps its dark green).
+    pub fog_reach: f32,
+    /// The map fog's colour scaled (auto-exposure lifts a dark rainy
+    /// frame, and the fog with it, past CoD4's).
+    pub fog_tone: f32,
+    /// How severe the storm is (1: as before): denser, heavier, more
+    /// slanted rain in gusting waves, louder, more frequent lightning,
+    /// darker sky, rougher sea.
+    pub severity: f32,
+}
 
-static SHOWCASE_MAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The maps the showcase is tuned for; elsewhere it stays off.
+pub const PROFILES: &[Profile] = &[
+    Profile { map: "mp_cargoship", clock: true, rain: SHOWCASE_RAIN, physical_sky: true, ocean: true, storm_dims: 1.0, snow: false, exposure_ev: 0.0, fog_reach: 1.0, fog_tone: 1.0, severity: 1.4 },
+    // Downpour: CoD4's own rainy afternoon, its light and sky kept; our
+    // rain, wet surfaces, ripples, reflections and now and then lightning.
+    Profile { map: "mp_farm", clock: false, rain: 0.7, physical_sky: false, ocean: false, storm_dims: 0.0, snow: false, exposure_ev: -0.7, fog_reach: 6.0, fog_tone: 0.6, severity: 1.35 },
+    // Winter Crash: CoD4's snowy night, its light kept; our falling snow
+    // (drifting with the wind, kept off under roofs), snow on upward
+    // faces, frosty fog. No lightning.
+    Profile { map: "mp_crash_snow", clock: false, rain: 0.6, physical_sky: false, ocean: false, storm_dims: 0.0, snow: true, exposure_ev: 0.0, fog_reach: 1.0, fog_tone: 1.0, severity: 1.0 },
+];
+
+/// The showcase's profile for the map being played, if it runs here.
+pub fn profile() -> Option<&'static Profile> {
+    if !enabled() {
+        return None;
+    }
+    PROFILES.get(SHOWCASE_MAP.load(std::sync::atomic::Ordering::Relaxed).checked_sub(1)?)
+}
+
+static SHOWCASE_MAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The showcase's exposure offset on this map (stops), 0 elsewhere.
+pub fn exposure_offset() -> f32 {
+    // (Live knob per map, `crate::tune`: `exposure.<map>`.)
+    match profile() {
+        Some(p) => crate::tune::get(&format!("exposure.{}", p.map), p.exposure_ev),
+        None => look_knob("exposure", |l| l.exposure_ev, 0.0),
+    }
+}
 
 /// Whether the showcase is switched on at all (`COD4RW_SHOWCASE=1`): for
 /// plugins deciding at startup what to add.
@@ -48,14 +108,68 @@ pub fn enabled() -> bool {
 }
 
 /// The map being loaded, for [`showcase`]. Called wherever `MapName` is set.
+/// How a map looks in normal play (not the showcase), where CoD4's own needs
+/// help in this renderer. Each value is also a live knob (`crate::tune`).
+#[derive(Clone, Copy, Debug)]
+pub struct MapLook {
+    pub map: &'static str,
+    /// Exposure offset (stops).
+    pub exposure_ev: f32,
+    /// Fog halfway distance scale, and fog colour scale.
+    pub fog_reach: f32,
+    pub fog_tone: f32,
+    /// Cloud cover for the dynamic sky (and how dark their undersides).
+    pub cloud_cover: f32,
+    /// The night sky: x stars, y zenith darkening (0..1), z warm city glow
+    /// at the horizon.
+    pub night_sky: [f32; 3],
+    /// The map's water as calm, dark, reflective mud (0 CoD4's water).
+    pub muddy_water: f32,
+}
+
+pub const LOOKS: &[MapLook] = &[
+    // Bog: a hot night over a swamp. Its orange fog, lifted by the
+    // auto-exposure of a dark frame, washed buildings out; clearer air,
+    // darker frame, a few clouds, a deep night sky over a warm city glow.
+    MapLook { map: "mp_bog", exposure_ev: -0.8, fog_reach: 3.0, fog_tone: 0.45, cloud_cover: 0.05, night_sky: [2.2, 0.6, 0.6], muddy_water: 0.8 },
+];
+
+static MAP: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// The map being played.
+pub fn map_name() -> String {
+    MAP.read().map(|m| m.clone()).unwrap_or_default()
+}
+
+/// The map's look in normal play, if it has one (not with the showcase,
+/// whose profiles take over).
+pub fn look() -> Option<&'static MapLook> {
+    if showcase() {
+        return None;
+    }
+    let map = map_name();
+    LOOKS.iter().find(|l| l.map == map)
+}
+
+/// A knob of the map's look: `<name>.<map>` (e.g. `exposure.mp_bog`), or the
+/// look's default.
+pub fn look_knob(name: &str, default: impl Fn(&MapLook) -> f32, otherwise: f32) -> f32 {
+    let map = map_name();
+    crate::tune::get(&format!("{name}.{map}"), look().map_or(otherwise, default))
+}
+
 pub fn set_map(map: &str) {
-    SHOWCASE_MAP.store(SHOWCASE_MAPS.contains(&map), std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut m) = MAP.write() {
+        *m = map.to_owned();
+    }
+    let index = PROFILES.iter().position(|p| p.map == map).map_or(0, |i| i + 1);
+    SHOWCASE_MAP.store(index, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether the showcase (time of day, weather) runs on this map: switched
-/// on and one of [`SHOWCASE_MAPS`].
+/// on and one of [`PROFILES`].
 pub fn showcase() -> bool {
-    enabled() && SHOWCASE_MAP.load(std::sync::atomic::Ordering::Relaxed)
+    profile().is_some()
 }
 
 /// Whether storm cloud hides the sun and moon now (the showcase): read
@@ -183,8 +297,13 @@ pub fn fit_path(dir: Vec3) -> (f32, f32) {
 
 fn reset(mut tod: ResMut<TimeOfDay>, mut weather: ResMut<Weather>) {
     let on = showcase();
-    *tod = TimeOfDay { enabled: on, speed: if on { env_f32("COD4RW_TOD_SPEED").unwrap_or(0.0) } else { 0.0 }, ..default() };
-    *weather = Weather { enabled: on, rain: if on { env_f32("COD4RW_RAIN").unwrap_or(SHOWCASE_RAIN).clamp(0.0, 1.0) } else { 0.0 }, ..default() };
+    let clock = profile().is_some_and(|p| p.clock);
+    let rain = profile().map_or(0.0, |p| if p.clock { env_f32("COD4RW_RAIN").unwrap_or(p.rain) } else { env_f32("COD4RW_RAIN_FIXED").unwrap_or(p.rain) });
+    *tod = TimeOfDay { enabled: on, speed: if clock { env_f32("COD4RW_TOD_SPEED").unwrap_or(0.0) } else { 0.0 }, ..default() };
+    let snowy = profile().is_some_and(|p| p.snow);
+    let (rain, snow) = if snowy { (0.0, rain) } else { (rain, 0.0) };
+    // (Snow lies from the start: it's been snowing.)
+    *weather = Weather { enabled: on, rain: rain.clamp(0.0, 1.0), snow: snow.clamp(0.0, 1.0), snow_cover: snow.clamp(0.0, 1.0), ..default() };
     weather.wetness = weather.rain;
     info!("climate: showcase {}", if on { "on" } else { "off" });
 }
@@ -215,7 +334,8 @@ fn learn_map_sun(
         azimuth_offset,
     };
     info!("climate: map sun at {:.1} h on the path (turned {:.0} degrees), {:.0} lux", hour, azimuth_offset.to_degrees(), light.illuminance);
-    let start = if tod.enabled { env_f32("COD4RW_TOD").map(|h| h.rem_euclid(24.0)).unwrap_or(hour) } else { hour };
+    let clock = profile().is_some_and(|p| p.clock);
+    let start = if tod.enabled && clock { env_f32("COD4RW_TOD").map(|h| h.rem_euclid(24.0)).unwrap_or(hour) } else { hour };
     tod.hours = start;
     tod.map = Some(map);
     apply_clock(&mut tod);
@@ -278,6 +398,16 @@ pub struct Weather {
     pub lightning: Option<Lightning>,
     /// How much of the sky clouds cover, 0..1.
     pub cloud_cover: f32,
+    /// How hard the rain comes down now (0..~1.6): `rain` × the profile's
+    /// severity, swelling and easing with the gusts. Renderers of falling
+    /// rain take this; wetness follows `rain`.
+    pub downpour: f32,
+    /// The gust now, 0..1 (waves of wind and heavier rain sweeping past).
+    pub gust: f32,
+    /// How hard it snows, 0..1 (snowy profiles; `rain` is 0 then).
+    pub snow: f32,
+    /// How much snow lies on upward faces, 0..1 (follows `snow`, slowly).
+    pub snow_cover: f32,
     /// The showcase drives this (false: dry and still, as CoD4).
     pub enabled: bool,
 }
@@ -300,7 +430,7 @@ pub struct Lightning {
 
 impl Default for Weather {
     fn default() -> Self {
-        Weather { rain: 0.0, wind: Vec3::new(3.0, 0.0, 1.0), wetness: 0.0, lightning: None, cloud_cover: 0.4, enabled: false }
+        Weather { rain: 0.0, wind: Vec3::new(3.0, 0.0, 1.0), wetness: 0.0, lightning: None, cloud_cover: 0.4, downpour: 0.0, gust: 0.0, snow: 0.0, snow_cover: 0.0, enabled: false }
     }
 }
 
@@ -325,8 +455,19 @@ fn tick_weather(time: Res<Time>, mut weather: ResMut<Weather>, mut strike: Local
     STORM_VEIL.store(weather.rain >= 0.5, std::sync::atomic::Ordering::Relaxed);
     // Cloud cover and wind with the rain.
     // (Never quite full: a storm deck keeps its lumps and breaks.)
-    weather.cloud_cover = 0.4 + 0.45 * smooth(weather.rain / 0.5);
-    weather.wind = Vec3::new(3.0, 0.0, 1.0) * (1.0 + 3.0 * weather.rain);
+    // (A severe storm closes the sky further: a heavy deck, few breaks.)
+    let severity_now = crate::tune::get("storm.severity", profile().map_or(1.0, |p| p.severity));
+    weather.cloud_cover = (0.4 + (0.45 + 0.08 * (severity_now - 1.0)) * smooth(weather.rain.max(weather.snow) / 0.5)).min(0.97);
+    // Snow settles in a few minutes and stays.
+    if weather.snow > weather.snow_cover {
+        weather.snow_cover = (weather.snow_cover + dt / 240.0).min(weather.snow);
+    }
+    // Gusts: two slow waves beating, so the rain sweeps in heavier bursts.
+    let severity = crate::tune::get("storm.severity", profile().map_or(1.0, |p| p.severity));
+    let g = 0.5 + 0.3 * (now * 0.21).sin() + 0.2 * (now * 0.57 + 1.3).sin();
+    weather.gust = smooth((g - 0.35) / 0.6) * smooth((severity - 1.0) / 0.3).max(0.3);
+    weather.downpour = weather.rain * severity * (0.8 + 0.4 * weather.gust);
+    weather.wind = Vec3::new(3.0, 0.0, 1.0) * (1.0 + 3.0 * weather.rain) * severity.sqrt() * (0.8 + 0.6 * weather.gust);
     // Wet in about a minute of hard rain, dry in about three.
     let target = weather.rain;
     let rate = if target > weather.wetness { 1.0 / 60.0 } else { 1.0 / 180.0 };
@@ -360,7 +501,7 @@ fn tick_weather(time: Res<Time>, mut weather: ResMut<Weather>, mut strike: Local
         strike.distance = 800.0 + 3200.0 * rand(strike.seed * 17);
         strike.strike = Vec3::new(a.cos(), 0.0, a.sin()) * strike.distance;
         strike.dir = (strike.strike + Vec3::Y * 1500.0).normalize();
-        strike.next = now + 6.0 + 14.0 * rand(strike.seed * 7) / weather.rain;
+        strike.next = now + (4.0 + 12.0 * rand(strike.seed * 7)) / (weather.rain * severity * severity * crate::tune::get("storm.lightning_rate", 1.0)).max(0.05);
     }
     // A flash: a bright first stroke, a dimmer return or two, ~0.6 s.
     let t = now - strike.start;

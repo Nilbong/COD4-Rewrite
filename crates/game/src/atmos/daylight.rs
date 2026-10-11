@@ -31,11 +31,43 @@ fn drive(
     mut flash: Query<(&mut DirectionalLight, &mut Transform), With<LightningLight>>,
     mut fogs: Query<&mut DistanceFog>,
     mut exposures: Query<&mut bevy::post_process::auto_exposure::AutoExposure>,
+    mut frost: Local<Option<(LinearRgba, FogFalloff)>>,
 ) {
     let (true, Some(map)) = (tod.enabled, tod.map) else { return };
     let tod = &mut *tod;
+    // A held clock (Downpour): CoD4's own light, sky and fog stand; only
+    // lightning flashes, and the horizon is the map's fog's.
+    if !super::climate::profile().is_some_and(|p| p.clock) {
+        flash_only(&mut commands, &weather, map.illuminance, &mut flash);
+        // Reflections of the probes (baked at CoD4's hour under its sky) on
+        // wet ground and guns, dimmer under a rainy sky: tips of stones and
+        // debris shone white (`reflections.<map>`).
+        let share = super::climate::profile().map_or(1.0, |p| crate::tune::get(&format!("reflections.{}", p.map), 0.55));
+        super::climate::LIGHT_SHARE.store(share.clamp(0.05, 1.5).to_bits(), std::sync::atomic::Ordering::Relaxed);
+        // Frosty air in snow: the map's fog a little thicker, paler and colder
+        // (falling snow scatters the night's light).
+        if weather.snow > 0.0 {
+            let k = weather.snow;
+            for mut f in &mut fogs {
+                let base = frost.get_or_insert((f.color.to_linear(), f.falloff.clone())).clone();
+                let c = base.0;
+                let cold = Vec3::new(c.red, c.green, c.blue).lerp(Vec3::new(0.55, 0.62, 0.75) * Vec3::new(c.red, c.green, c.blue).max_element().max(0.02) * 1.4, 0.6 * k);
+                f.color = Color::linear_rgba(cold.x, cold.y, cold.z, c.alpha);
+                if let FogFalloff::Linear { start, end } = base.1 {
+                    // (`end` is CoD4's halfway, `crate::fog`.)
+                    f.falloff = FogFalloff::Linear { start, end: end / (1.0 + 0.6 * k) };
+                }
+            }
+        }
+        if let Some(f) = fogs.iter().next() {
+            let c = f.color.to_linear();
+            tod.horizon = Vec3::new(c.red, c.green, c.blue);
+        }
+        return;
+    }
     // Storm cloud dims the light (by night less: the moon's is weak already).
-    let storm = smooth(weather.rain / 0.8) * (1.0 - 0.5 * tod.night);
+    let dims = super::climate::profile().map_or(1.0, |p| p.storm_dims);
+    let storm = smooth(weather.rain / 0.8) * (1.0 - 0.5 * tod.night) * dims;
     // The sun, or by night the moon, through the clouds.
     let (dir, color, lux) = if tod.sun_illuminance >= tod.moon_illuminance {
         (tod.sun_dir, tod.sun_color * map.color, tod.sun_illuminance)
@@ -134,6 +166,26 @@ const FOG_LEVEL: f32 = 0.4;
 
 /// The night's horizon (the frame's units, linear): a dim blue-grey glow.
 const NIGHT_HORIZON: Vec3 = Vec3::new(0.016, 0.019, 0.024);
+
+/// Lightning's light alone (held-clock maps).
+fn flash_only(commands: &mut Commands, weather: &Weather, lux: f32, flash: &mut Query<(&mut DirectionalLight, &mut Transform), With<LightningLight>>) {
+    let pulse = weather.lightning.map_or(0.0, |l| l.flash);
+    let bolt = weather.lightning.map_or(Vec3::Y, |l| l.dir);
+    match flash.single_mut() {
+        Ok((mut light, mut tf)) => {
+            light.illuminance = pulse * lux * 0.6;
+            *tf = Transform::default().looking_to(-bolt, if bolt.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y });
+        }
+        Err(_) => {
+            commands.spawn((
+                Name::new("lightning"),
+                LightningLight,
+                DirectionalLight { color: Color::linear_rgb(0.8, 0.85, 1.0), illuminance: 0.0, shadow_maps_enabled: false, ..default() },
+                Transform::default(),
+            ));
+        }
+    }
+}
 
 fn smooth(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);

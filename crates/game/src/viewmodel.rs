@@ -9,6 +9,7 @@ use crate::models::{spawn_model, AnimPlayer, Skeleton, SpawnModel};
 use crate::movement::Mover;
 
 use crate::grenades::{Offhand, Phase};
+use crate::killstreaks::hands::HardpointHands;
 use crate::weapons::{ReloadPhase, WeaponDef, WeaponInput, WeaponState};
 use bevy::camera::visibility::RenderLayers;
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
@@ -60,6 +61,8 @@ pub mod anim_slot {
     pub const SPRINT_IN: usize = 22;
     pub const SPRINT_LOOP: usize = 23;
     pub const SPRINT_OUT: usize = 24;
+    /// The C4's detonator pressed (also a hardpoint's call-in).
+    pub const DETONATE: usize = 25;
     pub const ADS_FIRE: usize = 28;
     pub const ADS_UP: usize = 31;
     pub const ADS_DOWN: usize = 32;
@@ -210,18 +213,23 @@ fn sync_viewmodel(
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut camo_materials: ResMut<Assets<CamoMaterial>>,
     mut camos: Local<CamoCache>,
-    players: Query<(&crate::splitscreen::LocalSlot, &WeaponState, Option<&Loadout>, Option<&Offhand>)>,
+    players: Query<(&crate::splitscreen::LocalSlot, &WeaponState, Option<&Loadout>, Option<&Offhand>, Option<&HardpointHands>)>,
     built: Query<(Entity, &BuiltFor, &ViewModelSlot), With<ViewModelRoot>>,
     wardrobe: Res<crate::wardrobe::Wardrobe>,
     mut bo1_content: ResMut<crate::bo1::MatchContent>,
     mut waw_content: ResMut<crate::waw::MatchContent>,
+    mut mw2_content: ResMut<crate::mw2guns::MatchContent>,
 ) {
-  for (slot, w, loadout, offhand) in &players {
+  for (slot, w, loadout, offhand, hands) in &players {
     let slot = slot.0;
     let Some(camera) = cameras.iter().find(|c| c.1.0 == slot).map(|c| c.0) else { continue };
     // A grenade in hand: its own viewmodel ([`crate::grenades`]).
     let grenade = offhand.filter(|o| o.grenade_in_hand());
     let shown: &'static WeaponDef = grenade.map_or(w.def, |o| o.def);
+    // A hardpoint being called in: its detonator ([`crate::killstreaks::hands`]).
+    let hardpoint = hands.filter(|h| h.item_in_hand());
+    let shown: &'static WeaponDef = hardpoint.map_or(shown, |h| h.def);
+    let grenade = grenade.filter(|_| hardpoint.is_none());
     let def: *const WeaponDef = shown;
     if built.iter().any(|(_, b, s)| s.0 == slot && b.0 == def) {
         continue;
@@ -229,15 +237,16 @@ fn sync_viewmodel(
     for (e, _, _) in built.iter().filter(|b| b.2.0 == slot) {
         commands.entity(e).despawn();
     }
-    let (spec, camo) = match (grenade, loadout) {
-        (None, Some(l)) => (l.gun().spec.clone(), l.gun().camo),
+    let (spec, camo) = match (grenade.is_some() || hardpoint.is_some(), loadout) {
+        (false, Some(l)) => (l.gun().spec.clone(), l.gun().camo),
         _ => (format!("{}:", shown.name.trim_end_matches("_mp")), 0),
     };
     // A Black Ops gun comes from Black Ops' content, a World at War gun from
     // World at War's (none until it has loaded).
     let bo1 = crate::bo1::is_bo1(crate::gunmodel::parse(&spec).0);
     let waw = crate::waw::is_waw(crate::gunmodel::parse(&spec).0);
-    if (bo1 && bo1_content.get().is_none()) || (waw && waw_content.get().is_none()) {
+    let mw2 = crate::mw2guns::is_mw2(crate::gunmodel::parse(&spec).0);
+    if (bo1 && bo1_content.get().is_none()) || (waw && waw_content.get().is_none()) || (mw2 && mw2_content.get().is_none()) {
         continue;
     }
     let layer = RenderLayers::layer(crate::splitscreen::viewmodel_layer(slot));
@@ -261,8 +270,8 @@ fn sync_viewmodel(
     // the team's.
     let team_hands = team_viewhands(&content, true);
     let hands = wardrobe.arms().filter(|_| slot == 0).or_else(|| content.model(team_hands, &mut meshes, &mut materials, &mut images, &mut bindposes));
-    let content: &mut Content = match (bo1_content.get().filter(|_| bo1), waw_content.get().filter(|_| waw)) {
-        (Some(c), _) | (_, Some(c)) => c,
+    let content: &mut Content = match (bo1_content.get().filter(|_| bo1), waw_content.get().filter(|_| waw), mw2_content.get().filter(|_| mw2)) {
+        (Some(c), ..) | (_, Some(c), _) | (.., Some(c)) => c,
         _ => &mut content,
     };
     let hands_name = hands.as_ref().map_or("no hands", |h| h.name.as_str());
@@ -317,6 +326,7 @@ struct VmAnim {
     last_reload: (ReloadPhase, u32),
     last_offhand: Option<(Phase, u32)>,
     last_melee: Option<u32>,
+    last_hands: Option<(crate::killstreaks::hands::HandsPhase, u32)>,
 }
 
 #[derive(Default, PartialEq, Clone, Copy, Debug)]
@@ -342,15 +352,46 @@ fn drive_viewmodel_anims(
         Has<Dead>,
         Option<&Offhand>,
         Option<&crate::melee::Melee>,
+        Option<&HardpointHands>,
     )>,
     mut vm: Query<(Entity, &ViewModelSlot, &mut AnimPlayer, &WeaponAnims, &mut Visibility, &mut WeaponMotion, &mut VmAnim), With<ViewModelRoot>>,
     (third_person, killcam, time): (Res<crate::wardrobe::ThirdPerson>, Res<crate::killcam::Killcam>, Res<Time>),
 ) {
     for (built, slot, mut anim, anims, mut vis, mut motion, mut st) in &mut vm {
-        let Some((_, w, input, mover, loadout, dead, offhand, melee)) = players.iter().find(|p| p.0.0 == slot.0) else { continue };
+        let Some((_, w, input, mover, loadout, dead, offhand, melee, hands)) = players.iter().find(|p| p.0.0 == slot.0) else { continue };
         // Seen from outside: third person, or Player 1's killcam.
         let outside = third_person.on(slot.0) || (slot.0 == 0 && killcam.showing());
-        let VmAnim { state, last_shots, rechamber_due, last_ads_frac, last_built, last_reload, last_offhand, last_melee } = &mut *st;
+        // A hardpoint's call-in: the gun down, the detonator up, pressed
+        // and away, the gun up, each to its time.
+        if let Some(h) = hands {
+            let part = (h.phase, h.started.to_bits());
+            if st.last_hands != Some(part) {
+                st.last_hands = Some(part);
+                use crate::killstreaks::hands::HandsPhase;
+                let (slot_anim, fade) = match h.phase {
+                    HandsPhase::GunDown | HandsPhase::PutAway => (anim_slot::DROP, 0.1),
+                    HandsPhase::Raise | HandsPhase::GunUp => (anim_slot::RAISE, 0.0),
+                    HandsPhase::Hold => (anim_slot::IDLE, 0.15),
+                    HandsPhase::Press => (anim_slot::DETONATE, 0.05),
+                    HandsPhase::Away => (anim_slot::IDLE, 0.0),
+                };
+                if let Some(a) = anims.get(slot_anim) {
+                    let seconds = h.until - h.started;
+                    anim.speed = if h.phase == HandsPhase::Hold { 1.0 } else { (a.duration() / seconds.max(0.05)).clamp(0.25, 4.0) };
+                    anim.play(a, fade);
+                }
+            }
+            // (Shots and the like from before don't replay after.)
+            st.last_shots = w.shots_fired_total;
+            st.state = VmState::OneShot;
+            st.last_built = Some(built);
+            let outside = third_person.on(slot.0) || (slot.0 == 0 && killcam.showing());
+            let away = h.phase == crate::killstreaks::hands::HandsPhase::Away;
+            *vis = if dead || outside || away { Visibility::Hidden } else { Visibility::Inherited };
+            continue;
+        }
+        st.last_hands = None;
+        let VmAnim { state, last_shots, rechamber_due, last_ads_frac, last_built, last_reload, last_offhand, last_melee, .. } = &mut *st;
         drive_one(
             (w, input, mover, loadout, dead, offhand, melee),
             (built, &mut anim, anims, &mut vis, &mut motion),
@@ -398,7 +439,7 @@ fn drive_one(
         *last_shots = w.shots_fired_total;
         *state = VmState::OneShot;
     }
-    let debug_hidden = std::env::var_os("COD4RW_DUMMY").is_some() || std::env::var_os("COD4RW_DUMMY_AT").is_some();
+    let debug_hidden = std::env::var_os("COD4RW_DUMMY").is_some() || std::env::var_os("COD4RW_DUMMY_AT").is_some() || std::env::var_os("COD4RW_TPANIM").is_some();
     *vis = if dead || debug_hidden || outside { Visibility::Hidden } else { Visibility::Inherited };
 
     // Debug: hold one named animation.

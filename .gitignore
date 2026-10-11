@@ -16,3 +16,15 @@
 # Local test helpers.
 /NewPlayerTest.cmd
 /test-*.cmd
+/play
+/tuning.txt
+/map_shots
+# This PC's build settings (linker, temp dir on D:).
+/.cargo/
+# Local launch scripts.
+/*.bat
+# The user's source art sheets (the game embeds the pieces cut from them).
+/crates/game/assets/ui/*.png
+/crates/game/assets/ui/*.preview
+/crates/game/assets/ui/headquarters
+/crates/game/assets/ui/joinagame

@@ -3,7 +3,7 @@
 
 use anyhow::{Result, bail, ensure};
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const MAX_PACKET: usize = 1100;
 pub const MAX_PLAYERS: usize = 18;
 pub const INPUT_REDUNDANCY: usize = 3;
@@ -138,7 +138,9 @@ pub mod button {
     pub const MELEE: u16 = 128;
     pub const USE: u16 = 256;
     pub const SWITCH: u16 = 512;
-    pub const ALL: u16 = 1023;
+    /// Took (or left) cover: 3rd Person TDM.
+    pub const COVER: u16 = 1024;
+    pub const ALL: u16 = 2047;
 }
 
 impl InputCommand {
@@ -174,7 +176,10 @@ pub mod pawn_flags {
     pub const SPRINT: u8 = 2;
     pub const ON_GROUND: u8 = 4;
     pub const RELOADING: u8 = 8;
-    pub const ALL: u8 = 15;
+    /// In cover (3rd Person TDM), and the cover is a tall one.
+    pub const IN_COVER: u8 = 16;
+    pub const COVER_HIGH: u8 = 32;
+    pub const ALL: u8 = 63;
 }
 
 impl PawnState {
@@ -526,6 +531,14 @@ mod tests {
             assert!(data.len() <= MAX_PACKET);
             assert_eq!(Packet::decode(&data).unwrap(), p);
         }
+    }
+    #[test]
+    fn cover_flags_roundtrip() {
+        let state = PawnState { id: 3, flags: pawn_flags::ADS | pawn_flags::IN_COVER | pawn_flags::COVER_HIGH, ..Default::default() };
+        assert!(state.validate().is_ok());
+        assert!(PawnState { flags: 64, ..Default::default() }.validate().is_err());
+        let p = Packet::Snapshot { recipient: 1, state: Snapshot { tick: 1, acknowledged_input: 0, pawns: vec![state] } };
+        assert_eq!(Packet::decode(&p.encode().unwrap()).unwrap(), p);
     }
     #[test]
     fn truncation_unknown_version_and_trailing_bytes_rejected() {

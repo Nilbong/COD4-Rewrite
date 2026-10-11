@@ -108,12 +108,12 @@ pub const GAME: &[Setting] = &[
     s("cg_damage_direction", "Damage Direction", "Red arcs showing where you're hit from.", OFF_ON, "1"),
     s("cg_scopestyle", "Sniper Scope", "CoD4's scope, a lens you see through, or 3D: the view in the scope's own eyepiece (ACOGs too).", Kind::Choice(&[("Classic", "classic"), ("Lens", "lens"), ("3D", "3d")]), "classic"),
     s("cg_xp_popups", "Score Popups", "+10 and the like as you score.", OFF_ON, "1"),
-    s("cg_hudstyle", "HUD Style", "The in-game HUD: the new one, or CoD4's own.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "modern"),
+    s("cg_hudstyle", "HUD Style", "The in-game HUD: the new one, or CoD4's own.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "classic"),
     s("cg_fullbody", "Full Body", "See your own body and legs when you look down.", OFF_ON, "1"),
     s("cg_vmlighting", "Weapon Lighting", "Light your gun and arms by the world around you (shade, sun, rooms), or as CoD4 did.", Kind::Choice(&[("World", "world"), ("Classic", "classic")]), "world"),
     s("cg_weaponsway", "Weapon Sway", "The gun lags a little behind the view as you turn.", OFF_ON, "1"),
-    s("cg_bobstyle", "Weapon Bob", "A fuller bob with footsteps, roll and landings, or CoD4's.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "modern"),
-    s("ui_menustyle", "Menu Style", "The main menu: the new one, or CoD4's own. Shows the next time it opens.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "modern"),
+    s("cg_bobstyle", "Weapon Bob", "A fuller bob with footsteps, roll and landings, or CoD4's.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "classic"),
+    s("ui_menustyle", "Menu Style", "The main menu: the new one, or CoD4's own. Shows the next time it opens.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "classic"),
 ];
 
 /// Controls > Look.
@@ -153,7 +153,11 @@ pub const COMBAT: &[Setting] = &[
     bind(Action::Frag, "Throw Frag Grenade"),
     bind(Action::Special, "Throw Special Grenade"),
     bind(Action::Equipment, "Equipment"),
-    bind(Action::Killstreak, "Kill Streak Reward"),
+    bind(Action::Killstreak1, "Kill Streak: UAV"),
+    bind(Action::Killstreak2, "Kill Streak: Airstrike"),
+    bind(Action::Killstreak3, "Kill Streak: Helicopter"),
+    bind(Action::Killstreak4, "Kill Streak: Care Package"),
+    bind(Action::Killstreak5, "Kill Streak: Sentry Gun"),
     bind(Action::Inspect, "Inspect Weapon"),
 ];
 

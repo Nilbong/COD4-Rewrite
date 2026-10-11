@@ -86,7 +86,8 @@ const EXPOSURE_RANGE_EV: f32 = 3.0;
 /// under it (a thin shell lets the ground "see" past it): cars standing in
 /// shade, which CoD4 never baked into the lightmaps, sit on the ground.
 pub fn ssao() -> bevy::pbr::ScreenSpaceAmbientOcclusion {
-    bevy::pbr::ScreenSpaceAmbientOcclusion { constant_object_thickness: 3.0, ..default() }
+    // (`ssao.thickness` in tuning.txt, read as the camera spawns.)
+    bevy::pbr::ScreenSpaceAmbientOcclusion { constant_object_thickness: crate::tune::get("ssao.thickness", 3.0), ..default() }
 }
 
 /// Sky luminance in cd/m^2 for a fully white sky texel, tuned to sit

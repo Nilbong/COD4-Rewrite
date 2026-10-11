@@ -119,7 +119,7 @@ pub struct Puppet {
 
 /// Host: what's been heard from each friend, and what's been told.
 #[derive(Resource, Default)]
-struct HostState {
+pub(crate) struct HostState {
     /// Each friend's newest controls, and the buttons of the ones before.
     inputs: HashMap<PeerId, (InputCommand, u16)>,
     /// Friends whose pawn is still to be spawned.
@@ -127,11 +127,13 @@ struct HostState {
     /// What each pawn's info was when last sent.
     sent: HashMap<u16, PawnInfo>,
     next_snapshot: f32,
+    /// How many pawns were in cover in the last snapshot (for the log).
+    covered_logged: usize,
 }
 
 /// Guest: the host's world as it arrives.
 #[derive(Resource, Default)]
-struct GuestState {
+pub(crate) struct GuestState {
     snapshots: Interpolation,
     latest: Option<Snapshot>,
     info: HashMap<u16, PawnInfo>,
@@ -371,6 +373,7 @@ fn spawn_remotes(
         let pawn = spawn_pawn(&mut commands, &assets, &m.profile.name, team, &spawn);
         commands.entity(pawn).insert((
             RemotePlayer { peer: m.peer },
+            crate::cover::CoverTap::default(),
             WeaponInput::default(),
             PawnClass(default_class()),
             // Spawns when the friend's class arrives (or right away if it
@@ -385,7 +388,7 @@ fn spawn_remotes(
 
 /// Each friend's soldier does what their controls say.
 #[allow(clippy::type_complexity)]
-fn drive_remotes(
+pub(crate) fn drive_remotes(
     mut state: ResMut<HostState>,
     mut remotes: Query<
         (
@@ -398,11 +401,12 @@ fn drive_remotes(
             Option<&mut crate::loadout::SwitchInput>,
             Option<&crate::loadout::Loadout>,
             &mut Visibility,
+            &mut crate::cover::CoverTap,
         ),
         Without<Dead>,
     >,
 ) {
-    for (remote, mut view, mut mv, mut wi, weapon, grenades, switch, loadout, mut visibility) in &mut remotes {
+    for (remote, mut view, mut mv, mut wi, weapon, grenades, switch, loadout, mut visibility, mut cover_tap) in &mut remotes {
         // Spawned: seen from now on.
         visibility.set_if_neq(Visibility::Inherited);
         let Some((c, earlier)) = state.inputs.get_mut(&remote.peer) else { continue };
@@ -437,11 +441,15 @@ fn drive_remotes(
         {
             s.to = Some(1 - l.current);
         }
+        // Once per press, however many frames the same controls last.
+        cover_tap.want = tapped(button::COVER) && !cover_tap.held;
+        cover_tap.held = pressed(button::COVER);
         *earlier = 0;
     }
 }
 
-fn pawn_state(id: u16, tf: &Transform, mover: &Mover, view: &ViewAngles, health: &Health, dead: bool, weapon: &WeaponState, ads: bool) -> PawnState {
+#[allow(clippy::too_many_arguments)]
+fn pawn_state(id: u16, tf: &Transform, mover: &Mover, view: &ViewAngles, health: &Health, dead: bool, weapon: &WeaponState, ads: bool, cover: Option<&crate::cover::InCover>) -> PawnState {
     let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
     let mut flags = 0;
     if ads {
@@ -455,6 +463,13 @@ fn pawn_state(id: u16, tf: &Transform, mover: &Mover, view: &ViewAngles, health:
     }
     if weapon.reload_until.is_some() {
         flags |= pawn_flags::RELOADING;
+    }
+    // In cover ([`crate::cover`]): seen in the cover poses.
+    if let Some(c) = cover {
+        flags |= pawn_flags::IN_COVER;
+        if c.high {
+            flags |= pawn_flags::COVER_HIGH;
+        }
     }
     let v = mover.velocity.clamp_length_max(999.0);
     PawnState {
@@ -490,12 +505,13 @@ fn send_world(
         Option<&RemotePlayer>,
         Has<LocalPlayer>,
         Option<&crate::loadout::Loadout>,
+        Option<&crate::cover::InCover>,
     )>,
 ) {
     let now = time.elapsed_secs();
     // Details first, so a new pawn's name arrives with it.
     let mut seen = Vec::new();
-    for (pawn, _, _, _, _, _, weapon, _, remote, local, loadout) in &pawns {
+    for (pawn, _, _, _, _, _, weapon, _, remote, local, loadout, _) in &pawns {
         let id = pawn.id as u16;
         seen.push(id);
         let info = PawnInfo {
@@ -534,11 +550,17 @@ fn send_world(
     let all: Vec<PawnState> = pawns
         .iter()
         .take(cod4rw_multiplayer::protocol::MAX_PLAYERS)
-        .map(|(pawn, tf, mover, view, health, dead, weapon, wi, _, _, _)| {
-            pawn_state(pawn.id as u16, tf, mover, view, health, dead, weapon, wi.is_some_and(|w| w.ads))
+        .map(|(pawn, tf, mover, view, health, dead, weapon, wi, _, _, _, cover)| {
+            pawn_state(pawn.id as u16, tf, mover, view, health, dead, weapon, wi.is_some_and(|w| w.ads), cover)
         })
         .filter(|p| p.validate().is_ok())
         .collect();
+    // (Cover, once, for the log.)
+    let covered = all.iter().filter(|p| p.flags & pawn_flags::IN_COVER != 0).count();
+    if covered != state.covered_logged {
+        info!("netplay: {covered} pawn(s) in cover in the snapshot");
+        state.covered_logged = covered;
+    }
     for m in net.members.iter().filter(|m| m.peer != HOST) {
         let ack = state.inputs.get(&m.peer).map_or(0, |(c, _)| c.sequence);
         online.send_snapshot(m.peer, Snapshot { tick, acknowledged_input: ack, pawns: all.clone() });
@@ -780,18 +802,18 @@ fn send_class(online: Res<Online>, mine: Query<&PawnClass, (With<LocalPlayer>, C
 /// Our controls to the host, up to 60 times a second, each with the few
 /// before it in case some go missing.
 #[allow(clippy::type_complexity)]
-fn send_inputs(
+pub(crate) fn send_inputs(
     online: Res<Online>,
     time: Res<Time>,
     mut state: ResMut<GuestState>,
     me: Query<
-        (&MoveInput, &ViewAngles, &WeaponInput, Option<&crate::grenades::GrenadeInput>, Option<&crate::loadout::Loadout>),
+        (&MoveInput, &ViewAngles, &WeaponInput, Option<&crate::grenades::GrenadeInput>, Option<&crate::loadout::Loadout>, Option<&crate::splitscreen::PlayerInput>),
         With<LocalPlayer>,
     >,
     mut held: Local<u16>,
     mut in_hand: Local<Option<usize>>,
 ) {
-    let Ok((mv, view, wi, grenades, loadout)) = me.single() else { return };
+    let Ok((mv, view, wi, grenades, loadout, player_input)) = me.single() else { return };
     let mut buttons = 0;
     let mut set = |on: bool, b: u16| {
         if on {
@@ -803,6 +825,8 @@ fn send_inputs(
     set(mv.jump, button::JUMP);
     set(mv.sprint, button::SPRINT);
     set(wi.reload, button::RELOAD);
+    // 3rd Person TDM: the cover button; the host does the rest ([`crate::cover`]).
+    set(crate::cover::active() && player_input.is_some_and(|p| p.live && p.keys.just_pressed(crate::cover::COVER_KEY)) || crate::cover::autokey(), button::COVER);
     set(grenades.is_some_and(|g| g.frag), button::FRAG);
     set(grenades.is_some_and(|g| g.special), button::SPECIAL);
     // Changed between primary and secondary: the host follows.
@@ -842,7 +866,7 @@ fn pose_puppets(
     mut state: ResMut<GuestState>,
     assets: Option<Res<PawnAssets>>,
     content: Res<crate::content::Content>,
-    mut puppets: Query<(Entity, &mut Puppet, &mut Pawn, &mut Transform, &mut Mover, &mut ViewAngles, &mut Health, &mut WeaponState, &mut WeaponInput, &mut Visibility, Has<Dead>)>,
+    mut puppets: Query<(Entity, &mut Puppet, &mut Pawn, &mut Transform, &mut Mover, &mut ViewAngles, &mut Health, &mut WeaponState, &mut WeaponInput, &mut Visibility, Has<Dead>, Has<crate::cover::InCover>)>,
     mut shots: MessageWriter<ShotFired>,
 ) {
     let Some(latest) = state.latest.as_ref().map(|s| s.tick as f32) else { return };
@@ -860,7 +884,7 @@ fn pose_puppets(
 
     let ids: Vec<u16> = state.latest.as_ref().map_or(Vec::new(), |s| s.pawns.iter().map(|p| p.id).collect());
     let mut posed = Vec::new();
-    for (e, mut puppet, mut pawn, mut tf, mut mover, mut view, mut health, mut weapon, mut wi, mut visibility, dead) in &mut puppets {
+    for (e, mut puppet, mut pawn, mut tf, mut mover, mut view, mut health, mut weapon, mut wi, mut visibility, dead, in_cover) in &mut puppets {
         posed.push(puppet.id);
         let Some(p) = state.snapshots.sample(puppet.id, tick, fraction) else { continue };
         if p.life == 0 && !puppet.lived {
@@ -893,6 +917,15 @@ fn pose_puppets(
         view.pitch = p.pitch;
         health.current = p.health as f32;
         wi.ads = p.flags & pawn_flags::ADS != 0;
+        // In cover on the host: shown in its poses ([`crate::cover`]).
+        let cover = p.flags & pawn_flags::IN_COVER != 0 && p.life == 0;
+        if cover && !in_cover {
+            bevy::log::info!("netplay: puppet {} takes cover", puppet.id);
+            commands.entity(e).insert(crate::cover::InCover::replicated(p.flags & pawn_flags::COVER_HIGH != 0, time.elapsed_secs()));
+        } else if !cover && in_cover {
+            bevy::log::info!("netplay: puppet {} leaves cover", puppet.id);
+            commands.entity(e).remove::<crate::cover::InCover>();
+        }
         match (p.life == 1, dead) {
             (true, false) => {
                 commands.entity(e).insert(Dead { respawn_at: f32::INFINITY, killer: None });
@@ -944,11 +977,12 @@ fn pose_puppets(
 fn correct_own(
     mut commands: Commands,
     state: Res<GuestState>,
-    mut me: Query<(Entity, &mut Transform, &mut Mover, &mut ViewAngles, &mut Health, &mut Pawn, Has<Dead>), With<LocalPlayer>>,
+    mut me: Query<(Entity, &mut Transform, &mut Mover, &mut ViewAngles, &mut Health, &mut Pawn, Has<Dead>, Has<crate::cover::InCover>), With<LocalPlayer>>,
+    time: Res<Time>,
 ) {
     let (Some(id), Some(latest)) = (state.my_id, state.latest.as_ref()) else { return };
     let Some(p) = latest.pawns.iter().find(|p| p.id == id) else { return };
-    let Ok((e, mut tf, mut mover, mut view, mut health, mut pawn, dead)) = me.single_mut() else { return };
+    let Ok((e, mut tf, mut mover, mut view, mut health, mut pawn, dead, in_cover)) = me.single_mut() else { return };
     health.current = p.health as f32;
     if let Some(info) = state.info.get(&id) {
         pawn.kills = info.kills as u32;
@@ -956,6 +990,21 @@ fn correct_own(
         pawn.team = team_of(info.team);
     }
     let at = Vec3::from_array(p.position);
+    // In cover on the host ([`crate::cover`]): shown in its poses, and held
+    // where the host has it (it moves it along the wall).
+    let covered = p.flags & pawn_flags::IN_COVER != 0 && p.life == 0;
+    if covered && !in_cover {
+        info!("netplay: our soldier is in cover on the host");
+        commands.entity(e).insert(crate::cover::InCover::replicated(p.flags & pawn_flags::COVER_HIGH != 0, time.elapsed_secs()));
+    } else if !covered && in_cover {
+        info!("netplay: our soldier left cover on the host");
+        commands.entity(e).remove::<crate::cover::InCover>();
+    }
+    if covered && !dead {
+        tf.translation = tf.translation.lerp(at, 0.4);
+        mover.velocity = Vec3::ZERO;
+        return;
+    }
     match (p.life == 1, dead) {
         (true, false) => {
             commands.entity(e).insert((Dead { respawn_at: f32::INFINITY, killer: state.killer.clone() }, Frozen));

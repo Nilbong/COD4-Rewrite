@@ -64,7 +64,8 @@ fn start(content: Res<Content>, map: Res<crate::world::MapName>, effects: Option
     }
     for p in &placed {
         // The showcase's storm brings its own rain (`crate::weather`).
-        if crate::weather::showcase() && p.effect.to_ascii_lowercase().contains("rain") {
+        let effect = p.effect.to_ascii_lowercase();
+        if crate::weather::showcase() && (effect.contains("rain") || (crate::atmos::climate::profile().is_some_and(|q| q.snow) && effect.contains("snow"))) {
             continue;
         }
         if only.as_ref().is_some_and(|o| !p.effect.contains(o.as_str())) {

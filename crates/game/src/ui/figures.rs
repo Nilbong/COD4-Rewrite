@@ -167,7 +167,7 @@ pub fn spawn(
     // A Black Ops or World at War gun comes from its game's content.
     let weapon = crate::gunmodel::parse(f.gun).0;
     let gun_content: &mut Content = match other_game {
-        Some(c) if crate::bo1::is_bo1(weapon) || crate::waw::is_waw(weapon) => c,
+        Some(c) if crate::bo1::is_bo1(weapon) || crate::waw::is_waw(weapon) || crate::mw2guns::is_mw2(weapon) => c,
         _ => &mut *common,
     };
     crate::gunmodel::spawn_world_gun(commands, gun_content, camos, a, &mut skeleton, f.gun, f.camo, target);

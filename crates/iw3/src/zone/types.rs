@@ -311,6 +311,8 @@ pub struct CollBox {
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
     pub contents: i32,
+    /// `surfFlags`: its surface type in bits 20-24 (cloth, metal, ...).
+    pub surf_flags: i32,
     /// Its triangles' corners (model space). Each is stored as a plane and
     /// two barycentric vectors (`XModelCollTri_s`); the corners are where
     /// (s, t) is (0, 0), (1, 0) and (0, 1) on the plane. Facing out: CoD4

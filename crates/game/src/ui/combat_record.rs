@@ -3,6 +3,7 @@
 //! and sharing are deliberately left to the multiplayer integration.
 
 mod menu;
+pub(super) use menu::{rank, rank_at};
 
 use super::{Frontend, progression::stat, stats::Stats};
 use crate::combat::{Dead, HitLocation, Killed, Pawn, hostile};
@@ -12,7 +13,8 @@ use crate::weapons::{ShotFired, WeaponState};
 use bevy::prelude::*;
 use std::collections::HashMap;
 
-const NAME: &str = "cod4rw_player_name";
+pub(super) const NAME_DVAR: &str = "cod4rw_player_name";
+const NAME: &str = NAME_DVAR;
 const CLAN: &str = "cod4rw_clan_tag";
 const EMBLEM: &str = "cod4rw_emblem";
 const CARD: &str = "cod4rw_calling_card";
@@ -98,7 +100,7 @@ fn decode_emblem(text: &str) -> Option<[u8; PIXELS]> {
 
 /// The bundled fonts are ASCII. Exclude colour escapes, localisation keys,
 /// control characters and save-file line breaks from user identity fields.
-fn clean_name(text: &str, limit: usize) -> String {
+pub(super) fn clean_name(text: &str, limit: usize) -> String {
     text.chars()
         .filter(|c| c.is_ascii_alphanumeric() || " _-.".contains(*c))
         .take(limit)

@@ -728,7 +728,7 @@ fn test(
         cursor.grab_mode = CursorGrabMode::Locked;
     }
     let held = |from: f32| (from..from + 0.1).contains(&t);
-    for (key, at) in [(KeyCode::Digit5, 5.5)] {
+    for (key, at) in [(KeyCode::Digit3, 5.5)] {
         if held(at) { keys.press(key) } else { keys.release(key) }
     }
     // C4 is thrown with aim and set off with fire; the rest fire.

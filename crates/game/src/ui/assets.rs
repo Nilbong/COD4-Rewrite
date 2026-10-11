@@ -45,7 +45,16 @@ impl UiAssets {
     pub fn load() -> anyhow::Result<UiAssets> {
         let t0 = std::time::Instant::now();
         let install = iw3::Install::locate()?;
-        let vfs = Arc::new(iw3::iwd::Vfs::mount(&install.iwd_paths()?)?);
+        // Custom maps' archives for their load screens, for the map list,
+        // and MW2's for its maps' minimaps: both before the game's, which
+        // override them (a custom map's own `weapon_m4carbine` showed for
+        // CoD4's).
+        let mut iwds = crate::mw2::iwd_paths();
+        for map in install.usermaps() {
+            iwds.extend(install.usermap_iwds(&map));
+        }
+        iwds.extend(install.iwd_paths()?);
+        let vfs = Arc::new(iw3::iwd::Vfs::mount(&iwds)?);
         let mut zones = Vec::new();
         for name in ZONES {
             let data = iw3::fastfile::load(&install.zone_path(name))?;
@@ -95,6 +104,7 @@ impl UiAssets {
         // attachments, for Create a Class.
         super::bo1::extend(&mut out.strings, &mut out.tables);
         super::waw::extend(&mut out.strings, &mut out.tables);
+        super::mw2::extend(&mut out.strings, &mut out.tables);
         super::camos::add(&mut out.strings, &mut out.tables, &mut out.menus);
         // Options > Game's rows for the sniper scope's style and the film's
         // tint.
@@ -188,6 +198,41 @@ impl UiAssets {
             let handle = crate::custom_camos::texture(&def, images);
             return Some(UiImage { handle, size: Vec2::splat(256.0) });
         }
+        // The hit marker, drawn to its tuned shape (`hud::hit_marker`).
+        if let Some(rest) = key.strip_prefix("cod4rw_hitmarker_") {
+            let p: Vec<f32> = rest.split('_').filter_map(|v| v.parse::<f32>().ok()).map(|v| v / 100.0).collect();
+            let [len, width, gap, outline, taper] = p[..] else { return None };
+            let handle = images.add(super::hud::hit_marker_image(len, width, gap, outline, taper));
+            let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
+        }
+        // The minimap's drawn marks (`hud::minimap_icon_image`).
+        if let Some(rest) = key.strip_prefix("cod4rw_mmicon_") {
+            let mut parts = rest.split('_');
+            let kind = parts.next().unwrap_or("enemy");
+            let mut num = || parts.next().and_then(|v| v.parse::<f32>().ok()).map_or(1.0, |v| v / 100.0);
+            let (amount, size) = (num(), num());
+            let handle = images.add(super::hud::minimap_icon_image(kind, amount, size));
+            let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
+        }
+        // A crosshair tick, drawn to its tuned shape (`hud::tuned_crosshair`).
+        if let Some(rest) = key.strip_prefix("cod4rw_xhairtick_") {
+            let p: Vec<f32> = rest.split('_').filter_map(|v| v.parse::<f32>().ok()).map(|v| v / 100.0).collect();
+            let [len, width, outline, round] = p[..] else { return None };
+            let handle = images.add(super::hud::crosshair_tick_image(len, width, outline, round));
+            let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
+        }
+        // The new UI's reticle glows (`next::sight`).
+        if let Some(handle) = super::next::sight::image(&key, images) {
+            let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
+        }
         // Reticle pictures (`reticle_menu`).
         if let Some(code) = key.strip_prefix("cod4rw_reticle_").and_then(|c| c.parse::<u16>().ok()) {
             let handle = crate::reticles::preview(crate::reticles::Reticle::from_code(code), images);
@@ -207,7 +252,7 @@ impl UiAssets {
         }
         // The modern main menu's own pictures, and the Modern HUD's atlases,
         // embedded.
-        if let Some(bytes) = super::modern::picture(&key).or_else(|| super::hud::modern::picture(&key)) {
+        if let Some(bytes) = super::modern::picture(&key).or_else(|| super::hud::modern::picture(&key)).or_else(|| super::next::picture(&key)) {
             let image = Image::from_buffer(
                 bytes,
                 bevy::image::ImageType::Extension("png"),
@@ -228,6 +273,17 @@ impl UiAssets {
             let data = crate::waw::data()?;
             let image = data.material_image(waw_name)?;
             let handle = self.waw_textures.get(&image, true, &data.vfs, images)?;
+            let image = Self::clamped(handle, images);
+            self.materials.insert(key, image.clone());
+            return image;
+        }
+        // Modern Warfare 2's pictures, swatches and kill icons: streamed from
+        // its iwds (mounted under CoD4's) or held in its zone.
+        if let Some(mw2_name) = key.strip_prefix(crate::mw2guns::MATERIAL_PREFIX) {
+            let handle = match crate::mw2guns::data()?.picture(mw2_name)? {
+                iw4::weapons::Picture::Streamed(image) => self.textures.get(image, true, &self.vfs, images)?,
+                iw4::weapons::Picture::Inline(iwi) => images.add(crate::textures::to_image(iwi, true)?),
+            };
             let image = Self::clamped(handle, images);
             self.materials.insert(key, image.clone());
             return image;

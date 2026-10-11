@@ -14,6 +14,7 @@ mod bo1;
 mod bodycam;
 mod bots;
 mod bugreport;
+mod campaign;
 mod characters;
 mod collision;
 mod combat;
@@ -35,6 +36,8 @@ mod hud;
 mod killstreaks;
 mod lightmaps;
 mod mapfx;
+mod mw2;
+mod glass;
 mod loadout;
 mod model_lighting;
 mod models;
@@ -72,9 +75,12 @@ mod thirdperson;
 mod ui;
 mod units;
 mod viewmodel;
+mod viewmodel_parts;
+mod wet_gun;
 mod vision;
 mod wardrobe;
 mod waw;
+mod mw2guns;
 mod weapons;
 mod walktest;
 mod weather;
@@ -82,8 +88,12 @@ mod wet;
 mod ssr;
 mod pom;
 mod vm_lights;
+mod settle;
 mod window_icon;
 mod world;
+mod target_practice;
+mod tune;
+mod photo;
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
@@ -144,8 +154,10 @@ fn main() -> AppExit {
     }
     // Black Ops' and World at War's guns (if installed), read while the
     // game starts.
+    log_panics();
     bo1::preload();
     waw::preload();
+    mw2guns::preload();
     let mut map = String::from("mp_killhouse");
     let mut bots_per_team = 6usize;
     let mut bot_skill = 0.6f32;
@@ -158,11 +170,16 @@ fn main() -> AppExit {
     // Splitscreen co-op for a run: `kbm,pad,pad` (`crate::splitscreen`).
     let mut splitscreen = std::env::var("COD4RW_SPLITSCREEN").ok();
     // Debug aids drive a match directly, skipping the menus.
-    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !k.starts_with("COD4RW_FP_") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER" | "COD4RW_RAGDOLL" | "COD4RW_NETLOOK" | "COD4RW_TIMELIMIT") && !net::setting(&k)) {
+    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !k.starts_with("COD4RW_FP_") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER" | "COD4RW_RAGDOLL" | "COD4RW_NETLOOK" | "COD4RW_TIMELIMIT" | "COD4RW_COVER_TEST" | "COD4RW_COVER_TEST_WAIT" | "COD4RW_COVER_AUTOKEY" | "COD4RW_COVER_BUGS") && !net::setting(&k)) {
         state::GameState::InGame
     } else {
         state::GameState::Frontend
     };
+    // `COD4RW_UISHOT` goes through the menus whatever else is set (with
+    // `COD4RW_PERF`: timing a match started as a player starts one).
+    if std::env::var_os("COD4RW_UISHOT").is_some() {
+        first_state = state::GameState::Frontend;
+    }
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -206,16 +223,20 @@ fn main() -> AppExit {
             ..default()
         }
     } else {
-        Window { title: "CoD4 Rewrite".into(), resolution: resolution.unwrap_or_default(), ..default() }
+        Window { title: window_title(), resolution: resolution.unwrap_or_default(), ..default() }
     };
+    let mut plugins = DefaultPlugins
+        .set(WindowPlugin { primary_window: Some(window), ..default() })
+        .set(bevy::log::LogPlugin { custom_layer: log_file_layer, ..default() });
+    // Silent debug runs never open the sound device ([`audio::silent_run`]).
+    if audio::silent_run() {
+        plugins = plugins.disable::<bevy::audio::AudioPlugin>();
+    }
     App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(window),
-            ..default()
-        }))
+        .add_plugins(plugins)
         .insert_resource(collision::physics_transform_config())
         .add_systems(avian3d::schedule::PhysicsSchedule, collision::sync_moved_colliders.in_set(avian3d::physics_transform::PhysicsTransformSystems::TransformToPosition))
-        .add_plugins((physics_plugins(), state::StatePlugin(first_state), ui::UiPlugin, gunmodel::GunModelPlugin, audio::AudioPlugin, bo1::Bo1Plugin, waw::WawPlugin))
+        .add_plugins((physics_plugins(), state::StatePlugin(first_state), ui::UiPlugin, gunmodel::GunModelPlugin, audio::AudioPlugin, bo1::Bo1Plugin, waw::WawPlugin, mw2guns::Mw2GunsPlugin))
         .insert_resource(Gravity(Vec3::ZERO))
         // The broad phase's and solver's sets the collider trees' systems
         // run in (updating AABBs, starting and finishing optimising), placed
@@ -289,17 +310,19 @@ fn main() -> AppExit {
         ))
         // The showcase's time-of-day baked lighting.
         .add_plugins(tod_light::TodLightPlugin)
-        .add_plugins((ragdoll::RagdollPlugin, pickups::PickupsPlugin, quake::QuakePlugin, hq::HqPlugin, render_scale::RenderScalePlugin))
+        .add_plugins((ragdoll::RagdollPlugin, pickups::PickupsPlugin, quake::QuakePlugin, hq::HqPlugin, campaign::CampaignPlugin, render_scale::RenderScalePlugin, tune::TunePlugin, target_practice::TargetPracticePlugin, photo::PhotoPlugin))
         .init_resource::<settings::Settings>()
         .add_plugins(settings_apply::SettingsApplyPlugin)
         // The characters worn: the player's (F5: third person) and the bots'.
         .add_plugins(wardrobe::WardrobePlugin)
         .add_plugins(cover::CoverPlugin)
         .add_plugins(first_person::FirstPersonPlugin)
-        .add_plugins((weather::WeatherPlugin, wet::WetPlugin, ssr::SsrPlugin, vm_lights::VmLightsPlugin))
+        .add_plugins(viewmodel_parts::ViewModelPartsPlugin)
+        .add_plugins(wet_gun::WetGunPlugin)
+        .add_plugins((weather::WeatherPlugin, wet::WetPlugin, ssr::SsrPlugin, vm_lights::VmLightsPlugin, settle::SettlePlugin))
         // G: grenades. 5: equipment and grenade launchers.
         .add_plugins((grenades::GrenadesPlugin, explosives::ExplosivesPlugin, perks::PerksPlugin, killcam::KillcamPlugin))
-        .add_plugins((melee::MeleePlugin, props::PropsPlugin, walktest::WalkTestPlugin, fog::FogPlugin, atmos::AtmosPlugin, window_icon::WindowIconPlugin))
+        .add_plugins((melee::MeleePlugin, props::PropsPlugin, glass::GlassPlugin, walktest::WalkTestPlugin, fog::FogPlugin, atmos::AtmosPlugin, window_icon::WindowIconPlugin))
         .add_plugins((net::NetPlugin, online::OnlinePlugin, netplay::NetplayPlugin, mesh_bounds::MeshBoundsPlugin))
         .add_systems(Update, collision::ray_test.run_if(state::in_game.and_then(|| std::env::var_os("COD4RW_RAYTEST").is_some())))
         // Muzzle flashes, bullet impacts and blood.
@@ -334,4 +357,59 @@ fn main() -> AppExit {
             bevy::diagnostic::FrameTimeDiagnosticsPlugin::default(),
         ))
         .run()
+}
+
+/// `cod4rw.log` next to the exe: this run's log (graphics card, errors), so a
+/// player whose game misbehaves has something to send.
+fn log_path() -> std::path::PathBuf {
+    std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("cod4rw.log"))).unwrap_or_else(|| "cod4rw.log".into())
+}
+
+fn log_file_layer(_: &mut App) -> Option<bevy::log::BoxedLayer> {
+    use bevy::log::tracing_subscriber::Layer;
+    let file = std::fs::File::create(log_path()).ok()?;
+    Some(bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)).boxed())
+}
+
+/// A crash's message goes in the log too (the window has no console).
+fn log_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(log_path()) {
+            let _ = writeln!(f, "CRASH: {info}
+{}", std::backtrace::Backtrace::force_capture());
+        }
+        previous(info);
+    }));
+}
+
+/// "CoD4 Rewrite - build <date time> UTC": when this exe was built (its file
+/// time), so it's clear which build is running.
+fn window_title() -> String {
+    let built = std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| {
+            let secs = t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) as i64;
+            let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+            let (y, m, d) = civil_from_days(days);
+            format!(" - build {y}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, rem % 3600 / 60)
+        })
+        .unwrap_or_default();
+    format!("CoD4 Rewrite{built}")
+}
+
+/// Days since 1970-01-01 to a calendar date (Howard Hinnant's algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
 }

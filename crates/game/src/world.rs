@@ -156,7 +156,10 @@ impl WorldLighting {
     fn water(mat: Option<&zone::Material>, world: &zone::GfxWorld, params: &mut WorldParams) {
         let constant = |name: &str| mat.and_then(|m| m.constants.iter().find(|c| c.name == name)).map(|c| Vec4::from_array(c.literal));
         let colour = constant("waterColor").unwrap_or(Vec4::new(0.3, 0.3, 0.24, 1.0));
-        params.water_color = colour.truncate().extend(1.0);
+        // (w: 1 for water, plus how muddy the map's look makes it,
+        // `crate::atmos::climate::MapLook`.)
+        let muddy = crate::atmos::climate::look().map_or(0.0, |l| l.muddy_water);
+        params.water_color = colour.truncate().extend(1.0 + muddy);
         params.water_env = constant("envMapParms").unwrap_or(Vec4::new(0.2, 0.5, 2.5, 2.5));
         let sun = &world.sun;
         let (pitch, yaw) = (sun.angles[0].to_radians(), sun.angles[1].to_radians());
@@ -252,7 +255,13 @@ pub fn load_map(
 ) {
     let t0 = std::time::Instant::now();
     let install = iw3::Install::locate().expect("CoD4 install not found (set COD4_PATH)");
-    let vfs = Arc::new(iw3::iwd::Vfs::mount(&install.iwd_paths().expect("listing iwds")).expect("mounting iwds"));
+    // (A custom map's own archives too; a Modern Warfare 2 map's, under
+    // CoD4's: see `crate::mw2`.)
+    let mw2 = crate::mw2::zone(&map.0);
+    crate::mw2::set_active(mw2.is_some());
+    let mut iwds = if mw2.is_some() { crate::mw2::iwd_paths() } else { Vec::new() };
+    iwds.extend(install.map_iwd_paths(&map.0).expect("listing iwds"));
+    let vfs = Arc::new(iw3::iwd::Vfs::mount(&iwds).expect("mounting iwds"));
     info!("mounted iwds in {:?}", t0.elapsed());
 
     let load_zone = |name: &str| {
@@ -266,10 +275,19 @@ pub fn load_map(
         );
         zone
     };
-    let mut content = Content::new(vec![load_zone(&map.0), load_zone("common_mp")], vfs);
+    let map_zone = match &mw2 {
+        Some(zone) => {
+            let z = crate::mw2::load(zone).unwrap_or_else(|e| panic!("loading MW2 map {zone}: {e:#}"));
+            info!("converted MW2 {zone}: {} assets ({:?})", z.assets.len(), t0.elapsed());
+            z
+        }
+        None => load_zone(&map.0),
+    };
+    let mut content = Content::new(vec![map_zone, load_zone("common_mp")], vfs);
 
     // Re-baked lighting (`crate::bake`) when wanted and cached, else CoD4's.
-    let rebaked = crate::lightmaps::load_rebaked(&mut commands, &map.0, &install.zone_path(&map.0), &mut images);
+    let zone_path = mw2.as_deref().and_then(crate::mw2::zone_path).unwrap_or_else(|| install.zone_path(&map.0));
+    let rebaked = crate::lightmaps::load_rebaked(&mut commands, &map.0, &zone_path, &mut images);
     let lightmaps = match &rebaked {
         Some(r) => r.lightmaps.clone(),
         None => crate::lightmaps::load(content.map(), content.map().gfx_world().expect("zone has no GfxWorld"), &mut images),
@@ -314,11 +332,12 @@ pub fn load_map(
             // bomb site box, Headquarters' radio boxes): CoD4's scripts
             // delete them outside their mode, and the modes place their own.
             // Kept, they stood invisible and solid on Wet Work's deck.
-            .filter(|e| e.classname() == "script_brushmodel" && e.get("script_gameobjectname").is_none())
+            .filter(|e| e.classname() == "script_brushmodel" && brush_entity_shown(e))
             .filter_map(|e| {
                 let n = e.get("model")?.strip_prefix('*')?.parse::<usize>().ok()?;
                 Some((n, units::pos(e.origin().unwrap_or([0.0; 3])), crate::modes::koth::cod_rotation(e.angles())))
             })
+            .chain(dyn_brush_places(&content))
             .collect();
         crate::collision::spawn_brush_entity_collision(&mut commands, clip, &places);
         crate::collision::spawn_static_model_collision(&mut commands, content.map(), clip);
@@ -328,6 +347,17 @@ pub fn load_map(
     info!("{} spawn points; map ready in {:?}", spawns.len(), t0.elapsed());
     commands.insert_resource(MapInfo { spawns });
     commands.insert_resource(content);
+}
+
+/// Whether a brush entity is there in a match, as CoD4's scripts leave it:
+/// not a game mode's object (`script_gameobjectname`: deleted outside its
+/// mode, and the modes place their own), nor an exploder's after-piece
+/// (`_load.gsc`'s `setupExploders`: `script_exploder` /
+/// `script_prefab_exploder` with targetname `exploder` or `exploderchunk`,
+/// hidden and not solid until it goes off).
+fn brush_entity_shown(e: &iw3::ents::Entity) -> bool {
+    let exploder = e.get("script_exploder").is_some() || e.get("script_prefab_exploder").is_some();
+    e.get("script_gameobjectname").is_none() && !(exploder && matches!(e.get("targetname"), Some("exploder" | "exploderchunk")))
 }
 
 /// Where each brush model is drawn (index = model; 0 the world, in place):
@@ -340,7 +370,7 @@ fn brush_model_places(content: &Content) -> Vec<Option<(Vec3, Quat)>> {
         *first = Some((Vec3::ZERO, Quat::IDENTITY));
     }
     let ents = content.map().map_ents().map(|e| iw3::ents::parse(&e.entity_string)).unwrap_or_default();
-    for e in ents.iter().filter(|e| e.get("script_gameobjectname").is_none()) {
+    for e in ents.iter().filter(|e| brush_entity_shown(e)) {
         let Some(n) = e.get("model").and_then(|m| m.strip_prefix('*')).and_then(|n| n.parse::<usize>().ok()) else { continue };
         if n == 0 || n >= count || out[n].is_some() {
             continue;
@@ -348,7 +378,29 @@ fn brush_model_places(content: &Content) -> Vec<Option<(Vec3, Quat)>> {
         let origin = e.origin().unwrap_or([0.0; 3]);
         out[n] = Some((units::pos(origin), crate::modes::koth::cod_rotation(e.angles())));
     }
+    for (n, at, turn) in dyn_brush_places(content) {
+        if n < count && out[n].is_none() {
+            out[n] = Some((at, turn));
+        }
+    }
     out
+}
+
+/// Brush models a dynamic entity stands for (MW2's destructible brush
+/// pieces: no entity places them), where it stands. Drawn and solid; they
+/// don't break yet.
+fn dyn_brush_places(content: &Content) -> Vec<(usize, Vec3, Quat)> {
+    content
+        .map()
+        .clip_map()
+        .map(|c| {
+            c.dyn_ents
+                .iter()
+                .filter(|d| d.model.is_none() && d.brush_model > 0)
+                .map(|d| (d.brush_model as usize, units::pos(d.origin), units::axis_rotation(crate::clutter::quat_axes(d.quat))))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// World vertex colours are gamma-space multipliers (IW3 lit everything in
@@ -440,6 +492,15 @@ fn spawn_world_geometry(
         if mat.sky {
             continue;
         }
+        // The showcase's rain-struck water (`shaders/world.wgsl`'s `water`):
+        // Downpour's opaque brown "murkiness" layer over its water left it a
+        // flat sheet; the water's own colour carries the mud.
+        // ... nor CoD4's HDR portals (sheets in doorways faking the eye
+        // adjusting, light or dark): auto-exposure does it, and they read as
+        // translucent slabs in Downpour's barn doors.
+        if crate::atmos::climate::showcase() && content.zone(MAP_ZONE).material(mat_id).is_some_and(|m| m.name.contains("water_mud_murkiness") || m.name.contains("hdrportal")) {
+            continue;
+        }
         let lightmap = lightmaps.get(lightmap_index as usize).cloned().flatten();
         // Probe 0 is the engine's placeholder (the same reddish cube on every
         // map): no probe.
@@ -463,7 +524,11 @@ fn spawn_world_geometry(
             None => {
                 let base = std_materials.get(&mat.handle).cloned().unwrap_or_default();
                 // `$identitynormalmap` and friends are flat; skip them.
-                let real = |h: Option<Handle<Image>>, name: Option<String>| h.filter(|_| !name.is_some_and(|n| n.starts_with('$')));
+                // (Also `,$identitynormalmap`: a reference to the one in another
+                // zone. Taken for a real normal map, it bent the normal far
+                // over: lit surfaces' directional light went black, Carentan's
+                // walls.)
+                let real = |h: Option<Handle<Image>>, name: Option<String>| h.filter(|_| !name.is_some_and(|n| n.trim_start_matches(',').starts_with('$')));
                 let normal_map = real(
                     content.material_texture(MAP_ZONE, mat_id, TextureSemantic::Normal, false, images),
                     content.material_texture_name(MAP_ZONE, mat_id, TextureSemantic::Normal),
@@ -495,7 +560,9 @@ fn spawn_world_geometry(
                             .map_or(0.0, |i| i.texture_descriptor.mip_level_count.saturating_sub(1) as f32),
                         // Wet surfaces' sky (`sky` below) in place of a probe.
                         (reflection_probe.is_none() && sky.is_some()) as u32 as f32,
-                        0.0,
+                        // MW2's normal maps (`crate::mw2`) are unit vectors' x
+                        // and y, not CoD4's slopes.
+                        crate::mw2::active() as u32 as f32,
                     ),
                     ..default()
                 };
@@ -624,16 +691,16 @@ fn spawn_world_geometry(
         }
     }
     if !proxy_indices.is_empty() {
+        let material =
+            std_materials.add(StandardMaterial { unlit: true, cull_mode: None, ..default() });
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
         let normals = vec![[0.0, 1.0, 0.0]; proxy_positions.len()];
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, proxy_positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
         mesh.insert_indices(Indices::U32(proxy_indices));
-        let material =
-            std_materials.add(StandardMaterial { unlit: true, cull_mode: None, ..default() });
         commands.spawn((
             Name::new("world shadow caster"),
-            Mesh3d(meshes.add(mesh)),
+            Mesh3d(crate::mesh_bounds::add(meshes, mesh)),
             MeshMaterial3d(material),
             RenderLayers::layer(SHADOW_PROXY_LAYER),
             ChildOf(root),
@@ -656,6 +723,7 @@ fn spawn_static_models(
     let mut falloff_mats: HashMap<(usize, AssetId), Option<Handle<WorldMaterial>>> = HashMap::new();
     let instances: Vec<_> = content.map().gfx_world().expect("gfxworld").static_models.clone();
     let mut batches: HashMap<(BatchMaterial, IVec3, u32), Vec<(Handle<Mesh>, Transform)>> = HashMap::new();
+    let mut logged = std::collections::HashSet::new();
     // Models drawn with surfaces missing, or not at all (their collision
     // still stands): name -> (instances, surfaces missed, why).
     let mut missed: std::collections::BTreeMap<String, (usize, usize, &'static str)> = Default::default();
@@ -716,6 +784,10 @@ fn spawn_static_models(
                 Some(m) => BatchMaterial::World(m),
                 None => BatchMaterial::Standard(mat.handle.clone()),
             };
+            if std::env::var("COD4RW_BATCHLOG").is_ok_and(|v| !v.is_empty() && name.contains(&v)) {
+                info!("batchlog: {name} surf {surf} -> cell {cell} cull {cull} material {:?}", match &material { BatchMaterial::World(m) => m.id().to_string(), BatchMaterial::Standard(m) => m.id().to_string() });
+                logged.insert((material.clone(), cell, cull));
+            }
             batches.entry((material, cell, cull)).or_default().push((mesh, transform));
         }
     }
@@ -747,17 +819,38 @@ fn spawn_static_models(
     let mut proxy: Vec<(Handle<Mesh>, Transform)> = Vec::new();
     let mut wet_materials: std::collections::HashMap<bevy::asset::AssetId<StandardMaterial>, Handle<WorldMaterial>> = Default::default();
     let sky = crate::atmos::climate::showcase().then(|| content.sky_cube(images)).flatten();
-    for ((material, _, cull), parts) in batches {
+    for ((material, _cell, cull), parts) in batches {
         let opaque = matches!(&material, BatchMaterial::Standard(m) if std_materials.get(m).is_some_and(|m| m.alpha_mode == AlphaMode::Opaque));
         if opaque && std::env::var_os("COD4RW_NOBATCH").is_none() {
             proxy.extend(parts.iter().cloned());
         }
-        let Some(mesh) = merge_meshes(&parts, meshes) else { continue };
-        let mut e = commands.spawn((Name::new("static models batch"), Mesh3d(meshes.add(mesh)), Transform::default(), ChildOf(root)));
-        match material {
+        // Meshes already handed to the renderer (a model the props or the
+        // clutter drew first) can't be read to merge: each its own then.
+        // (Skipped, they stood invisible but cast the proxy's shadow: MW2
+        // Terminal's tables and plane seats.)
+        let merged = merge_meshes(&parts, meshes);
+        if logged.contains(&(material.clone(), _cell, cull)) {
+            info!("batchlog: batch of {} parts, alpha {:?}, merged {:?}", parts.len(), match &material { BatchMaterial::Standard(m) => std_materials.get(m).map(|m| m.alpha_mode), _ => None }, merged.as_ref().map(|m| bevy::camera::primitives::MeshAabb::compute_aabb(m)));
+        }
+        let spawned: Vec<Entity> = match merged {
+            // (Bounds noted while the vertices are here: worked out later,
+            // after the mesh went to the GPU, there were none, and the draw
+            // distance check hid the batch: MW2 Terminal's tables.)
+            Some(mesh) => {
+                let (mesh, centre) = recentre(mesh);
+                vec![commands.spawn((Name::new("static models batch"), Mesh3d(crate::mesh_bounds::add(meshes, mesh)), Transform::from_translation(centre), ChildOf(root))).id()]
+            }
+            None => parts.iter().map(|(mesh, tf)| commands.spawn((Name::new("static model"), Mesh3d(mesh.clone()), *tf, ChildOf(root))).id()).collect(),
+        };
+        for id in spawned {
+        let mut e = commands.entity(id);
+        match material.clone() {
             BatchMaterial::World(m) => e.insert((MeshMaterial3d(m), NotShadowCaster)),
             // The showcase's rain wets them too (`crate::wet`).
-            BatchMaterial::Standard(m) if crate::atmos::climate::showcase() => {
+            // (Alpha-tested ones always take the world shader: its cutoff
+            // drops with distance, so grass and leaves keep their cover far
+            // off rather than thinning to see-through cards.)
+            BatchMaterial::Standard(m) if crate::atmos::climate::showcase() || std_materials.get(&m).is_some_and(|m| matches!(m.alpha_mode, AlphaMode::Mask(_))) => {
                 let wet = wet_materials.entry(m.id()).or_insert_with(|| crate::wet::wet_material(std_materials.get(&m), sky.clone(), world_materials)).clone();
                 e.insert(MeshMaterial3d(wet))
             }
@@ -771,12 +864,22 @@ fn spawn_static_models(
             e.insert(VisibilityRange { start_margin: 0.0..0.0, end_margin: end..end + CULL_STEP, use_aabb: true });
         }
         entities += 1;
+        }
     }
+    // (Only what can be read: one model handed to the renderer already
+    // would otherwise cost every static model its shadow.)
+    proxy.retain(|(h, _)| {
+        meshes.get(h).is_some_and(|m| {
+            m.try_attribute_option(Mesh::ATTRIBUTE_POSITION).is_ok_and(|p| p.is_some())
+                && m.attribute(Mesh::ATTRIBUTE_NORMAL).is_some()
+                && m.attribute(Mesh::ATTRIBUTE_UV_0).is_some()
+        })
+    });
     if let Some(mesh) = merge_meshes(&proxy, meshes) {
         let material = std_materials.add(StandardMaterial { unlit: true, cull_mode: None, ..default() });
         commands.spawn((
             Name::new("static models shadow caster"),
-            Mesh3d(meshes.add(mesh)),
+            Mesh3d(crate::mesh_bounds::add(meshes, mesh)),
             MeshMaterial3d(material),
             Transform::default(),
             RenderLayers::layer(SHADOW_PROXY_LAYER),
@@ -824,6 +927,25 @@ pub(crate) fn merge_meshes(parts: &[(Handle<Mesh>, Transform)], meshes: &Assets<
     merge_mesh_data(&read)
 }
 
+/// `mesh` moved to stand around its own origin, and where that was.
+///
+/// Bevy's draw distance fade measures from a mesh's origin, not its bounds:
+/// a merged batch left at the world's origin faded out wherever that was
+/// further off than its draw distance (MW2 Terminal's escape slide).
+fn recentre(mut mesh: Mesh) -> (Mesh, Vec3) {
+    use bevy::mesh::VertexAttributeValues as V;
+    let Some(V::Float32x3(pos)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) else { return (mesh, Vec3::ZERO) };
+    let (lo, hi) = pos.iter().fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(Vec3::from(*p)), hi.max(Vec3::from(*p))));
+    if lo.x > hi.x {
+        return (mesh, Vec3::ZERO);
+    }
+    let centre = (lo + hi) * 0.5;
+    for p in pos.iter_mut() {
+        *p = (Vec3::from(*p) - centre).to_array();
+    }
+    (mesh, centre)
+}
+
 /// [`merge_meshes`] of meshes in hand.
 pub(crate) fn merge_mesh_data(read: &[(&Mesh, &Transform)]) -> Option<Mesh> {
     use bevy::mesh::VertexAttributeValues as V;
@@ -834,7 +956,9 @@ pub(crate) fn merge_mesh_data(read: &[(&Mesh, &Transform)]) -> Option<Mesh> {
         let (Some(V::Float32x3(p)), Some(V::Float32x3(n)), Some(V::Float32x2(u))) =
             (m.attribute(Mesh::ATTRIBUTE_POSITION), m.attribute(Mesh::ATTRIBUTE_NORMAL), m.attribute(Mesh::ATTRIBUTE_UV_0))
         else {
-            continue;
+            // (Not merged without them: the callers draw the parts one by
+            // one instead, rather than lose this one.)
+            return None;
         };
         let base = pos.len() as u32;
         let matrix = t.to_matrix();

@@ -240,6 +240,31 @@ pub(super) struct Row {
 /// template, the rows' column and frame stretch to fit, and locks and "new"
 /// marks go (Black Ops' guns are all unlocked).
 pub(super) fn with_rows(template: &Menu, name: &str, rows: &[Row]) -> Option<Menu> {
+    rows_menu(template, name, rows, None)
+}
+
+/// [`with_rows`] for a list of guns that keeps CoD4's locks and "new"
+/// marks, each row's pointed at its gun's unlock stat (`stats`, by row).
+pub(super) fn with_gun_rows(template: &Menu, name: &str, rows: &[Row], stats: &[i32]) -> Option<Menu> {
+    rows_menu(template, name, rows, Some(stats))
+}
+
+/// Point a template row's unlock checks (`stat(3000 + its gun)`) at `to`.
+fn retarget_stat(exp: &mut [Token], to: i32) {
+    let mut after_stat = false;
+    for t in exp.iter_mut() {
+        match t {
+            Token::Op(op::STAT) => after_stat = true,
+            Token::Int(n) if after_stat && (3000..3000 + bo1::FIRST_INDEX).contains(n) => {
+                *n = to;
+                after_stat = false;
+            }
+            _ => after_stat = false,
+        }
+    }
+}
+
+fn rows_menu(template: &Menu, name: &str, rows: &[Row], stats: Option<&[i32]>) -> Option<Menu> {
     let left = |it: &Item| it.window.rect.x > -100.0 && it.window.rect.x < 230.0;
     // Rows are the buttons that move the highlight.
     let mut ys: Vec<f32> = template
@@ -273,12 +298,24 @@ pub(super) fn with_rows(template: &Menu, name: &str, rows: &[Row]) -> Option<Men
     };
     for (i, row) in rows.iter().enumerate() {
         let n = i as i32 + 1;
-        for mut it in template_row.iter().filter(|it| !locks(it)).cloned() {
+        let stat = stats.and_then(|s| s.get(i)).copied();
+        for mut it in template_row.iter().filter(|it| stat.is_some() || !locks(it)).cloned() {
             it.window.rect.y = first + i as f32 * pitch;
             it.window.name.clear();
-            // Unlock checks go; the highlight follows the row.
-            if it.visible_exp.iter().any(|t| matches!(t, Token::Op(op::STAT))) {
-                it.visible_exp.clear();
+            // Unlock checks go (or check this row's gun); the highlight
+            // follows the row.
+            match stat {
+                // The row's button: shown while its gun is unlocked
+                // (CoD4's also asks which weapon slot is being picked).
+                Some(s) if it.ty == item_type::BUTTON => {
+                    it.visible_exp = vec![Token::Op(op::LEFTPAREN), Token::Op(op::STAT), Token::Int(s), Token::Op(op::RIGHTPAREN), Token::Op(op::BITWISEAND), Token::Int(1)];
+                }
+                Some(s) => {
+                    retarget_stat(&mut it.visible_exp, s);
+                    retarget_stat(&mut it.material_exp, s);
+                }
+                None if it.visible_exp.iter().any(|t| matches!(t, Token::Op(op::STAT))) => it.visible_exp.clear(),
+                None => {}
             }
             retarget_highlight(&mut it.visible_exp, n);
             if let Some((from, to)) = &row.rename {
@@ -328,7 +365,7 @@ impl Frontend {
     /// it was just picked there); opening its camo popup for a Black Ops (or
     /// World at War) gun opens that game's camos.
     pub(super) fn bo1_redirect(&mut self, key: &str) -> Option<String> {
-        if bo1::data().is_none() && crate::waw::data().is_none() {
+        if bo1::data().is_none() && crate::waw::data().is_none() && crate::mw2guns::data().is_none() {
             return None;
         }
         if self.bo1_bypass.as_deref() == Some(key) {
@@ -341,6 +378,7 @@ impl Frontend {
             "primary" | "primary2" | "secondary" => Some(key_for("game", class, if rest == "primary" { base + 1 } else { base + 3 }, rest)),
             "camo" if bo1::is_index(self.stat(base + 1)) => Some(key_for("popup_cac_camo", class, base + 1, "")),
             "camo" if crate::waw::is_index(self.stat(base + 1)) => Some(super::waw::camo_key(class, base + 1)),
+            "camo" if crate::mw2guns::is_index(self.stat(base + 1)) => Some(super::mw2::camo_key(class, base + 1)),
             _ => None,
         }
     }
@@ -356,7 +394,12 @@ impl Frontend {
         // installed), in the weapon groups' popup.
         if kind == "game" {
             let t = template("popup_cac_primary")?;
-            let games = [("T5_GAME_COD4", "cod4", true), ("T5_GAME_BO1", "bo1", bo1::data().is_some()), ("T5_GAME_WAW", "waw", crate::waw::data().is_some())];
+            let games = [
+                ("T5_GAME_COD4", "cod4", true),
+                ("T5_GAME_MW2", "mw2", crate::mw2guns::data().is_some()),
+                ("T5_GAME_BO1", "bo1", bo1::data().is_some()),
+                ("T5_GAME_WAW", "waw", crate::waw::data().is_some()),
+            ];
             let rows: Vec<Row> = games
                 .into_iter()
                 .filter(|g| g.2)
@@ -397,7 +440,8 @@ impl Frontend {
                         rename: from.clone().map(|f| (f, g.id())),
                     })
                     .collect();
-                let mut m = with_rows(&t, key, &rows)?;
+                let stats: Vec<i32> = data.guns.iter().filter(|g| g.group == group).map(|g| 3000 + g.index).collect();
+                let mut m = with_gun_rows(&t, key, &rows, &stats)?;
                 // The popup's own preview shows the gun under the mouse.
                 m.on_open = format!(
                     "\"execnow\" \"set ui_primary_highlighted {}; set ui_sidearm_highlighted {}\" ; ",
@@ -479,6 +523,8 @@ impl Frontend {
                     self.open(&original);
                 } else if a(1) == "waw" {
                     self.waw_game(class, stat, popup);
+                } else if a(1) == "mw2" {
+                    self.mw2_game(class, stat, popup);
                 } else if popup == "secondary" {
                     self.set_dvar("ui_weapon_class_selected", "@MPUI_PISTOLS");
                     self.open(&key_for("list", class, stat, group_name(Group::Pistol)));
