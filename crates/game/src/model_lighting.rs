@@ -187,7 +187,7 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
         // clock runs (`crate::tod_light`): kept in the main world for that
         // (a render-world-only image leaves it once uploaded, and the
         // rewrites were lost: the gun and arms kept the first hour's light).
-        if crate::atmos::climate::enabled() { RenderAssetUsages::default() } else { RenderAssetUsages::RENDER_WORLD },
+        if crate::atmos::climate::showcase() { RenderAssetUsages::default() } else { RenderAssetUsages::RENDER_WORLD },
     );
     image.sampler = ImageSampler::linear();
     let voxels = images.add(image);

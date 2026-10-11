@@ -287,10 +287,11 @@ pub fn look_scale(gunplay: Gunplay, weapon: &WeaponState) -> f32 {
 
 fn mouse_look(
     gunplay: Res<Gunplay>,
-    mut players: Query<(&PlayerInput, &mut ViewAngles, &WeaponState), (With<LocalSlot>, Without<Dead>)>,
+    mut players: Query<(&PlayerInput, &mut ViewAngles, &WeaponState, Has<LocalPlayer>), (With<LocalSlot>, Without<Dead>)>,
 ) {
-    for (input, mut view, weapon) in &mut players {
-        if !input.live || input.look == Vec2::ZERO {
+    for (input, mut view, weapon, me) in &mut players {
+        // The airstrike's laptop has the mouse (`ui::laptop_screen`).
+        if !input.live || input.look == Vec2::ZERO || (me && crate::killstreaks::hands::laptop_open()) {
             continue;
         }
         let scale = look_scale(*gunplay, weapon);

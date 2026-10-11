@@ -1,12 +1,14 @@
 //! A trusted relay forwards validated messages and stamps sender identities.
 //! It never forwards connection addresses or lets a client impersonate a host.
 
+use crate::matchmaking::{self as mm, Filter, HostCandidate, LobbyInfo, Listing};
 use crate::{protocol::*, security::*, transport};
 use anyhow::{Result, bail, ensure};
 use bytes::Bytes;
 use quinn::{Connection, Endpoint, VarInt};
 use std::{
     collections::HashMap,
+    sync::atomic::{AtomicU16, Ordering},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::Instant,
@@ -20,6 +22,8 @@ use tokio::{
 struct Member {
     connection: Connection,
     control: mpsc::Sender<Control>,
+    /// Its peer ID, shared with its connection's task: an election swaps it.
+    id: Arc<AtomicU16>,
 }
 struct Room {
     map: String,
@@ -27,6 +31,22 @@ struct Room {
     code: LobbyCode,
     next_peer: PeerId,
     members: HashMap<PeerId, Member>,
+    /// Public rooms' listing, and when the host last sent it.
+    listing: Option<(Listing, Instant)>,
+}
+
+impl Room {
+    /// The room as a browser sees it, if it's listed and its host is still
+    /// there. `asker_rtt`: the relay's round trip to whoever asks.
+    fn info(&self, id: u64, now: Instant, ttl: std::time::Duration, asker_rtt: std::time::Duration) -> Option<LobbyInfo> {
+        let (listing, at) = self.listing.as_ref()?;
+        let host = self.members.get(&HOST)?;
+        if now.duration_since(*at) > ttl || host.connection.close_reason().is_some() {
+            return None;
+        }
+        let ping = (host.connection.rtt() + asker_rtt).as_millis().min(u16::MAX as u128) as u16;
+        Some(LobbyInfo { room: id, listing: listing.clone(), humans: self.members.len().min(MAX_PLAYERS) as u8, ping })
+    }
 }
 #[derive(Default)]
 struct Registry {
@@ -38,20 +58,51 @@ struct Registry {
     failures: HashMap<IpAddr, (u32, Instant)>,
 }
 
+/// A player must be this much nearer the relay than the host to take over.
+const ELECT_MARGIN: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// A browsing connection's questions: a few a second.
+const BROWSE_RATE: f64 = 2.0;
+const BROWSE_BURST: f64 = 10.0;
+/// A browser is let go after this long (it reconnects to look again).
+const BROWSE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+/// A host's listing updates: it only needs one every few seconds.
+const PUBLISH_RATE: f64 = 2.0;
+const PUBLISH_BURST: f64 = 6.0;
+
 /// Failed joins allowed per address per [`FAILURE_WINDOW`].
 const MAX_FAILURES: u32 = 10;
 const FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Owns only local infrastructure state. QUIC remote addresses never enter
 /// protocol messages, room advertisements, or client event queues.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Relay {
     registry: Arc<Mutex<Registry>>,
+    /// How long a listing lasts without a refresh.
+    listing_ttl: std::time::Duration,
+    /// Added to the host's round trip in elections (tests: a far host).
+    host_penalty: std::time::Duration,
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self { registry: Default::default(), listing_ttl: mm::LISTING_TTL, host_penalty: Default::default() }
+    }
 }
 
 impl Relay {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// A relay that counts hosts as this much further away in elections
+    /// (tests, where every connection is on this PC).
+    pub fn with_host_penalty(penalty: std::time::Duration) -> Self {
+        Self { host_penalty: penalty, ..Self::default() }
+    }
+    /// A relay whose listings expire sooner (tests).
+    pub fn with_listing_ttl(ttl: std::time::Duration) -> Self {
+        Self { listing_ttl: ttl, ..Self::default() }
     }
 
     /// Serve until the endpoint is closed. Shutdown closes rooms and awaits
@@ -109,24 +160,46 @@ impl Relay {
     async fn handle(&self, connection: Connection, ip: IpAddr) -> Result<()> {
         let (mut send, mut recv) = timeout(HANDSHAKE_TIMEOUT, connection.accept_bi()).await??;
         let hello = Hello::decode(&timeout(HANDSHAKE_TIMEOUT, transport::read_frame(&mut recv)).await??)?;
+        if hello == Hello::Browse {
+            return self.browse(connection, send, recv).await;
+        }
         let (control_tx, mut control_rx) = mpsc::channel(CONTROL_QUEUE);
-        let welcome = self.admit(hello, Member { connection: connection.clone(), control: control_tx }, ip)?;
+        let id = Arc::new(AtomicU16::new(HOST));
+        let welcome = self.admit(hello, Member { connection: connection.clone(), control: control_tx, id: id.clone() }, ip)?;
         let Control::Welcome { room, peer, .. } = &welcome else { unreachable!() };
         let (room, peer) = (*room, *peer);
-        let lease = Membership { relay: self.clone(), room, peer };
+        let lease = Membership { relay: self.clone(), room, id: id.clone() };
         // This is the only server-side control writer, preserving order.
         timeout(HANDSHAKE_TIMEOUT, transport::write_frame(&mut send, &welcome.encode()?)).await??;
         self.announce_join(room, peer)?;
 
-        let now = Instant::now();
-        let host = peer == HOST;
-        let mut packets = RateLimit::new(if host { 400.0 } else { 90.0 }, if host { 800.0 } else { 180.0 }, now);
-        let mut bytes =
-            RateLimit::new(if host { 512_000.0 } else { 12_000.0 }, if host { 1_024_000.0 } else { 24_000.0 }, now);
-        let mut replay = ReplayWindow::default();
-        let mut snapshot_ticks: HashMap<PeerId, u32> = HashMap::new();
-        let mut message_count = RateLimit::new(20.0, 60.0, now);
-        let mut message_bytes = RateLimit::new(16_000.0, 32_000.0, now);
+        // Allowances by role (an election can change it).
+        struct Limits {
+            host: bool,
+            packets: RateLimit,
+            bytes: RateLimit,
+            message_count: RateLimit,
+            message_bytes: RateLimit,
+            replay: ReplayWindow,
+            snapshot_ticks: HashMap<PeerId, u32>,
+        }
+        let limits = |host: bool| {
+            let now = Instant::now();
+            // The host tells everyone everything (kills, awards, streaks,
+            // each guest's damage): three times a player's messages.
+            let k = if host { 3.0 } else { 1.0 };
+            Limits {
+                host,
+                packets: RateLimit::new(if host { 400.0 } else { 90.0 }, if host { 800.0 } else { 180.0 }, now),
+                bytes: RateLimit::new(if host { 512_000.0 } else { 12_000.0 }, if host { 1_024_000.0 } else { 24_000.0 }, now),
+                message_count: RateLimit::new(20.0 * k, 60.0 * k, now),
+                message_bytes: RateLimit::new(16_000.0 * k, 32_000.0 * k, now),
+                replay: ReplayWindow::default(),
+                snapshot_ticks: HashMap::new(),
+            }
+        };
+        let mut l = limits(peer == HOST);
+        let mut publishes = RateLimit::new(PUBLISH_RATE, PUBLISH_BURST, Instant::now());
         // One persistent frame reader (read_exact isn't cancellation safe in
         // the select below); it ends on a malformed frame or a closed stream.
         let (frames_tx, mut frames) = mpsc::channel::<Vec<u8>>(CONTROL_QUEUE);
@@ -139,6 +212,12 @@ impl Relay {
         });
         let _reader = AbortOnDrop(reader);
         loop {
+            let peer = id.load(Ordering::Relaxed);
+            let host = peer == HOST;
+            if host != l.host {
+                l = limits(host);
+            }
+            let Limits { packets, bytes, message_count, message_bytes, replay, snapshot_ticks, .. } = &mut l;
             tokio::select! {
                 data = connection.read_datagram() => {
                     let data = data?;
@@ -178,10 +257,18 @@ impl Relay {
                         message_count.allow(1, now) && message_bytes.allow(frame.len(), now),
                         "message rate limit exceeded"
                     );
-                    let Control::Message { peer: to, data } = Control::decode(&frame)? else {
-                        bail!("only messages are accepted after joining")
-                    };
-                    self.message(room, peer, to, data)?;
+                    match Control::decode(&frame)? {
+                        Control::Message { peer: to, data } => self.message(room, peer, to, data)?,
+                        Control::Publish(listing) if host => {
+                            ensure!(publishes.allow(1, now), "listing rate limit exceeded");
+                            self.publish(room, listing);
+                        }
+                        Control::Elect if host => {
+                            ensure!(publishes.allow(1, now), "election rate limit exceeded");
+                            self.elect(room);
+                        }
+                        _ => bail!("only messages (and a host's listing) are accepted after joining"),
+                    }
                 }
                 _ = connection.closed() => { break; }
             }
@@ -201,7 +288,7 @@ impl Relay {
                 ensure!(count < MAX_FAILURES, "join rejected");
             }
         }
-        let result = Self::admit_locked(&mut registry, hello, member);
+        let result = Self::admit_locked(&mut registry, hello, member, self.listing_ttl);
         if result.is_err() {
             let entry = registry.failures.entry(ip).or_insert((0, now));
             entry.0 += 1;
@@ -213,7 +300,7 @@ impl Relay {
         result
     }
 
-    fn admit_locked(registry: &mut Registry, hello: Hello, member: Member) -> Result<Control> {
+    fn admit_locked(registry: &mut Registry, hello: Hello, member: Member, ttl: std::time::Duration) -> Result<Control> {
         let hello = match hello {
             Hello::JoinCode(code) => {
                 let Some(&room) = registry.codes.get(&code) else { bail!("join rejected") };
@@ -221,6 +308,16 @@ impl Relay {
                 let Some(invite) = invite else { bail!("join rejected") };
                 Hello::Join { room, invite }
             }
+            Hello::JoinListed { room } => {
+                // Only a listed room taking players; otherwise the same
+                // failure as a wrong code.
+                let now = Instant::now();
+                let open = registry.rooms.get(&room).and_then(|r| r.info(room, now, ttl, Default::default())).is_some_and(|i| i.open());
+                ensure!(open, "join rejected");
+                let invite = registry.rooms[&room].invite.clone();
+                Hello::Join { room, invite }
+            }
+            Hello::Browse => bail!("browsers don't join rooms"),
             hello => hello,
         };
         match hello {
@@ -243,9 +340,10 @@ impl Relay {
                     code: Some(code),
                 };
                 registry.codes.insert(code, id);
+                member.id.store(HOST, Ordering::Relaxed);
                 registry
                     .rooms
-                    .insert(id, Room { map, invite, code, next_peer: 1, members: HashMap::from([(HOST, member)]) });
+                    .insert(id, Room { map, invite, code, next_peer: 1, members: HashMap::from([(HOST, member)]), listing: None });
                 Ok(welcome)
             }
             Hello::Join { room, invite } => {
@@ -257,10 +355,11 @@ impl Relay {
                 let peer = r.next_peer;
                 r.next_peer += 1;
                 let map = r.map.clone();
+                member.id.store(peer, Ordering::Relaxed);
                 r.members.insert(peer, member);
                 Ok(Control::Welcome { room, peer, map, invite: None, code: None })
             }
-            Hello::JoinCode(_) => unreachable!(),
+            Hello::JoinCode(_) | Hello::JoinListed { .. } | Hello::Browse => unreachable!(),
         }
     }
 
@@ -287,6 +386,107 @@ impl Relay {
             }
         }
         Ok(())
+    }
+
+    /// The host's match is about to start: the member nearest the relay
+    /// (then the one losing fewest packets) becomes the host, if it's
+    /// clearly nearer than the host. Everyone hears the result.
+    fn elect(&self, room: u64) {
+        let mut registry = self.registry.lock().unwrap();
+        let Some(r) = registry.rooms.get_mut(&room) else { return };
+        let candidates: Vec<HostCandidate> = r
+            .members
+            .iter()
+            .map(|(id, m)| {
+                let path = m.connection.stats().path;
+                let penalty = if *id == HOST { self.host_penalty } else { Default::default() };
+                HostCandidate {
+                    peer: *id,
+                    rtt: m.connection.rtt() + penalty,
+                    loss_permille: path.lost_packets.saturating_mul(1000) / path.sent_packets.max(1),
+                }
+            })
+            .collect();
+        let swap = mm::choose_host(&candidates, ELECT_MARGIN);
+        if let Some(new) = swap
+            && let (Some(old_host), Some(new_host)) = (r.members.remove(&HOST), r.members.remove(&new))
+        {
+            old_host.id.store(new, Ordering::Relaxed);
+            new_host.id.store(HOST, Ordering::Relaxed);
+            r.members.insert(HOST, new_host);
+            r.members.insert(new, old_host);
+        }
+        for m in r.members.values() {
+            if m.control.try_send(Control::Elected { swap }).is_err() {
+                m.connection.close(VarInt::from_u32(2), b"control consumer too slow");
+            }
+        }
+    }
+
+    fn publish(&self, room: u64, listing: Option<Listing>) {
+        if let Some(r) = self.registry.lock().unwrap().rooms.get_mut(&room) {
+            r.listing = listing.map(|l| (l, Instant::now()));
+        }
+    }
+
+    /// The listed rooms matching `filter`, as `asker_rtt` away.
+    fn lobbies(&self, filter: &Filter, asker_rtt: std::time::Duration) -> Vec<LobbyInfo> {
+        let now = Instant::now();
+        let registry = self.registry.lock().unwrap();
+        registry.rooms.iter().filter_map(|(id, r)| r.info(*id, now, self.listing_ttl, asker_rtt)).filter(|l| filter.matches(l)).collect()
+    }
+
+    /// A browsing connection: questions about the public lobbies, answered
+    /// on its stream, until it goes (or [`BROWSE_LIFETIME`]).
+    async fn browse(&self, connection: Connection, mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
+        let mut questions = RateLimit::new(BROWSE_RATE, BROWSE_BURST, Instant::now());
+        let session = async {
+            loop {
+                let frame = tokio::select! {
+                    f = transport::read_frame(&mut recv) => f?,
+                    _ = connection.closed() => return Ok(()),
+                };
+                ensure!(questions.allow(1, Instant::now()), "browse rate limit exceeded");
+                let (mut lobbies, total, quick) = match Control::decode(&frame)? {
+                    Control::List(f) => {
+                        let l = self.lobbies(&f, connection.rtt());
+                        let n = l.len();
+                        (l, n, false)
+                    }
+                    // `total`: the open lobbies at any ping, so a searcher
+                    // knows whether loosening its ping cap could help.
+                    Control::QuickMatch(f) => {
+                        let open = self.lobbies(&Filter { open_only: true, max_ping: 0, ..f.clone() }, connection.rtt());
+                        let n = open.len();
+                        (open.into_iter().filter(|l| f.max_ping == 0 || l.ping <= f.max_ping).collect(), n, true)
+                    }
+                    _ => bail!("browsers may only ask for lobbies"),
+                };
+                let total = total.min(u16::MAX as usize) as u16;
+                if quick {
+                    mm::sort_for_quick_match(&mut lobbies);
+                    lobbies.truncate(mm::QUICK_MATCH_CHOICES);
+                } else {
+                    mm::sort_for_list(&mut lobbies);
+                    lobbies.truncate(mm::MAX_LOBBIES);
+                }
+                let mut frames: Vec<&[LobbyInfo]> = lobbies.chunks(mm::LOBBIES_PER_FRAME).collect();
+                if frames.is_empty() {
+                    frames.push(&[]);
+                }
+                let n = frames.len();
+                for (i, chunk) in frames.into_iter().enumerate() {
+                    let c = Control::Lobbies { total, last: i + 1 == n, lobbies: chunk.to_vec() };
+                    timeout(HANDSHAKE_TIMEOUT, transport::write_frame(&mut send, &c.encode()?)).await??;
+                }
+            }
+        };
+        let result: Result<()> = match timeout(BROWSE_LIFETIME, session).await {
+            Ok(r) => r,
+            Err(_) => Ok(()),
+        };
+        connection.close(VarInt::from_u32(0), b"browse ended");
+        result
     }
 
     fn has_member(&self, room: u64, peer: PeerId) -> bool {
@@ -353,11 +553,12 @@ impl Drop for AbortOnDrop {
 struct Membership {
     relay: Relay,
     room: u64,
-    peer: PeerId,
+    /// Its current peer ID (an election may have changed it).
+    id: Arc<AtomicU16>,
 }
 impl Drop for Membership {
     fn drop(&mut self) {
-        self.relay.leave(self.room, self.peer);
+        self.relay.leave(self.room, self.id.load(Ordering::Relaxed));
     }
 }
 struct IpLease {

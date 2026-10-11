@@ -30,7 +30,7 @@ impl Plugin for HqPlugin {
         // Debug aid: `COD4RW_HQ` goes straight to Headquarters (`=x,y,z,yaw`
         // in CoD units and degrees starts there instead).
         if let Ok(at) = std::env::var("COD4RW_HQ") {
-            app.insert_resource(crate::world::MapName(MAP.into())).insert_resource(config()).insert_resource(Headquarters);
+            app.insert_resource(crate::world::MapName(crate::atmos::climate::set_map(MAP))).insert_resource(config()).insert_resource(Headquarters);
             let v: Vec<f32> = at.split(',').filter_map(|x| x.trim().parse().ok()).collect();
             if let [x, y, z, yaw] = v[..] {
                 app.insert_resource(SpawnAt([x, y, z], yaw));

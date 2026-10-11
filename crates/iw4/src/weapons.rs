@@ -122,6 +122,10 @@ fn values(zone: &Zone, node: &GNode, out: &mut HashMap<String, String>) {
             match node.field(name) {
                 Some(GVal::Str(v)) => v.clone().unwrap_or_default(),
                 Some(GVal::Asset(id)) => id.map_or(String::new(), |i| zone.assets[i].name.trim_start_matches(',').to_owned()),
+                // Float arrays behind a pointer (`locationDamageMultipliers`).
+                Some(GVal::Bytes(b)) if r.base == "float" => {
+                    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).to_string()).collect::<Vec<_>>().join(" ")
+                }
                 // A sound: `SndAliasCustom` -> its alias name.
                 Some(GVal::Nodes(ns)) if m.ty == "SndAliasCustom" => ns
                     .first()

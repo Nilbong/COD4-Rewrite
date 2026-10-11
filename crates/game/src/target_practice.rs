@@ -21,6 +21,7 @@ impl Plugin for TargetPracticePlugin {
             return;
         }
         app.add_systems(Update, (spawn_targets, place_targets, hold_targets).chain().run_if(crate::state::in_game));
+        app.add_systems(Update, refill_uav.run_if(crate::state::in_game));
     }
 }
 
@@ -150,5 +151,33 @@ fn hold_targets(
         if !frozen {
             commands.entity(e).insert(Frozen);
         }
+    }
+}
+
+/// A UAV always to hand, for trying the phone's call-in (and comparing its
+/// anims: `hands.phone.mocap` in tuning.txt): held from the start, and back
+/// a moment after each one is called in (`practice.uav_refill` seconds).
+fn refill_uav(
+    time: Res<Time>,
+    mut player: Query<(&mut crate::killstreaks::Killstreak, Has<crate::killstreaks::hands::HardpointHands>), With<LocalPlayer>>,
+    mut gone_at: Local<Option<f32>>,
+) {
+    use crate::killstreaks::Hardpoint;
+    let Ok((mut streak, in_hands)) = player.single_mut() else { return };
+    // Its key is the first streak's: the UAV takes that slot here.
+    if streak.chosen.first() != Some(&Hardpoint::Uav) {
+        streak.chosen.retain(|&h| h != Hardpoint::Uav);
+        streak.chosen.insert(0, Hardpoint::Uav);
+        streak.chosen.truncate(3);
+    }
+    if streak.held.has(Hardpoint::Uav) {
+        *gone_at = None;
+        return;
+    }
+    let now = time.elapsed_secs();
+    let since = *gone_at.get_or_insert(now);
+    if !in_hands && now - since >= crate::tune::get("practice.uav_refill", 2.0) {
+        streak.held.add(Hardpoint::Uav);
+        *gone_at = None;
     }
 }

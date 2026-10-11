@@ -20,6 +20,9 @@ pub enum Kind {
     Slider { min: f32, max: f32, step: f32, decimals: u8, suffix: &'static str },
     /// The keys bound to an action ([`crate::bindings`]).
     Bind(Action),
+    /// A Call of Duty install's folder ([`gamepaths`]): shown, and picked
+    /// in Windows' folder picker. Saved in `game_paths.txt`, not a dvar.
+    Folder(gamepaths::Game),
 }
 
 /// One setting: its dvar, its row's label, a line about it, how it's
@@ -51,6 +54,20 @@ const fn s(dvar: &'static str, label: &'static str, desc: &'static str, kind: Ki
 const fn bind(action: Action, label: &'static str) -> Setting {
     Setting { dvar: "", label, desc: "Select, then press a key or mouse button (Backspace clears, Escape cancels).", kind: Kind::Bind(action), default: "" }
 }
+
+const fn folder(game: gamepaths::Game, dvar: &'static str, label: &'static str, desc: &'static str) -> Setting {
+    Setting { dvar, label, desc, kind: Kind::Folder(game), default: "" }
+}
+
+/// Options > Game Folders (in CoD4's Voice Chat page's place): where the
+/// Call of Duty games are. Each one found adds its guns, maps and
+/// characters, from the next start.
+pub const FOLDERS: &[Setting] = &[
+    folder(gamepaths::Game::Cod4, "gamefolder_cod4", "Call of Duty 4", "Needed to play: maps, guns, sounds and menus come from it."),
+    folder(gamepaths::Game::BlackOps, "gamefolder_blackops", "Black Ops", "Optional: adds Black Ops' guns, attachments, camos and characters."),
+    folder(gamepaths::Game::Mw2, "gamefolder_mw2", "Modern Warfare 2", "Optional: adds MW2's maps and guns (needs MW2 Multiplayer installed)."),
+    folder(gamepaths::Game::WaW, "gamefolder_waw", "World at War", "Optional: adds World at War's guns and characters."),
+];
 
 /// Options > Graphics.
 pub const GRAPHICS: &[Setting] = &[
@@ -106,8 +123,9 @@ pub const GAME: &[Setting] = &[
     s("cg_killfeed", "Kill Feed", "Who killed whom, at the bottom left.", OFF_ON, "1"),
     s("cg_minimap_rotate", "Minimap", "Turn the minimap with you, or keep north up.", Kind::Choice(&[("Rotating", "1"), ("North Up", "0")]), "1"),
     s("cg_damage_direction", "Damage Direction", "Red arcs showing where you're hit from.", OFF_ON, "1"),
-    s("cg_scopestyle", "Sniper Scope", "CoD4's scope, a lens you see through, or 3D: the view in the scope's own eyepiece (ACOGs too).", Kind::Choice(&[("Classic", "classic"), ("Lens", "lens"), ("3D", "3d")]), "classic"),
+    s("cg_scopestyle", "Sniper Scope", "CoD4's scope, a lens you see through, or 3D: the view in the scope's own eyepiece (ACOGs too).", Kind::Choice(&[("Classic", "classic"), ("Lens", "lens"), ("3D", "3d")]), "3d"),
     s("cg_xp_popups", "Score Popups", "+10 and the like as you score.", OFF_ON, "1"),
+    s("cg_xpbar", "XP Bar", "Your progress to the next rank, along the bottom of the screen.", OFF_ON, "1"),
     s("cg_hudstyle", "HUD Style", "The in-game HUD: the new one, or CoD4's own.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "classic"),
     s("cg_fullbody", "Full Body", "See your own body and legs when you look down.", OFF_ON, "1"),
     s("cg_vmlighting", "Weapon Lighting", "Light your gun and arms by the world around you (shade, sun, rooms), or as CoD4 did.", Kind::Choice(&[("World", "world"), ("Classic", "classic")]), "world"),
@@ -153,11 +171,9 @@ pub const COMBAT: &[Setting] = &[
     bind(Action::Frag, "Throw Frag Grenade"),
     bind(Action::Special, "Throw Special Grenade"),
     bind(Action::Equipment, "Equipment"),
-    bind(Action::Killstreak1, "Kill Streak: UAV"),
-    bind(Action::Killstreak2, "Kill Streak: Airstrike"),
-    bind(Action::Killstreak3, "Kill Streak: Helicopter"),
-    bind(Action::Killstreak4, "Kill Streak: Care Package"),
-    bind(Action::Killstreak5, "Kill Streak: Sentry Gun"),
+    bind(Action::Killstreak1, "Kill Streak 1"),
+    bind(Action::Killstreak2, "Kill Streak 2"),
+    bind(Action::Killstreak3, "Kill Streak 3"),
     bind(Action::Inspect, "Inspect Weapon"),
 ];
 
@@ -188,6 +204,7 @@ pub const PAGES: &[Page] = &[
     Page { menu: "options_graphics_texture", title: "Quality", rows: QUALITY },
     Page { menu: "options_sound", title: "Sound", rows: SOUND },
     Page { menu: "options_game", title: "Game Options", rows: GAME },
+    Page { menu: "options_voice", title: "Game Folders", rows: FOLDERS },
     Page { menu: "options_look", title: "Look", rows: LOOK },
     Page { menu: "options_move", title: "Move", rows: MOVE },
     Page { menu: "options_shoot", title: "Combat", rows: COMBAT },
@@ -322,7 +339,7 @@ mod tests {
             Kind::Toggle => v == "0" || v == "1",
             Kind::Choice(list) => list.iter().any(|(_, value)| *value == v),
             Kind::Slider { min, max, .. } => v.parse::<f32>().is_ok_and(|x| (min..=max).contains(&x)),
-            Kind::Bind(_) => true,
+            Kind::Bind(_) | Kind::Folder(_) => true,
         };
         for s in all() {
             assert!(valid(s, &default_of(s)), "{}: default {:?}", dvar_of(s), default_of(s));

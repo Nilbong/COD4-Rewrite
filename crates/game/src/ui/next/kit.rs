@@ -331,6 +331,13 @@ impl<'a> Kit<'a> {
         self.ops.push(Op::Pic { pos, size, material: GLOW.into(), color });
     }
 
+    /// A picture inside `r` at its own shape (centred): weapon pictures,
+    /// which are 2:1, 4:1 or square depending on the game.
+    pub fn pic_fit(&mut self, r: R, material: &str) {
+        let (pos, size) = (self.p(r.x, r.y), Vec2::new(r.w, r.h) * self.v.s);
+        self.ops.push(Op::Gun { pos, size, key: super::super::PICTURE_ONLY, weapon: String::new(), camo: 0, picture: material.into() });
+    }
+
     /// A UI material (CoD4's or one of ours) stretched over `r`.
     pub fn pic(&mut self, r: R, material: &str, c: Rgba) {
         let (pos, size) = (self.p(r.x, r.y), Vec2::new(r.w, r.h) * self.v.s);

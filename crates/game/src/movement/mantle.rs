@@ -181,7 +181,7 @@ fn start_mantle(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, anims: &MantleAnims, d
     m.mantle = Some(mantle);
     m.velocity = Vec3::ZERO;
     m.on_ground = false;
-    m.sprinting = false;
+    m.stop_sprint();
     m.jump_held = true;
 }
 

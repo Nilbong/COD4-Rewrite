@@ -10,6 +10,7 @@ name = "Launcher"
 path = "src/main.rs"
 
 [dependencies]
+gamepaths = { path = "../gamepaths" }
 ureq = "2"
 serde_json = "1"
 

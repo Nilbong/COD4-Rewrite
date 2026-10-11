@@ -1,9 +1,10 @@
-//! Modern Warfare 2's sentry gun (`_autosentry.gsc`), the 6 kill streak.
+//! The sentry gun, after Modern Warfare 2's (`_autosentry.gsc`), built from
+//! CoD4's mounted SAW and sounds: the 6 kill streak.
 //! Called in, it's carried: a ghost of it stands on the ground in front of
 //! its owner, green where it can go and red where it can't (on a steep
 //! slope, in a wall, out of sight), the gun put away meanwhile. Fire, Use or
 //! its key again plants it there (`sentry_setPlaced`); dying while carrying
-//! it keeps it held for later. Planted, it watches 55° either side of the
+//! it keeps it held for later. Planted, it sweeps 60° either side of the
 //! way it faces for its owner's enemies within 1800 units, turns its gun to
 //! the nearest it can see, beeps three times and fires bursts of 20 to 120
 //! rounds (`sentry_minigun_mp`: 10 a round to players, 20 rounds a second)
@@ -35,13 +36,16 @@ const HEALTH: f32 = 1000.0;
 const FIRE_TIME: f32 = 0.05;
 const DAMAGE: f32 = 10.0;
 const RANGE: f32 = 1800.0;
-const SIDE_ARC: f32 = 55.0;
+const SIDE_ARC: f32 = 60.0;
 const TOP_ARC: f32 = 45.0;
 const BOTTOM_ARC: f32 = 20.0;
 const SPREAD: f32 = 0.6;
 /// How fast the gun turns (degrees a second; the turret's `maxTurnSpeed`).
 const YAW_SPEED: f32 = 200.0;
 const PITCH_SPEED: f32 = 60.0;
+/// With nothing to shoot it sweeps its arc, there and back in this long
+/// (s), as MW2's does.
+const SWEEP_TIME: f32 = 8.0;
 /// Fires once aimed this near (degrees).
 const AIMED: f32 = 6.0;
 /// `level.sentrySettings`: bursts, pauses between (s).
@@ -55,19 +59,27 @@ const OVERHEAT: f32 = 8.0;
 const SCAN: f32 = 0.1;
 /// The gun's pivot above the feet, and the muzzle in front of it (CoD
 /// units, the model's `tag_aim` and `tag_flash`).
-const PIVOT: f32 = 48.5;
-const MUZZLE: f32 = 37.0;
+const PIVOT: f32 = TRIPOD_TOP + GUN_SEAT;
+const MUZZLE: f32 = 10.0;
 /// Planted this far in front of its carrier (CoD units), on ground no
 /// steeper than this (the normal's up part), with this much room.
 const CARRY_AHEAD: f32 = 40.0;
 const FLAT: f32 = 0.82;
 const ROOM_RADIUS: f32 = 14.0;
-const ROOM_HEIGHT: f32 = 52.0;
+const ROOM_HEIGHT: f32 = 70.0;
 /// Its body for bullets and blasts (a capsule, CoD units), and for walking
 /// into.
-const BODY: (f32, f32, f32) = (8.0, 50.0, 18.0);
+const BODY: (f32, f32, f32) = (8.0, 66.0, 14.0);
 /// The wreck lies smoking this long.
 const WRECK_TIME: f32 = 6.0;
+/// Its sounds, CoD4's (the first the bank has): the SAW firing, a beep
+/// (on locking on, and now and then), set down, blowing up.
+const FIRE_SOUNDS: [&str; 2] = ["weap_m249saw_turret_fire_npc", "weap_m60_fire_npc"];
+const BEEP_SOUNDS: [&str; 1] = ["claymore_activated"];
+const PLANT_SOUNDS: [&str; 3] = ["claymore_plant_concrete", "claymore_plant_asphalt", "weap_pickup"];
+const EXPLODE_SOUND: &str = "detpack_explo_main";
+/// The head's servo whirring round onto a target.
+const SERVO_SOUND: &str = "bradley_turret_spin";
 /// `sentry_beepSounds`.
 const BEEP_EVERY: f32 = 3.0;
 
@@ -76,7 +88,7 @@ pub(super) fn build(app: &mut App) {
         .add_systems(OnEnter(crate::state::GameState::InGame), clear)
         .add_systems(
             Update,
-            (start_carrying, carry, take_damage, think, wrecks).chain().after(super::use_hardpoints).run_if(crate::state::in_game),
+            (start_carrying, carry, take_damage, think, wrecks).chain().after(super::use_hardpoints).run_if(crate::state::in_game.and_then(crate::netplay::authority)),
         )
         .add_systems(Update, hold_gun.after(crate::player::InputSet).before(crate::weapons::WeaponSet).run_if(crate::state::in_game));
 }
@@ -115,6 +127,8 @@ pub struct Sentry {
     pitch: f32,
     target: Option<Entity>,
     next_scan: f32,
+    /// How far through its idle sweep it is (s).
+    sweep: f32,
     /// Since when it has had its target (the lock beeps first).
     locked: Option<f32>,
     burst: u32,
@@ -145,6 +159,12 @@ impl Wreck {
 
 impl Sentry {
     /// Shooting now (for the HUD's compass).
+    /// Where the gun points from the way it was planted (radians: yaw
+    /// left, pitch up), for online guests ([`crate::netplay`]).
+    pub(crate) fn aim(&self) -> (f32, f32) {
+        (self.yaw, self.pitch)
+    }
+
     pub fn firing(&self) -> bool {
         self.loop_sound.is_some()
     }
@@ -154,10 +174,36 @@ fn clear(mut calls: ResMut<Calls>) {
     calls.0.clear();
 }
 
-/// The model's names: MW2's, then CoD4's mounted SAW (on some maps), then
-/// the SAW itself.
-const MODEL: [&str; 3] = ["sentry_minigun", "weapon_saw_mg_setup", "weapon_saw"];
-const WRECK: [&str; 1] = ["sentry_minigun_destroyed"];
+/// Its parts, CoD4's (the map's, or [`super::models::PROPS_ZONE`]'s): a
+/// tripod, cut down, and on its head the M60 (`common_mp`'s world model,
+/// else the SAW), which turns.
+pub(crate) const TRIPOD: &str = "com_tripod";
+pub(crate) const MODEL: [&str; 2] = ["weapon_m60", "weapon_saw"];
+/// How far the gun's middle sits above the tripod's head (CoD units).
+const GUN_SEAT: f32 = 1.5;
+/// The tripod at this of its size, its head then this high (CoD units).
+const TRIPOD_SCALE: f32 = 0.7;
+const TRIPOD_TOP: f32 = 60.3 * TRIPOD_SCALE;
+
+/// The sentry's look under `parent`: the tripod, and the gun on a head at
+/// its top (sat on the ground without one). The head (to turn: yaw about
+/// Y, pitch about Z, CoD's x forward), and every surface.
+pub(crate) fn spawn_parts(commands: &mut Commands, models: &mut StreakModels, parent: Entity, shadows: bool) -> Option<(Entity, Vec<Entity>)> {
+    let stand = commands.spawn((Transform::from_scale(Vec3::splat(TRIPOD_SCALE)), Visibility::default(), ChildOf(parent))).id();
+    let tripod = models.spawn(commands, &[TRIPOD], stand, shadows);
+    let top = if tripod.is_some() { u(TRIPOD_TOP) } else { 0.0 };
+    let head = commands.spawn((Transform::from_translation(Vec3::Y * top), Visibility::default(), ChildOf(parent))).id();
+    let holder = commands.spawn((Transform::default(), Visibility::default(), ChildOf(head))).id();
+    let gun = models.spawn(commands, &MODEL, holder, shadows)?;
+    // The gun's middle on the head (its underside, the magazine, hangs
+    // below it, as on a real mount).
+    let (lo, hi) = gun.bounds;
+    let centre = (lo + hi) * 0.5;
+    commands.entity(holder).insert(Transform::from_translation(Vec3::new(-centre.x, -centre.y + u(GUN_SEAT), -centre.z)));
+    let mut surfaces = tripod.map(|t| t.surfaces).unwrap_or_default();
+    surfaces.extend(gun.surfaces);
+    Some((head, surfaces))
+}
 
 /// Hand each caller the ghost to carry (or, dead by now, the sentry back).
 fn start_carrying(
@@ -176,15 +222,14 @@ fn start_carrying(
         }
         let ghost = commands.spawn((Name::new("sentry ghost"), Transform::from_translation(tf.translation), Visibility::default())).id();
         // The sentry itself, see-through green where it can go and red
-        // where it can't (MW2's `_obj` models are that glow, which isn't
-        // drawn here).
+        // where it can't.
         let part = |commands: &mut Commands, models: &mut StreakModels, color: Color, shown: bool| {
             let holder = commands
                 .spawn((Transform::default(), if shown { Visibility::Inherited } else { Visibility::Hidden }, ChildOf(ghost)))
                 .id();
-            let m = models.spawn(commands, &MODEL, holder, false)?;
+            let (_, surfaces) = spawn_parts(commands, models, holder, false)?;
             let material = models.ghost_material(color);
-            for s in m.surfaces {
+            for s in surfaces {
                 commands.entity(s).insert((MeshMaterial3d(material.clone()), bevy::light::NotShadowCaster));
             }
             Some(holder)
@@ -223,6 +268,25 @@ fn placement(spatial: &SpatialQuery, feet: Vec3, eye: Vec3, forward: Vec3) -> (T
     (spot, seen)
 }
 
+/// `spot` turned to face the longest open line from its gun (of eight
+/// ways round).
+fn facing_open(spatial: &SpatialQuery, spot: Transform) -> Transform {
+    let pivot = spot.translation + Vec3::Y * u(PIVOT);
+    let filter = collision::sight_filter();
+    let reach = u(RANGE);
+    let best = (0..8)
+        .map(|k| k as f32 * std::f32::consts::FRAC_PI_4)
+        .max_by(|a, b| {
+            let open = |yaw: f32| {
+                let dir = Dir3::new(Quat::from_rotation_y(yaw) * Vec3::X).unwrap_or(Dir3::X);
+                spatial.cast_ray(pivot, dir, reach, true, &filter).map_or(reach, |h| h.distance)
+            };
+            open(*a).total_cmp(&open(*b))
+        })
+        .unwrap_or(0.0);
+    spot.with_rotation(Quat::from_rotation_y(best))
+}
+
 /// Carry the ghost about, and plant it: a player with Fire, Use or the
 /// sentry's key (a pad's picker button), a bot as soon as it can (trying
 /// round itself).
@@ -247,6 +311,7 @@ fn carry(
     mut ghosts: Query<(&mut Transform, &mut Visibility), Without<Pawn>>,
     mut models: StreakModels,
     mut sfx: ResMut<crate::audio::Sfx>,
+    bank: Option<Res<crate::audio::Bank>>,
 ) {
     let now = time.elapsed_secs();
     for (e, pawn, tf, mover, view, mut c, mut streak, dead, player, slot, place_now) in &mut carriers {
@@ -273,6 +338,8 @@ fn carry(
                 .find(|(_, ok)| *ok)
                 .unwrap_or_else(|| placement(&spatial, tf.translation, eye, forward))
         };
+        // A bot faces it down the longest open line from there.
+        let spot = if player.is_none() && valid { facing_open(&spatial, spot) } else { spot };
         c.spot = spot;
         c.valid = valid && mover.on_ground;
         if let Ok((mut g, _)) = ghosts.get_mut(c.ghost) {
@@ -294,7 +361,7 @@ fn carry(
                     && (p.mouse.just_pressed(MouseButton::Left)
                         || keys.just_pressed(KeyCode::KeyF)
                         || p.pad.interact
-                        || keys.just_pressed(Hardpoint::Sentry.key())
+                        || streak.chosen.iter().position(|&h| h == Hardpoint::Sentry).is_some_and(|i| keys.just_pressed(super::KEYS_READ[i]))
                         || keys.just_pressed(PAD_PICK))
             }
             // Bots: a moment after calling it in, or wherever after a while.
@@ -317,24 +384,22 @@ fn carry(
         if let Some(s) = slot {
             super::PROMPTS.set(s, None);
         }
-        plant(&mut commands, &mut models, &mut sfx, e, pawn.team, spot, now);
+        plant(&mut commands, &mut models, &mut sfx, bank.as_deref(), e, pawn.team, spot, now);
     }
 }
 
 /// `sentry_setPlaced`: the sentry where it was carried to.
-fn plant(commands: &mut Commands, models: &mut StreakModels, sfx: &mut crate::audio::Sfx, owner: Entity, team: Team, spot: Transform, now: f32) {
+#[allow(clippy::too_many_arguments)]
+fn plant(commands: &mut Commands, models: &mut StreakModels, sfx: &mut crate::audio::Sfx, bank: Option<&crate::audio::Bank>, owner: Entity, team: Team, spot: Transform, now: f32) {
     let base_yaw = {
         let f = spot.rotation * Vec3::X;
         (-f.z).atan2(f.x)
     };
     let sentry = commands.spawn((Name::new("sentry gun"), spot, Visibility::default())).id();
-    let body = commands.spawn((Transform::default(), Visibility::default(), ChildOf(sentry))).id();
-    let model = models.spawn(commands, &MODEL, body, true);
-    let aim = model.as_ref().and_then(|m| {
-        let e = m.skeleton.joint("tag_aim")?;
-        m.skeleton.joints.iter().find(|j| j.entity == e).map(|j| (e, j.bind))
-    });
-    info!("sentry: planted ({}) at CoD {:?}", model.as_ref().map_or("no model", |m| m.name.as_str()), units::to_cod(spot.translation).map(f32::round));
+    let parts = spawn_parts(commands, models, sentry, true);
+    let body = parts.as_ref().map_or(sentry, |p| p.0);
+    let aim = None;
+    info!("sentry: planted ({}) at CoD {:?}", if parts.is_some() { "tripod and gun" } else { "no model" }, units::to_cod(spot.translation).map(f32::round));
     let (a, b, r) = BODY;
     commands.spawn((
         Hitbox { owner: sentry, location: HitLocation::Torso },
@@ -343,14 +408,8 @@ fn plant(commands: &mut Commands, models: &mut StreakModels, sfx: &mut crate::au
         Transform::default(),
         ChildOf(sentry),
     ));
-    // Solid to walk into (not to bullets, which its hitbox takes).
-    commands.spawn((
-        RigidBody::Static,
-        Collider::cylinder(u(ROOM_RADIUS), u(b)),
-        CollisionLayers::new(Layer::PlayerClip, LayerMask::NONE),
-        Transform::from_translation(Vec3::Y * u(b * 0.5)),
-        ChildOf(sentry),
-    ));
+    // (Nothing solid: players and bots walk through it, as the user asked;
+    // bullets, blasts and knives hit its hitbox.)
     commands.entity(sentry).insert(Sentry {
         owner,
         team,
@@ -361,6 +420,7 @@ fn plant(commands: &mut Commands, models: &mut StreakModels, sfx: &mut crate::au
         pitch: 0.0,
         target: None,
         next_scan: now,
+        sweep: 0.0,
         locked: None,
         burst: 0,
         next_shot: now,
@@ -371,7 +431,9 @@ fn plant(commands: &mut Commands, models: &mut StreakModels, sfx: &mut crate::au
         aim,
         loop_sound: None,
     });
-    sfx.play("iw4/sentry_gun_plant", Some(spot.translation));
+    if let Some(a) = super::alias(bank, &PLANT_SOUNDS) {
+        sfx.play(a, Some(spot.translation));
+    }
 }
 
 /// No firing or aiming while carrying a sentry: the hands carry it.
@@ -397,9 +459,9 @@ fn take_damage(
     mut models: StreakModels,
     mut fx: Option<ResMut<Effects>>,
     mut sfx: ResMut<crate::audio::Sfx>,
-    sides: Option<Res<crate::audio::Sides>>,
-    locals: Query<(), With<crate::player::LocalPlayer>>,
+    bank: Option<Res<crate::audio::Bank>>,
 ) {
+    let bank = bank.as_deref();
     let now = time.elapsed_secs();
     let mut hurt: Vec<(Entity, Entity, f32)> = damage.read().map(|d| (d.target, d.attacker.unwrap_or(Entity::PLACEHOLDER), d.amount)).collect();
     for b in blasts.read() {
@@ -445,21 +507,15 @@ fn take_damage(
         }
         // `sentry_handleDeath`: the wreck, a blast and smoke.
         let wreck = commands.spawn((Name::new("sentry wreck"), *tf, Visibility::default(), Wreck::new(now))).id();
-        if models.spawn(&mut commands, &WRECK, wreck, true).is_none() {
-            // (No wreck model: the gun itself, tipped over.)
-            models.spawn(&mut commands, &MODEL, wreck, true);
-            commands.entity(wreck).insert(tf.with_rotation(tf.rotation * Quat::from_rotation_x(1.3)));
-        }
+        // (Itself, knocked over.)
+        spawn_parts(&mut commands, &mut models, wreck, true);
+        commands.entity(wreck).insert(tf.with_rotation(tf.rotation * Quat::from_rotation_x(1.3)));
         let at = tf.translation + Vec3::Y * u(PIVOT);
         if let Some(fx) = fx.as_deref_mut() {
             fx.play("explosions/small_vehicle_explosion", Anchor::Fixed(Frame::facing(at, Vec3::Y, 0.0)), FxLayer::World);
         }
-        sfx.play("iw4/sentry_explode", Some(at));
-        sfx.play_later("iw4/sentry_explode_smoke", Some(at), now, 1.5);
-        // "Sentry destroyed" / "Sentry gone" to its owner.
-        if let (Some(sides), true) = (&sides, locals.contains(s.owner)) {
-            let line = if s.damage_taken >= HEALTH { "sentry_destroyed" } else { "sentry_gone" };
-            sfx.play(format!("iw4/{}_1mc_{line}", sides.of(s.team).voice.to_ascii_lowercase()), None);
+        if let Some(a) = super::alias(bank, &[EXPLODE_SOUND]) {
+            sfx.play(a, Some(at));
         }
         commands.entity(e).despawn();
     }
@@ -512,8 +568,12 @@ fn think(
     mut impacts: MessageWriter<BulletImpact>,
     mut fx: Option<ResMut<Effects>>,
     mut sfx: ResMut<crate::audio::Sfx>,
+    bank: Option<Res<crate::audio::Bank>>,
 ) {
     let (now, dt) = (time.elapsed_secs(), time.delta_secs());
+    // The SAW's shots (every other round heard).
+    let fire_shot = super::alias(bank.as_deref(), &FIRE_SOUNDS);
+    let beep = super::alias(bank.as_deref(), &BEEP_SOUNDS);
     let mut rng = rand::rng();
     for (e, mut s, tf) in &mut sentries {
         let pivot = tf.translation + Vec3::Y * u(PIVOT);
@@ -544,10 +604,18 @@ fn think(
                 .min_by(|a, b| a.2.translation.distance_squared(pivot).total_cmp(&b.2.translation.distance_squared(pivot)))
                 .map(|(t, ..)| t);
             if best.is_some() && best != s.target {
+                if let Some((_, p, ..)) = best.and_then(|b| pawns.get(b).ok()) {
+                    info!("sentry: targets {}", p.name);
+                }
                 if s.target.is_none() {
+                    if let Some(a) = super::alias(bank.as_deref(), &[SERVO_SOUND]) {
+                        sfx.play(a, Some(pivot));
+                    }
                     // `sentry_targetLockSound`.
                     for k in 0..3 {
-                        sfx.play_later("iw4/sentry_gun_beep", Some(pivot), now, k as f32 * 0.1);
+                        if let Some(a) = &beep {
+                            sfx.play_later(a.clone(), Some(pivot), now, k as f32 * 0.1);
+                        }
                     }
                     s.locked = Some(now);
                 }
@@ -560,7 +628,11 @@ fn think(
                 let aim_at = chest(ptf).lerp(mover.eye(ptf.translation), 0.3);
                 aim_angles(s.base_yaw, (aim_at - pivot).normalize_or_zero())
             }
-            None => (0.0, 0.0),
+            // Nothing to shoot: sweeping its arc.
+            None => {
+                s.sweep += dt;
+                ((s.sweep * std::f32::consts::TAU / SWEEP_TIME).sin() * SIDE_ARC.to_radians(), 0.0)
+            }
         };
         let step = |from: f32, to: f32, speed: f32| from + (to - from).clamp(-speed.to_radians() * dt, speed.to_radians() * dt);
         s.yaw = step(s.yaw, want.0.clamp(-SIDE_ARC.to_radians(), SIDE_ARC.to_radians()), YAW_SPEED);
@@ -578,8 +650,8 @@ fn think(
                 jt.rotation = (p.inverse() * world_turn * p * bind.rotation).normalize();
             }
         } else if let Ok(mut b) = joints.get_mut(s.body) {
-            // (A model without the joint turns whole.)
-            b.rotation = Quat::from_rotation_y(s.yaw);
+            // The tripod's head turns the gun.
+            b.rotation = Quat::from_rotation_y(s.yaw) * Quat::from_rotation_z(s.pitch);
         }
         // Heat wears off when it's not firing.
         let firing_now = s.target.is_some()
@@ -599,18 +671,18 @@ fn think(
             }
             if let Some(l) = s.loop_sound.take() {
                 commands.entity(l).despawn();
-                sfx.play("iw4/sentry_minigun_cooldown", Some(pivot));
             }
             s.burst = 0;
             if now >= s.next_beep {
                 s.next_beep = now + BEEP_EVERY;
-                sfx.play("iw4/sentry_gun_beep", Some(pivot));
+                if let Some(a) = &beep {
+                    sfx.play(a.clone(), Some(pivot));
+                }
             }
             continue;
         }
         if s.loop_sound.is_none() {
             let carrier = commands.spawn((Transform::from_translation(Vec3::Y * u(PIVOT)), Visibility::default(), ChildOf(e))).id();
-            sfx.play_on("iw4/sentry_minigun_fire", carrier);
             s.loop_sound = Some(carrier);
         }
         // Rounds due this frame (20 a second), in bursts.
@@ -624,6 +696,9 @@ fn think(
             s.burst -= 1;
             s.next_shot = if s.burst == 0 { now + rng.random_range(PAUSE.0..PAUSE.1) } else { s.next_shot.max(now - FIRE_TIME) + FIRE_TIME };
             s.heat += FIRE_TIME;
+            if let Some(a) = fire_shot.as_ref().filter(|_| s.burst % 2 == 0) {
+                sfx.play(a.clone(), Some(muzzle));
+            }
             shoot(e, s.owner, muzzle, dir, &spatial, &hitboxes, &pawns, &mut damage, &mut impacts, &mut rng);
         }
         if shots > 0 {

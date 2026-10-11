@@ -30,7 +30,7 @@ impl Plugin for SabPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(GameState::InGame), setup.in_set(Setup::Spawn))
             .add_systems(Update, hold_still.after(crate::player::InputSet).before(crate::movement::MovementSet).run_if(in_game.and_then(playing)))
-            .add_systems(Update, (sudden_death, bomb, rounds, show_models).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)));
+            .add_systems(Update, (sudden_death.run_if(crate::netplay::authority), bomb.run_if(crate::netplay::authority), rounds.run_if(crate::netplay::authority), show_models).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)));
     }
 }
 

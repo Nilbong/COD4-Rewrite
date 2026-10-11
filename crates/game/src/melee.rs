@@ -187,7 +187,7 @@ fn melee(
                 weapon.reload_until = None;
                 weapon.reload_add_at = None;
                 weapon.next_fire = weapon.next_fire.max(now + length);
-                mover.sprinting = false;
+                mover.stop_sprint();
                 *wi = WeaponInput::default();
                 if let Some(s) = swipe {
                     sfx.play(s, Some(eye));
@@ -222,7 +222,9 @@ fn melee(
                         })
                         .and_then(|hit| hitboxes.get(hit.entity).ok())
                         .map(|h| h.owner)
-                        .filter(|owner| others.iter().any(|o| o.0 == *owner && crate::combat::hostile(&o.1, pawn)));
+                        // An enemy; or something not a player at all (a sentry
+                        // gun, whose own damage handling spares friends).
+                        .filter(|owner| others.iter().find(|o| o.0 == *owner).is_none_or(|o| crate::combat::hostile(&o.1, pawn)));
                     if let Some(victim) = struck {
                         damage.write(Damage { target: victim, attacker: Some(me), amount: DAMAGE, location: HitLocation::Torso, weapon: WEAPON });
                         hits.write(HitConfirmed { shooter: me, headshot: false });

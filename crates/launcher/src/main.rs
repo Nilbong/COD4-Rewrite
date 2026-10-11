@@ -12,10 +12,15 @@
 //!
 //! `Launcher.exe --build` builds the game from this folder's source instead
 //! (needs Rust: https://rustup.rs) and starts that build.
+//!
+//! Before starting, it checks the Call of Duty installs ([`folders`]):
+//! `Launcher.exe --folders` picks their folders.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod folders;
 
 const REPO: &str = "Nilbong/COD4-Rewrite";
 const GAME_ASSET: &str = "cod4rw.exe";
@@ -25,10 +30,13 @@ fn main() {
     let here = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| PathBuf::from("."));
     println!("CoD4 Rewrite launcher");
     println!();
+    let pick_folders = args.iter().any(|a| a == "--folders");
     let result = if args.iter().any(|a| a == "--build") {
-        build_from_source(&here).and_then(|exe| start(&exe, &here, &args))
+        build_from_source(&here).and_then(|exe| folders::check(pick_folders).map(|()| exe)).and_then(|exe| start(&exe, &here, &args))
     } else {
-        update(&here).and_then(|exe| start(&exe, &exe.parent().unwrap_or(&here).to_path_buf(), &args))
+        update(&here)
+            .and_then(|exe| folders::check(pick_folders).map(|()| exe))
+            .and_then(|exe| start(&exe, &exe.parent().unwrap_or(&here).to_path_buf(), &args))
     };
     if let Err(e) = result {
         println!();
@@ -150,7 +158,7 @@ fn build_from_source(here: &Path) -> Result<PathBuf, String> {
 
 /// Start the game (arguments passed on, minus the launcher's own) and return.
 fn start(exe: &Path, dir: &Path, args: &[String]) -> Result<(), String> {
-    let pass: Vec<&String> = args.iter().filter(|a| a.as_str() != "--build").collect();
+    let pass: Vec<&String> = args.iter().filter(|a| !matches!(a.as_str(), "--build" | "--folders")).collect();
     println!("Starting the game...");
     Command::new(exe).args(pass).current_dir(dir).spawn().map_err(|e| format!("can't start {}: {e}", exe.display()))?;
     Ok(())

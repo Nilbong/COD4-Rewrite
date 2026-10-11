@@ -803,9 +803,9 @@ fn explode(
                 _ => {}
             }
         }
-        // A marker's smoke only marks the spot.
+        // A marker is a flare, not a cloud
+        // ([`crate::killstreaks::carepackage`] lights it).
         if how == How::Marker {
-            effects.play(&stats.effect, Anchor::Fixed(Frame::facing(at, Vec3::Y, 0.0)), FxLayer::World);
             sfx.play(stats.sound.clone(), Some(at));
             continue;
         }

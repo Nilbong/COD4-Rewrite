@@ -670,6 +670,7 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
             fire_delay: fo("fireDelay", 0.0) / 1000.0,
             gun_kick: [crate::weapons::GunKick::read(&|k| fo(&lower_first(k), 0.0), "Hip"), crate::weapons::GunKick::read(&|k| fo(&lower_first(k), 0.0), "Ads")],
             gun_max: (fo("gunMaxPitch", 6.0), fo("gunMaxYaw", 6.0)),
+            shot_count: fo("shotCount", 1.0).clamp(1.0, 32.0) as u32,
         },
     }
 }

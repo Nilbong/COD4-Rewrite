@@ -9,25 +9,14 @@ pub struct Install {
 }
 
 impl Install {
-    /// Use `MW2_PATH` if set, otherwise probe common install locations.
+    /// The install `gamepaths` finds: its environment variable, the
+    /// player's chosen folder (Game Folders), Steam's libraries, then the
+    /// usual places.
     pub fn locate() -> Result<Install> {
-        if let Ok(p) = std::env::var("MW2_PATH") {
-            return Self::at(p);
-        }
-        let mut candidates = Vec::new();
-        for drive in ["C", "D", "E", "F", "G", "H"] {
-            for sub in [
-                r"Games\Call of Duty - Modern Warfare 2",
-                r"SteamLibrary\steamapps\common\Call of Duty Modern Warfare 2",
-                r"Steam\steamapps\common\Call of Duty Modern Warfare 2",
-                r"Program Files (x86)\Steam\steamapps\common\Call of Duty Modern Warfare 2",
-            ] {
-                candidates.push(PathBuf::from(format!(r"{drive}:\{sub}")));
-            }
-        }
-        match candidates.into_iter().find(|c| Self::looks_valid(c)) {
+        let game = gamepaths::Game::Mw2;
+        match gamepaths::find(game) {
             Some(root) => Ok(Install { root }),
-            None => bail!("could not find a Modern Warfare 2 install; set MW2_PATH to the folder containing iw4mp.exe"),
+            None => bail!("could not find a Modern Warfare 2 install; pick its folder (the one with {}) in the launcher's or Options' Game Folders, or set {}", game.exe(), game.env_var()),
         }
     }
 

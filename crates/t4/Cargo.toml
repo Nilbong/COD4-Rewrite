@@ -6,6 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+gamepaths = { path = "../gamepaths" }
 iw3 = { path = "../iw3" }
 # Black Ops' xWMA decoder (Windows' WMA decoder), for World at War's few xWMA sounds.
 t5 = { path = "../t5" }

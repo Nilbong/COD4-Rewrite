@@ -286,10 +286,14 @@ fn sync_viewmodel(
         bindposes: &mut bindposes,
         camo_materials: &mut camo_materials,
     };
-    let target = GunTarget { owner, attach_to: skeleton.joint("tag_weapon"), layers: Some(layer) };
+    let target = GunTarget { owner, attach_to: skeleton.joint("tag_weapon"), layers: Some(layer.clone()) };
     let gun = crate::gunmodel::spawn_gun(&mut commands, content, &mut camos, &mut assets, &mut skeleton, &spec, camo, target);
     if gun.is_none() {
         warn!("viewmodel: no gun model for {spec}");
+    }
+    // A hardpoint's: what the hands hold instead of the detonator.
+    if let Some(h) = hardpoint {
+        crate::killstreaks::hands::spawn_prop(&mut commands, content, &mut meshes, &mut materials, &mut images, &mut bindposes, &mut skeleton, h.def, layer);
     }
     let slots = shown.xanims.iter().map(|n| n.as_deref().filter(|s| !s.is_empty()).and_then(|n| content.anim(n))).collect();
     let anims = WeaponAnims { slots };
@@ -375,7 +379,9 @@ fn drive_viewmodel_anims(
                     HandsPhase::Press => (anim_slot::DETONATE, 0.05),
                     HandsPhase::Away => (anim_slot::IDLE, 0.0),
                 };
-                if let Some(a) = anims.get(slot_anim) {
+                // The phone's: the motion-captured take (`hands.phone.mocap`).
+                let captured = (!crate::killstreaks::hands::is_laptop(h.def)).then(|| crate::killstreaks::mocap::phone_anim(h.phase)).flatten();
+                if let Some(a) = captured.or_else(|| anims.get(slot_anim)) {
                     let seconds = h.until - h.started;
                     anim.speed = if h.phase == HandsPhase::Hold { 1.0 } else { (a.duration() / seconds.max(0.05)).clamp(0.25, 4.0) };
                     anim.play(a, fade);
@@ -613,11 +619,15 @@ fn drive_one(
 pub(crate) fn weapon_angles(
     time: Res<Time>,
     players: Query<(&crate::splitscreen::LocalSlot, &Mover, &WeaponState, Option<&crate::first_person::feel::Feel>)>,
-    mut vm: Query<(&ViewModelSlot, &mut Transform, &mut WeaponMotion, &Skeleton, &GlobalTransform), With<ViewModelRoot>>,
+    mut vm: Query<(&ViewModelSlot, &mut Transform, &mut WeaponMotion, &Skeleton, &GlobalTransform, &ChildOf), With<ViewModelRoot>>,
     joints: Query<&GlobalTransform, Without<ViewModelRoot>>,
     mut poses: Query<(&mut Transform, &ChildOf), Without<ViewModelRoot>>,
+    hands: Query<&crate::killstreaks::hands::HardpointHands, With<crate::player::LocalPlayer>>,
+    screens: Query<(&GlobalTransform, &crate::killstreaks::hands::LaptopScreen)>,
+    projections: Query<&Projection>,
+    mut laptop: Local<f32>,
 ) {
-  for (vslot, mut tf, mut motion, skeleton, root) in &mut vm {
+  for (vslot, mut tf, mut motion, skeleton, root, camera) in &mut vm {
     let Some((_, mover, w, feel)) = players.iter().find(|p| p.0.0 == vslot.0) else { continue };
     let (d, f, dt) = (&w.def, w.ads, time.delta_secs());
 
@@ -776,5 +786,38 @@ pub(crate) fn weapon_angles(
     // the right.
     let ofs = motion.sprint_pose.map_or(Vec3::ZERO, |p| p.ofs * k);
     tf.translation = along(ofs + feel_shift) + offset * moved;
+
+    // The airstrike's laptop, once up, is brought before the eye, arms and
+    // all: the whole viewmodel moved so the screen sits in the middle of
+    // the view, facing the eye, filling a share of the view's
+    // height (live tuned: `hands.laptop.view_*`), then swaying as the gun
+    // does.
+    if vslot.0 == 0 {
+        use crate::killstreaks::hands::{HandsPhase, is_laptop};
+        let held = hands.iter().any(|h| is_laptop(h.def) && matches!(h.phase, HandsPhase::Hold | HandsPhase::Press));
+        let g = |n: &str, d: f32| crate::tune::get(&format!("hands.laptop.view_{n}"), d);
+        let step = dt / g("ease", 0.3).max(0.01);
+        *laptop = (*laptop + if held { step } else { -step }).clamp(0.0, 1.0);
+        if let (true, Some((screen_at, screen))) = (*laptop > 0.0, screens.iter().next()) {
+            let (fov, aspect) = match projections.get(camera.parent()) {
+                Ok(Projection::Perspective(p)) => (p.fov, p.aspect_ratio),
+                _ => (65f32.to_radians(), 16.0 / 9.0),
+            };
+            // The screen in the viewmodel's own space (as last placed).
+            let local = root.affine().inverse() * screen_at.affine();
+            let (scale, ..) = local.to_scale_rotation_translation();
+            let half = (fov * 0.5).tan();
+            let dist = screen.size.y * scale.y / (2.0 * half * g("fill", 0.4));
+            let middle = Vec3::new(g("x", 0.0) * half * aspect * dist, g("y", 0.05) * half * dist, -dist);
+            // Facing the eye, its top leant towards it (so the keyboard and
+            // the hands on it show below: the lid opens only 105 degrees).
+            let facing = Transform::default().looking_to(middle.normalize(), Vec3::Y).rotation;
+            let target = bevy::math::Affine3A::from_rotation_translation(facing * Quat::from_rotation_x(g("tilt", 20.0).to_radians()), middle);
+            let (_, rotation, translation) = (target * local.inverse()).to_scale_rotation_translation();
+            let e = *laptop * *laptop * (3.0 - 2.0 * *laptop);
+            tf.translation = tf.translation.lerp(offset * translation, e);
+            tf.rotation = tf.rotation.slerp(offset * rotation, e);
+        }
+    }
   }
 }

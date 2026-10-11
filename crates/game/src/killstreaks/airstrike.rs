@@ -125,6 +125,18 @@ impl Airstrikes {
         let third = second + rand::random_range(1.5..2.5);
         self.strikes.push(Strike { owner, target, dir, called: now, plane_times: [first, second, third], planes: Vec::new() });
     }
+
+    /// The strikes under way: owner, target, heading, when called and the
+    /// planes' times ([`crate::netplay`] tells guests).
+    pub(crate) fn under_way(&self) -> impl Iterator<Item = (Entity, Vec3, Vec3, f32, [f32; 3])> + '_ {
+        self.strikes.iter().map(|s| (s.owner, s.target, s.dir, s.called, s.plane_times))
+    }
+
+    /// The host's strike, on an online guest: flown and dropped the same
+    /// (its damage is the host's).
+    pub(crate) fn replay(&mut self, owner: Entity, target: Vec3, dir: Vec3, called: f32, plane_times: [f32; 3]) {
+        self.strikes.push(Strike { owner, target, dir, called, plane_times, planes: Vec::new() });
+    }
 }
 
 /// The ground under `at` (Bevy space; only its x and z count) for a strike

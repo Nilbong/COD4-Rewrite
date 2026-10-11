@@ -16,7 +16,9 @@ pub mod color;
 #[allow(dead_code)]
 pub mod font;
 pub mod home;
+pub mod join;
 pub mod lobby;
+pub mod loading;
 pub mod maps;
 pub mod match_menus;
 pub mod modes;
@@ -28,6 +30,7 @@ pub mod popup;
 pub mod profiles;
 pub mod settings;
 pub mod sight;
+pub mod streaks;
 #[allow(dead_code)]
 pub(in crate::ui) mod shell;
 #[allow(dead_code)]
@@ -43,6 +46,7 @@ static IN_FRONTEND: AtomicBool = AtomicBool::new(false);
 
 pub(super) fn build(app: &mut App) {
     app.add_systems(Update, (font::make_wanted, textures, track));
+    app.add_systems(Update, join::sync.run_if(resource_exists::<Frontend>));
     settings::build(app);
     if std::env::var_os("COD4RW_UIDUMP").is_some() {
         app.add_systems(Update, dump_menus);
@@ -53,6 +57,9 @@ pub(super) fn build(app: &mut App) {
 /// dressed): its items' labels, rects, visibility and actions.
 fn dump_menus(fe: Option<Res<Frontend>>, mut last: Local<String>) {
     let Some(fe) = fe else { return };
+    if last.is_empty() {
+        popup::dump_rejected(&fe);
+    }
     let Some(om) = fe.stack.last() else { return };
     let key = format!("{}#{}", om.name, om.menu.items.len());
     if *last == key {
@@ -210,7 +217,8 @@ impl Cursor {
 /// The new UI's mouse cursor at `p` (window `h` pixels tall); false when
 /// the classic one is wanted.
 pub(super) fn cursor(fe: &Frontend, p: Vec2, h: f32, ops: &mut Vec<Op>) -> bool {
-    if mock_full().is_none() && !home::on_top(fe) && !cac::on_top(fe) && !picker::on_top(fe) && !camo_edit::on_top(fe) && !color::on_top(fe) && !character::on_top(fe) && !lobby::on_top(fe) && !maps::on_top(fe) && !modes::on_top(fe) && !popup::on_top(fe) && !drops::on_top(fe) {
+    // Every menu's, with the new style on (CoD4's own screens too).
+    if mock_full().is_none() && !super::modern::wanted(fe) {
         return false;
     }
     // A hand over something to click.

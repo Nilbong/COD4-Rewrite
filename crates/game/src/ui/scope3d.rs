@@ -148,7 +148,7 @@ impl Material for ScopeGlass {
 }
 
 #[derive(Component)]
-struct ScopeCamera3d;
+pub struct ScopeCamera3d;
 
 /// The scope camera's picture and the glass made with it.
 #[derive(Resource)]

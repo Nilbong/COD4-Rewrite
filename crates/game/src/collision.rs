@@ -151,6 +151,21 @@ pub fn physics_transform_config() -> avian3d::physics_transform::PhysicsTransfor
     avian3d::physics_transform::PhysicsTransformConfig { transform_to_position: false, transform_to_collider_scale: false, ..default() }
 }
 
+/// Avian keeps its collider trees tidy each step on an async task that the
+/// step then waits for. Ours are the map's static brushes (built once) and
+/// ~50 hitboxes (a dozen move every step): that's next to no work, but the
+/// wait was on whatever else the async pool was busy with, 75-100 ms
+/// hitches mid-match. Done in place, on the spot, instead (nothing queries
+/// the trees during the step). `COD4RW_PERFOLD=avian`: avian's way.
+pub fn collider_tree_optimization() -> avian3d::collider_tree::ColliderTreeOptimization {
+    let mut o = avian3d::collider_tree::ColliderTreeOptimization::default();
+    if !crate::perf::old("avian") {
+        o.optimize_in_place = true;
+        o.use_async_tasks = false;
+    }
+    o
+}
+
 pub fn spawn_collision(commands: &mut Commands, clip: &ClipMap) {
     let mut faces = BrushFaces::default();
     let (mut solid, mut player_clip, mut shot_clip, mut no_sight, mut skipped) = (0, 0, 0, 0, 0);

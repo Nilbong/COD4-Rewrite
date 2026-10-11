@@ -269,7 +269,7 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
                 if let Some(weapon) = focus_value(it, "ui_primary_highlighted") {
                     let picture = fe.table_lookup("mp/statstable.csv", 4, &weapon, 6);
                     if !picture.is_empty() {
-                        k.pic(R::new(right - 112.0, r.cy() - 22.0, 112.0, 44.0), &picture, [1.0, 1.0, 1.0, if focused { 1.0 } else { 0.75 }]);
+                        k.pic_fit(R::new(right - 112.0, r.cy() - 22.0, 112.0, 44.0), &picture);
                     }
                     let stat = fe.table_lookup("mp/statstable.csv", 4, &weapon, 1).parse::<i32>().unwrap_or(0);
                     if stat > 0 && fe.stat(stat) & 65536 != 0 {

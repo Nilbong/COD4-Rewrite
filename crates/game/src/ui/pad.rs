@@ -234,7 +234,7 @@ fn show_footer(
 ) {
     let menus = fe.as_deref().is_some_and(|fe| !fe.stack.is_empty() && !fe.match_only) && *state.get() != GameState::Loading;
     // The new UI's screens draw their own button prompts.
-    let own_prompts = fe.as_deref().is_some_and(|fe| super::next::home::on_top(fe) || super::next::cac::on_top(fe) || super::next::picker::on_top(fe) || super::next::camo_edit::on_top(fe) || super::next::color::on_top(fe) || super::next::character::on_top(fe) || super::next::lobby::on_top(fe) || super::next::maps::on_top(fe) || super::next::modes::on_top(fe) || super::next::popup::on_top(fe) || super::next::drops::on_top(fe) || super::next::settings::on_top(fe) || super::next::match_menus::on_top(fe) || super::next::profiles::on_top(fe));
+    let own_prompts = fe.as_deref().is_some_and(|fe| super::next::home::on_top(fe) || super::next::cac::on_top(fe) || super::next::picker::on_top(fe) || super::next::camo_edit::on_top(fe) || super::next::color::on_top(fe) || super::next::character::on_top(fe) || super::next::lobby::on_top(fe) || super::next::maps::on_top(fe) || super::next::modes::on_top(fe) || super::next::join::on_top(fe) || super::next::popup::on_top(fe) || super::next::drops::on_top(fe) || super::next::settings::on_top(fe) || super::next::match_menus::on_top(fe) || super::next::profiles::on_top(fe) || super::next::streaks::on_top(fe));
     let menus = menus && !own_prompts;
     let show = |on: bool| if on { Visibility::Inherited } else { Visibility::Hidden };
     for mut v in &mut footer {

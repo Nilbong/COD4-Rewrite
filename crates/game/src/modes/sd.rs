@@ -40,7 +40,7 @@ impl Plugin for SdPlugin {
             )
             .add_systems(
                 Update,
-                (one_life, bomb, rounds, show_models).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
+                (one_life.run_if(crate::netplay::authority), bomb.run_if(crate::netplay::authority), rounds.run_if(crate::netplay::authority), show_models).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
             );
     }
 }

@@ -65,8 +65,9 @@ impl ReplayWindow {
 }
 
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-pub const MAX_CONNECTIONS: usize = 128;
-pub const MAX_ROOMS: usize = 32;
+/// A relay on a small server: 128 rooms of up to 18, plus browsers.
+pub const MAX_CONNECTIONS: usize = 1024;
+pub const MAX_ROOMS: usize = 128;
 pub const MAX_PER_IP: usize = 8;
 pub const CONTROL_QUEUE: usize = 32;
 

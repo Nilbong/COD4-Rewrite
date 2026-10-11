@@ -48,7 +48,18 @@ impl Plugin for ExplosivesPlugin {
             .add_systems(OnEnter(crate::state::GameState::InGame), load_defs.after(crate::world::load_map).in_set(crate::state::Setup::Content))
             .add_systems(
                 Update,
-                (launch, fly, detonate, damaged, claymores, explode).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+                (
+                    launch,
+                    fly,
+                    // An online guest's go off when the host's do ([`crate::netplay`]).
+                    detonate.run_if(crate::netplay::authority),
+                    damaged.run_if(crate::netplay::authority),
+                    claymores.run_if(crate::netplay::authority),
+                    explode,
+                )
+                    .chain()
+                    .after(crate::weapons::WeaponSet)
+                    .run_if(crate::state::in_game),
             );
         if let Ok(dir) = std::env::var("COD4RW_EQUIPTEST") {
             app.insert_resource(TestDir(dir.into()))

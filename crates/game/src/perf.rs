@@ -32,6 +32,15 @@ pub fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("COD4RW_PERF").is_some())
 }
 
+/// `COD4RW_PERFOLD=<name>,...`: a main-thread speed-up named here runs its
+/// old way, to A/B it (`move`: pawns moved one after another).
+pub fn old(name: &str) -> bool {
+    static OLD: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    OLD.get_or_init(|| std::env::var("COD4RW_PERFOLD").map(|v| v.split(',').map(|s| s.trim().to_owned()).collect()).unwrap_or_default())
+        .iter()
+        .any(|o| o == name || o == "all")
+}
+
 /// A system timing itself under `COD4RW_PERF`: hold one for the system's
 /// run (`let _t = perf::Probe::start("name");`); every 300 runs the average
 /// is logged.
@@ -121,9 +130,49 @@ impl Plugin for PerfPlugin {
                 r.add_systems(Render, (|_: &mut World| busy_mark(&RENDER_BUSY, true)).in_set(RenderSystems::ExtractCommands));
                 r.add_systems(Render, (|_: &mut World| busy_mark(&RENDER_BUSY, false)).in_set(RenderSystems::PostCleanup));
                 r.add_systems(Render, draw_census.in_set(RenderSystems::Render));
+                // GPU spans per camera (its whole graph) and around the
+                // shadow maps (Bevy times neither). Spans nest per thread,
+                // so these all run on the render thread (NonSendMarker);
+                // passes recorded on other threads stay top level.
+                use bevy::core_pipeline::{schedule::{Core3d, Core3dSystems}, upscaling::upscaling};
+                use bevy::pbr::{clear_indirect_parameters_metadata, early_prepass_build_indirect_parameters, late_prepass_build_indirect_parameters, main_build_indirect_parameters, per_view_shadow_pass, shared_shadow_pass, EARLY_SHADOW_PASS, LATE_SHADOW_PASS};
+                use bevy::core_pipeline::mip_generation::experimental::depth::early_downsample_depth;
+                r.add_systems(
+                    Core3d,
+                    (
+                        camera_span_begin.before(clear_indirect_parameters_metadata).before(Core3dSystems::Prepass),
+                        camera_span_end.after(upscaling),
+                        (|_: bevy::ecs::system::NonSendMarker, c: bevy::render::renderer::RenderContext| gpu_span(c, Some("shadows")))
+                            .after(early_prepass_build_indirect_parameters)
+                            .before(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+                            .before(shared_shadow_pass::<EARLY_SHADOW_PASS>),
+                        (|_: bevy::ecs::system::NonSendMarker, c: bevy::render::renderer::RenderContext| gpu_span(c, None))
+                            .after(per_view_shadow_pass::<EARLY_SHADOW_PASS>)
+                            .after(shared_shadow_pass::<EARLY_SHADOW_PASS>)
+                            .before(early_downsample_depth),
+                        (|_: bevy::ecs::system::NonSendMarker, c: bevy::render::renderer::RenderContext| gpu_span(c, Some("shadows_late")))
+                            .after(late_prepass_build_indirect_parameters)
+                            .before(per_view_shadow_pass::<LATE_SHADOW_PASS>)
+                            .before(shared_shadow_pass::<LATE_SHADOW_PASS>),
+                        (|_: bevy::ecs::system::NonSendMarker, c: bevy::render::renderer::RenderContext| gpu_span(c, None))
+                            .after(per_view_shadow_pass::<LATE_SHADOW_PASS>)
+                            .after(shared_shadow_pass::<LATE_SHADOW_PASS>)
+                            .before(main_build_indirect_parameters),
+                    ),
+                );
             }
-            app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin)
-                .init_resource::<FrameTimes>()
+            // Bevy's GPU pass timings panic with its trace spans on
+            // (`systrace`): those builds time systems, not passes.
+            if !cfg!(feature = "systrace") {
+                app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+            }
+            app.add_systems(
+                avian3d::schedule::PhysicsSchedule,
+                collider_tree_log
+                    .after(avian3d::collider_tree::ColliderTreeSystems::UpdateAabbs)
+                    .before(avian3d::collider_tree::ColliderTreeSystems::BeginOptimize),
+            );
+            app.init_resource::<FrameTimes>()
                 .insert_resource(without)
                 .init_resource::<Redone>()
                 .add_systems(Last, (leave_out, count_redone, log_frames, census).chain())
@@ -244,6 +293,7 @@ fn leave_out(
     if without.vsync && window.present_mode != unsynced {
         window.present_mode = unsynced;
     }
+    crate::settings_apply::present_overrides(&mut window);
     if without.shadows {
         for mut sun in &mut suns {
             if sun.shadow_maps_enabled {
@@ -458,6 +508,12 @@ fn log_frames(
         (true, None) => *frames.started.insert(now),
         (true, Some(t)) => t,
     };
+    #[cfg(feature = "systrace")]
+    if let Ok(mut spikes) = systrace::SPIKES.lock() {
+        for (name, ms) in spikes.drain(..) {
+            info!("perf: sys spike {ms:.1} ms {name} at {:.1} s into the match", now - started);
+        }
+    }
     if now - started >= WARMUP {
         let ms = time.delta_secs() * 1000.0;
         if ms > hitch_ms() {
@@ -500,16 +556,31 @@ fn log_frames(
         // Busy cycles of the two threads themselves (waits left out): what
         // bounds the frame rate once nothing caps it.
         info!("perf: thread Mcycles per frame: main {main_cycles:.1}, render {render_cycles:.1}");
+        #[cfg(feature = "systrace")]
+        {
+            let list = systrace::take(frames_since);
+            let ours: f64 = list.iter().filter(|(n, ..)| !n.starts_with("bevy") && !n.starts_with("avian")).map(|e| e.1).sum();
+            let all: f64 = list.iter().map(|e| e.1).sum();
+            info!("perf: sys total {all:.2} ms/frame, game's own {ours:.2}");
+            for (name, ms, runs) in list.iter().filter(|e| e.1 >= 0.01) {
+                info!("perf: sys {ms:.3} ms {runs:.2}x {name}");
+            }
+        }
         // The GPU's time per pass (top level and their parts), longest first.
         let mut gpu: Vec<(String, f64)> = diagnostics
             .iter()
             .filter(|d| d.path().as_str().starts_with("render/") && d.path().as_str().ends_with("/elapsed_gpu"))
+            // Only passes still running: a camera that's since gone (the
+            // scope's warm-up at spawn) keeps its old average.
+            .filter(|d| d.measurement().is_some_and(|m| m.time.elapsed().as_secs_f32() < 3.0))
             .filter_map(|d| Some((d.path().as_str().trim_start_matches("render/").trim_end_matches("/elapsed_gpu").to_owned(), d.average()?)))
             .collect();
         gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
         let list: Vec<String> = gpu.iter().take(24).map(|(p, ms)| format!("{p} {ms:.2}")).collect();
         // The top-level passes' sum (nested ones are inside theirs).
-        let total: f64 = gpu.iter().filter(|(p, _)| !p.contains('/')).map(|(_, ms)| ms).sum();
+        // With the camera spans (which take in every pass) only theirs.
+        let cams = gpu.iter().any(|(p, _)| p.starts_with("cam"));
+        let total: f64 = gpu.iter().filter(|(p, _)| !p.contains('/') && (!cams || p.starts_with("cam"))).map(|(_, ms)| ms).sum();
         info!("perf: gpu {total:.2} ms in timed passes ({} timed)", gpu.len());
         info!("perf: gpu ms: {}", list.join(", "));
     }
@@ -519,6 +590,14 @@ fn log_frames(
         sorted.sort_by(f32::total_cmp);
         let p99 = sorted[(sorted.len() - 1) * 99 / 100];
         info!("perf: run {avg:.2} ms avg ({:.0} fps), median {median:.2}, p95 {p95:.2}, p99 {p99:.2}, worst {worst:.2} over {} frames", 1000.0 / avg, frames.all.len());
+        // Frame times by 1 ms bucket: presentation latched to the display's
+        // refreshes shows as clusters at multiples of its period.
+        let mut hist = [0u32; 40];
+        for ms in &frames.all {
+            hist[(*ms as usize).min(39)] += 1;
+        }
+        let list: Vec<String> = hist.iter().enumerate().filter(|(_, n)| **n > 0).map(|(ms, n)| format!("{ms}:{n}")).collect();
+        info!("perf: frame ms histogram {}", list.join(" "));
     }
 }
 
@@ -805,7 +884,8 @@ fn mesh_log(
     *next = now + 5.0;
     let mut rows: Vec<(u32, String, usize)> = Vec::new();
     for (id, n) in seen.drain() {
-        let verts = meshes.get(id).map_or(0, |m| m.count_vertices());
+        // A render-world-only mesh's data is gone (`count_vertices` panics).
+        let verts = meshes.get(id).filter(|m| m.try_attributes().is_ok()).map_or(0, |m| m.count_vertices());
         let owner = users.iter().find(|(_, m)| m.id() == id).map_or("(no entity)".to_string(), |(e, _)| {
             let mut top = e;
             while let Ok(p) = parents.get(top) {
@@ -819,5 +899,150 @@ fn mesh_log(
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     for (n, owner, verts) in rows.iter().take(12) {
         info!("perf: mesh changed {n}x in 5 s: {owner} ({verts} vertices)");
+    }
+}
+
+/// `--features systrace` (Bevy's system spans) with `COD4RW_PERF`: each
+/// system's time, summed in-process by name and logged every five seconds
+/// in a match as ms per frame, longest first (`perf: sys ...`). No trace
+/// file: the totals are all that's kept.
+#[cfg(feature = "systrace")]
+pub mod systrace {
+    use bevy::log::tracing::{self, span, Subscriber};
+    use bevy::log::tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    pub static TIMES: Mutex<Option<HashMap<String, (f64, u32)>>> = Mutex::new(None);
+    /// Single runs longer than [`SPIKE_SECS`], logged as they happen
+    /// (`perf: sys spike`): what's behind a hitch.
+    pub static SPIKES: Mutex<Vec<(String, f64)>> = Mutex::new(Vec::new());
+    const SPIKE_SECS: f64 = 0.015;
+
+    struct Name(String);
+    struct Entered(Instant);
+
+    struct NameOf<'a>(&'a mut Option<String>);
+    impl tracing::field::Visit for NameOf<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "name" {
+                *self.0 = Some(value.to_owned());
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "name" {
+                *self.0 = Some(format!("{value:?}").trim_matches('"').to_owned());
+            }
+        }
+    }
+
+    pub struct SysLayer;
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for SysLayer {
+        fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+            let kind = attrs.metadata().name();
+            if kind != "system" && kind != "system_commands" {
+                return;
+            }
+            let mut name = None;
+            attrs.record(&mut NameOf(&mut name));
+            let Some(name) = name else { return };
+            let name = if kind == "system" { name } else { format!("{name} [cmds]") };
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(Name(name));
+            }
+        }
+        fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+            if let Some(span) = ctx.span(id) {
+                let mut ext = span.extensions_mut();
+                if ext.get_mut::<Name>().is_some() {
+                    ext.replace(Entered(Instant::now()));
+                }
+            }
+        }
+        fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+            let Some(span) = ctx.span(id) else { return };
+            let ext = span.extensions();
+            let (Some(Name(name)), Some(Entered(t0))) = (ext.get::<Name>(), ext.get::<Entered>()) else { return };
+            let secs = t0.elapsed().as_secs_f64();
+            if secs > SPIKE_SECS {
+                if let Ok(mut spikes) = SPIKES.lock() {
+                    spikes.push((name.clone(), secs * 1000.0));
+                }
+            }
+            let Ok(mut times) = TIMES.lock() else { return };
+            let times = times.get_or_insert_with(Default::default);
+            match times.get_mut(name.as_str()) {
+                Some(e) => {
+                    e.0 += secs;
+                    e.1 += 1;
+                }
+                None => {
+                    times.insert(name.clone(), (secs, 1));
+                }
+            }
+        }
+    }
+
+    /// The totals since the last call, as ms per frame over `frames`,
+    /// longest first, and cleared.
+    pub fn take(frames: u64) -> Vec<(String, f64, f64)> {
+        let Ok(mut times) = TIMES.lock() else { return Vec::new() };
+        let Some(times) = times.as_mut() else { return Vec::new() };
+        let f = frames.max(1) as f64;
+        let mut list: Vec<(String, f64, f64)> = times.drain().map(|(n, (s, runs))| (n, s * 1000.0 / f, runs as f64 / f)).collect();
+        list.sort_by(|a, b| b.1.total_cmp(&a.1));
+        list
+    }
+}
+
+fn gpu_span(mut ctx: bevy::render::renderer::RenderContext, name: Option<&'static str>) {
+    use bevy::render::diagnostic::RecordDiagnostics;
+    let diagnostics = ctx.diagnostic_recorder();
+    match name {
+        Some(n) => diagnostics.as_deref().begin_time_span(ctx.command_encoder(), n.into()),
+        None => diagnostics.as_deref().end_time_span(ctx.command_encoder()),
+    }
+}
+
+fn camera_span_begin(_main: bevy::ecs::system::NonSendMarker, view: bevy::render::renderer::ViewQuery<&bevy::render::camera::ExtractedCamera>, mut ctx: bevy::render::renderer::RenderContext) {
+    use bevy::render::diagnostic::RecordDiagnostics;
+    let name = format!("cam{}", view.into_inner().order);
+    let diagnostics = ctx.diagnostic_recorder();
+    diagnostics.as_deref().begin_time_span(ctx.command_encoder(), name.into());
+}
+
+fn camera_span_end(_main: bevy::ecs::system::NonSendMarker, _view: bevy::render::renderer::ViewQuery<&bevy::render::camera::ExtractedCamera>, ctx: bevy::render::renderer::RenderContext) {
+    gpu_span(ctx, None);
+}
+
+/// Under `COD4RW_PERF`: how many of each avian collider tree's proxies
+/// moved before it's optimized (a share over 15% means a partial or full
+/// rebuild: logged as it happens), and the average every 300 steps.
+fn collider_tree_log(trees: Res<avian3d::collider_tree::ColliderTrees>, mut acc: Local<([usize; 4], u32)>) {
+    let all = [("dynamic", &trees.dynamic_tree), ("kinematic", &trees.kinematic_tree), ("static", &trees.static_tree), ("standalone", &trees.standalone_tree)];
+    for (i, (name, tree)) in all.iter().enumerate() {
+        let (moved, total) = (tree.moved_proxies.len(), tree.proxies.len());
+        acc.0[i] += moved;
+        if moved > 0 && moved as f32 > 0.15 * total as f32 && total > 50 {
+            info!("perf: collider tree {name}: {moved} of {total} proxies moved (rebuild)");
+        }
+    }
+    acc.1 += 1;
+    if acc.1 >= 300 {
+        let n = acc.1 as f32;
+        info!(
+            "perf: collider trees moved per step: dynamic {:.1}/{}, kinematic {:.1}/{}, static {:.1}/{}, standalone {:.1}/{}",
+            acc.0[0] as f32 / n,
+            all[0].1.proxies.len(),
+            acc.0[1] as f32 / n,
+            all[1].1.proxies.len(),
+            acc.0[2] as f32 / n,
+            all[2].1.proxies.len(),
+            acc.0[3] as f32 / n,
+            all[3].1.proxies.len()
+        );
+        *acc = Default::default();
     }
 }

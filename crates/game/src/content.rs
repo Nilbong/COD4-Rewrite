@@ -349,7 +349,11 @@ impl Content {
         images: &mut Assets<Image>,
         bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     ) -> Option<PreparedModel> {
-        let (zi, id) = self.find(name)?;
+        // The model by that name (a material can share it: CoD4's phone,
+        // `com_cellphone_on`, is both, the material first).
+        let (zi, id) = self.zones.iter().enumerate().find_map(|(zi, z)| {
+            z.assets.iter().position(|a| matches!(a, iw3::zone::Asset::XModel(m) if m.name == name)).map(|id| (zi, id))
+        })?;
         let xm = self.zones[zi].xmodel(id)?;
         let n = xm.num_bones as usize;
         let roots = xm.num_root_bones as usize;

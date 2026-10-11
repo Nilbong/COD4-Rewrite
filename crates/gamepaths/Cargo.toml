@@ -1,0 +1,8 @@
+[package]
+name = "gamepaths"
+description = "Where the player's Call of Duty installs are: found, or chosen and saved."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

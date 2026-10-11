@@ -30,7 +30,7 @@ fn hardcore_rect(n: usize) -> R {
 const PANEL: R = R::new(826.0, 192.0, 998.0, 440.0);
 
 /// A mode's icon (sheet, index) and its line.
-fn about(name: &str) -> ((&'static str, usize), &'static str) {
+pub(in crate::ui) fn about(name: &str) -> ((&'static str, usize), &'static str) {
     match name {
         "Team Deathmatch" => ((HUD_ICONS, 10), "Two teams. The first to the score limit wins."),
         "Free-for-all" => ((MENU_ICONS, icons::CROSSHAIR), "Every player for themselves."),

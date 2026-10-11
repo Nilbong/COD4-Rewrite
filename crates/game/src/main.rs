@@ -46,6 +46,7 @@ mod melee;
 mod mesh_bounds;
 mod net;
 mod online;
+mod matchmaking;
 mod netplay;
 mod movement;
 mod perf;
@@ -89,6 +90,7 @@ mod ssr;
 mod pom;
 mod vm_lights;
 mod settle;
+mod scope_shadows;
 mod window_icon;
 mod world;
 mod target_practice;
@@ -97,6 +99,10 @@ mod photo;
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Avian for colliders and spatial queries only. Nothing in the game is a
 /// rigid body (pawns, grenades and projectiles move themselves, casting
@@ -219,7 +225,21 @@ fn main() -> AppExit {
             focused: false,
             // A timing run (`COD4RW_RES`) stays in view: a covered window is held
             // to the compositor's rate.
-            window_level: if resolution.is_some() { bevy::window::WindowLevel::Normal } else { bevy::window::WindowLevel::AlwaysOnBottom },
+            // `COD4RW_ONTOP=1` keeps it above every other window.
+            window_level: if std::env::var_os("COD4RW_ONTOP").is_some() {
+                bevy::window::WindowLevel::AlwaysOnTop
+            } else if resolution.is_some() {
+                bevy::window::WindowLevel::Normal
+            } else {
+                bevy::window::WindowLevel::AlwaysOnBottom
+            },
+            // `COD4RW_BORDERLESS=1`: borderless fullscreen, as players run it
+            // (the compositor treats a window's frames differently).
+            mode: if std::env::var_os("COD4RW_BORDERLESS").is_some() {
+                bevy::window::WindowMode::BorderlessFullscreen(bevy::window::MonitorSelection::Primary)
+            } else {
+                bevy::window::WindowMode::Windowed
+            },
             ..default()
         }
     } else {
@@ -235,6 +255,7 @@ fn main() -> AppExit {
     App::new()
         .add_plugins(plugins)
         .insert_resource(collision::physics_transform_config())
+        .insert_resource(collision::collider_tree_optimization())
         .add_systems(avian3d::schedule::PhysicsSchedule, collision::sync_moved_colliders.in_set(avian3d::physics_transform::PhysicsTransformSystems::TransformToPosition))
         .add_plugins((physics_plugins(), state::StatePlugin(first_state), ui::UiPlugin, gunmodel::GunModelPlugin, audio::AudioPlugin, bo1::Bo1Plugin, waw::WawPlugin, mw2guns::Mw2GunsPlugin))
         .insert_resource(Gravity(Vec3::ZERO))
@@ -275,10 +296,7 @@ fn main() -> AppExit {
                 ..default()
             });
         })
-        .insert_resource(world::MapName({
-            atmos::climate::set_map(&map);
-            map
-        }))
+        .insert_resource(world::MapName(atmos::climate::set_map(&map)))
         .insert_resource(tdm::MatchConfig {
             mode,
             score_limit: mode.default_score_limit(),
@@ -319,11 +337,11 @@ fn main() -> AppExit {
         .add_plugins(first_person::FirstPersonPlugin)
         .add_plugins(viewmodel_parts::ViewModelPartsPlugin)
         .add_plugins(wet_gun::WetGunPlugin)
-        .add_plugins((weather::WeatherPlugin, wet::WetPlugin, ssr::SsrPlugin, vm_lights::VmLightsPlugin, settle::SettlePlugin))
+        .add_plugins((weather::WeatherPlugin, wet::WetPlugin, ssr::SsrPlugin, vm_lights::VmLightsPlugin, settle::SettlePlugin, scope_shadows::ScopeShadowsPlugin))
         // G: grenades. 5: equipment and grenade launchers.
         .add_plugins((grenades::GrenadesPlugin, explosives::ExplosivesPlugin, perks::PerksPlugin, killcam::KillcamPlugin))
         .add_plugins((melee::MeleePlugin, props::PropsPlugin, glass::GlassPlugin, walktest::WalkTestPlugin, fog::FogPlugin, atmos::AtmosPlugin, window_icon::WindowIconPlugin))
-        .add_plugins((net::NetPlugin, online::OnlinePlugin, netplay::NetplayPlugin, mesh_bounds::MeshBoundsPlugin))
+        .add_plugins((net::NetPlugin, online::OnlinePlugin, matchmaking::MatchmakingPlugin, netplay::NetplayPlugin, mesh_bounds::MeshBoundsPlugin))
         .add_systems(Update, collision::ray_test.run_if(state::in_game.and_then(|| std::env::var_os("COD4RW_RAYTEST").is_some())))
         // Muzzle flashes, bullet impacts and blood.
         .add_plugins(fx::FxPlugin)
@@ -368,7 +386,10 @@ fn log_path() -> std::path::PathBuf {
 fn log_file_layer(_: &mut App) -> Option<bevy::log::BoxedLayer> {
     use bevy::log::tracing_subscriber::Layer;
     let file = std::fs::File::create(log_path()).ok()?;
-    Some(bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)).boxed())
+    let layer = bevy::log::tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file));
+    #[cfg(feature = "systrace")]
+    let layer = layer.and_then(perf::systrace::SysLayer);
+    Some(layer.boxed())
 }
 
 /// A crash's message goes in the log too (the window has no console).

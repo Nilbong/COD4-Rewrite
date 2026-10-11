@@ -102,15 +102,16 @@ fn stick_look(
     gunplay: Res<Gunplay>,
     settings: Res<PadSettings>,
     spatial: SpatialQuery,
-    mut players: Query<(Entity, &PlayerInput, &Transform, &Mover, &mut ViewAngles, &WeaponState, &Pawn), (With<LocalSlot>, Without<Dead>)>,
+    mut players: Query<(Entity, &PlayerInput, &Transform, &Mover, &mut ViewAngles, &WeaponState, &Pawn, Has<crate::player::LocalPlayer>), (With<LocalSlot>, Without<Dead>)>,
     pawns: Query<(Entity, &Pawn), Without<Dead>>,
     hitboxes: Query<(&Hitbox, &GlobalTransform)>,
     mut assists: Local<HashMap<Entity, Assist>>,
 ) {
     assists.retain(|e, _| players.contains(*e));
-    for (entity, input, tf, mover, mut view, weapon, me) in &mut players {
+    for (entity, input, tf, mover, mut view, weapon, me, local) in &mut players {
         let assist = assists.entry(entity).or_default();
-        if !input.live {
+        // (The airstrike's laptop has the right stick: `ui::laptop_screen`.)
+        if !input.live || (local && crate::killstreaks::hands::laptop_open()) {
             *assist = Assist::default();
             continue;
         }

@@ -18,8 +18,11 @@ fn simulate(position: &mut f32, c: InputCommand, dt: f32) {
 fn snapshot(tick: u32, peer: PeerId, x: f32, ack: u32) -> Snapshot {
     Snapshot {
         tick,
+        sequence: 0,
         acknowledged_input: ack,
+        ack_age: 0,
         pawns: vec![PawnState { id: peer, position: [x, 0.0, 0.0], health: 100, ..Default::default() }],
+        extra: Vec::new(),
     }
 }
 

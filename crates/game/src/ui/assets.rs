@@ -179,6 +179,10 @@ impl UiAssets {
     /// The image behind a 2D material, loaded on first use. Names no zone
     /// has as a material are tried as images (`damage_feedback`).
     /// A material made here (an atlas or picture), under `name`.
+    pub fn has_image(&self, name: &str) -> bool {
+        self.materials.get(&name.to_ascii_lowercase()).is_some_and(Option::is_some)
+    }
+
     pub fn add_image(&mut self, name: &str, image: UiImage) {
         self.materials.insert(name.to_ascii_lowercase(), Some(image));
     }

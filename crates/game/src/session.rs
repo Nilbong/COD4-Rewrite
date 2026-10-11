@@ -38,7 +38,8 @@ impl Plugin for SessionPlugin {
 
 /// Debug aid: with `COD4RW_LEAVETEST=<dir>`, leave the match after 8 s, go
 /// back into it from the menu 4 s later, and do that again; screenshot each
-/// step, then exit.
+/// step, then exit. `COD4RW_LEAVETEST_MAPS=<map>,<map>`: the second and
+/// third matches on these maps.
 #[derive(Resource)]
 struct LeaveTest(std::path::PathBuf);
 
@@ -51,6 +52,7 @@ fn leave_test(
     mut step: Local<(usize, f32)>,
     mut exit: MessageWriter<AppExit>,
     entities: Query<Entity>,
+    mut fe: Option<ResMut<crate::ui::Frontend>>,
 ) {
     use bevy::render::view::screenshot::{Screenshot, save_to_disk};
     let now = real.elapsed_secs();
@@ -71,6 +73,8 @@ fn leave_test(
             (*n, *at) = (2, now);
         }
         (2, GameState::Frontend) if now - *at > 1.0 => {
+            next_map(&mut commands, 0);
+            fe.as_mut().map(|f| f.close_all());
             next.set(GameState::Loading);
             (*n, *at) = (3, now);
         }
@@ -90,6 +94,8 @@ fn leave_test(
             (*n, *at) = (6, now);
         }
         (6, GameState::Frontend) if now - *at > 1.0 => {
+            next_map(&mut commands, 1);
+            fe.as_mut().map(|f| f.close_all());
             next.set(GameState::Loading);
             (*n, *at) = (7, now);
         }
@@ -103,6 +109,13 @@ fn leave_test(
         }
         _ => {}
     }
+}
+
+/// The leave test's next map, if `COD4RW_LEAVETEST_MAPS` names one.
+fn next_map(commands: &mut Commands, n: usize) {
+    let Some(map) = std::env::var("COD4RW_LEAVETEST_MAPS").ok().and_then(|v| v.split(',').nth(n).map(|s| s.trim().to_owned())) else { return };
+    info!("leave test: next map {map}");
+    commands.insert_resource(crate::world::MapName(crate::atmos::climate::set_map(&map)));
 }
 
 /// The entities that existed before the match.

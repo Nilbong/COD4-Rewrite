@@ -159,8 +159,17 @@ pub(in crate::ui) fn menu(fe: &Frontend, classic: &Menu) -> Option<Menu> {
     Some(out)
 }
 
+/// The lobby is being rebuilt (its rows changed), not opened.
+static REBUILDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(in crate::ui) fn rebuilding(on: bool) {
+    REBUILDING.store(on, Ordering::Relaxed);
+}
+
 pub(in crate::ui) fn opened(fe: &Frontend) {
-    OPENED.store(fe.millis(), Ordering::Relaxed);
+    if !REBUILDING.load(Ordering::Relaxed) {
+        OPENED.store(fe.millis(), Ordering::Relaxed);
+    }
 }
 
 pub(in crate::ui) fn on_top(fe: &Frontend) -> bool {
@@ -207,8 +216,8 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
     let since = (fe.millis() - OPENED.load(Ordering::Relaxed)).max(0) as f32 / 1000.0;
     let ease = t::ease_out(since / t::MEDIUM);
     k.alpha = ease;
-    header(&mut k, "Play", "Private Match");
     let view = fe.lobby_view();
+    header(&mut k, "Play", if view.public { "Public Match" } else { "Private Match" });
     let hot = fe.focus.as_ref().filter(|(m, _)| *m == om.name).and_then(|(_, i)| om.menu.items.get(*i)).map(|it| it.window.name.clone());
     let is_hot = |name: &str| hot.as_deref() == Some(name);
     let item = |name: &str| om.menu.items.iter().enumerate().find(|(i, it)| it.window.name == name && fe.item_visible(om, *i)).map(|(_, it)| it);

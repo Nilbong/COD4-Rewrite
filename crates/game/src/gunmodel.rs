@@ -393,6 +393,10 @@ fn spawn_model_of(
     // pair; their camos are models of their own, with CoD4's camo layer.)
     let waw = crate::waw::is_waw(weapon) || mw2;
     let gl = !bo1 && !waw && attachments.contains(&"gl");
+    // A silencer that's the silencer variant's own gun, not a part added to
+    // the base one (the MP5SD's shroud rather than a can): that model is the
+    // gun then, and the sights come from the base model (`sights_from`).
+    let mut sights_from: Option<String> = None;
 
     // The base model with the variant's hidden tags; each sight or grip
     // shows the tags its single-attachment variant shows (and hides what it
@@ -407,8 +411,16 @@ fn spawn_model_of(
         let (name, hide) = crate::waw::data()?.model(weapon, &attachments, field == WORLD_MODEL)?;
         (crate::waw::model_name(content, &name)?, hide)
     } else {
-        let (model_name, base_hide) =
+        let (mut model_name, base_hide) =
             gun_model(content, &format!("{weapon}_{}mp", if gl { "gl_" } else { "" }), camo, field)?;
+        if !gl
+            && attachments.contains(&"silencer")
+            && let Some((silenced, _)) = gun_model(content, &format!("{weapon}_silencer_mp"), camo, field)
+            && silenced != model_name
+            && !own_material_names(content, &silenced, &model_name).iter().any(|m| m.contains("suppressor") || m.contains("silencer"))
+        {
+            sights_from = Some(std::mem::replace(&mut model_name, silenced));
+        }
         let mut hide: BTreeSet<String> = base_hide.clone();
         if !gl {
             let (mut shown, mut hidden) = (BTreeSet::new(), BTreeSet::new());
@@ -462,14 +474,28 @@ fn spawn_model_of(
             env.z = env.z.abs();
         }
     }
-    // A silencer: the suppressor surfaces of the silencer variant's model.
+    // A silencer: the suppressor surfaces of the silencer variant's model;
+    // or, with the silencer built into the gun, the base model's sights.
     let suppressor = (!bo1 && !waw && !gl && attachments.contains(&"silencer"))
-        .then(|| gun_model(content, &format!("{weapon}_silencer_mp"), camo, field))
+        .then(|| match &sights_from {
+            Some(base) => Some(base.clone()),
+            None => gun_model(content, &format!("{weapon}_silencer_mp"), camo, field).map(|(name, _)| name),
+        })
         .flatten()
-        .and_then(|(name, _)| {
+        .and_then(|name| {
             let keep = own_materials(content, &name, &model_name, materials, images);
             content.model(&name, meshes, materials, images, a.bindposes).map(|m| (m, keep))
         });
+    // Those sights' red dots and lenses.
+    let (extra_reflex, extra_lens, extra_crosshair) = match &sights_from {
+        Some(base) if field == GUN_MODEL => (
+            self::reflex_surfaces(content, base, materials, images),
+            self::lens_surfaces(content, base, materials, images, false),
+            self::lens_surfaces(content, base, materials, images, true),
+        ),
+        Some(base) => (self::reflex_surfaces(content, base, materials, images), HashMap::new(), HashMap::new()),
+        None => (HashMap::new(), HashMap::new(), HashMap::new()),
+    };
 
     // The bind-pose bounds of the gun (and its suppressor), as worked out
     // when they were prepared: once a mesh is on the GPU its vertices can't
@@ -498,12 +524,24 @@ fn spawn_model_of(
     if let Some((model, keep)) = &suppressor {
         // Joints shared with the base model are reused; drop all but the suppressor.
         let parts = spawn_model(commands, skeleton, SpawnModel { model, owner, attach_to, layers, shadows: true });
+        let vfs = content.vfs.clone();
         for (entity, (_, material)) in parts.into_iter().zip(&model.surfaces) {
             if !keep.contains(&material.id()) {
                 commands.entity(entity).despawn();
-            } else {
-                commands.entity(entity).insert(GunSurface);
-                spawned.push(entity);
+                continue;
+            }
+            commands.entity(entity).insert(GunSurface);
+            spawned.push(entity);
+            if extra_crosshair.contains_key(&material.id()) {
+                commands.entity(entity).insert(ScopeCrosshair);
+            }
+            if let Some(geom) = extra_lens.get(&material.id()) {
+                commands.entity(entity).insert((ScopeLens, *geom));
+            } else if let Some(info) = extra_reflex.get(&material.id())
+                && let Some(dot) = camos.textures.get(&info.dot, true, &vfs, images)
+            {
+                let grain = info.grain.as_ref().and_then(|g| camos.textures.get(g, true, &vfs, images));
+                commands.entity(entity).insert(ReflexDot(dot, grain, info.scale, reticle));
             }
         }
     }
@@ -1056,6 +1094,20 @@ fn gun_model(content: &Content, def: &str, camo: usize, field: &str) -> Option<(
         .filter_map(|i| zone.script_strings.get(i).map(|s| s.to_ascii_lowercase()))
         .collect();
     Some((model, hide))
+}
+
+/// The names (lower case) of [`own_materials`]' materials.
+fn own_material_names(content: &Content, model: &str, base: &str) -> Vec<String> {
+    let lod0 = |name: &str| -> Option<(usize, Vec<iw3::zone::AssetId>)> {
+        let (zi, id) = content.find(name)?;
+        let xm = content.zones[zi].xmodel(id)?;
+        let lod = xm.lods.first()?;
+        let range = lod.surf_index as usize..(lod.surf_index + lod.num_surfs) as usize;
+        Some((zi, range.filter_map(|s| xm.materials.get(s).copied().flatten()).collect()))
+    };
+    let (Some((zi, own)), Some((bzi, used))) = (lod0(model), lod0(base)) else { return Vec::new() };
+    let used: HashSet<String> = used.iter().map(|&m| content.zones[bzi].get(m).name().to_ascii_lowercase()).collect();
+    own.iter().map(|&m| content.zones[zi].get(m).name().to_ascii_lowercase()).filter(|n| !used.contains(n)).collect()
 }
 
 /// Materials of `model` that `base` doesn't use (a silencer variant's

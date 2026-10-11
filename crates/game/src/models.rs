@@ -450,9 +450,11 @@ pub(crate) fn animate_skeletons(
             _ => 1,
         };
         if every > 1 && player.last_pose.len() == skel.joints.len() && frame_no.wrapping_add(owner.to_bits() as u32) % every != 0 {
+            // (Only joints something else moved since: an unchanged one
+            // isn't marked changed, so isn't propagated again.)
             for (j, pose) in skel.joints.iter().zip(&player.last_pose) {
                 if let Ok(mut tf) = joints.get_mut(j.entity) {
-                    *tf = *pose;
+                    tf.set_if_neq(*pose);
                 }
             }
             continue;
@@ -528,7 +530,7 @@ pub(crate) fn animate_skeletons(
                 pose.scale = Vec3::ZERO;
             }
             player.last_pose[i] = pose;
-            *tf = pose;
+            tf.set_if_neq(pose);
         }
         player.from_pose = from_pose;
     }

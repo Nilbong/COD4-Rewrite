@@ -10,11 +10,14 @@ name = "cod4rw"
 path = "src/main.rs"
 
 [dependencies]
+# (The schedule build pass type in `atmos::volumetric`; already bevy_ecs's.)
+indexmap = "2"
 # Rasterises the modern main menu's system font (ui/modern.rs).
 ab_glyph = "0.2"
 # Cuts the controller button art out of its atlases (gamepad/glyphs.rs).
 image = { version = "0.25", default-features = false, features = ["png"] }
 iw3 = { path = "../iw3" }
+gamepaths = { path = "../gamepaths" }
 gsc = { path = "../gsc" }
 t5 = { path = "../t5" }
 t4 = { path = "../t4" }
@@ -38,6 +41,8 @@ half = "2"
 obvhs = "0.3.3"
 glam33 = { package = "glam", version = "0.33" }
 rayon = "1"
+# The global allocator (feature `mimalloc`, on by default).
+mimalloc = { version = "0.1", optional = true, default-features = false }
 
 # DualSense and DualShock 4 rumble: Windows' controller API (through gilrs)
 # can't rumble them, so it goes to them as HID output reports.
@@ -49,10 +54,19 @@ hidapi = { version = "2", default-features = false, features = ["windows-native"
 gilrs = "0.11"
 
 [features]
+# mimalloc as the global allocator: the Windows heap's churn under per-frame
+# allocations (fx batch meshes, render-world frees) cost 3-6 Mcycles a frame
+# on the render thread and multi-second stalls (`--no-default-features` for
+# the system allocator, to compare).
+default = ["mimalloc"]
 # Test features, off in the normal build: ray-traced lighting (Bevy's Solari;
 # Options > Graphics > Lighting) and the Diamond mastery camo.
 raytracing = ["bevy/bevy_solari"]
 diamond = []
+# Per-system timings in the COD4RW_PERF log (Bevy's system spans, summed
+# in-process: perf.rs systrace).
+systrace = ["bevy/trace", "bevy/debug"]
+mimalloc = ["dep:mimalloc"]
 
 [build-dependencies]
 winresource = "0.1"

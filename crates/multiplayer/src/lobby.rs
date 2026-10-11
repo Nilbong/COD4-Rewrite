@@ -110,7 +110,7 @@ pub enum LobbyMsg {
     MatchOver(u8),
     /// Host -> everyone: a kill, by the pawns' snapshot IDs ([`BOT`] for no
     /// attacker), the weapon's asset name, and where it hit (0 head, 1
-    /// neck, 2 torso, 3 legs).
+    /// neck, 2 torso, 3 legs, 4 lower torso).
     Kill { victim: u16, attacker: u16, weapon: String, location: u8 },
     /// Host -> everyone: the teams' scores, when they change.
     Scores { allies: u32, axis: u32 },
@@ -120,7 +120,13 @@ pub enum LobbyMsg {
     /// Host -> everyone: a launched explosive (rocket, launcher grenade, C4,
     /// claymore): the weapon, from where, which way.
     Launch { shooter: u16, weapon: String, from: [f32; 3], dir: [f32; 3], yaw: f32 },
+    /// The match's other state, either way (objectives, killstreaks, the
+    /// clock, rounds...): the game encodes and checks it ([`MAX_GAME`]).
+    Game(Vec<u8>),
 }
+
+/// The largest [`LobbyMsg::Game`] payload.
+pub const MAX_GAME: usize = MAX_MESSAGE - 8;
 
 fn finite(v: &[f32]) -> bool {
     v.iter().all(|x| x.is_finite() && x.abs() <= 100_000.0)
@@ -277,8 +283,14 @@ impl LobbyMsg {
                 w.0.extend(allies.to_le_bytes());
                 w.0.extend(axis.to_le_bytes());
             }
+            Self::Game(data) => {
+                ensure!(!data.is_empty() && data.len() <= MAX_GAME, "invalid game message");
+                w.0.push(14);
+                w.0.extend((data.len() as u16).to_le_bytes());
+                w.0.extend(data);
+            }
             Self::Kill { victim, attacker, weapon, location } => {
-                ensure!(*location <= 3, "invalid hit location");
+                ensure!(*location <= 4, "invalid hit location");
                 w.0.push(10);
                 w.0.extend(victim.to_le_bytes());
                 w.0.extend(attacker.to_le_bytes());
@@ -395,9 +407,14 @@ impl LobbyMsg {
             10 => {
                 let k = Self::Kill { victim: r.u16()?, attacker: r.u16()?, weapon: r.asset()?, location: r.u8()? };
                 if let Self::Kill { location, .. } = &k {
-                    ensure!(*location <= 3, "invalid hit location");
+                    ensure!(*location <= 4, "invalid hit location");
                 }
                 k
+            }
+            14 => {
+                let n = r.u16()? as usize;
+                ensure!(n > 0 && n <= MAX_GAME, "invalid game message");
+                Self::Game(r.take(n)?.to_vec())
             }
             9 => {
                 let w = r.u8()?;
@@ -457,7 +474,9 @@ mod tests {
             LobbyMsg::Scores { allies: 7, axis: 75 },
             LobbyMsg::Throw { thrower: 2, kind: 0, at: [1.0, 2.0, 3.0], velocity: [0.0, 5.0, -9.0], fuse: 3.5 },
             LobbyMsg::Launch { shooter: 2, weapon: "rpg_mp".into(), from: [1.0, 2.0, 3.0], dir: [0.0, 0.0, -1.0], yaw: 0.5 },
-            LobbyMsg::Kill { victim: 3, attacker: BOT, weapon: "m16_gl_mp".into(), location: 0 },
+            LobbyMsg::Kill { victim: 3, attacker: BOT, weapon: "m16_gl_mp".into(), location: 4 },
+            LobbyMsg::Game(vec![1, 2, 3]),
+            LobbyMsg::Game(vec![9; MAX_GAME]),
             LobbyMsg::Class(Class {
                 guns: vec![("m4_mp:acog".into(), 2), ("deserteagle_mp".into(), 0)],
                 perks: vec!["specialty_fraggrenade".into(), "specialty_bulletdamage".into(), "specialty_longersprint".into()],

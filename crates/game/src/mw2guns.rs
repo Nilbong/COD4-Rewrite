@@ -448,34 +448,10 @@ impl Data {
                 names.extend(w.notetrack_sounds.iter().map(|(_, s)| s.to_ascii_lowercase()));
             }
         }
-        names.extend(STREAK_SOUNDS.iter().map(|s| s.to_string()));
-        for voice in ["us", "uk", "ab", "ru"] {
-            for line in ["achieve_carepackage", "use_carepackage", "enemy_carepackage", "achieve_sentrygun", "enemy_sentrygun", "sentry_destroyed", "sentry_gone"] {
-                names.insert(format!("{voice}_1mc_{line}"));
-            }
-        }
         names.remove("");
         names
     }
 }
-
-/// MW2's kill streak sounds the care package and the sentry gun play
-/// ([`crate::killstreaks`]); the announcer's lines are added per voice.
-const STREAK_SOUNDS: [&str; 13] = [
-    "mp_killstreak_carepackage",
-    "mp_killstreak_sentrygun",
-    "ammo_crate_use",
-    "sentry_drop",
-    "sentry_gun_plant",
-    "sentry_gun_beep",
-    "sentry_explode",
-    "sentry_explode_smoke",
-    "sentry_minigun_fire",
-    "sentry_minigun_cooldown",
-    "sentry_minigun_spin",
-    "sentry_minigun_spinup1",
-    "sentry_minigun_spindown1",
-];
 
 /// The weapon members naming sounds the game plays.
 const SOUND_FIELDS: [&str; 14] = [
@@ -643,7 +619,13 @@ fn def_from_weapon(w: &Weapon, group: Group) -> WeaponDef {
             height: fo("overlayHeight", 480.0),
         }),
         gunplay: crate::weapons::Gunplay {
-            location_mult: [1.4, 1.0, 1.0, 1.0, 1.0],
+            // `hitLocation_t` as CoD4's: 2 head, 3 neck, 4 upper torso, 5
+            // lower torso, 12 upper right leg (MW2's snipers' 1.5 on the
+            // chest is their one-shot kill).
+            location_mult: {
+                let m: Vec<f32> = w.get("locationDamageMultipliers").split_whitespace().filter_map(|v| v.parse().ok()).collect();
+                [2, 3, 4, 5, 12].map(|i| m.get(i).copied().filter(|v| *v > 0.0).unwrap_or(1.0))
+            },
             kick_center: (fo("fHipViewKickCenterSpeed", 1500.0), fo("fAdsViewKickCenterSpeed", 1500.0)),
             reduced_kick: [
                 (fo("hipGunKickReducedKickBullets", 0.0), fo("hipGunKickReducedKickPercent", 0.0)),
@@ -657,6 +639,7 @@ fn def_from_weapon(w: &Weapon, group: Group) -> WeaponDef {
                 crate::weapons::GunKick::read(&|k| fo(&format!("f{k}"), 0.0), "Ads"),
             ],
             gun_max: (fo("fGunMaxPitch", 6.0), fo("fGunMaxYaw", 6.0)),
+            shot_count: fo("shotCount", 1.0).clamp(1.0, 32.0) as u32,
         },
     }
 }
@@ -670,30 +653,9 @@ pub fn load_content() -> anyhow::Result<Content> {
     let common = parse(&data.install, "common_mp")?;
     let anims = iw4::convert::to_iw3_anims(&common);
     let zone = iw4::convert::to_iw3(&common, None);
-    let mut zones = vec![zone, anims];
-    zones.extend(crate_models(&data.install));
+    let zones = vec![zone, anims];
     log::info!("mw2 guns: gun content loaded in {:.2?}", t0.elapsed());
     Ok(Content::new(zones, data.vfs.clone()))
-}
-
-/// The care package's crates, one per team: MW2's big plastic cases (its
-/// team crates, `com_plasticcase_taskforce141` and `_arab`, borrow their
-/// mesh from a zone of another map), taken out of Rust's zone with what
-/// they use (MW2 keeps them in each map's zone, not `common_mp`).
-pub const CRATE_MODELS: [&str; 2] = ["com_plasticcase_green_big_us_dirt", "com_plasticcase_beige_big"];
-
-fn crate_models(install: &iw4::Install) -> Option<iw3::zone::Zone> {
-    let map = parse(install, "mp_rust").map_err(|e| log::warn!("mw2 guns: no crate models: {e:#}")).ok()?;
-    let empty = || iw4::zone::GNode { ty: String::new(), data: Vec::new(), fields: Vec::new(), locs: Vec::new() };
-    // Stand-ins for them, filled from the map's zone.
-    let wanted = iw4::zone::Zone {
-        script_strings: Vec::new(),
-        assets: CRATE_MODELS.iter().map(|n| iw4::zone::Asset { ty: iw4::zone::AssetType::XModel, name: format!(",{n}"), root: empty() }).collect(),
-        top_level: Vec::new(),
-        stats: Default::default(),
-        block_sizes: [0; iw4::zone::reader::BLOCK_COUNT],
-    };
-    Some(iw4::convert::to_iw3(&wanted, Some(&map)))
 }
 
 /// MW2's gun content for matches: loaded in the background when a match

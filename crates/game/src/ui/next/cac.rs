@@ -393,36 +393,59 @@ pub(in crate::ui) fn paint_select(fe: &Frontend, om: &OpenMenu, pl: &Placement, 
 // --- Class editor -----------------------------------------------------------
 
 static EDITOR_OPENED: AtomicI64 = AtomicI64::new(i64::MIN);
+/// The editor row last focused (its details stay shown).
+static EDITOR_SHOWN: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-/// The editor's places.
-const PRIMARY: R = R::new(96.0, 196.0, 1170.0, 352.0);
-const SECONDARY: R = R::new(96.0, 566.0, 1170.0, 214.0);
-const SIDE_X: f32 = 1290.0;
-const SIDE_W: f32 = 534.0;
-fn side(i: usize) -> R {
-    R::new(SIDE_X, 196.0 + i as f32 * 148.0, SIDE_W, 136.0)
+/// The editor's rows, in sections: (section, item name, the classic
+/// button's label, the row's label).
+const EDITOR_ROWS: [(&str, &str, &str, &str); 12] = [
+    ("Weapons", "cac_primary", "Primary Weapon", "Primary"),
+    ("Weapons", "cac_primary_variant", "Primary Variant", "Variant"),
+    ("Weapons", "cac_camo", "Camo", "Camo"),
+    ("Weapons", "cac_secondary", "Secondary Weapon", "Secondary"),
+    ("Weapons", "cac_secondary_variant", "Secondary Variant", "Variant"),
+    ("Perks", "cac_perk1", "Perk 1", "Perk 1"),
+    ("Perks", "cac_perk2", "Perk 2", "Perk 2"),
+    ("Perks", "cac_perk3", "Perk 3", "Perk 3"),
+    ("Perks", "cac_special", "Special Grenade", "Special Grenade"),
+    ("Kill Streaks", "cac_streaks", "", "Kill Streaks"),
+    ("Class", "cac_rename", "Rename", "Rename"),
+    ("Class", "cac_reset", "Reset to Default", "Reset to Default"),
+];
+
+const EDITOR_TOP: f32 = 176.0;
+const EDITOR_PITCH: f32 = 44.0;
+/// The details, right of the rows.
+const DETAILS: R = R::new(826.0, 192.0, 998.0, 780.0);
+
+/// Section headers (y, title) and each row's rect, by row.
+fn editor_layout() -> (Vec<(f32, &'static str)>, Vec<R>) {
+    let (mut heads, mut rows) = (Vec::new(), Vec::new());
+    let mut y = EDITOR_TOP;
+    let mut last = "";
+    for (section, ..) in EDITOR_ROWS {
+        if section != last {
+            if !last.is_empty() {
+                y += 18.0;
+            }
+            heads.push((y, section));
+            y += 32.0;
+            last = section;
+        }
+        rows.push(R::new(col_x(0), y, cols(4), EDITOR_PITCH - 4.0));
+        y += EDITOR_PITCH;
+    }
+    (heads, rows)
 }
-const RENAME: R = R::new(SIDE_X, 798.0, (SIDE_W - 14.0) * 0.5, 48.0);
-const RESET: R = R::new(SIDE_X + (SIDE_W + 14.0) * 0.5, 798.0, (SIDE_W - 14.0) * 0.5, 48.0);
 
 /// Where a classic button goes, by its label.
 fn editor_place(label: &str) -> Option<(R, &'static str)> {
-    let chip_at = |card: R, from_right: f32| R::new(card.right() - from_right, card.bottom() - 58.0, from_right - 24.0, 38.0);
-    Some(match label {
-        "Primary Weapon" => (PRIMARY, "cac_primary"),
-        "Side Arm" | "Secondary Weapon" => (SECONDARY, "cac_secondary"),
-        "Perk 1" => (side(0), "cac_perk1"),
-        "Perk 2" => (side(1), "cac_perk2"),
-        "Perk 3" => (side(2), "cac_perk3"),
-        "Special Grenade" => (side(3), "cac_special"),
-        "Primary Variant" => (chip_at(PRIMARY, 200.0), "cac_primary_variant"),
-        "Secondary Variant" => (chip_at(SECONDARY, 200.0), "cac_secondary_variant"),
-        "Camo" => (chip_at(PRIMARY, 360.0), "cac_camo"),
-        "Rename" => (RENAME, "cac_rename"),
-        "Reset to Default" => (RESET, "cac_reset"),
-        "Back" => (BACK, "cac_back"),
-        _ => return None,
-    })
+    if label == "Back" {
+        return Some((BACK, "cac_back"));
+    }
+    let (_, rows) = editor_layout();
+    let i = EDITOR_ROWS.iter().position(|(_, _, l, _)| !l.is_empty() && (*l == label || (label == "Side Arm" && *l == "Secondary Weapon")))?;
+    Some((rows[i], EDITOR_ROWS[i].1))
 }
 
 /// The class editor built from `menu_cac_<class>`.
@@ -446,9 +469,19 @@ pub(in crate::ui) fn editor_menu(fe: &Frontend, classic: &Menu) -> Option<Menu> 
         }
         out.items.push(item);
     }
+    let template = out.items.first()?.clone();
     if !out.items.iter().any(|it| it.window.name == "cac_back") {
-        let template = out.items.first()?.clone();
         out.items.push(back_item(&template, &out.on_esc));
+    }
+    // Kill streaks: the player's three (`super::streaks`).
+    let (_, rows) = editor_layout();
+    if let Some(i) = EDITOR_ROWS.iter().position(|r| r.1 == "cac_streaks") {
+        let mut it = place(template, rows[i], "cac_streaks".into(), "Kill Streaks".into());
+        it.action = format!("\"play\" \"mouse_click\" ; \"open\" \"{}\" ; ", super::streaks::MENU);
+        it.on_focus = "\"play\" \"mouse_over\" ; ".into();
+        it.mouse_enter = String::new();
+        it.visible_exp = Statement::default();
+        out.items.push(it);
     }
     Some(out)
 }
@@ -469,93 +502,130 @@ pub(in crate::ui) fn paint_editor(fe: &Frontend, om: &OpenMenu, pl: &Placement, 
     loadout_backdrop(&mut k);
     let ease = ease(fe, &EDITOR_OPENED);
     k.alpha = ease;
-    let class = fe.class_loadout(&format!("custom{}", slot + 1));
+    let class_key = format!("custom{}", slot + 1);
+    let class = fe.class_loadout(&class_key);
     let title = class.as_ref().map_or_else(|| format!("Custom Slot {}", slot + 1), |c| c.name.clone());
     header(&mut k, "Loadout  /  Create a Class", &title);
     // A popup over the editor: it stays, a little dimmer.
     let popup = covered(fe, om);
     let hot = if popup { None } else { focused_name(fe, om) };
     let shown = |name: &str| om.menu.items.iter().enumerate().any(|(i, it)| it.window.name == name && fe.item_visible(om, i));
-
-    // Rename.
-    if shown("cac_rename") {
-        let on = hot == Some("cac_rename");
-        let r = RENAME;
-        k.fill(r, if on { t::with_alpha(t::ACCENT, 0.35) } else { t::hex(0x000000, 0.45) });
-        k.frame(r, 1.5, if on { t::ACCENT } else { t::LINE });
-        k.text_mid(r.cx(), r.cy(), Type { size: 20.0, ..t::ROW_TEXT }, "Rename", t::INK, 1);
-    }
-
-    k.shift = Vec2::new(0.0, (1.0 - ease) * 16.0);
-    // Primary.
-    let on = hot == Some("cac_primary");
-    card(&mut k, PRIMARY, on);
-    let (x, y) = (PRIMARY.x + 40.0, PRIMARY.y + 32.0);
-    k.text(x, y, t::LABEL, "Primary weapon", if on { t::ACCENT } else { t::INK_DIM }, 0);
-    if let Some(g) = class.as_ref().and_then(|c| c.guns.first()) {
-        k.text(x, y + 26.0, Type { size: 52.0, ..t::DISPLAY }, &g.name, t::INK, 0);
-        let h = chips(&mut k, x, y + 92.0, x + 470.0, &gun_chips(fe, g));
-        stat_bars(&mut k, x, y + 108.0 + h, 420.0, &g.spec);
-        gun(&mut k, R::new(PRIMARY.x + 470.0, PRIMARY.y + 12.0, PRIMARY.w - 490.0, 290.0), b + 1, &g.spec, g.camo);
-    }
-    // Secondary.
-    let on = hot == Some("cac_secondary");
-    card(&mut k, SECONDARY, on);
-    let (x, y) = (SECONDARY.x + 40.0, SECONDARY.y + 30.0);
-    k.text(x, y, t::LABEL, "Secondary weapon", if on { t::ACCENT } else { t::INK_DIM }, 0);
-    if let Some(g) = class.as_ref().and_then(|c| c.guns.get(1)) {
-        k.text(x, y + 26.0, Type { size: 40.0, ..t::H1 }, &g.name, t::INK, 0);
-        chips(&mut k, x, y + 80.0, x + 520.0, &gun_chips(fe, g));
-        gun(&mut k, R::new(SECONDARY.x + 520.0, SECONDARY.y + 8.0, 420.0, 196.0), b + 3, &g.spec, g.camo);
-    }
-    // The variant and camo chips inside the weapon cards.
-    for (name, label) in [("cac_primary_variant", "Variant"), ("cac_secondary_variant", "Variant"), ("cac_camo", "Camo")] {
-        if !shown(name) {
-            continue;
-        }
-        let Some((r, _)) = editor_place(match name {
-            "cac_primary_variant" => "Primary Variant",
-            "cac_secondary_variant" => "Secondary Variant",
-            _ => "Camo",
-        }) else {
-            continue;
-        };
-        let on = hot == Some(name);
-        k.fill(r, if on { t::with_alpha(t::ACCENT, 0.35) } else { t::hex(0x000000, 0.5) });
-        k.frame(r, 1.5, if on { t::ACCENT } else { t::LINE });
-        k.text_mid(r.cx(), r.cy(), Type { size: 19.0, ..t::ROW_TEXT }, label, t::INK, 1);
-    }
-
-    // Perks and the special grenade.
     let items = class_items(fe, slot);
-    for (i, (name, over)) in [("cac_perk1", "Perk 1"), ("cac_perk2", "Perk 2"), ("cac_perk3", "Perk 3"), ("cac_special", "Special grenade")].iter().enumerate() {
-        // Not editable now (a weapon perk set by an attachment): shown,
-        // locked.
-        let editable = shown(name);
-        let r = side(i);
-        let on = hot == Some(*name);
-        card(&mut k, r, on);
-        k.text(r.x + 28.0, r.y + 22.0, t::LABEL, over, if on { t::ACCENT } else { t::INK_DIM }, 0);
-        if !editable {
-            k.lock(Vec2::new(r.right() - 30.0, r.y + 28.0), 18.0, t::INK_MUTE);
+    let primary = class.as_ref().and_then(|c| c.guns.first());
+    let secondary = class.as_ref().and_then(|c| c.guns.get(1));
+
+    // The rows.
+    k.shift = Vec2::new((1.0 - ease) * -20.0, 0.0);
+    let (heads, rects) = editor_layout();
+    for (y, title) in heads {
+        section(&mut k, col_x(0), y, cols(4), title);
+    }
+    let regular = Type { cut: super::font::Cut::Regular, size: 19.0, ..t::ROW_TEXT };
+    for (i, r) in rects.iter().enumerate() {
+        let (_, name, _, label) = EDITOR_ROWS[i];
+        let on = hot == Some(name);
+        let available = shown(name);
+        let ty = Type { size: 24.0, ..t::ROW_TEXT };
+        if on {
+            k.slice3(R::new(r.x - 4.0, r.y - 3.0, r.w + 8.0, r.h + 6.0), "next:panels/row_focus", Vec2::new(450.0, 88.0), 70.0, 80.0, [1.0; 4]);
+            k.grad_h(R::new(r.x + 8.0, r.y + 4.0, r.w * 0.7, r.h - 8.0), t::ACCENT, 0.22, 0.0);
+        } else {
+            k.hline(r.x + 24.0, r.right(), r.bottom(), 1.0, t::HAIRLINE);
         }
-        if let Some(reference) = items[i].clone() {
-            let (title, picture) = item(fe, &reference);
-            k.text(r.x + 28.0, r.y + 46.0, Type { size: 28.0, ..t::H2 }, &title, t::INK, 0);
-            let about = description(fe, &reference);
-            k.para(r.x + 28.0, r.y + 84.0, r.w - 150.0, Type { size: 17.0, ..t::CAPTION }, &about, t::INK_DIM, 1.2);
-            if !picture.is_empty() {
-                icon_box(&mut k, R::new(r.right() - 116.0, r.y + 22.0, 96.0, 96.0));
-                k.pic(R::new(r.right() - 108.0, r.y + 30.0, 80.0, 80.0), &picture, [1.0; 4]);
+        let ink = if !available { t::INK_MUTE } else if on { t::INK } else { t::INK_DIM };
+        // (Variant and camo rows sit under their gun.)
+        let indent = if matches!(name, "cac_primary_variant" | "cac_camo" | "cac_secondary_variant") { 44.0 } else { 24.0 };
+        k.text_mid(r.x + indent, r.cy(), ty, label, ink, 0);
+        // What's chosen, on the right.
+        let right = r.right() - 16.0;
+        let perk = |n: usize| items[n].clone().map(|reference| item(fe, &reference));
+        let value: Option<(String, Option<String>)> = match name {
+            "cac_primary" => primary.map(|g| (g.name.clone(), None)),
+            "cac_secondary" => secondary.map(|g| (g.name.clone(), None)),
+            "cac_primary_variant" => primary.map(|g| (if g.variant.is_some() { "Equipped".into() } else { "None".into() }, None)),
+            "cac_secondary_variant" => secondary.map(|g| (if g.variant.is_some() { "Equipped".into() } else { "None".into() }, None)),
+            "cac_camo" => primary.map(|g| (camo_name(g.camo).unwrap_or("None").into(), None)),
+            "cac_perk1" => perk(0).map(|(n, p)| (n, Some(p))),
+            "cac_perk2" => perk(1).map(|(n, p)| (n, Some(p))),
+            "cac_perk3" => perk(2).map(|(n, p)| (n, Some(p))),
+            "cac_special" => perk(3).map(|(n, p)| (n, Some(p))),
+            _ => None,
+        };
+        if name == "cac_streaks" {
+            for (n, h) in super::streaks::chosen(fe).iter().rev().enumerate() {
+                k.pic(R::new(right - 34.0 - n as f32 * 40.0, r.cy() - 16.0, 32.0, 32.0), h.hud_icon(), [1.0, 1.0, 1.0, if on { 1.0 } else { 0.8 }]);
+            }
+        } else if let Some((text, icon)) = value {
+            let mut x = right;
+            if let Some(p) = icon.filter(|p| !p.is_empty()) {
+                k.pic(R::new(x - 30.0, r.cy() - 15.0, 30.0, 30.0), &p, [1.0, 1.0, 1.0, if on { 1.0 } else { 0.8 }]);
+                x -= 40.0;
+            }
+            k.text_mid(x, r.cy(), regular, &text, if on { t::INK } else { t::INK_MUTE }, 2);
+        } else if !available && !matches!(name, "cac_rename" | "cac_reset") {
+            k.lock(Vec2::new(right - 10.0, r.cy()), 16.0, t::INK_MUTE);
+        }
+    }
+
+    // The details of the row focused (or last focused).
+    k.shift = Vec2::new((1.0 - ease) * 20.0, 0.0);
+    let showing = {
+        let mut last = EDITOR_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = hot.filter(|h| h.starts_with("cac_") && *h != "cac_back") {
+            *last = h.to_owned();
+        }
+        last.clone()
+    };
+    let p = DETAILS;
+    let (x, w) = (p.x + 44.0, p.w - 88.0);
+    match showing.as_str() {
+        "cac_primary" | "cac_primary_variant" | "cac_camo" | "cac_secondary" | "cac_secondary_variant" => {
+            let second = showing.starts_with("cac_secondary");
+            let (gun_key, over) = if second { (b + 3, "Secondary weapon") } else { (b + 1, "Primary weapon") };
+            grid_panel(&mut k, p, 84.0, 1.0);
+            if let Some(g) = if second { secondary } else { primary } {
+                k.text(x, p.y + 36.0, t::LABEL, over, t::ACCENT, 0);
+                k.text(x, p.y + 60.0, Type { size: 52.0, ..t::DISPLAY }, &g.name, t::INK, 0);
+                // The gun itself, large: the 3D preview, not its small picture.
+                gun(&mut k, R::new(p.x + 40.0, p.y + 130.0, p.w - 80.0, 380.0), gun_key, &g.spec, g.camo);
+                let h = chips(&mut k, x, p.y + 540.0, x + w, &gun_chips(fe, g));
+                stat_bars(&mut k, x, p.y + 560.0 + h, w * 0.6, &g.spec);
             }
         }
-    }
-    // Reset.
-    if shown("cac_reset") {
-        let on = hot == Some("cac_reset");
-        k.fill(RESET, if on { t::with_alpha(t::ENEMY, 0.25) } else { t::hex(0x000000, 0.45) });
-        k.frame(RESET, 1.5, if on { t::ENEMY } else { t::LINE });
-        k.text_mid(RESET.cx(), RESET.cy(), Type { size: 21.0, ..t::ROW_TEXT }, "Reset to Default", t::INK, 1);
+        "cac_perk1" | "cac_perk2" | "cac_perk3" | "cac_special" => {
+            let names = ["cac_perk1", "cac_perk2", "cac_perk3", "cac_special"];
+            let n = names.iter().position(|s| *s == showing).unwrap_or(0);
+            grid_panel(&mut k, R::new(p.x, p.y, p.w, 420.0), 84.0, 1.0);
+            let over = ["Perk 1", "Perk 2", "Perk 3", "Special grenade"][n];
+            k.text(x, p.y + 36.0, t::LABEL, over, t::ACCENT, 0);
+            if let Some(reference) = items[n].clone() {
+                let (title, picture) = item(fe, &reference);
+                k.text(x, p.y + 60.0, Type { size: 52.0, ..t::DISPLAY }, &title, t::INK, 0);
+                if !picture.is_empty() {
+                    icon_box(&mut k, R::new(x, p.y + 150.0, 180.0, 180.0));
+                    k.pic(R::new(x + 18.0, p.y + 168.0, 144.0, 144.0), &picture, [1.0; 4]);
+                }
+                k.para(x + 210.0, p.y + 160.0, w - 210.0, Type { size: 22.0, ..t::BODY }, &description(fe, &reference), t::INK_DIM, 1.3);
+            }
+            if !shown(names[n]) {
+                k.text(x, p.y + 360.0, Type { size: 19.0, ..t::CAPTION }, "Set by the primary weapon's attachment.", t::INK_MUTE, 0);
+            }
+        }
+        "cac_streaks" => {
+            grid_panel(&mut k, R::new(p.x, p.y, p.w, 420.0), 84.0, 1.0);
+            k.text(x, p.y + 36.0, t::LABEL, "Kill streaks", t::ACCENT, 0);
+            k.text(x, p.y + 60.0, Type { size: 40.0, ..t::H1 }, "Yours, in every class", t::INK, 0);
+            let picked = super::streaks::chosen(fe);
+            let cw = (w - 32.0) / super::streaks::MAX as f32;
+            for (i, h) in picked.iter().enumerate() {
+                let cx = x + i as f32 * (cw + 16.0);
+                icon_box(&mut k, R::new(cx, p.y + 130.0, 150.0, 150.0));
+                k.pic(R::new(cx + 15.0, p.y + 145.0, 120.0, 120.0), h.hud_icon(), [1.0; 4]);
+                k.text(cx, p.y + 296.0, Type { size: 26.0, ..t::H2 }, h.name(), t::INK, 0);
+                k.text(cx, p.y + 330.0, t::MICRO, &format!("{} kills", h.kills()), t::INK_DIM, 0);
+            }
+        }
+        _ => class_panel(&mut k, p, &class_key, "Custom class", b),
     }
     k.shift = Vec2::ZERO;
     if popup {

@@ -38,11 +38,13 @@ impl Frontend {
         super::next::lobby::paint(self, om, pl, ops);
         super::next::maps::paint(self, om, pl, ops);
         super::next::modes::paint(self, om, pl, ops);
+        super::next::join::paint(self, om, pl, ops);
         super::next::popup::paint(self, om, pl, ops);
         super::next::drops::paint(self, om, pl, ops);
         super::next::settings::paint(self, om, pl, ops);
         super::next::match_menus::paint(self, om, pl, ops);
         super::next::profiles::paint(self, om, pl, ops);
+        super::next::streaks::paint(self, om, pl, ops);
     }
 }
 

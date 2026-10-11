@@ -119,8 +119,6 @@ pub enum Action {
     Killstreak1,
     Killstreak2,
     Killstreak3,
-    Killstreak4,
-    Killstreak5,
     Inspect,
     Use,
     NightVision,
@@ -129,7 +127,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 29] = [
+    pub const ALL: [Action; 27] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -152,8 +150,6 @@ impl Action {
         Action::Killstreak1,
         Action::Killstreak2,
         Action::Killstreak3,
-        Action::Killstreak4,
-        Action::Killstreak5,
         Action::Inspect,
         Action::Use,
         Action::NightVision,
@@ -183,14 +179,12 @@ impl Action {
             Action::Weapon2 => Digit2,
             Action::Frag => KeyG,
             Action::Special => Digit4,
-            // Equipment on 3, the kill streaks on 5 to 9 (one each: UAV,
-            // airstrike, helicopter, then the care package and the sentry).
+            // Equipment on 3, the kill streaks on 5, 6 and 7: the first,
+            // second and third of the player's chosen three.
             Action::Equipment => Digit3,
             Action::Killstreak1 => Digit5,
             Action::Killstreak2 => Digit6,
             Action::Killstreak3 => Digit7,
-            Action::Killstreak4 => Digit8,
-            Action::Killstreak5 => Digit9,
             Action::Inspect => KeyI,
             Action::Use => KeyF,
             Action::NightVision => KeyN,
@@ -224,8 +218,6 @@ impl Action {
             Action::Killstreak1 => "bind_killstreak1",
             Action::Killstreak2 => "bind_killstreak2",
             Action::Killstreak3 => "bind_killstreak3",
-            Action::Killstreak4 => "bind_killstreak4",
-            Action::Killstreak5 => "bind_killstreak5",
             Action::Inspect => "bind_inspect",
             Action::Use => "bind_activate",
             Action::NightVision => "bind_nightvision",

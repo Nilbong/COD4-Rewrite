@@ -1,28 +1,35 @@
-//! Playing an online private match together ([`crate::online`]'s lobby
-//! started it).
+//! Playing an online match together ([`crate::online`]'s lobby started it).
 //!
-//! The host's game is the match: its pawns, bots, shots, damage, deaths and
-//! score are the real ones. A friend's soldier on the host is a pawn like a
-//! bot, driven by the controls the friend's game sends ([`RemotePlayer`]).
-//! Twenty times a second the host sends everyone where every pawn is
-//! (a snapshot), and when a pawn's name, team, weapon or score changes, that
-//! too ([`PawnInfo`]).
+//! The host's game is the match: its pawns, bots, shots, damage, deaths,
+//! objectives, kill streaks and score are the real ones. A friend's soldier
+//! on the host is a pawn like a bot, moved by the controls the friend's game
+//! sends, command by command, for as long as each was held
+//! ([`RemotePlayer`], [`step_remotes`]). Twenty times a second the host
+//! sends everyone where every pawn is (a snapshot) with the rest of what's
+//! going on (the clock, objectives, UAVs, killstreak aircraft and sentries:
+//! [`world`], [`streaks`]); when a pawn's name, team, weapon or score
+//! changes, that too ([`PawnInfo`]).
 //!
 //! A friend's game ("guest") moves its own soldier itself, straight away,
-//! as the host will (same movement code, same controls), and is put right
-//! when the two drift apart. Everyone else is a [`Puppet`]: posed from the
-//! snapshots, a tenth of a second behind so there's always a next one to
-//! move towards. The guest's game decides nothing: health, deaths and
-//! respawns come from the host ([`authority`] turns its own off).
+//! as the host will (same movement code, same controls), and replays what
+//! the host hasn't seen yet over each snapshot's word ([`predict`]).
+//! Everyone else is a [`Puppet`]: posed from the snapshots, a little behind
+//! (more on a jittery or lossy connection) so there's always a next one to
+//! move towards, and carried on along their way for a moment if they stop
+//! coming. The guest's game decides nothing: health, deaths, respawns,
+//! objectives and kill streaks come from the host ([`authority`] turns its
+//! own off). The host traces a friend's shots against everyone where the
+//! friend saw them ([`lagcomp`]).
 //!
 //! The host also tells guests about kills (their kill feeds, ragdolls,
 //! killcams and "Killed by"), team scores, grenades thrown and explosives
-//! launched (seen and heard; their damage is the host's), and the end of
-//! the match (everyone sees the result and goes back to the lobby).
+//! launched and set off (seen and heard; their damage is the host's),
+//! rounds ending, awards, killstreaks called in, and the end of the match
+//! (everyone sees the result and goes back to the lobby). Friends can join
+//! a match under way, in place of a bot ([`join`]).
 //!
-//! Not yet: killstreaks and objectives (Domination's flags, the bomb) are
-//! seen only by the host, so online play is Team Deathmatch and
-//! free-for-all for now; shots aren't rewound for lag.
+//! Testing: `COD4RW_NETSIM=ms,loss%[,jitter]` ([`crate::online::NetSim`]),
+//! `COD4RW_NETGRAPH=1` ([`graph`]).
 
 use crate::combat::{Dead, Health, Pawn, PawnAssets, Team, spawn_pawn};
 use crate::loadout::{ClassLoadout, Gun, PawnClass};
@@ -32,10 +39,20 @@ use crate::online::{EVERYONE, Event, HOST, Online};
 use crate::player::LocalPlayer;
 use crate::weapons::{ShotFired, WeaponInput, WeaponState};
 use bevy::prelude::*;
-use cod4rw_multiplayer::protocol::{INPUT_REDUNDANCY, InputCommand, PawnState, PeerId, Snapshot, button, pawn_flags};
 use cod4rw_multiplayer::netcode::Interpolation;
-use std::collections::HashMap;
+use cod4rw_multiplayer::protocol::{INPUT_REDUNDANCY, InputCommand, PawnState, PeerId, Snapshot, button, pawn_flags};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+pub mod graph;
+pub mod join;
+pub mod lagcomp;
+mod predict;
+mod streaks;
+mod wire;
+mod world;
+
+pub(crate) use predict::send_inputs;
 
 pub struct NetplayPlugin;
 
@@ -43,18 +60,20 @@ impl Plugin for NetplayPlugin {
     fn build(&self, app: &mut App) {
         use crate::movement::MovementSet;
         use crate::player::InputSet;
-        app.add_systems(OnEnter(crate::state::GameState::InGame), begin.in_set(crate::state::Setup::Spawn))
+        app.init_resource::<graph::NetStats>()
+            .init_resource::<world::HostInbox>()
+            .init_resource::<world::GuestInbox>()
+            .add_systems(OnEnter(crate::state::GameState::InGame), begin.in_set(crate::state::Setup::Spawn))
             .add_systems(OnExit(crate::state::GameState::InGame), end)
             .add_systems(
                 Update,
                 (
-                    (receive_host, spawn_remotes).chain().before(InputSet),
+                    (receive_host, join::admit_joiners, join::refill, spawn_remotes).chain().before(InputSet),
                     drive_remotes.after(InputSet).before(MovementSet),
+                    step_remotes.in_set(MovementSet),
+                    lagcomp::record.after(MovementSet).before(crate::weapons::WeaponSet),
                     send_world.after(crate::weapons::WeaponSet),
-                    announce_end,
-                    send_kills,
-                    send_scores,
-                    send_throws,
+                    (announce_end, send_kills, send_throws, world::host_news, world::host_requests, world::test_give, streaks::host_blasts, host_pings),
                     report.run_if(bevy::time::common_conditions::on_timer(std::time::Duration::from_secs(2))),
                     look_at_friend.after(InputSet).before(MovementSet).run_if(|| std::env::var_os("COD4RW_NETLOOK").is_some()),
                 )
@@ -66,12 +85,15 @@ impl Plugin for NetplayPlugin {
                     (receive_guest, send_class).chain().before(InputSet),
                     aim_at_host.after(InputSet).before(send_inputs).run_if(|| std::env::var("COD4RW_NETLOOK").is_ok_and(|v| v == "fire")),
                     send_inputs.after(InputSet).before(MovementSet),
+                    predict::predict_own.in_set(MovementSet),
                     leave_with_host,
+                    (world::apply, world::guest_news, world::guest_streaks, streaks::mirror).chain().after(receive_guest),
                     (pose_puppets, correct_own).after(MovementSet).before(crate::thirdperson::BodyAnimSet),
                     report.run_if(bevy::time::common_conditions::on_timer(std::time::Duration::from_secs(2))),
                 )
                     .run_if(crate::state::in_game.and_then(guesting)),
-            );
+            )
+            .add_systems(Update, (graph::count_hits.after(crate::weapons::WeaponSet), graph::show).run_if(crate::state::in_game.and_then(|n: Option<Res<NetStart>>| n.is_some())));
     }
 }
 
@@ -82,11 +104,50 @@ pub struct NetStart {
     pub members: Vec<Member>,
 }
 
+/// Players' pings for the scoreboard, by pawn ID ([`BOT_PING`] for bots):
+/// the host's friends as their games measure it, the host 0, kept by the
+/// host and sent to guests in the snapshots.
+static PINGS: std::sync::Mutex<Vec<(u32, u16)>> = std::sync::Mutex::new(Vec::new());
+const BOT_PING: u16 = u16::MAX;
+
+/// The scoreboard's Ping for a pawn in an online match ("BOT" for a bot),
+/// or `None` offline.
+pub fn ping_text(pawn: u32) -> Option<String> {
+    let pings = PINGS.lock().ok()?;
+    let &(_, ms) = pings.iter().find(|(id, _)| *id == pawn)?;
+    Some(if ms == BOT_PING { "BOT".into() } else { ms.to_string() })
+}
+
+/// Is there a ping to show (an online match)?
+pub fn has_pings() -> bool {
+    PINGS.lock().is_ok_and(|p| !p.is_empty())
+}
+
+fn set_pings(list: Vec<(u32, u16)>) {
+    if let Ok(mut p) = PINGS.lock() {
+        *p = list;
+    }
+}
+
+/// Host: everyone's ping, once a second.
+fn host_pings(time: Res<Time>, mut next: Local<f32>, stats: Res<graph::NetStats>, pawns: Query<(&Pawn, Option<&RemotePlayer>, Has<crate::bots::Bot>)>) {
+    if time.elapsed_secs() < *next {
+        return;
+    }
+    *next = time.elapsed_secs() + 1.0;
+    set_pings(
+        pawns
+            .iter()
+            .map(|(p, remote, bot)| (p.id, if bot { BOT_PING } else { remote.and_then(|r| stats.peer_ping.get(&r.peer).copied()).unwrap_or(0).min(9999) }))
+            .collect(),
+    );
+}
+
 /// Set while this game is a guest: its own game logic stands down.
 static GUEST: AtomicBool = AtomicBool::new(false);
 
-/// Does this game decide what happens (health, deaths, score)? Everyone
-/// but an online guest. A run condition.
+/// Does this game decide what happens (health, deaths, score, objectives,
+/// kill streaks)? Everyone but an online guest. A run condition.
 pub fn authority() -> bool {
     !GUEST.load(Ordering::Relaxed)
 }
@@ -117,15 +178,40 @@ pub struct Puppet {
     lived: bool,
 }
 
+/// Host: one friend's connection.
+#[derive(Default)]
+pub(crate) struct Peer {
+    /// Commands to run, oldest first; the newest heard (for the gun,
+    /// grenades...), and buttons tapped since the last frame.
+    queue: VecDeque<InputCommand>,
+    newest: Option<InputCommand>,
+    taps: u16,
+    /// Movement time the friend may still use (ms): it can't run its
+    /// soldier faster than the clock.
+    budget: f32,
+    /// The last command run, and when.
+    applied: u32,
+    applied_at: f32,
+    /// Commands heard and missed (net graph).
+    heard: u32,
+    missed: u32,
+    rate_from: f32,
+    /// Snapshots sent them.
+    snapshots: u16,
+}
+
 /// Host: what's been heard from each friend, and what's been told.
 #[derive(Resource, Default)]
 pub(crate) struct HostState {
-    /// Each friend's newest controls, and the buttons of the ones before.
-    inputs: HashMap<PeerId, (InputCommand, u16)>,
+    peers: HashMap<PeerId, Peer>,
     /// Friends whose pawn is still to be spawned.
     waiting: Vec<Member>,
+    /// Friends in the match (snapshots go to them).
+    members: Vec<Member>,
     /// What each pawn's info was when last sent.
     sent: HashMap<u16, PawnInfo>,
+    /// Sides to give a bot (a friend left).
+    refill: Vec<Team>,
     next_snapshot: f32,
     /// How many pawns were in cover in the last snapshot (for the log).
     covered_logged: usize,
@@ -139,24 +225,41 @@ pub(crate) struct GuestState {
     info: HashMap<u16, PawnInfo>,
     /// Where puppets are drawn, in host ticks (a little behind the newest).
     clock: Option<f32>,
-    /// Our controls: the next number, and the last few sent.
-    sequence: u32,
-    recent: Vec<InputCommand>,
-    next_send: f32,
+    /// How far behind (ticks): more on a jittery or lossy connection.
+    delay: f32,
+    /// Ticks between snapshots (smoothed).
+    interval: f32,
     /// This game's pawn as the host numbers it.
     my_id: Option<u16>,
     /// Who last killed us, for "Killed by".
     killer: Option<String>,
+    /// Snapshots: when the last came (s), its sequence, the jitter (s),
+    /// arrivals in the last second, and recent losses.
+    arrived_at: Option<f32>,
+    sequence: Option<u16>,
+    jitter: f32,
+    arrivals: VecDeque<f32>,
+    lost: f32,
+    next_ping: f32,
 }
 
 /// Host ticks (60 a second), the snapshots' clock.
 const TICK_RATE: f32 = 60.0;
-/// Snapshots a second.
-const SNAPSHOT_RATE: f32 = 20.0;
-/// Puppets are drawn this far behind the newest snapshot (ticks: 100 ms).
-const DELAY_TICKS: f32 = 6.0;
-/// Our soldier is put where the host has it when they're this far apart.
-const SNAP_DISTANCE: f32 = 1.5;
+/// Snapshots a second (`net.snapshot_hz` in tuning.txt, 10 to 60).
+fn snapshot_rate() -> f32 {
+    // (`COD4RW_NETTEST_SNAPHZ` for tests: the old 20, to compare.)
+    let test = std::env::var("COD4RW_NETTEST_SNAPHZ").ok().and_then(|v| v.parse::<f32>().ok());
+    test.unwrap_or_else(|| crate::tune::get("net.snapshot_hz", 40.0)).clamp(10.0, 60.0)
+}
+/// Puppets are drawn about two snapshots behind the newest, plus the
+/// jitter, plus more while snapshots go missing ([`GuestState::delay`]):
+/// at least this far (ticks: 33 ms)...
+const MIN_DELAY_TICKS: f32 = 2.0;
+/// ...and at most this far (300 ms).
+const MAX_DELAY_TICKS: f32 = 18.0;
+/// Puppets carry on along their way for at most this long (ticks) when
+/// snapshots stop coming.
+const EXTRAPOLATE_TICKS: f32 = 9.0;
 
 /// The class a friend starts with until they pick one.
 fn default_class() -> ClassLoadout {
@@ -174,24 +277,35 @@ fn default_class() -> ClassLoadout {
 fn begin(mut commands: Commands, net: Option<Res<NetStart>>) {
     let Some(net) = net else {
         GUEST.store(false, Ordering::Relaxed);
+        join::accept(&mut commands, false);
         return;
     };
     let guest = net.me != HOST;
     GUEST.store(guest, Ordering::Relaxed);
+    join::accept(&mut commands, !guest);
+    commands.insert_resource(graph::NetStats::default());
     if guest {
         info!("netplay: joining the host's match as player {}", net.me);
-        commands.insert_resource(GuestState::default());
+        commands.insert_resource(GuestState { delay: 6.0, interval: 1.5, ..default() });
+        commands.insert_resource(predict::Prediction::default());
     } else {
         info!("netplay: hosting {} friends", net.members.len().saturating_sub(1));
-        commands.insert_resource(HostState { waiting: net.members.iter().filter(|m| m.peer != HOST).cloned().collect(), ..default() });
+        let friends: Vec<Member> = net.members.iter().filter(|m| m.peer != HOST).cloned().collect();
+        // Test aid: `COD4RW_NETTEST_BOTS=<n>` adds n bots a side.
+        let bots = std::env::var("COD4RW_NETTEST_BOTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(8);
+        let refill = [Team::Allies, Team::Axis].into_iter().flat_map(|t| std::iter::repeat_n(t, bots)).collect();
+        commands.insert_resource(HostState { waiting: friends.clone(), members: friends, refill, ..default() });
     }
 }
 
 fn end(mut commands: Commands) {
     GUEST.store(false, Ordering::Relaxed);
+    set_pings(Vec::new());
+    join::accept(&mut commands, false);
     commands.remove_resource::<NetStart>();
     commands.remove_resource::<HostState>();
     commands.remove_resource::<GuestState>();
+    commands.remove_resource::<predict::Prediction>();
 }
 
 fn team_of(t: u8) -> Team {
@@ -231,7 +345,15 @@ fn class_to(c: &ClassLoadout) -> Class {
     }
 }
 
+/// A weapon or asset name as the protocol carries it.
+fn asset_name(s: &str) -> String {
+    s.chars().take(48).filter(|c| c.is_ascii_alphanumeric() || "_:+".contains(*c)).collect()
+}
+
+// ---- Debug ----
+
 /// Where everyone is, now and then (debug).
+#[allow(clippy::type_complexity)]
 fn report(pawns: Query<(&Pawn, &Transform, Has<Dead>, Has<LocalPlayer>, Has<RemotePlayer>, Has<Puppet>, &Health, &WeaponState, Option<&WeaponInput>)>) {
     let line: Vec<String> = pawns
         .iter()
@@ -292,7 +414,8 @@ fn look_at_friend(
 
 // ---- Host ----
 
-/// Friends' controls and classes; friends who left.
+/// Friends' controls, classes and requests; friends who left.
+#[allow(clippy::too_many_arguments)]
 fn receive_host(
     mut commands: Commands,
     mut online: ResMut<Online>,
@@ -301,17 +424,31 @@ fn receive_host(
     time: Res<Time>,
     mut remotes: Query<(Entity, &RemotePlayer, Option<&mut Dead>)>,
     mut pawns: Query<&mut Pawn>,
+    mut inbox: ResMut<world::HostInbox>,
+    mut stats: ResMut<graph::NetStats>,
 ) {
+    let now = time.elapsed_secs();
     let mut switch = Vec::new();
     for event in online.take_game() {
         match event {
-            Event::Inputs(peer, commands) => {
-                for c in commands {
-                    let entry = state.inputs.entry(peer).or_insert((c, 0));
-                    if cod4rw_multiplayer::security::newer(c.sequence, entry.0.sequence) {
-                        // Buttons pressed between the newest two count.
-                        entry.1 |= entry.0.buttons;
-                        entry.0 = c;
+            Event::Inputs(peer, list) => {
+                let Some(p) = state.peers.get_mut(&peer) else { continue };
+                for c in list {
+                    // Not run yet and not already waiting (a late one comes
+                    // in in its place).
+                    if p.applied != 0 && !cod4rw_multiplayer::security::newer(c.sequence, p.applied) || p.queue.iter().any(|q| q.sequence == c.sequence) {
+                        continue;
+                    }
+                    p.heard += 1;
+                    p.taps |= c.buttons;
+                    if p.newest.is_none_or(|n| cod4rw_multiplayer::security::newer(c.sequence, n.sequence)) {
+                        p.newest = Some(c);
+                    }
+                    let at = p.queue.iter().position(|q| cod4rw_multiplayer::security::newer(q.sequence, c.sequence)).unwrap_or(p.queue.len());
+                    p.queue.insert(at, c);
+                    // A friend far behind: the oldest go.
+                    while p.queue.len() > 30 {
+                        p.queue.pop_front();
                     }
                 }
             }
@@ -325,10 +462,14 @@ fn receive_host(
                         && dead.respawn_at == f32::INFINITY
                         && !locked
                     {
-                        dead.respawn_at = time.elapsed_secs();
+                        dead.respawn_at = now;
                     }
                 }
             }
+            Event::Message(peer, LobbyMsg::Game(data)) => match wire::GameMsg::decode(&data) {
+                Ok(m) => inbox.0.push((peer, m)),
+                Err(e) => debug!("netplay: a bad message from player {peer}: {e}"),
+            },
             // A friend changed sides from the in-game menu: their soldier
             // goes over, waiting for their class for the new side.
             Event::Message(peer, LobbyMsg::SwitchTeam) => {
@@ -340,9 +481,17 @@ fn receive_host(
             }
             Event::PeerLeft(peer) => {
                 state.waiting.retain(|m| m.peer != peer);
-                state.inputs.remove(&peer);
+                state.members.retain(|m| m.peer != peer);
+                state.peers.remove(&peer);
+                stats.peer_ping.remove(&peer);
+                stats.peer_rate.remove(&peer);
+                stats.peer_loss.remove(&peer);
                 for (e, r, _) in &remotes {
                     if r.peer == peer {
+                        if let Ok(p) = pawns.get(e) {
+                            info!("netplay: {} left; a bot takes their place", p.name);
+                            state.refill.push(p.team);
+                        }
                         commands.entity(e).despawn();
                     }
                 }
@@ -352,9 +501,19 @@ fn receive_host(
     }
     for e in switch {
         if let Ok(mut pawn) = pawns.get_mut(e) {
-            pawn.team = if pawn.team == crate::combat::Team::Allies { crate::combat::Team::Axis } else { crate::combat::Team::Allies };
+            pawn.team = if pawn.team == Team::Allies { Team::Axis } else { Team::Allies };
             info!("netplay: {} switched to {:?}", pawn.name, pawn.team);
             commands.entity(e).insert((Dead { respawn_at: f32::INFINITY, killer: None }, Frozen));
+        }
+    }
+    // The net graph: commands a second and the share lost, per friend.
+    for (peer, p) in state.peers.iter_mut() {
+        if now - p.rate_from >= 1.0 {
+            let span = now - p.rate_from;
+            stats.peer_rate.insert(*peer, p.heard as f32 / span);
+            let total = (p.heard + p.missed).max(1);
+            stats.peer_loss.insert(*peer, p.missed as f32 / total as f32);
+            (p.heard, p.missed, p.rate_from) = (0, 0, now);
         }
     }
 }
@@ -363,6 +522,7 @@ fn receive_host(
 fn spawn_remotes(
     mut commands: Commands,
     mut state: ResMut<HostState>,
+    time: Res<Time>,
     assets: Option<Res<PawnAssets>>,
     map: Option<Res<crate::world::MapInfo>>,
 ) {
@@ -376,19 +536,24 @@ fn spawn_remotes(
             crate::cover::CoverTap::default(),
             WeaponInput::default(),
             PawnClass(default_class()),
+            crate::movement::NetDriven,
+            lagcomp::Rewind { tick: lagcomp::now_tick(&time) },
             // Spawns when the friend's class arrives (or right away if it
             // came first); unseen until then, like a player picking a class.
             Dead { respawn_at: f32::INFINITY, killer: None },
             Frozen,
             Visibility::Hidden,
         ));
+        state.peers.insert(m.peer, Peer { rate_from: time.elapsed_secs(), ..default() });
         info!("netplay: {} joined the match on {team:?}", m.profile.name);
     }
 }
 
-/// Each friend's soldier does what their controls say.
+/// Each friend's gun, grenades and buttons do what their newest controls
+/// say (their movement is [`step_remotes`]').
 #[allow(clippy::type_complexity)]
 pub(crate) fn drive_remotes(
+    time: Res<Time>,
     mut state: ResMut<HostState>,
     mut remotes: Query<
         (
@@ -402,36 +567,42 @@ pub(crate) fn drive_remotes(
             Option<&crate::loadout::Loadout>,
             &mut Visibility,
             &mut crate::cover::CoverTap,
+            &mut lagcomp::Rewind,
+            Option<&mut crate::modes::UseObjective>,
+            Option<&mut crate::killstreaks::carepackage::UseCrate>,
         ),
         Without<Dead>,
     >,
 ) {
-    for (remote, mut view, mut mv, mut wi, weapon, grenades, switch, loadout, mut visibility, mut cover_tap) in &mut remotes {
+    let now = lagcomp::now_tick(&time);
+    for (remote, mut view, mut mv, mut wi, weapon, grenades, switch, loadout, mut visibility, mut cover_tap, mut rewind, use_objective, use_crate) in &mut remotes {
         // Spawned: seen from now on.
         visibility.set_if_neq(Visibility::Inherited);
-        let Some((c, earlier)) = state.inputs.get_mut(&remote.peer) else { continue };
+        let Some(peer) = state.peers.get_mut(&remote.peer) else { continue };
+        let Some(c) = peer.newest else { continue };
+        let earlier = std::mem::take(&mut peer.taps);
         let pressed = |b: u16| c.buttons & b != 0;
         // Taps: pressed now, or in a command since the last frame.
-        let tapped = |b: u16| (c.buttons | *earlier) & b != 0;
+        let tapped = |b: u16| (c.buttons | earlier) & b != 0;
         view.yaw = c.yaw;
         view.pitch = c.pitch;
-        *mv = MoveInput {
-            forward: c.forward as f32 / 127.0,
-            right: c.right as f32 / 127.0,
-            jump: pressed(button::JUMP),
-            sprint: pressed(button::SPRINT),
-            stance: match c.stance {
-                1 => Stance::Crouch,
-                2 => Stance::Prone,
-                _ => Stance::Stand,
-            },
-            speed_scale: weapon.speed_scale(),
-            lean: 0.0,
-        };
+        // (Movement is run command by command in [`step_remotes`]; this is
+        // for the body's animations until then.)
+        *mv = predict::move_input_of(&c, weapon.speed_scale(), false);
         *wi = WeaponInput { fire: pressed(button::FIRE), ads: pressed(button::AIM), reload: tapped(button::RELOAD), inspect: false };
+        // Their shots meet everyone where they saw them.
+        // (`COD4RW_NETTEST_NOLAGCOMP=1`: not, to compare.)
+        rewind.tick = if std::env::var_os("COD4RW_NETTEST_NOLAGCOMP").is_some() { now } else { lagcomp::rewind_to(c.view_tick, now) };
         if let Some(mut g) = grenades {
             g.frag = tapped(button::FRAG);
             g.special = tapped(button::SPECIAL);
+        }
+        // "Use": the bomb, a crate.
+        if let Some(mut u) = use_objective {
+            u.0 = pressed(button::USE);
+        }
+        if let Some(mut u) = use_crate {
+            u.0 = pressed(button::USE);
         }
         // The friend changed between primary and secondary.
         if let (Some(mut s), Some(l)) = (switch, loadout)
@@ -444,12 +615,58 @@ pub(crate) fn drive_remotes(
         // Once per press, however many frames the same controls last.
         cover_tap.want = tapped(button::COVER) && !cover_tap.held;
         cover_tap.held = pressed(button::COVER);
-        *earlier = 0;
+    }
+}
+
+/// Each friend's soldier moves by their commands, each for as long as the
+/// friend's game ran it (and no faster than the clock allows): as the
+/// friend's own game predicted.
+#[allow(clippy::type_complexity)]
+fn step_remotes(
+    time: Res<Time>,
+    mut state: ResMut<HostState>,
+    world: crate::movement::MoveWorld,
+    objectives: Option<Res<crate::modes::Objectives>>,
+    mut remotes: Query<(Entity, &RemotePlayer, &mut Transform, &mut Mover, &mut MoveInput, &mut ViewAngles, &WeaponState, Has<Frozen>, Has<Dead>)>,
+    mut landed: MessageWriter<crate::movement::Landed>,
+) {
+    let now = time.elapsed_secs();
+    let dt = time.delta_secs().min(0.25);
+    for (e, remote, mut tf, mut mover, mut mv, mut view, weapon, frozen, dead) in &mut remotes {
+        let Some(peer) = state.peers.get_mut(&remote.peer) else { continue };
+        peer.budget = (peer.budget + dt * 1000.0).min(250.0);
+        let held = objectives.as_ref().is_some_and(|o| o.using.iter().any(|u| u.0 == e));
+        let mut pos = tf.translation;
+        while let Some(c) = peer.queue.pop_front() {
+            // Commands that never came (more lost in a row than the
+            // redundancy covers).
+            if peer.applied != 0 {
+                peer.missed += c.sequence.wrapping_sub(peer.applied).saturating_sub(1).min(60);
+            }
+            let msec = (c.msec as f32).min(peer.budget);
+            peer.budget -= msec;
+            peer.applied = c.sequence;
+            peer.applied_at = now;
+            if frozen || dead {
+                continue;
+            }
+            let input = predict::move_input_of(&c, weapon.speed_scale(), held);
+            let angles = ViewAngles { yaw: c.yaw, pitch: c.pitch };
+            if let Some(h) = world.run(&mut pos, &mut mover, &input, &angles, msec / 1000.0) {
+                landed.write(crate::movement::Landed { entity: e, fall_height: h });
+            }
+            *mv = input;
+            *view = angles;
+        }
+        if !(frozen || dead) {
+            tf.translation = pos;
+            tf.rotation = Quat::from_rotation_y(view.yaw);
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pawn_state(id: u16, tf: &Transform, mover: &Mover, view: &ViewAngles, health: &Health, dead: bool, weapon: &WeaponState, ads: bool, cover: Option<&crate::cover::InCover>) -> PawnState {
+fn pawn_state(id: u16, tf: &Transform, mover: &Mover, view: &ViewAngles, health: &Health, dead: bool, frozen: bool, weapon: &WeaponState, ads: bool, cover: Option<&crate::cover::InCover>) -> PawnState {
     let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
     let mut flags = 0;
     if ads {
@@ -463,6 +680,9 @@ fn pawn_state(id: u16, tf: &Transform, mover: &Mover, view: &ViewAngles, health:
     }
     if weapon.reload_until.is_some() {
         flags |= pawn_flags::RELOADING;
+    }
+    if frozen {
+        flags |= pawn_flags::FROZEN;
     }
     // In cover ([`crate::cover`]): seen in the cover poses.
     if let Some(c) = cover {
@@ -487,19 +707,20 @@ fn pawn_state(id: u16, tf: &Transform, mover: &Mover, view: &ViewAngles, health:
 }
 
 /// The world to every friend, and pawns' details when they change.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn send_world(
     online: Res<Online>,
-    net: Res<NetStart>,
     time: Res<Time>,
     mut state: ResMut<HostState>,
     pawns: Query<(
+        Entity,
         &Pawn,
         &Transform,
         &Mover,
         &ViewAngles,
         &Health,
         Has<Dead>,
+        Has<Frozen>,
         &WeaponState,
         Option<&WeaponInput>,
         Option<&RemotePlayer>,
@@ -507,11 +728,13 @@ fn send_world(
         Option<&crate::loadout::Loadout>,
         Option<&crate::cover::InCover>,
     )>,
+    (match_state, objectives, radar): (Option<Res<crate::tdm::MatchState>>, Option<Res<crate::modes::Objectives>>, Res<crate::killstreaks::uav::Radar>),
+    mirrors: streaks::Mirrors,
 ) {
     let now = time.elapsed_secs();
     // Details first, so a new pawn's name arrives with it.
     let mut seen = Vec::new();
-    for (pawn, _, _, _, _, _, weapon, _, remote, local, loadout, _) in &pawns {
+    for (_, pawn, _, _, _, _, _, _, weapon, _, remote, local, loadout, _) in &pawns {
         let id = pawn.id as u16;
         seen.push(id);
         let info = PawnInfo {
@@ -521,13 +744,7 @@ fn send_world(
             team: side_of(pawn.team),
             // The gun's spec (what the guest loads it by), or the
             // equipment's name.
-            weapon: loadout
-                .and_then(|l| l.class.guns.get(l.current))
-                .map_or(weapon.def.name.as_str(), |g| g.spec.as_str())
-                .chars()
-                .take(48)
-                .filter(|c| c.is_ascii_alphanumeric() || "_:+".contains(*c))
-                .collect(),
+            weapon: asset_name(loadout.and_then(|l| l.class.guns.get(l.current)).map_or(weapon.def.name.as_str(), |g| g.spec.as_str())),
             kills: pawn.kills.min(u16::MAX as u32) as u16,
             deaths: pawn.deaths.min(u16::MAX as u32) as u16,
         };
@@ -545,13 +762,16 @@ fn send_world(
     if now < state.next_snapshot {
         return;
     }
-    state.next_snapshot = now + 1.0 / SNAPSHOT_RATE;
+    // On a steady beat (not "a period from now", which rounds up to whole
+    // frames: 40 Hz came out at 30), catching up after a stall.
+    let period = 1.0 / snapshot_rate();
+    state.next_snapshot = if now - state.next_snapshot > period { now + period } else { state.next_snapshot + period };
     let tick = (now * TICK_RATE) as u32;
     let all: Vec<PawnState> = pawns
         .iter()
         .take(cod4rw_multiplayer::protocol::MAX_PLAYERS)
-        .map(|(pawn, tf, mover, view, health, dead, weapon, wi, _, _, _, cover)| {
-            pawn_state(pawn.id as u16, tf, mover, view, health, dead, weapon, wi.is_some_and(|w| w.ads), cover)
+        .map(|(_, pawn, tf, mover, view, health, dead, frozen, weapon, wi, _, _, _, cover)| {
+            pawn_state(pawn.id as u16, tf, mover, view, health, dead, frozen, weapon, wi.is_some_and(|w| w.ads), cover)
         })
         .filter(|p| p.validate().is_ok())
         .collect();
@@ -561,15 +781,29 @@ fn send_world(
         info!("netplay: {covered} pawn(s) in cover in the snapshot");
         state.covered_logged = covered;
     }
-    for m in net.members.iter().filter(|m| m.peer != HOST) {
-        let ack = state.inputs.get(&m.peer).map_or(0, |(c, _)| c.sequence);
-        online.send_snapshot(m.peer, Snapshot { tick, acknowledged_input: ack, pawns: all.clone() });
+    // Everything else going on, as much as fits beside the pawns.
+    let id = |e: Entity| pawns.get(e).map_or(BOT, |p| p.1.id as u16);
+    let default_objectives = crate::modes::Objectives::default();
+    let pings: Vec<(u16, u16)> = PINGS.lock().map(|p| p.iter().map(|(id, ms)| (*id as u16, *ms)).collect()).unwrap_or_default();
+    let world = world::encode(&time, match_state.as_deref(), objectives.as_deref().unwrap_or(&default_objectives), &radar, &pings, &id);
+    let room = cod4rw_multiplayer::protocol::MAX_PACKET.saturating_sub(40 + all.len() * 40 + 2 + world.len());
+    let mut extra = Vec::with_capacity(2 + world.len() + room.min(400));
+    extra.extend((world.len() as u16).to_le_bytes());
+    extra.extend(&world);
+    extra.extend(mirrors.encode(room, &id));
+    let members: Vec<PeerId> = state.members.iter().map(|m| m.peer).collect();
+    for peer in members {
+        let Some(p) = state.peers.get_mut(&peer) else { continue };
+        p.snapshots = p.snapshots.wrapping_add(1);
+        let ack_age = ((now - p.applied_at) * 1000.0).clamp(0.0, 255.0) as u8;
+        online.send_snapshot(peer, Snapshot { tick, sequence: p.snapshots, acknowledged_input: p.applied, ack_age, pawns: all.clone(), extra: extra.clone() });
     }
 }
 
 // ---- Guest ----
 
-/// Snapshots and pawns' details from the host.
+/// Snapshots, pawns' details and news from the host.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn receive_guest(
     mut commands: Commands,
     mut online: ResMut<Online>,
@@ -577,15 +811,37 @@ fn receive_guest(
     mut state: ResMut<GuestState>,
     puppets: Query<(Entity, &Puppet)>,
     (time, mut match_state, everyone): (Res<Time>, Option<ResMut<crate::tdm::MatchState>>, Query<Entity, With<Pawn>>),
-    (mine, mut killed): (Query<Entity, With<LocalPlayer>>, MessageWriter<crate::combat::Killed>),
+    (mine, mut killed, mut damage): (Query<Entity, With<LocalPlayer>>, MessageWriter<crate::combat::Killed>, MessageWriter<crate::combat::Damage>),
     (mut pending, mut launches): (ResMut<crate::grenades::Pending>, MessageWriter<crate::explosives::Launch>),
+    (mut inbox, mut stats, mut feed, names): (ResMut<world::GuestInbox>, ResMut<graph::NetStats>, ResMut<crate::combat::KillFeed>, Query<&Pawn>),
+    prediction: Res<predict::Prediction>,
 ) {
+    let now = time.elapsed_secs();
     // Another pawn's puppet, by the host's ID (not ours: we threw it).
     let puppet_of = |id: u16, puppets: &Query<(Entity, &Puppet)>| puppets.iter().find(|(_, p)| p.id == id).map(|(e, _)| e);
     for event in online.take_game() {
         match event {
             Event::Snapshot(s) => {
-                if state.latest.as_ref().is_none_or(|l| cod4rw_multiplayer::security::newer(s.tick, l.tick)) {
+                // Loss and jitter, for the delay and the net graph.
+                if let Some(last) = state.sequence {
+                    let gap = s.sequence.wrapping_sub(last);
+                    if gap > 0 && gap < 1000 {
+                        state.lost = state.lost * 0.95 + (gap - 1) as f32 * 0.05;
+                    }
+                }
+                state.sequence = Some(s.sequence);
+                let fresh = state.latest.as_ref().is_none_or(|l| cod4rw_multiplayer::security::newer(s.tick, l.tick));
+                if fresh {
+                    if let (Some(at), Some(l)) = (state.arrived_at, state.latest.as_ref()) {
+                        let gap = s.tick.wrapping_sub(l.tick) as f32;
+                        if gap > 0.0 && gap < 30.0 {
+                            state.interval += (gap - state.interval) * 0.1;
+                        }
+                        let expected = gap / TICK_RATE;
+                        state.jitter = state.jitter * 0.9 + ((now - at) - expected).abs() * 0.1;
+                    }
+                    state.arrived_at = Some(now);
+                    state.arrivals.push_back(now);
                     let _ = state.snapshots.push(s.clone());
                     state.latest = Some(s);
                 }
@@ -596,16 +852,21 @@ fn receive_guest(
                 }
                 state.info.insert(info.id, info);
             }
+            Event::Message(_, LobbyMsg::Game(data)) => match wire::GameMsg::decode(&data) {
+                Ok(m) => inbox.0.push(m),
+                Err(e) => warn!("netplay: a bad message from the host: {e}"),
+            },
             Event::Message(_, LobbyMsg::MatchOver(winner)) => {
                 if let Some(state) = match_state.as_deref_mut()
                     && state.ended.is_none()
                 {
                     let winner = match winner {
-                        0 => Some(crate::combat::Team::Allies),
-                        1 => Some(crate::combat::Team::Axis),
+                        0 => Some(Team::Allies),
+                        1 => Some(Team::Axis),
                         _ => None,
                     };
-                    state.ended = Some((winner, time.elapsed_secs()));
+                    info!("netplay: the match is over: {winner:?} won");
+                    state.ended = Some((winner, now));
                     for e in &everyone {
                         commands.entity(e).insert(Frozen);
                     }
@@ -614,29 +875,30 @@ fn receive_guest(
             Event::Message(_, LobbyMsg::Kill { victim, attacker, weapon, location }) => {
                 // The pawns as this game has them: puppets, and our own.
                 let my_id = state.my_id;
-                let entity = |id: u16| {
-                    if Some(id) == my_id {
-                        mine.single().ok()
-                    } else {
-                        puppets.iter().find(|(_, p)| p.id == id).map(|(e, _)| e)
-                    }
-                };
+                let entity = |id: u16| world::entity_of(id, my_id, mine.single().ok(), &puppets);
                 let Some(victim_e) = entity(victim) else { continue };
                 if Some(victim) == state.my_id {
                     state.killer = state.info.get(&attacker).filter(|_| attacker != victim).map(|i| i.name.clone());
                 }
-                killed.write(crate::combat::Killed {
-                    victim: victim_e,
-                    attacker: if attacker == BOT { None } else { entity(attacker) },
-                    weapon: intern(&weapon),
-                    location: match location {
-                        0 => crate::combat::HitLocation::Head,
-                        1 => crate::combat::HitLocation::Neck,
-                        3 => crate::combat::HitLocation::Legs,
-                        4 => crate::combat::HitLocation::TorsoLower,
-                        _ => crate::combat::HitLocation::Torso,
-                    },
-                });
+                let attacker_e = if attacker == BOT { None } else { entity(attacker) };
+                let location = world::location_from(location);
+                let weapon = intern(&weapon);
+                // The finishing hit first: the kill feed's headshot icon,
+                // the killcam's weapon ([`crate::ui`] reads it from damage).
+                damage.write(crate::combat::Damage { target: victim_e, attacker: attacker_e, amount: 0.0, location, weapon });
+                killed.write(crate::combat::Killed { victim: victim_e, attacker: attacker_e, weapon, location });
+                // The kill feed's text, as the host's.
+                let name = |e: Option<Entity>| e.and_then(|e| names.get(e).ok()).map(|p| p.name.clone());
+                let victim_name = name(Some(victim_e)).unwrap_or_default();
+                let text = match name(attacker_e) {
+                    Some(a) if attacker != victim => {
+                        let hs = location == crate::combat::HitLocation::Head;
+                        format!("{a}  [{}{}]  {victim_name}", crate::killstreaks::feed_name(weapon), if hs { " HS" } else { "" })
+                    }
+                    _ => format!("{victim_name} died"),
+                };
+                info!("netplay: kill: {text}");
+                feed.entries.push(crate::combat::KillFeedEntry { text, time: now });
             }
             Event::Message(_, LobbyMsg::Scores { allies, axis }) => {
                 if let Some(s) = match_state.as_deref_mut() {
@@ -647,11 +909,13 @@ fn receive_guest(
             // our game threw already; the damage is the host's).
             Event::Message(_, LobbyMsg::Throw { thrower, kind, at, velocity, fuse }) => {
                 let (Some(kind), Some(by)) = (crate::grenades::Kind::from_index(kind), puppet_of(thrower, &puppets)) else { continue };
-                pending.queue_throw(kind, by, Vec3::from_array(at), Vec3::from_array(velocity), time.elapsed_secs() + fuse.clamp(0.0, 60.0));
+                pending.queue_throw(kind, by, Vec3::from_array(at), Vec3::from_array(velocity), now + fuse.clamp(0.0, 60.0));
                 debug!("netplay: a {kind:?} from {thrower}");
             }
             Event::Message(_, LobbyMsg::Launch { shooter, weapon, from, dir, yaw }) => {
-                let Some(by) = puppet_of(shooter, &puppets) else { continue };
+                // A pawn's, or a helicopter's rocket (nobody's here).
+                let by = if shooter == BOT { Some(Entity::PLACEHOLDER) } else { puppet_of(shooter, &puppets) };
+                let Some(by) = by else { continue };
                 launches.write(crate::explosives::Launch { shooter: by, weapon, from: Vec3::from_array(from), dir: Vec3::from_array(dir), yaw });
             }
             Event::Message(_, LobbyMsg::PawnGone(id)) => {
@@ -665,21 +929,43 @@ fn receive_guest(
             _ => {}
         }
     }
+    // The net graph.
+    while state.arrivals.front().is_some_and(|t| *t < now - 1.0) {
+        state.arrivals.pop_front();
+    }
+    stats.snapshot_rate = state.arrivals.len() as f32;
+    stats.loss = (state.lost / (1.0 + state.lost)).clamp(0.0, 1.0);
+    stats.jitter_ms = state.jitter * 1000.0;
+    stats.interp_ms = state.delay / TICK_RATE * 1000.0;
+    // Our ping to the host, for its net graph.
+    if now >= state.next_ping {
+        state.next_ping = now + 2.0;
+        if let Some(rtt) = prediction.rtt {
+            online.send(HOST, &LobbyMsg::Game(wire::GameMsg::Ping((rtt * 1000.0).round().clamp(0.0, 9999.0) as u16).encode()));
+        }
+    }
 }
 
-/// Debug (`COD4RW_NETLOOK=fire`): a guest aims at the first puppet in
-/// sight range and holds the trigger, to test shots through the host.
+/// Debug (`COD4RW_NETLOOK=fire`): a guest aims at the nearest enemy puppet
+/// and pulls the trigger when it's close, to test shots through the host.
 fn aim_at_host(
-    puppets: Query<&Transform, (With<Puppet>, Without<Dead>)>,
-    mut me: Query<(&Transform, &mut ViewAngles, &mut WeaponInput), (With<LocalPlayer>, Without<Puppet>, Without<Dead>)>,
+    puppets: Query<(&Transform, &Pawn), (With<Puppet>, Without<Dead>)>,
+    mut me: Query<(&Transform, &Pawn, &mut ViewAngles, &mut WeaponInput), (With<LocalPlayer>, Without<Puppet>, Without<Dead>)>,
 ) {
-    let Ok((tf, mut view, mut wi)) = me.single_mut() else { return };
-    let Some(target) = puppets.iter().min_by(|a, b| a.translation.distance(tf.translation).total_cmp(&b.translation.distance(tf.translation))) else { return };
+    let Ok((tf, pawn, mut view, mut wi)) = me.single_mut() else { return };
+    let Some((target, _)) = puppets
+        .iter()
+        .filter(|(_, p)| crate::combat::hostile(pawn, p))
+        .min_by(|a, b| a.0.translation.distance(tf.translation).total_cmp(&b.0.translation.distance(tf.translation)))
+    else {
+        wi.fire = false;
+        return;
+    };
     let d = target.translation + Vec3::Y * 1.2 - (tf.translation + Vec3::Y * 1.5);
     view.yaw = (-d.x).atan2(-d.z);
     view.pitch = (d.y / d.xz().length().max(0.1)).atan();
     // Pulled and let go, for burst and single-shot guns.
-    wi.fire = d.length() < 12.0 && (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis()) / 150) % 2 == 0;
+    wi.fire = d.length() < 35.0 && (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |t| t.as_millis()) / 150) % 2 == 0;
 }
 
 /// A weapon name as the kill messages keep it (`&'static`): each distinct
@@ -699,26 +985,10 @@ fn intern(name: &str) -> &'static str {
 fn send_kills(online: Res<Online>, mut killed: MessageReader<crate::combat::Killed>, pawns: Query<&Pawn>) {
     for k in killed.read() {
         let Ok(victim) = pawns.get(k.victim) else { continue };
-        let attacker = k.attacker.and_then(|a| pawns.get(a).ok()).map_or(BOT, |p| p.id as u16);
-        let weapon: String = k.weapon.chars().take(48).filter(|c| c.is_ascii_alphanumeric() || "_:+".contains(*c)).collect();
-        let location = match k.location {
-            crate::combat::HitLocation::Head => 0,
-            crate::combat::HitLocation::Neck => 1,
-            crate::combat::HitLocation::Torso => 2,
-            crate::combat::HitLocation::Legs => 3,
-            crate::combat::HitLocation::TorsoLower => 4,
-        };
-        online.send(EVERYONE, &LobbyMsg::Kill { victim: victim.id as u16, attacker, weapon, location });
-    }
-}
-
-/// Host: the teams' scores when they change (a guest's own game doesn't
-/// keep score).
-fn send_scores(online: Res<Online>, state: Option<Res<crate::tdm::MatchState>>, mut sent: Local<Option<(u32, u32)>>) {
-    let Some(s) = state else { return };
-    if *sent != Some((s.allies, s.axis)) {
-        *sent = Some((s.allies, s.axis));
-        online.send(EVERYONE, &LobbyMsg::Scores { allies: s.allies, axis: s.axis });
+        let by = k.attacker.and_then(|a| pawns.get(a).ok());
+        let attacker = by.map_or(BOT, |p| p.id as u16);
+        info!("netplay: kill: {} [{}] {}", by.map_or("-", |p| p.name.as_str()), k.weapon, victim.name);
+        online.send(EVERYONE, &LobbyMsg::Kill { victim: victim.id as u16, attacker, weapon: asset_name(k.weapon), location: world::location_byte(k.location) });
     }
 }
 
@@ -745,8 +1015,7 @@ fn send_throws(
         );
     }
     for l in launches.read() {
-        let weapon: String = l.weapon.chars().take(48).filter(|c| c.is_ascii_alphanumeric() || "_:+".contains(*c)).collect();
-        online.send(EVERYONE, &LobbyMsg::Launch { shooter: id(l.shooter), weapon, from: l.from.to_array(), dir: l.dir.to_array(), yaw: l.yaw });
+        online.send(EVERYONE, &LobbyMsg::Launch { shooter: id(l.shooter), weapon: asset_name(&l.weapon), from: l.from.to_array(), dir: l.dir.to_array(), yaw: l.yaw });
     }
 }
 
@@ -757,10 +1026,11 @@ fn announce_end(online: Res<Online>, state: Option<Res<crate::tdm::MatchState>>,
         Some((winner, _)) if !*sent => {
             *sent = true;
             let code = match winner {
-                Some(crate::combat::Team::Allies) => 0,
-                Some(crate::combat::Team::Axis) => 1,
+                Some(Team::Allies) => 0,
+                Some(Team::Axis) => 1,
                 None => 2,
             };
+            info!("netplay: the match is over: {winner:?} won");
             online.send(EVERYONE, &LobbyMsg::MatchOver(code));
         }
         None => *sent = false,
@@ -778,7 +1048,7 @@ fn leave_with_host(
     over: Option<Res<crate::tdm::MatchOver>>,
     mut left: Local<bool>,
 ) {
-    let shown = state.and_then(|s| s.ended).is_some_and(|(_, at)| time.elapsed_secs() - at > crate::tdm::POST_MATCH);
+    let shown = state.and_then(|s| s.ended).is_some_and(|(_, at)| time.elapsed_secs() - at > crate::tdm::POST_MATCH) && !crate::killcam::busy();
     let gone = !matches!(online.status, crate::online::Status::Connected(_));
     if !(shown || gone) {
         *left = false;
@@ -799,65 +1069,6 @@ fn send_class(online: Res<Online>, mine: Query<&PawnClass, (With<LocalPlayer>, C
     }
 }
 
-/// Our controls to the host, up to 60 times a second, each with the few
-/// before it in case some go missing.
-#[allow(clippy::type_complexity)]
-pub(crate) fn send_inputs(
-    online: Res<Online>,
-    time: Res<Time>,
-    mut state: ResMut<GuestState>,
-    me: Query<
-        (&MoveInput, &ViewAngles, &WeaponInput, Option<&crate::grenades::GrenadeInput>, Option<&crate::loadout::Loadout>, Option<&crate::splitscreen::PlayerInput>),
-        With<LocalPlayer>,
-    >,
-    mut held: Local<u16>,
-    mut in_hand: Local<Option<usize>>,
-) {
-    let Ok((mv, view, wi, grenades, loadout, player_input)) = me.single() else { return };
-    let mut buttons = 0;
-    let mut set = |on: bool, b: u16| {
-        if on {
-            buttons |= b;
-        }
-    };
-    set(wi.fire, button::FIRE);
-    set(wi.ads, button::AIM);
-    set(mv.jump, button::JUMP);
-    set(mv.sprint, button::SPRINT);
-    set(wi.reload, button::RELOAD);
-    // 3rd Person TDM: the cover button; the host does the rest ([`crate::cover`]).
-    set(crate::cover::active() && player_input.is_some_and(|p| p.live && p.keys.just_pressed(crate::cover::COVER_KEY)) || crate::cover::autokey(), button::COVER);
-    set(grenades.is_some_and(|g| g.frag), button::FRAG);
-    set(grenades.is_some_and(|g| g.special), button::SPECIAL);
-    // Changed between primary and secondary: the host follows.
-    let current = loadout.map(|l| l.current);
-    set(in_hand.is_some() && current != *in_hand && current.is_some_and(|c| c < 2), button::SWITCH);
-    *in_hand = current;
-    // Taps between sends still count.
-    *held |= buttons;
-    let now = time.elapsed_secs();
-    if now < state.next_send {
-        return;
-    }
-    state.next_send = now + 1.0 / TICK_RATE;
-    let wrap = |a: f32| (a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
-    state.sequence = state.sequence.wrapping_add(1).max(1);
-    let axis = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
-    let command = InputCommand {
-        sequence: state.sequence,
-        forward: axis(mv.forward),
-        right: axis(mv.right),
-        yaw: wrap(view.yaw),
-        pitch: view.pitch.clamp(-1.55, 1.55),
-        buttons: std::mem::take(&mut *held),
-        stance: mv.stance as u8,
-    };
-    state.recent.push(command);
-    let excess = state.recent.len().saturating_sub(INPUT_REDUNDANCY);
-    state.recent.drain(..excess);
-    online.send_inputs(state.recent.iter().rev().copied().collect());
-}
-
 /// Everyone else, posed from the snapshots.
 #[allow(clippy::type_complexity)]
 fn pose_puppets(
@@ -870,11 +1081,20 @@ fn pose_puppets(
     mut shots: MessageWriter<ShotFired>,
 ) {
     let Some(latest) = state.latest.as_ref().map(|s| s.tick as f32) else { return };
-    // The puppets' clock: steady, a little behind the newest snapshot.
-    let target = latest - DELAY_TICKS;
+    // How far behind: two snapshots, and more when they come unevenly or
+    // go missing (so there's still one to move towards). Up quickly, back
+    // down gently.
+    let floor = (state.interval * 2.0).max(MIN_DELAY_TICKS);
+    let want = (floor + state.jitter * TICK_RATE * 1.5 + state.lost.min(1.0) * state.interval * 4.0).clamp(floor.min(MAX_DELAY_TICKS), MAX_DELAY_TICKS);
+    let rate = if want > state.delay { 4.0 } else { 0.5 };
+    state.delay += (want - state.delay) * (time.delta_secs() * rate).min(1.0);
+    // The puppets' clock: steady, that far behind the newest snapshot.
+    let target = latest - state.delay;
     let clock = match state.clock {
-        Some(c) if (target - c).abs() < 12.0 => {
+        Some(c) if (target - c).abs() < 20.0 => {
             let c = c + time.delta_secs() * TICK_RATE;
+            // Snapshots late: carry on ahead of the newest a little.
+            let c = c.min(latest + EXTRAPOLATE_TICKS);
             c + (target - c) * 0.05
         }
         _ => target,
@@ -886,7 +1106,14 @@ fn pose_puppets(
     let mut posed = Vec::new();
     for (e, mut puppet, mut pawn, mut tf, mut mover, mut view, mut health, mut weapon, mut wi, mut visibility, dead, in_cover) in &mut puppets {
         posed.push(puppet.id);
-        let Some(p) = state.snapshots.sample(puppet.id, tick, fraction) else { continue };
+        let Some(mut p) = state.snapshots.sample(puppet.id, tick, fraction) else { continue };
+        // Past the newest snapshot: on along their way, briefly.
+        let ahead = clock - latest;
+        if ahead > 0.0 && p.life == 0 {
+            for i in 0..3 {
+                p.position[i] += p.velocity[i] * ahead.min(EXTRAPOLATE_TICKS) / TICK_RATE * if i == 1 { 0.0 } else { 1.0 };
+            }
+        }
         if p.life == 0 && !puppet.lived {
             puppet.lived = true;
             *visibility = Visibility::Inherited;
@@ -971,12 +1198,13 @@ fn pose_puppets(
     }
 }
 
-/// Our own soldier: health, death and respawn from the host, and put where
-/// the host has it if the two drift apart.
+/// Our own soldier: health, death, respawn and being held still from the
+/// host (its movement is [`predict`]'s).
 #[allow(clippy::type_complexity)]
 fn correct_own(
     mut commands: Commands,
     state: Res<GuestState>,
+    mut prediction: ResMut<predict::Prediction>,
     mut me: Query<(Entity, &mut Transform, &mut Mover, &mut ViewAngles, &mut Health, &mut Pawn, Has<Dead>, Has<crate::cover::InCover>), With<LocalPlayer>>,
     time: Res<Time>,
 ) {
@@ -1003,6 +1231,7 @@ fn correct_own(
     if covered && !dead {
         tf.translation = tf.translation.lerp(at, 0.4);
         mover.velocity = Vec3::ZERO;
+        prediction.reset();
         return;
     }
     match (p.life == 1, dead) {
@@ -1013,13 +1242,13 @@ fn correct_own(
             // Respawned: where the host put us, facing its way.
             commands.entity(e).remove::<(Dead, Frozen, crate::loadout::AwaitingClass)>();
             tf.translation = at;
-            mover.velocity = Vec3::ZERO;
+            // (Fresh, as the host's respawn leaves it.)
+            let stance = mover.stance;
+            *mover = Mover::default();
+            mover.stance = stance;
             view.yaw = p.yaw;
             view.pitch = 0.0;
-        }
-        (false, false) if tf.translation.distance(at) > SNAP_DISTANCE => {
-            tf.translation = at;
-            mover.velocity = Vec3::from_array(p.velocity);
+            prediction.reset();
         }
         _ => {}
     }

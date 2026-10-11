@@ -35,7 +35,8 @@ pub struct OceanPlugin;
 impl Plugin for OceanPlugin {
     fn build(&self, app: &mut App) {
         // (`COD4RW_NOOCEAN`: the showcase without it, for timing.)
-        if !crate::atmos::climate::enabled() || std::env::var_os("COD4RW_NOOCEAN").is_some() {
+        // (Always added otherwise: the showcase is picked per match.)
+        if std::env::var_os("COD4RW_NOOCEAN").is_some() {
             return;
         }
         app.world().resource::<bevy::asset::io::embedded::EmbeddedAssetRegistry>().insert_asset(

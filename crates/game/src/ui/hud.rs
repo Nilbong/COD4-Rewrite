@@ -304,8 +304,28 @@ impl Minimap {
         Some(Minimap { material, northwest, east, north, size })
     }
 
+    /// The minimap's picture (material name).
+    pub(super) fn material_name(&self) -> &str {
+        &self.material
+    }
+
+    /// The CoD-space point at a place in the image (0..1, y down).
+    pub(super) fn world_at(&self, uv: Vec2) -> Vec2 {
+        self.northwest + self.east * uv.x * self.size.x - self.north * uv.y * self.size.y
+    }
+
+    /// World units across the image.
+    pub(super) fn width(&self) -> f32 {
+        self.size.x
+    }
+
+    /// The image's north, clockwise from its up (radians).
+    pub(super) fn north_angle(&self) -> f32 {
+        self.north.y.atan2(self.north.x)
+    }
+
     /// A CoD-space point's place in the image (0..1, y down).
-    fn uv(&self, p: Vec2) -> Vec2 {
+    pub(super) fn uv(&self, p: Vec2) -> Vec2 {
         let d = p - self.northwest;
         Vec2::new(d.dot(self.east) / self.size.x, -d.dot(self.north) / self.size.y)
     }
@@ -381,6 +401,8 @@ pub(super) struct HudState {
     /// The team UAV's last sweep: its number, and the enemies it saw (where,
     /// when).
     radar_sweep: Option<u32>,
+    /// When the last sweep began (the minimap's sweep line runs from then).
+    radar_sweep_at: f32,
     radar_pings: Vec<(Vec3, f32)>,
     /// A kill streak's announcement (`hardpointNotify`): the streak, what it
     /// earned and when; and a hardpoint that couldn't be used now.
@@ -563,6 +585,7 @@ impl Default for HudState {
             notify: Vec::new(),
             pings: HashMap::new(),
             radar_sweep: None,
+            radar_sweep_at: f32::NEG_INFINITY,
             radar_pings: Vec::new(),
             streak_notify: None,
             unavailable: None,
@@ -679,6 +702,7 @@ fn collect(
     match me.and_then(|m| radar.sweep_for(my_team, m.0, now)) {
         Some((k, at)) if hud.radar_sweep != Some(k) => {
             hud.radar_sweep = Some(k);
+            hud.radar_sweep_at = at;
             // UAV Jammer (`specialty_gpsjammer`) keeps them off it.
             hud.radar_pings = alive
                 .iter()
@@ -851,7 +875,21 @@ pub(super) fn prepare(
     content: Res<Content>,
     map: Res<MapName>,
     mut done: Local<Option<String>>,
+    (glyphs, images): (Option<Res<crate::gamepad::glyphs::Glyphs>>, Res<Assets<Image>>),
 ) {
+    // The pads' D-pad art (`gamepad::glyphs`), for the HUD's button hints.
+    if let Some(g) = glyphs.as_deref() {
+        for kind in [crate::gamepad::PadKind::Xbox, crate::gamepad::PadKind::PlayStation] {
+            let name = pad_glyph_material(kind);
+            if fe.assets.has_image(name) {
+                continue;
+            }
+            if let Some(art) = g.get(kind, crate::gamepad::glyphs::Glyph::DPad) {
+                let size = images.get(&art.image).map_or(Vec2::new(art.aspect * 96.0, 96.0), |i| i.size().as_vec2());
+                fe.assets.add_image(name, super::assets::UiImage { handle: art.image.clone(), size });
+            }
+        }
+    }
     if hud.menus.is_empty() {
         // The in-game menus live in common_mp, which the match has loaded.
         if !fe.ingame {
@@ -1151,7 +1189,8 @@ fn paint_player(
             }
             if !gunplay.is_bodycam() {
                 if let Some((_, _, Projection::Perspective(proj))) = camera {
-                    if !mover.sprinting && !hardcore && show(Hud::Crosshair) {
+                    // (None over the airstrike's laptop: it has its own cursor.)
+                    if !mover.sprinting && !hardcore && show(Hud::Crosshair) && !(slot == 0 && crate::killstreaks::hands::laptop_open()) {
                         let color = if hud.aim_enemy { [1.0, 0.0, 0.0] } else { [1.0; 3] };
                         crosshair(p, weapon, mover, proj.fov, color);
                     }
@@ -1171,8 +1210,10 @@ fn paint_player(
             }
             grenade_danger(p, tf.translation, view.yaw, live);
             // Teammates' names over their heads, an enemy's under the crosshair.
-            // (The campaign has none: its soldiers aren't players.)
-            if let Some((cam, cam_tf, _)) = camera.filter(|_| !killcam_on && !crate::campaign::active()) {
+            // (The campaign has none: its soldiers aren't players. None over
+            // the airstrike's laptop either.)
+            let laptop = slot == 0 && crate::killstreaks::hands::laptop_open();
+            if let Some((cam, cam_tf, _)) = camera.filter(|_| !killcam_on && !crate::campaign::active() && !laptop) {
                 names::paint(p, slot, (cam, cam_tf));
             }
             if crate::perks::has(loadout, "specialty_detectexplosive") {
@@ -1248,11 +1289,16 @@ fn paint_player(
         score_panel(p, fe);
     }
     // The scoreboard waits for the final killcam.
-    for om in shared.menus.iter().filter(|_| !campaign).filter(|m| !modern || m.name == "scoreboard").filter(|m| m.name != "scoreboard" || (fe.game.scoreboard && !killcam_on)) {
+    let new_board = crate::tune::get("scoreboard.style", 1.0) > 0.5;
+    for om in shared.menus.iter().filter(|_| !campaign).filter(|m| !modern || m.name == "scoreboard").filter(|m| !(new_board && m.name == "scoreboard")).filter(|m| m.name != "scoreboard" || (fe.game.scoreboard && !killcam_on)) {
         fe.paint_menu(om, &p.pl, None, &mut p.ops);
     }
     if fe.game.scoreboard && !killcam_on && !campaign {
-        scoreboard(p, pawns, me.map(|m| m.0.0), my_team, sides);
+        if crate::tune::get("scoreboard.style", 1.0) > 0.5 {
+            scoreboard_mw3(p, pawns, me.map(|m| m.0.0), my_team, sides);
+        } else {
+            scoreboard(p, pawns, me.map(|m| m.0.0), my_team, sides);
+        }
     }
     // The killcam's banner (`_killcam.gsc`).
     if let Some(b) = killcam.and_then(|k| k.banner()).filter(|_| slot == 0) {
@@ -1280,15 +1326,22 @@ fn paint_player(
     if slot == 0 {
         if !hardcore {
             xp(p, hud, now);
+            if !killcam_on && !campaign {
+                xp_bar(p, hud, now);
+            }
         }
         notify(p, hud, now);
-        streak_notice(p, hud, now);
-        if let (Some(m), Some(((_, pawn, _, _, _, tf, view, ..), ..)), true) = (minimap, me, selecting) {
+        // (The banner stands down while the laptop's screen is up.)
+        if !crate::killstreaks::hands::laptop_open() {
+            streak_notice(p, hud, now);
+        }
+        // (Not while the laptop's screen shows it: `laptop_screen`.)
+        if let (Some(m), Some(((_, pawn, _, _, _, tf, view, ..), ..)), true, false) = (minimap, me, selecting, crate::killstreaks::hands::laptop_open()) {
             location_map(p, m, (pawn.team, tf.translation, view.yaw), pawns, window.cursor_position());
         }
     }
     if let Some((streak, m)) = me.and_then(|m| Some((m.2?, m))).filter(|(_, m)| m.0.7.is_none() && !hardcore) {
-        killstreak_panel(p, streak, m.1.1.pad_kind.is_some());
+        killstreak_panel(p, streak, m.1.1.pad_kind);
     }
     compass_view
 }
@@ -1355,6 +1408,26 @@ pub(super) fn menu_banner_ops(fe: &Frontend, pl: &Placement, text: &str) -> Vec<
 fn loc(fe: &Frontend, key: &str, fallback: &str) -> String {
     let s = fe.assets.localize(&format!("@{key}"));
     if s == key { fallback.to_owned() } else { s }
+}
+
+/// The equipment's pad button: the D-pad, drawn as its art.
+const DPAD_KEY: &str = "D-PAD";
+
+/// The HUD's material for a pad's D-pad art ([`prepare`]).
+fn pad_glyph_material(kind: crate::gamepad::PadKind) -> &'static str {
+    match kind {
+        crate::gamepad::PadKind::PlayStation => "cod4rw_pad_ps_dpad",
+        crate::gamepad::PadKind::Xbox => "cod4rw_pad_xbox_dpad",
+    }
+}
+
+/// The pad's D-pad, `height` virtual units tall with its middle at `x`, `y`
+/// (`align` as the text's: 0 left, 0.5 centre, 1 right of `x`).
+#[allow(clippy::too_many_arguments)]
+fn dpad_glyph(p: &mut Painter, kind: crate::gamepad::PadKind, x: f32, y: f32, horz: u8, vert: u8, height: f32, align: f32, alpha: f32) {
+    let w = height;
+    let left = x - w * align;
+    p.image(pad_glyph_material(kind), vr(left, y - height * 0.5, w, height, horz, vert), [1.0, 1.0, 1.0, alpha], 1);
 }
 
 fn vr(x: f32, y: f32, w: f32, h: f32, horz_align: u8, vert_align: u8) -> VRect {
@@ -1482,7 +1555,7 @@ fn hit_marker(p: &mut Painter, since: f32, since_start: f32, since_kill: f32, ad
     // The pop: appearing, it starts `pop` bigger and springs back through a
     // small dip; each further hit while it shows (automatic fire) only
     // bumps it a little (`repop`), so it doesn't keep blowing up.
-    let pop = get("hitmarker.pop", 0.12);
+    let pop = get("hitmarker.pop", 0.5);
     let pop_time = get("hitmarker.pop_time", 0.11);
     let spring = |t: f32, amount: f32| {
         let x = (t / pop_time).min(1.0);
@@ -1491,8 +1564,8 @@ fn hit_marker(p: &mut Painter, since: f32, since_start: f32, since_kill: f32, ad
     let first = spring(since_start, pop);
     let bump = if since_start - since > 1e-4 { spring(since, get("hitmarker.repop", 0.05)) } else { 0.0 };
     let scale = 1.0 + first.max(bump);
-    let (len, width, gap) = (get("hitmarker.length", 4.0), get("hitmarker.width", 1.2), get("hitmarker.gap", 5.0));
-    let (outline, taper) = (get("hitmarker.outline", 1.1), get("hitmarker.taper", 0.35));
+    let (len, width, gap) = (get("hitmarker.length", 2.5), get("hitmarker.width", 1.0), get("hitmarker.gap", 7.0));
+    let (outline, taper) = (get("hitmarker.outline", 0.8), get("hitmarker.taper", 0.8));
     let name = format!(
         "cod4rw_hitmarker_{}_{}_{}_{}_{}",
         (len * 100.0) as i32,
@@ -1613,7 +1686,7 @@ fn compass(
     for (knob, default) in [("friendlies", 1.0), ("show_enemies", 0.0), ("enemy_ping_time", PING_TIME), ("uav_ping_time", crate::killstreaks::uav::PING_FADE), ("glow", 1.0), ("glow_size", 1.0), ("hd_icons", 1.0)] {
         get(&format!("minimap.{knob}"), default);
     }
-    let range = get("minimap.range", COMPASS_RANGE).max(50.0);
+    let range = get("minimap.range", 1100.0).max(50.0);
     let round = get("minimap.round", 0.0).clamp(0.0, 1.0);
     let pos = flat(at);
     // The player's facing in the image, screen up on the compass; or
@@ -1640,19 +1713,19 @@ fn compass(
     let [mx, my, mw, mh] = if modern {
         modern::map_rect()
     } else {
-        let size = get("minimap.size", MAP_RECT[2]).max(10.0);
-        [get("minimap.x", MAP_RECT[0]), get("minimap.y", MAP_RECT[1]), size, size]
+        let size = get("minimap.size", 110.0).max(10.0);
+        [get("minimap.x", 2.0), get("minimap.y", 2.0), size, size]
     };
     if modern {
         modern::minimap_frame(p);
         modern::compass_rail(p, heading);
     } else {
         let k = mw / MAP_RECT[2];
-        let frame = get("minimap.frame", 1.0).clamp(0.0, 1.0);
+        let frame = get("minimap.frame", 0.0).clamp(0.0, 1.0);
         if frame > 0.0 {
             p.image("minimap_background", vr(mx - 14.0 * k, my - 6.0 * k, 125.0 * k, 125.0 * k, 1, 1), [1.0, 1.0, 1.0, frame], 0);
         }
-        let tape = get("minimap.heading_tape", 1.0).clamp(0.0, 1.0);
+        let tape = get("minimap.heading_tape", 0.0).clamp(0.0, 1.0);
         if tape > 0.0 {
             p.image("minimap_tickertape_background", vr(mx, my - 15.0 * k, mw, 14.0 * k, 1, 1), [1.0, 1.0, 1.0, tape], 1);
             ticker(p, heading, (mx, my - 12.0 * k, mw, 9.0 * k), tape);
@@ -1665,16 +1738,20 @@ fn compass(
         let q = s.abs() - Vec2::splat(1.0 - round);
         q.max(Vec2::ZERO).length() + q.max_element().min(0.0) - round <= 0.0
     };
-    let tint = |name: &str| [get(&format!("minimap.{name}_red"), 1.0), get(&format!("minimap.{name}_green"), 1.0), get(&format!("minimap.{name}_blue"), 1.0)];
+    let tint = |name: &str| {
+        // (Friendlies a little greener, as the user tuned them.)
+        let green = if name == "friendly" { 1.5 } else { 1.0 };
+        [get(&format!("minimap.{name}_red"), 1.0), get(&format!("minimap.{name}_green"), green), get(&format!("minimap.{name}_blue"), 1.0)]
+    };
     let icon = |p: &mut Painter, material: &str, s: Vec2, size: f32, rot: f32, alpha: f32| {
         let c = center + s * half;
         // The tuned size and colour of the player's, friendlies' and
         // enemies' marks (sizes grow with the map).
         let k = mw / MAP_RECT[2];
         let ([r, g, b], size) = match material {
-            "compassping_player" => (tint("player"), get("minimap.player_size", size) * k),
-            "compassping_friendly" => (tint("friendly"), get("minimap.friendly_size", size) * k),
-            "compassping_enemy" => (tint("enemy"), get("minimap.enemy_size", size) * k),
+            "compassping_player" => (tint("player"), get("minimap.player_size", 12.0) * k),
+            "compassping_friendly" => (tint("friendly"), get("minimap.friendly_size", 10.0) * k),
+            "compassping_enemy" => (tint("enemy"), get("minimap.enemy_size", 10.0) * k),
             _ => ([1.0; 3], size * k),
         };
         let color = [r, g, b, alpha];
@@ -1689,7 +1766,7 @@ fn compass(
         // (`minimap.hd_icons 0` for those).
         let hd = match material {
             "compassping_player" | "compassping_friendly" | "compassping_enemy" if own.is_none() && get("minimap.hd_icons", 1.0) > 0.5 => {
-                Some(format!("cod4rw_mmicon_{}_{}_{}", &material["compassping_".len()..], (get("minimap.glow", 1.0).clamp(0.0, 3.0) * 100.0) as i32, (get("minimap.glow_size", 1.0).clamp(0.0, 1.2) * 100.0) as i32))
+                Some(format!("cod4rw_mmicon_{}_{}_{}", &material["compassping_".len()..], (get("minimap.glow", 0.5).clamp(0.0, 3.0) * 100.0) as i32, (get("minimap.glow_size", 1.0).clamp(0.0, 1.2) * 100.0) as i32))
             }
             _ => None,
         };
@@ -1724,10 +1801,35 @@ fn compass(
         }
         icon(p, "compassping_enemy", s, COMPASS_ICON, 0.0, 1.0 - (now - t) / get("minimap.enemy_ping_time", PING_TIME));
     }
+    // The UAV's sweep (MW2's): a line crossing the map left to right over
+    // `minimap.sweep_time`, each enemy lighting up as it passes them.
+    let sweep_time = get("minimap.sweep_time", 1.5).max(0.05);
+    let swept = now - hud.radar_sweep_at;
+    if hud.radar_sweep.is_some() && (0.0..sweep_time).contains(&swept) && get("minimap.sweep", 1.0) > 0.5 {
+        let f = swept / sweep_time;
+        let x = f * 2.0 - 1.0;
+        // Within the map's shape (a chord of a round one).
+        let half = if round > 0.5 { (1.0 - x * x).max(0.0).sqrt() } else { 1.0 };
+        let (lx, ly) = (mx + mw * f, my + mh * 0.5 * (1.0 - half));
+        let c = [get("minimap.sweep_red", 0.45), get("minimap.sweep_green", 1.0), get("minimap.sweep_blue", 0.45)];
+        let a = get("minimap.sweep_alpha", 0.8) * (1.0 - f * 0.3);
+        p.image("white", vr(lx - 0.75, ly, 1.5, mh * half, 1, 1), [c[0], c[1], c[2], a], 1);
+        // A fading wash behind it.
+        let trail = (mw * 0.12).min(mw * f);
+        for i in 0..6 {
+            let k = i as f32 / 6.0;
+            p.image("white", vr(lx - trail * (k + 1.0 / 6.0), ly, trail / 6.0, mh * half, 1, 1), [c[0], c[1], c[2], a * 0.18 * (1.0 - k)], 1);
+        }
+    }
     for &(at, t) in &hud.radar_pings {
         let s = to_compass(at);
         if inside(s) {
-            icon(p, "compassping_enemy", s, COMPASS_ICON, 0.0, 1.0 - (now - t) / get("minimap.uav_ping_time", crate::killstreaks::uav::PING_FADE));
+            // Lit when the sweep's line reaches it.
+            let lit = t + sweep_time * (s.x + 1.0) * 0.5;
+            if now < lit {
+                continue;
+            }
+            icon(p, "compassping_enemy", s, COMPASS_ICON, 0.0, 1.0 - (now - lit) / get("minimap.uav_ping_time", crate::killstreaks::uav::PING_FADE));
         }
     }
     if let Some(o) = goals {
@@ -1744,7 +1846,7 @@ fn compass(
         scale: Vec2::splat(range) / m.size,
         dir: d,
         alpha: get("minimap.opacity", 1.0).clamp(0.0, 1.0),
-        shape: Vec4::new(round, get("minimap.outline", 0.0).max(0.0) / (mw * 0.5), get("minimap.fill", 0.0).clamp(0.0, 1.0), 0.0),
+        shape: Vec4::new(round, get("minimap.outline", 0.5).max(0.0) / (mw * 0.5), get("minimap.fill", 0.5).clamp(0.0, 1.0), 0.0),
         outline: Vec4::new(get("minimap.outline_red", 0.0), get("minimap.outline_green", 0.0), get("minimap.outline_blue", 0.0), get("minimap.outline_alpha", 1.0)),
     })
 }
@@ -1767,19 +1869,19 @@ fn top_compass(
     if get("compass.enabled", 1.0) < 0.5 {
         return;
     }
-    let width = get("compass.width", 240.0).max(20.0);
-    let y = get("compass.y", 6.0);
-    let height = get("compass.height", 16.0).max(2.0);
-    let span = get("compass.span", 140.0).clamp(10.0, 360.0);
+    let width = get("compass.width", 200.0).max(20.0);
+    let y = get("compass.y", 2.0);
+    let height = get("compass.height", 20.0).max(2.0);
+    let span = get("compass.span", 120.0).clamp(10.0, 360.0);
     let opacity = get("compass.opacity", 1.0).clamp(0.0, 1.0);
-    let back = get("compass.background", 0.35).clamp(0.0, 1.0);
+    let back = get("compass.background", 0.2).clamp(0.0, 1.0);
     let step = get("compass.tick_step", 15.0).max(1.0);
     let tick_h = get("compass.tick_height", 4.0);
-    let major_h = get("compass.major_tick_height", 7.0);
+    let major_h = get("compass.major_tick_height", 3.0);
     let tick_w = get("compass.tick_width", 0.8).max(0.1);
-    let text = get("compass.text_size", 9.0).max(2.0);
-    let degrees = get("compass.degrees", 1.0) > 0.5;
-    let fade = get("compass.edge_fade", 0.3).clamp(0.0, 1.0);
+    let text = get("compass.text_size", 8.0).max(2.0);
+    let degrees = get("compass.degrees", 5.0) > 0.5;
+    let fade = get("compass.edge_fade", 0.5).clamp(0.0, 1.0);
     let color = [get("compass.red", 1.0), get("compass.green", 1.0), get("compass.blue", 1.0)];
     let accent = [get("compass.north_red", 1.0), get("compass.north_green", 0.82), get("compass.north_blue", 0.3)];
     let half = width * 0.5;
@@ -1798,7 +1900,7 @@ fn top_compass(
     };
     let rgba = |c: [f32; 3], a: f32| [c[0], c[1], c[2], a * opacity];
     use super::next::font::Cut;
-    let label_cut = if get("compass.bold", 1.0) > 0.5 { Cut::Semi } else { Cut::Regular };
+    let label_cut = if get("compass.bold", 5.0) > 0.5 { Cut::Semi } else { Cut::Regular };
     if back > 0.0 {
         // The backing fades out towards the ends with the ticks.
         let pieces = 24;
@@ -1828,11 +1930,11 @@ fn top_compass(
         }
     }
     // The centre mark, and the heading under it.
-    let mark = get("compass.marker", 1.0).clamp(0.0, 1.0);
+    let mark = get("compass.marker", 0.0).clamp(0.0, 1.0);
     if mark > 0.0 {
         p.bar(vr(-tick_w, y + height, tick_w * 2.0, 4.0, 2, 1), rgba(accent, mark));
     }
-    if get("compass.heading_number", 1.0) > 0.5 {
+    if get("compass.heading_number", 2.0) > 0.5 {
         let size = text * 0.8;
         p.text_hd(&format!("{}", heading.round() as i32 % 360), 0.0, y + height + 5.0 + size * 0.5, 2, 1, size, label_cut, rgba(color, 0.9), 0.5, true);
     }
@@ -1841,7 +1943,7 @@ fn top_compass(
         return;
     }
     let pos = flat(at);
-    let dot = get("compass.enemy_size", 4.0).max(0.5);
+    let dot = get("compass.enemy_size", 3.5).max(0.5);
     let red = [get("compass.enemy_red", 1.0), get("compass.enemy_green", 1.0), get("compass.enemy_blue", 1.0)];
     let mut show = |p: &mut Painter, world: Vec3, alpha: f32| {
         let d = flat(world) - pos;
@@ -1884,26 +1986,26 @@ fn score_panel(p: &mut Painter, fe: &Frontend) {
         return;
     }
     let g = &fe.game;
-    let (horz, vert) = (get("score.h", 1.0).round().clamp(1.0, 3.0) as u8, get("score.v", 3.0).round().clamp(1.0, 3.0) as u8);
-    let width = get("score.width", 120.0).max(20.0);
+    let (horz, vert) = (get("score.h", 1.0).round().clamp(1.0, 3.0) as u8, get("score.v", 20.0).round().clamp(1.0, 3.0) as u8);
+    let width = get("score.width", 110.0).max(20.0);
     let row = get("score.row_height", 11.0).max(3.0);
-    let gap = get("score.row_gap", 2.0);
+    let gap = get("score.row_gap", 2.5);
     let opacity = get("score.opacity", 1.0).clamp(0.0, 1.0);
-    let back = get("score.background", 0.45).clamp(0.0, 1.0);
+    let back = get("score.background", 0.85).clamp(0.0, 1.0);
     let text = get("score.text_size", 10.0).max(3.0);
-    let show_icons = get("score.icons", 1.0) > 0.5;
+    let show_icons = get("score.icons", 0.0) > 0.5;
     let show_timer = get("score.timer", 1.0) > 0.5;
-    let timer_size = get("score.timer_size", 12.0).max(3.0);
+    let timer_size = get("score.timer_size", 10.0).max(3.0);
     let rgb = |name: &str, d: [f32; 3]| [get(&format!("score.{name}_red"), d[0]), get(&format!("score.{name}_green"), d[1]), get(&format!("score.{name}_blue"), d[2])];
-    let ours_c = rgb("ours", [0.45, 0.85, 0.3]);
+    let ours_c = rgb("ours", [0.35, 0.9, 0.95]);
     let theirs_c = rgb("theirs", [0.95, 0.3, 0.22]);
     let text_c = rgb("text", [1.0, 1.0, 1.0]);
     // The whole panel's size, so it can sit against any edge.
     let rows_h = row * 2.0 + gap;
     let total_h = rows_h + if show_timer { gap * 2.0 + timer_size } else { 0.0 };
     let (x0, y0) = (
-        get("score.x", 6.0) - match horz { 2 => width * 0.5, 3 => width, _ => 0.0 },
-        get("score.y", -8.0) - match vert { 2 => total_h * 0.5, 3 => total_h, _ => 0.0 },
+        get("score.x", 2.0) - match horz { 2 => width * 0.5, 3 => width, _ => 0.0 },
+        get("score.y", -325.0) - match vert { 2 => total_h * 0.5, 3 => total_h, _ => 0.0 },
     );
     let at = |x: f32, y: f32, w: f32, h: f32| vr(x0 + x, y0 + y, w, h, horz, vert);
     let limit: f32 = fe.dvar("ui_scorelimit").parse().unwrap_or(0.0);
@@ -1930,7 +2032,7 @@ fn score_panel(p: &mut Painter, fe: &Frontend) {
         }
         // The fill: how near the score limit.
         let frac = (*score as f32 / full).clamp(0.0, 1.0);
-        let fill = get("score.fill", 0.75).clamp(0.0, 1.0);
+        let fill = get("score.fill", 0.5).clamp(0.0, 1.0);
         if frac > 0.0 && fill > 0.0 {
             p.image("white", at(x, y, bar_w * frac, row), [color[0], color[1], color[2], fill * opacity], 1);
         }
@@ -1959,7 +2061,7 @@ fn score_panel(p: &mut Painter, fe: &Frontend) {
 /// while it's open). Beside the boxes, MW3's ladder: a pip per kill up to
 /// the last streak's, lit for the kills of the streak so far, the pips that
 /// earn a streak level with its box.
-fn killstreak_panel(p: &mut Painter, streak: &crate::killstreaks::Killstreak, pad: bool) {
+fn killstreak_panel(p: &mut Painter, streak: &crate::killstreaks::Killstreak, pad: Option<crate::gamepad::PadKind>) {
     use super::next::font::Cut;
     use crate::killstreaks::Hardpoint;
     use crate::tune::get;
@@ -1967,14 +2069,14 @@ fn killstreak_panel(p: &mut Painter, streak: &crate::killstreaks::Killstreak, pa
         return;
     }
     let (horz, vert) = (get("killstreaks.h", 3.0).round().clamp(1.0, 3.0) as u8, get("killstreaks.v", 3.0).round().clamp(1.0, 3.0) as u8);
-    let size = get("killstreaks.box_size", 24.0).max(4.0);
+    let size = get("killstreaks.box_size", 30.0).max(4.0);
     let gap = get("killstreaks.gap", 5.0);
     let icon = size * get("killstreaks.icon_scale", 0.8).clamp(0.1, 1.5);
     let text = get("killstreaks.text_size", 10.0).max(3.0);
-    let opacity = get("killstreaks.opacity", 1.0).clamp(0.0, 1.0);
+    let opacity = get("killstreaks.opacity", 1.5).clamp(0.0, 1.0);
     let dim = get("killstreaks.dim", 0.3).clamp(0.0, 1.0);
-    let back = get("killstreaks.background", 0.35).clamp(0.0, 1.0);
-    let line = get("killstreaks.outline", 1.0).max(0.0);
+    let back = get("killstreaks.background", 0.65).clamp(0.0, 1.0);
+    let line = get("killstreaks.outline", 1.5).max(0.0);
     let glow = get("killstreaks.fill", 0.15).clamp(0.0, 1.0);
     let rgb = |name: &str, d: [f32; 3]| [get(&format!("killstreaks.{name}_red"), d[0]), get(&format!("killstreaks.{name}_green"), d[1]), get(&format!("killstreaks.{name}_blue"), d[2])];
     let ready_c = rgb("ready", [0.35, 1.0, 0.4]);
@@ -1985,14 +2087,18 @@ fn killstreak_panel(p: &mut Painter, streak: &crate::killstreaks::Killstreak, pa
     let list = streak.held.list();
     let picked = streak.picker.and_then(|(i, _)| list.get(i).copied());
     // Best on top.
-    let items: Vec<Hardpoint> = Hardpoint::ALL.into_iter().rev().collect();
+    // The player's chosen three ([`crate::killstreaks::choice`]).
+    let items: Vec<Hardpoint> = streak.chosen.iter().rev().copied().collect();
+    if items.is_empty() {
+        return;
+    }
     let total = items.len() as f32 * size + (items.len() as f32 - 1.0) * gap;
     let items = items.as_slice();
     // The boxes' right edge at `killstreaks.x`, the stack's bottom at `y`.
     // The ladder on the outer side of the boxes.
     let pips = get("killstreaks.pips", 1.0) > 0.5;
-    let pip_w = get("killstreaks.pip_width", 5.0).max(0.5);
-    let pip_space = get("killstreaks.pip_spacing", 3.0);
+    let pip_w = get("killstreaks.pip_width", 2.5).max(0.5);
+    let pip_space = get("killstreaks.pip_spacing", 2.0);
     let ladder = if pips { pip_w + pip_space } else { 0.0 };
     let x0 = get("killstreaks.x", -10.0) - match horz { 1 => -size - ladder, 2 => size * 0.5, _ => 0.0 } - size - if horz == 3 { ladder } else { 0.0 };
     let y0 = get("killstreaks.y", -58.0) - match vert { 2 => total * 0.5, 3 => total, _ => 0.0 };
@@ -2015,9 +2121,14 @@ fn killstreak_panel(p: &mut Painter, streak: &crate::killstreaks::Killstreak, pa
         p.image(pic, at((size - icon) * 0.5, y + (size - icon) * 0.5, icon, icon), rgba(icon_c, a), 1);
         let cy = y0 + y + size * 0.5;
         if ready {
-            let key = if pad { "D-PAD".to_owned() } else { crate::killstreaks::key_name(item) };
             let c = outline.unwrap_or(ready_c);
-            p.text_hd(&key, label_x, cy, horz, vert, text, Cut::Semi, rgba(c, 1.0), align, true);
+            match pad {
+                // The pad's D-pad art (its picker opens on it).
+                Some(kind) => dpad_glyph(p, kind, label_x, cy, horz, vert, text * 1.6, align, opacity),
+                None => {
+                    p.text_hd(&crate::killstreaks::key_name(item), label_x, cy, horz, vert, text, Cut::Semi, rgba(c, 1.0), align, true);
+                }
+            }
         } else if get("killstreaks.show_kills", 0.0) > 0.5 {
             p.text_hd(&item.kills().to_string(), label_x, cy, horz, vert, text * 0.85, Cut::Regular, rgba(text_c, dim + 0.15), align, true);
         }
@@ -2030,10 +2141,10 @@ fn killstreak_panel(p: &mut Painter, streak: &crate::killstreaks::Killstreak, pa
     // the box's height, kill 1 at the bottom; lit
     // for the kills of the streak so far, each pip outlined.
     let lx = if horz == 1 { -ladder } else { size + pip_space };
-    let on_c = rgb("pip", [1.0, 0.85, 0.2]);
+    let on_c = rgb("pip", [0.9, 0.8, 0.2]);
     let line_c = rgb("pip_outline", [0.9, 0.9, 0.9]);
-    let off = get("killstreaks.pip_off", 0.35).clamp(0.0, 1.0);
-    let pip_gap = get("killstreaks.pip_gap", 1.5).max(0.0);
+    let off = get("killstreaks.pip_off", 0.5).clamp(0.0, 1.0);
+    let pip_gap = get("killstreaks.pip_gap", 1.8).max(0.0);
     let edge = get("killstreaks.pip_outline", 0.75).max(0.0);
     let edge_a = get("killstreaks.pip_outline_alpha", 0.7).clamp(0.0, 1.0);
     for (n, item) in items.iter().enumerate() {
@@ -2111,7 +2222,8 @@ fn ammo_panel(
         Some(match a {
             Action::Frag => if ps { "R1" } else { "RB" },
             Action::Special => if ps { "L1" } else { "LB" },
-            Action::Equipment => "D-PAD",
+            // (Drawn as the pad's D-pad art.)
+            Action::Equipment => DPAD_KEY,
             _ => return None,
         })
     };
@@ -2170,7 +2282,12 @@ fn ammo_panel(
         let iy = top + count_size + 2.0;
         p.image(pic, vr(cx - icon * 0.5, iy, icon, icon, horz, vert), [1.0, 1.0, 1.0, if have { 0.95 * opacity } else { 0.3 * opacity }], 1);
         if get("ammo.keys", 1.0) > 0.5 && !k.is_empty() {
-            p.text_hd(k, cx, bottom - key_size * 0.5, horz, vert, key_size, Cut::Semi, rgba(key_c, 0.85), 0.5, true);
+            match pad.filter(|_| k == DPAD_KEY) {
+                Some(kind) => dpad_glyph(p, kind, cx, bottom - key_size * 0.5, horz, vert, key_size * 1.5, 0.5, 0.85 * opacity),
+                None => {
+                    p.text_hd(k, cx, bottom - key_size * 0.5, horz, vert, key_size, Cut::Semi, rgba(key_c, 0.85), 0.5, true);
+                }
+            }
         }
         x -= column;
     }
@@ -2197,7 +2314,7 @@ fn ammo_panel(
         let gw = gun_h * ratio;
         p.image(&w.def.kill_icon, vr(x - gw, top + (height - gun_h) * 0.5, gw, gun_h, horz, vert), [1.0, 1.0, 1.0, get("ammo.gun_alpha", 0.9) * opacity], 1);
         let t = now - since;
-        let alpha = if get("ammo.name_always", 0.0) > 0.5 || t < NAME_SHOW { 1.0 } else { 1.0 - (t - NAME_SHOW) / NAME_FADE };
+        let alpha = if get("ammo.name_always", 1.0) > 0.5 || t < NAME_SHOW { 1.0 } else { 1.0 - (t - NAME_SHOW) / NAME_FADE };
         if alpha > 0.0 && get("ammo.name", 1.0) > 0.5 {
             let size = get("ammo.name_text", 9.0).max(3.0);
             p.text_hd(name, x, top - size * 0.6, horz, vert, size, Cut::Semi, rgba(text_c, 0.85 * alpha), 1.0, true);
@@ -2306,12 +2423,12 @@ fn crosshair(p: &mut Painter, w: &WeaponState, mover: &Mover, fov: f32, [cr, cg,
 /// `reticle_side` ticks.
 fn tuned_crosshair(p: &mut Painter, out: f32, [cr, cg, cb, ca]: [f32; 4]) {
     use crate::tune::get;
-    let len = get("crosshair.length", 5.5).max(0.5);
-    let width = get("crosshair.width", 1.4).max(0.2);
-    let outline = get("crosshair.outline", 0.6).max(0.0);
-    let round = get("crosshair.round", 0.4).clamp(0.0, 1.0);
+    let len = get("crosshair.length", 3.5).max(0.5);
+    let width = get("crosshair.width", 1.2).max(0.2);
+    let outline = get("crosshair.outline", 0.8).max(0.0);
+    let round = get("crosshair.round", 5.0).clamp(0.0, 1.0);
     // How far out the ticks start: a fixed gap plus a share of the spread.
-    let inner = get("crosshair.gap", -3.0) + get("crosshair.spread", 1.0) * out;
+    let inner = get("crosshair.gap", 5.0) + get("crosshair.spread", 1.0) * out;
     let alpha = ca * get("crosshair.alpha", 0.9).clamp(0.0, 1.0);
     // Over an enemy the caller's red; otherwise the tuned colour.
     let color = if cg > 0.9 && cb > 0.9 {
@@ -2732,14 +2849,146 @@ fn scoreboard(
             }
             let text = [1.0, 1.0, 1.0, if dead { 0.6 } else { 1.0 }];
             p.text(&pawn.name, LEFT + 52.0, y + 14.0, 2, 1, 0.3 * 48.0, 0, text, 0.0, true);
-            let ping = if bot.is_some() { "BOT" } else { "0" };
-            let values = [(pawn.kills * KILL_XP + pawn.assists * ASSIST_SCORE).to_string(), pawn.kills.to_string(), pawn.assists.to_string(), pawn.deaths.to_string(), ping.into()];
+            // Online: everyone's ping as the host has it ([`crate::netplay`]).
+            let ping = crate::netplay::ping_text(pawn.id).unwrap_or_else(|| if bot.is_some() { "BOT" } else { "0" }.into());
+            let values = [(pawn.kills * KILL_XP + pawn.assists * ASSIST_SCORE).to_string(), pawn.kills.to_string(), pawn.assists.to_string(), pawn.deaths.to_string(), ping];
             for ((_, _, right), v) in COLUMNS.iter().zip(values) {
                 p.text(&v, LEFT + right, y + 14.0, 2, 1, 0.3 * 48.0, 0, text, 1.0, true);
             }
             y += ROW;
         }
         y += 6.0;
+    }
+}
+
+/// The scoreboard, MW3 (2023) style (`scoreboard.*` in `tuning.txt`;
+/// `scoreboard.style 0` for CoD4's): a panel per team, the player's on top
+/// in `friendly_*`, the other below in `enemy_*`; over each, the side's name
+/// and how many are alive of how many, and its score big on the right over
+/// a bar filling towards the score limit, the side's emblem faint behind the
+/// panel's right edge; a band of column titles in the side's colour, then a
+/// row per player by score: rank icon, level, name (a BOT tag on bots,
+/// faint while dead), score, kills, assists, deaths and K/D, the player's
+/// own row lit. Free-for-all: one panel.
+fn scoreboard_mw3(
+    p: &mut Painter,
+    pawns: &Query<(Entity, &Pawn, &Transform, &ViewAngles, Has<Dead>, Option<&crate::bots::Bot>)>,
+    me: Option<Entity>,
+    mine: Team,
+    sides: Option<&crate::audio::Sides>,
+) {
+    use super::next::font::Cut;
+    use crate::tune::get;
+    let width = get("scoreboard.width", 520.0).max(100.0);
+    let row = get("scoreboard.row_height", 18.0).max(6.0);
+    let band = get("scoreboard.header_height", 22.0).max(6.0);
+    let text = get("scoreboard.text_size", 9.5).max(3.0);
+    let title = get("scoreboard.title_size", 14.0).max(3.0);
+    let score_size = get("scoreboard.score_size", 30.0).max(3.0);
+    let gap = get("scoreboard.team_gap", 30.0);
+    let opacity = get("scoreboard.opacity", 1.0).clamp(0.0, 1.0);
+    let rgb = |name: &str, d: [f32; 3]| [get(&format!("scoreboard.{name}_red"), d[0]), get(&format!("scoreboard.{name}_green"), d[1]), get(&format!("scoreboard.{name}_blue"), d[2])];
+    let friendly = rgb("friendly", [0.35, 0.9, 0.95]);
+    let enemy = rgb("enemy", [0.95, 0.38, 0.33]);
+    let neutral = rgb("ffa", [0.95, 0.82, 0.4]);
+    let rgba = |c: [f32; 3], a: f32| [c[0], c[1], c[2], a * opacity];
+    let left = -width * 0.5;
+    // Right edges of the number columns, as shares of the panel's width.
+    // Online, a Ping column too (`scoreboard.ping`, [`crate::netplay`]).
+    let ping = crate::netplay::has_pings() && get("scoreboard.ping", 1.0) > 0.5;
+    let columns: Vec<(&str, f32)> = if ping {
+        vec![("SCORE", 0.55), ("KILLS", 0.63), ("ASSISTS", 0.71), ("DEATHS", 0.79), ("K/D RATIO", 0.885), ("PING", 0.985)]
+    } else {
+        vec![("SCORE", 0.62), ("KILLS", 0.71), ("ASSISTS", 0.8), ("DEATHS", 0.89), ("K/D RATIO", 0.985)]
+    };
+    let (rank, icon) = player_rank(p.fe);
+    let limit: f32 = p.fe.dvar("ui_scorelimit").parse().unwrap_or(0.0);
+    let ffa = crate::combat::free_for_all();
+    let groups = if ffa { vec![None] } else { vec![Some(mine), Some(mine.other())] };
+    let mut y = get("scoreboard.y", 40.0);
+    for group in groups {
+        let color = match group {
+            None => neutral,
+            Some(t) if t == mine => friendly,
+            Some(_) => enemy,
+        };
+        let mut rows: Vec<_> = pawns.iter().filter(|r| group.is_none_or(|team| r.1.team == team)).collect();
+        let points = |p: &Pawn| p.kills * KILL_XP + p.assists * ASSIST_SCORE;
+        rows.sort_by(|a, b| points(b.1).cmp(&points(a.1)).then(b.1.kills.cmp(&a.1.kills)).then(a.1.deaths.cmp(&b.1.deaths)).then(a.1.name.cmp(&b.1.name)));
+        let alive = rows.iter().filter(|r| !r.4).count();
+        // The side's name and count, its score and the bar to the limit.
+        let (name, team_key) = group.map_or(("", ""), |team| faction(sides, team));
+        let side = match group {
+            Some(team) => loc(p.fe, &format!("{team_key}_SHORT"), team.name()).to_uppercase(),
+            None => "FREE-FOR-ALL".into(),
+        };
+        let head_y = y + score_size * 0.55;
+        p.text_hd(&format!("{side}  [{alive}/{}]", rows.len()), left, head_y + score_size * 0.25, 2, 1, title, Cut::Semi, rgba(color, 1.0), 0.0, true);
+        let score = match group {
+            Some(team) => p.fe.game.scores[(team == Team::Axis) as usize],
+            None => rows.first().map_or(0, |r| points(r.1) as i32),
+        };
+        let right = left + width;
+        p.text_hd(&score.to_string(), right, head_y, 2, 1, score_size, Cut::Display, rgba(color, 1.0), 1.0, true);
+        let bar_w = width * get("scoreboard.bar_width", 0.3);
+        let bar_y = y + score_size * 1.15;
+        p.image("white", vr(right - bar_w, bar_y, bar_w, 3.5, 2, 1), [0.0, 0.0, 0.0, 0.45 * opacity], 1);
+        let fill = if limit > 0.0 { (score as f32 / limit).clamp(0.0, 1.0) } else { 1.0 };
+        p.image("white", vr(right - bar_w, bar_y, bar_w * fill, 3.5, 2, 1), rgba(color, 1.0), 1);
+        y = bar_y + 5.0;
+        // The emblem, faint behind the right edge.
+        if !name.is_empty() && get("scoreboard.emblems", 1.0) > 0.5 {
+            let size = band + row * rows.len().max(1) as f32;
+            p.image(&format!("faction_128_{name}"), vr(right - size * 0.45, y, size, size, 2, 1), [1.0, 1.0, 1.0, get("scoreboard.emblem_alpha", 0.35) * opacity], 0);
+        }
+        // The band of column titles.
+        p.image("white", vr(left, y, width, band, 2, 1), rgba(color, get("scoreboard.band_alpha", 0.4)), 1);
+        for &(label, at) in &columns {
+            p.text_hd(label, left + width * at, y + band * 0.5, 2, 1, text, Cut::Semi, rgba(color, 1.0), 1.0, true);
+        }
+        y += band;
+        // The players.
+        for (k, (e, pawn, _, _, dead, bot)) in rows.into_iter().enumerate() {
+            let own = Some(e) == me;
+            let shade = if own {
+                [0.82, 0.82, 0.82, get("scoreboard.own_alpha", 0.8) * opacity]
+            } else if k % 2 == 0 {
+                [0.0, 0.0, 0.0, get("scoreboard.row_alpha", 0.6) * opacity]
+            } else {
+                [0.07, 0.07, 0.07, get("scoreboard.row_alpha", 0.6) * opacity]
+            };
+            p.image("white", vr(left, y, width, row, 2, 1), shade, 1);
+            let ink = if own { [0.12, 0.12, 0.12] } else { [1.0, 1.0, 1.0] };
+            let a = if dead { 0.5 } else { 1.0 };
+            let cy = y + row * 0.5;
+            let (r, rank_icon) = match bot {
+                Some(b) if !own => (b.rank.0, rank_icon(p.fe, b.rank.0, b.rank.1)),
+                _ if own => (rank, icon.clone()),
+                _ => (0, "rank_pvt1".into()),
+            };
+            let ic = row * 0.85;
+            p.image(&rank_icon, vr(left + 10.0, cy - ic * 0.5, ic, ic, 2, 1), [1.0, 1.0, 1.0, a * opacity], 1);
+            p.text_hd(&(r + 1).to_string(), left + 14.0 + ic, cy, 2, 1, text, Cut::Regular, rgba(if own { ink } else { color }, a), 0.0, true);
+            let name_x = left + 22.0 + ic + text * 2.2;
+            let w = p.text_hd(&pawn.name, name_x, cy, 2, 1, text, Cut::Regular, rgba(ink, a), 0.0, true);
+            if bot.is_some() && get("scoreboard.bot_tag", 1.0) > 0.5 {
+                p.text_hd("BOT", name_x + w + 5.0, cy, 2, 1, text * 0.7, Cut::Semi, rgba(ink, 0.45 * a), 0.0, true);
+            }
+            if dead {
+                let s = row * 0.7;
+                p.image("hud_status_dead", vr(left - s - 3.0, cy - s * 0.5, s, s, 2, 1), [1.0, 1.0, 1.0, 0.8 * opacity], 1);
+            }
+            let kd = if pawn.deaths == 0 { pawn.kills as f32 } else { pawn.kills as f32 / pawn.deaths as f32 };
+            let mut values = vec![points(pawn).to_string(), pawn.kills.to_string(), pawn.assists.to_string(), pawn.deaths.to_string(), format!("{kd:.2}")];
+            if ping {
+                values.push(crate::netplay::ping_text(pawn.id).unwrap_or_else(|| "0".into()));
+            }
+            for ((_, at), v) in columns.iter().zip(values) {
+                p.text_hd(&v, left + width * at, cy, 2, 1, text, Cut::Regular, rgba(ink, a), 1.0, true);
+            }
+            y += row;
+        }
+        y += gap;
     }
 }
 
@@ -2782,8 +3031,33 @@ fn location_map(
     pawns: &Query<(Entity, &Pawn, &Transform, &ViewAngles, Has<Dead>, Option<&crate::bots::Bot>)>,
     cursor: Option<Vec2>,
 ) {
+    use super::next::font::Cut;
+    use crate::tune::get;
     let [x, y, w, h] = LOCATION_MAP;
+    let new_look = get("airstrike_map.style", 1.0) > 0.5;
+    let accent = [get("airstrike_map.accent_red", 0.35), get("airstrike_map.accent_green", 0.9), get("airstrike_map.accent_blue", 0.95)];
+    if new_look {
+        // The view dimmed, a dark panel round the map with a sharp edge and
+        // corner brackets, the title and what to do over it.
+        p.image("white", vr(0.0, 0.0, 640.0, 480.0, 4, 4), [0.0, 0.0, 0.0, get("airstrike_map.dim", 0.55)], 1);
+        let pad = 10.0;
+        let (px, py, pw, ph) = (x - pad, y - pad - 34.0, w + pad * 2.0, h + pad * 2.0 + 34.0 + 22.0);
+        p.outlined_box(vr(px, py, pw, ph, 2, 2), [0.02, 0.03, 0.035, 0.88], 0.6, [accent[0], accent[1], accent[2], 0.5]);
+        let (bl, bt) = (14.0, 1.6);
+        for (cx, cy, sx, sy) in [(px, py, 1.0, 1.0), (px + pw, py, -1.0, 1.0), (px, py + ph, 1.0, -1.0), (px + pw, py + ph, -1.0, -1.0)] {
+            let hx = if sx > 0.0 { cx } else { cx - bl };
+            let vy = if sy > 0.0 { cy } else { cy - bl };
+            p.bar(vr(hx, if sy > 0.0 { cy } else { cy - bt }, bl, bt, 2, 2), [accent[0], accent[1], accent[2], 1.0]);
+            p.bar(vr(if sx > 0.0 { cx } else { cx - bt }, vy, bt, bl, 2, 2), [accent[0], accent[1], accent[2], 1.0]);
+        }
+        p.text_hd("AIRSTRIKE", px + 10.0, py + 17.0, 2, 2, 20.0, Cut::Display, [1.0, 1.0, 1.0, 1.0], 0.0, true);
+        p.text_hd("SELECT LOCATION", px + pw - 10.0, py + 17.0, 2, 2, 9.0, Cut::Semi, [accent[0], accent[1], accent[2], 1.0], 1.0, true);
+        p.text_hd("CLICK  call in      RIGHT CLICK  cancel", px + pw * 0.5, py + ph - 11.0, 2, 2, 8.5, Cut::Semi, [0.8, 0.8, 0.8, 0.9], 0.5, true);
+    }
     p.image(&m.material.clone(), vr(x, y, w, h, 2, 2), WHITE, 1);
+    if new_look {
+        p.outlined_box(vr(x, y, w, h, 2, 2), [0.0; 4], 0.6, [accent[0], accent[1], accent[2], 0.7]);
+    }
     let (pos, size) = location_rect(&p.pl);
     if let Some(c) = cursor.filter(|c| c.cmpge(pos).all() && c.cmple(pos + size).all()) {
         let r = SELECTOR_RADIUS / m.size.x * size.x;
@@ -2807,15 +3081,19 @@ fn location_map(
     for (_, pawn, tf, view, dead, _) in pawns {
         let (c, turn) = place(tf.translation, view.yaw);
         if pawn.team == team && !crate::combat::free_for_all() && !dead && (tf.translation - at).length() > 0.01 {
-            p.image_uv("compassping_friendly", vr(c.x - 8.0, c.y - 8.0, 16.0, 16.0, 2, 2), WHITE, None, turn, 1);
+            let pic = if new_look { "cod4rw_mmicon_friendly_100_100" } else { "compassping_friendly" };
+            p.image_uv(pic, vr(c.x - 8.0, c.y - 8.0, 16.0, 16.0, 2, 2), WHITE, None, turn, 1);
         }
     }
     let (c, turn) = place(at, yaw);
-    p.image_uv("compassping_player", vr(c.x - 9.0, c.y - 9.0, 18.0, 18.0, 2, 2), WHITE, None, turn, 1);
-    let [bx, by, bw, bh] = LOCATION_BORDER;
-    p.image("map_border", vr(bx, by, bw, bh, 2, 2), WHITE, 1);
-    let text = loc(p.fe, "PLATFORM_PRESS_TO_SET_AIRSTRIKE", "Press Fire to set Air Strike location");
-    p.text(&text, 0.0, -160.0, 2, 2, 0.4 * 48.0, 0, WHITE, 0.5, true);
+    let pic = if new_look { "cod4rw_mmicon_player_100_100" } else { "compassping_player" };
+    p.image_uv(pic, vr(c.x - 9.0, c.y - 9.0, 18.0, 18.0, 2, 2), WHITE, None, turn, 1);
+    if !new_look {
+        let [bx, by, bw, bh] = LOCATION_BORDER;
+        p.image("map_border", vr(bx, by, bw, bh, 2, 2), WHITE, 1);
+        let text = loc(p.fe, "PLATFORM_PRESS_TO_SET_AIRSTRIKE", "Press Fire to set Air Strike location");
+        p.text(&text, 0.0, -160.0, 2, 2, 0.4 * 48.0, 0, WHITE, 0.5, true);
+    }
 }
 
 /// Picking the spot: a click on the map (or its border, taken to the
@@ -2832,6 +3110,10 @@ pub(super) fn pick_airstrike(
     mut inputs: Query<(&mut crate::killstreaks::HardpointInput, &Transform)>,
 ) {
     let (Some(sel), Some(m)) = (selecting, minimap) else { return };
+    // (The laptop's screen takes the clicks: `laptop_screen`.)
+    if crate::killstreaks::hands::laptop_open() {
+        return;
+    }
     if mouse.just_pressed(MouseButton::Right) {
         commands.remove_resource::<crate::killstreaks::airstrike::Selecting>();
         return;
@@ -2918,6 +3200,50 @@ fn xp(p: &mut Painter, hud: &HudState, now: f32) {
     // fontScale 2 (twelve units a unit of scale), centred on y -60.
     let height = 2.0 * pulse * 12.0;
     p.text(&format!("+{}", hud.xp.0), 0.0, -60.0 + height * 0.35, 2, 2, height, 0, [1.0, 1.0, 0.5, alpha], 0.5, false);
+}
+
+/// The XP bar along the bottom edge (CoD4's `xpbar`, MW2's): the way from
+/// this rank to the next, in segments. XP just earned fills in over a
+/// moment; a promotion flashes it and starts the new rank's bar.
+fn xp_bar(p: &mut Painter, hud: &HudState, now: f32) {
+    use super::progression::stat;
+    use crate::tune::get;
+    if !show(Hud::XpBar) || get("xpbar.show", 1.0) < 0.5 {
+        return;
+    }
+    let stats = &p.fe.stats;
+    let (xp, min, max) = (stats.get(stat::RANKXP), stats.get(stat::MINXP), stats.get(stat::MAXXP));
+    // Just earned (the "+N" adding up): eased in from where it was.
+    let since = now - hud.xp.1;
+    let fill_time = get("xpbar.fill_time", 0.6);
+    let k = (since / fill_time).clamp(0.0, 1.0);
+    let ease = 1.0 - (1.0 - k).powi(3);
+    let shown = xp as f32 - hud.xp.0 as f32 * (1.0 - ease);
+    // Promoted by it: the new rank's bar fills from empty, after a flash.
+    let promoted = hud.xp.0 > 0 && (xp - hud.xp.0 as i32) < min && since < 1.5;
+    let frac = if max <= min { 1.0 } else { ((shown - min as f32) / (max - min) as f32).clamp(0.0, 1.0) };
+    let h = get("xpbar.height", 2.6);
+    let alpha = get("xpbar.alpha", 0.35);
+    let blue = [0.35, 0.9, 0.95];
+    let y = -h;
+    // The track, the fill, then the ticks over both.
+    p.bar(vr(0.0, y, 640.0, h, 4, 3), [0.0, 0.0, 0.0, 0.45 * alpha]);
+    if frac > 0.0 {
+        p.bar(vr(0.0, y, 640.0 * frac, h, 4, 3), [blue[0], blue[1], blue[2], alpha]);
+        // A brighter leading edge while it fills.
+        if k < 1.0 {
+            let edge = 640.0 * frac;
+            p.bar(vr((edge - 3.0).max(0.0), y, 3.0_f32.min(edge), h, 4, 3), [1.0, 1.0, 1.0, alpha * (1.0 - k)]);
+        }
+    }
+    let segments = get("xpbar.segments", 10.0).round().max(1.0) as i32;
+    for i in 1..segments {
+        p.bar(vr(640.0 * i as f32 / segments as f32 - 0.5, y, 1.0, h, 4, 3), [0.0, 0.0, 0.0, 0.6 * alpha]);
+    }
+    if promoted {
+        let flash = (1.0 - since / 1.5).max(0.0);
+        p.bar(vr(0.0, y - h, 640.0, h * 2.0, 4, 3), [1.0, 1.0, 1.0, 0.7 * flash * alpha]);
+    }
 }
 
 #[cfg(test)]

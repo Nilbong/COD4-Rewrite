@@ -378,6 +378,17 @@ impl Mover {
         self.eye_height = u(h);
     }
 
+    /// Stop sprinting (mantling, a melee lunge, a ladder, frozen). The end
+    /// must be noted: without it the sprint counted as still running, its
+    /// stamina drained to nothing, and sprint never started again until
+    /// the player died.
+    pub fn stop_sprint(&mut self) {
+        if self.sprinting {
+            self.sprinting = false;
+            self.sprint.last_end = self.clock_ms;
+        }
+    }
+
     /// `PM_GetSprintLeft`, in ms.
     fn sprint_left_ms(&self) -> f32 {
         let max = SPRINT_TIME * self.sprint_time_scale * 1000.0;
@@ -520,7 +531,7 @@ pub fn mantle_landing(spatial: &SpatialQuery, feet: Vec3, yaw: f32, over: &[Enti
 fn settle_frozen(mut pawns: Query<&mut Mover, (With<Frozen>, Without<crate::combat::Dead>, Without<crate::netplay::Puppet>)>) {
     for mut m in &mut pawns {
         if m.sprinting || m.velocity.x != 0.0 || m.velocity.z != 0.0 {
-            m.sprinting = false;
+            m.stop_sprint();
             m.velocity.x = 0.0;
             m.velocity.z = 0.0;
         }
@@ -531,12 +542,13 @@ fn move_pawns(
     time: Res<Time>,
     tuning: Res<MoveTuning>,
     spatial: SpatialQuery,
-    mut pawns: Query<(Entity, &mut Transform, &mut Mover, &MoveInput, &ViewAngles, Has<crate::player::LocalPlayer>), Without<Frozen>>,
+    mut pawns: Query<(Entity, &mut Transform, &mut Mover, &MoveInput, &ViewAngles, Has<crate::player::LocalPlayer>), (Without<Frozen>, Without<NetDriven>)>,
     mut landed: MessageWriter<Landed>,
     mantle_anims: Option<Res<MantleAnims>>,
     mantle_surfaces: Query<(Entity, &collision::MantleSurface)>,
     faces: Option<Res<collision::BrushFaces>>,
     ladders: Query<Entity, With<collision::Ladder>>,
+    mut landings: Local<bevy::utils::Parallel<Vec<Landed>>>,
 ) {
     let dt = time.delta_secs().min(0.1);
     let steps = (dt / MAX_SUBSTEP).ceil().max(1.0);
@@ -545,12 +557,15 @@ fn move_pawns(
     let over: Vec<Entity> = mantle_surfaces.iter().filter(|(_, s)| s.over).map(|(e, _)| e).collect();
     let ladders: Vec<Entity> = ladders.iter().collect();
     let ctx = Ctx { mantle: mantle_anims.as_deref(), mantle_over: &over, spatial: &spatial, filter: &filter, tuning: *tuning, faces: faces.as_deref(), ladders: &ladders };
-    for (entity, mut tf, mut mover, input, view, local) in &mut pawns {
+    // Pawns only collide with the world (not each other), so each moves
+    // on its own: in parallel, landings gathered and sent in entity order.
+    let sink = &*landings;
+    let move_one = |(entity, mut tf, mut mover, input, view, local): (Entity, Mut<Transform>, Mut<Mover>, &MoveInput, &ViewAngles, bool)| {
         tf.rotation = Quat::from_rotation_y(view.yaw);
         let mut pos = tf.translation;
         for _ in 0..steps as u32 {
             if let Some(h) = pmove(&ctx, &mut pos, &mut mover, input, view, step_dt) {
-                landed.write(Landed { entity, fall_height: h });
+                sink.scope(|l| l.push(Landed { entity, fall_height: h }));
             }
         }
         update_lean(&ctx, pos, &mut mover, input, view.yaw, dt);
@@ -559,6 +574,56 @@ fn move_pawns(
             && mover.mantle.is_none()
             && ctx.mantle.is_some_and(|a| mantle::available(&ctx, pos, &mover, view.yaw, a, ctx.mantle_over));
         tf.translation = pos;
+    };
+    if crate::perf::old("move") {
+        pawns.iter_mut().for_each(move_one);
+    } else {
+        pawns.par_iter_mut().for_each(move_one);
+    }
+    let mut all: Vec<Landed> = landings.drain().collect();
+    all.sort_by_key(|l| l.entity);
+    landed.write_batch(all);
+}
+
+/// Moved by [`crate::netplay`] a command at a time ([`MoveWorld::run`]),
+/// not by [`move_pawns`]: a friend's soldier on the host, and an online
+/// guest's own (predicted, and replayed when the host's word arrives).
+#[derive(Component)]
+pub struct NetDriven;
+
+/// What moving a pawn needs, for moving one outside [`move_pawns`]
+/// ([`NetDriven`]).
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct MoveWorld<'w, 's> {
+    tuning: Res<'w, MoveTuning>,
+    spatial: SpatialQuery<'w, 's>,
+    mantle_anims: Option<Res<'w, MantleAnims>>,
+    mantle_surfaces: Query<'w, 's, (Entity, &'static collision::MantleSurface)>,
+    faces: Option<Res<'w, collision::BrushFaces>>,
+    ladders: Query<'w, 's, Entity, With<collision::Ladder>>,
+}
+
+impl MoveWorld<'_, '_> {
+    /// Move a pawn at `pos` for `dt` seconds, as [`move_pawns`] would in a
+    /// frame that long. Returns the fall height if it landed.
+    pub fn run(&self, pos: &mut Vec3, mover: &mut Mover, input: &MoveInput, view: &ViewAngles, dt: f32) -> Option<f32> {
+        let dt = dt.min(0.25);
+        if dt <= 0.0 {
+            return None;
+        }
+        let filter = collision::movement_filter();
+        let over: Vec<Entity> = self.mantle_surfaces.iter().filter(|(_, s)| s.over).map(|(e, _)| e).collect();
+        let ladders: Vec<Entity> = self.ladders.iter().collect();
+        let ctx = Ctx { mantle: self.mantle_anims.as_deref(), mantle_over: &over, spatial: &self.spatial, filter: &filter, tuning: *self.tuning, faces: self.faces.as_deref(), ladders: &ladders };
+        let steps = (dt / MAX_SUBSTEP).ceil().max(1.0);
+        let mut fall = None;
+        for _ in 0..steps as u32 {
+            if let Some(h) = pmove(&ctx, pos, mover, input, view, dt / steps) {
+                fall = Some(h);
+            }
+        }
+        update_lean(&ctx, *pos, mover, input, view.yaw, dt);
+        fall
     }
 }
 
@@ -614,7 +679,7 @@ fn pmove(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, input: &MoveInput, view: &Vie
     if let Some(v) = m.charge {
         let speed = (v.length() - u(MELEE_CHARGE_FRICTION) * dt).max(0.0);
         m.charge = (speed > 0.0).then(|| v.normalize_or_zero() * speed);
-        m.sprinting = false;
+        m.stop_sprint();
         m.velocity = Vec3::new(v.x, m.velocity.y.min(0.0), v.z);
         step_slide_move(ctx, pos, m, !m.on_ground, dt);
         m.jump_held = input.jump;
@@ -627,7 +692,7 @@ fn pmove(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, input: &MoveInput, view: &Vie
 
     check_ladder(ctx, *pos, m, fmove, yaw);
     if let Some(ladder) = m.ladder {
-        m.sprinting = false;
+        m.stop_sprint();
         if jump_check(m, input, *pos) {
             push_off_ladder(m, ladder, yaw);
             air_move(ctx, pos, m, fmove, smove, yaw, dt);
@@ -1324,6 +1389,22 @@ mod tests {
         assert!(m.sprint.button_up_required);
         m.clock_ms += 2000.0;
         assert!((m.sprint_left_ms() - 2000.0).abs() < 1.0);
+    }
+
+    /// A sprint cut short (a mantle, a lunge) recharges: it used to count
+    /// as still running, draining to nothing for good.
+    #[test]
+    fn sprint_cut_short_recharges() {
+        let mut m = Mover { on_ground: true, ..Default::default() };
+        let input = MoveInput { forward: 1.0, sprint: true, ..Default::default() };
+        update_sprint(&mut m, &input, 127.0);
+        m.clock_ms += 500.0;
+        m.stop_sprint();
+        m.clock_ms += 10_000.0;
+        update_sprint(&mut m, &MoveInput::default(), 0.0);
+        assert!((m.sprint_left_ms() - SPRINT_TIME * 1000.0).abs() < 1.0);
+        update_sprint(&mut m, &input, 127.0);
+        assert!(m.sprinting);
     }
 
     #[test]

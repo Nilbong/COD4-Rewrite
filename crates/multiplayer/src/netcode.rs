@@ -278,7 +278,10 @@ mod tests {
         let snap = |tick, x, yaw, life| Snapshot {
             tick,
             acknowledged_input: 0,
+            sequence: 0,
+            ack_age: 0,
             pawns: vec![PawnState { id: 1, position: [x, 0.0, 0.0], yaw, life, ..Default::default() }],
+            extra: Vec::new(),
         };
         i.push(snap(10, 0.0, 3.1, 0)).unwrap();
         i.push(snap(16, 6.0, -3.1, 0)).unwrap();

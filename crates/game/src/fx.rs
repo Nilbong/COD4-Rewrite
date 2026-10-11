@@ -289,7 +289,17 @@ impl Effects {
         if name.is_empty() {
             return;
         }
-        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false });
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false, tint: [1.0; 3] });
+    }
+
+    /// The same, its colours multiplied by `tint` (linear RGB): a care
+    /// package's marker's smoke made red.
+    pub fn play_tinted(&mut self, name: &str, anchor: Anchor, layer: FxLayer, tint: [f32; 3]) {
+        let name = name.trim_start_matches(',');
+        if name.is_empty() {
+            return;
+        }
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false, tint });
     }
 
     /// Start a map's ambient effect (its createfx placements) at `frame`,
@@ -302,7 +312,7 @@ impl Effects {
             return;
         }
         let at = self.now + delay_ms.max(-AMBIENT_PREWARM_MSEC);
-        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor: Anchor::Fixed(frame), layer: FxLayer::World, at: Some(at), forever: true });
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor: Anchor::Fixed(frame), layer: FxLayer::World, at: Some(at), forever: true, tint: [1.0; 3] });
     }
 
     fn next_seed(&mut self) -> u32 {
@@ -326,12 +336,14 @@ struct Play {
     forever: bool,
     /// When it starts (ms on the effects clock); `None` for this frame.
     at: Option<f64>,
+    /// Its colours multiplied by this.
+    tint: [f32; 3],
 }
 
 impl Play {
     /// A particle's child effect, from now.
     fn child(name: &str, frame: Frame, layer: FxLayer) -> Play {
-        Play { effect: EffectRef::Name(name.trim_start_matches(',').to_owned()), anchor: Anchor::Fixed(frame), layer, at: None, forever: false }
+        Play { effect: EffectRef::Name(name.trim_start_matches(',').to_owned()), anchor: Anchor::Fixed(frame), layer, at: None, forever: false, tint: [1.0; 3] }
     }
 }
 
@@ -367,6 +379,8 @@ struct Instance {
     live: u32,
     /// Looping for good (a map's ambient effect).
     forever: bool,
+    /// Its colours multiplied by this ([`Effects::play_tinted`]).
+    tint: [f32; 3],
 }
 
 struct Particle {
@@ -726,11 +740,11 @@ fn make_material(content: &mut Content, a: &mut FxAssets, name: &str) -> Option<
 impl Effects {
     /// Start an effect: spawn its one-shot elements and set up its looping
     /// ones.
-    fn start(&mut self, id: FxId, frame: Frame, bolt: Option<Entity>, layer: FxLayer, at: f64, forever: bool) {
+    fn start(&mut self, id: FxId, frame: Frame, bolt: Option<Entity>, layer: FxLayer, at: f64, forever: bool, tint: [f32; 3]) {
         let seed = self.next_seed();
         let def = &self.defs[id.0 as usize].def;
         let looping = def.looping().map(|i| (i as u16, 0)).collect();
-        let instance = Instance { def: id, bolt, frame, layer, start: at, looping, live: 0, forever };
+        let instance = Instance { def: id, bolt, frame, layer, start: at, looping, live: 0, forever, tint };
         let slot = match self.free.pop() {
             Some(s) => {
                 self.instances[s as usize] = Some(instance);
@@ -840,7 +854,7 @@ impl Effects {
                     Some(b) => Anchor::Bolted(b),
                     None => Anchor::Fixed(child),
                 };
-                self.queue.push(Play { effect: EffectRef::Id(id), anchor, layer, at: Some(begin), forever: false });
+                self.queue.push(Play { effect: EffectRef::Id(id), anchor, layer, at: Some(begin), forever: false, tint: [1.0; 3] });
             }
             ElemType::Decal => {
                 let Vis::Decal(material) = vis else { return };
@@ -1369,7 +1383,7 @@ fn run_effects(
                     Err(_) => continue,
                 },
             };
-            fx.start(id, frame, bolt, play.layer, at, play.forever);
+            fx.start(id, frame, bolt, play.layer, at, play.forever, play.tint);
             started = true;
         }
         if !started {
@@ -1477,6 +1491,9 @@ fn run_effects(
         }
         p.last = Some(pos);
         let mut look = look(e, p.seed, t, p.life);
+        for (c, k) in look.color.iter_mut().zip(inst.tint) {
+            *c *= k;
+        }
         let dist = pos.distance(view.pos) / INCH;
         look.color[3] *= distance_fade(e, dist);
         if e.elem_type == ElemType::OmniLight {
@@ -1635,6 +1652,24 @@ fn run_effects(
     place_decals(&mut commands, fx, &mut content, &mut assets, &spatial);
     fx.busy.0 += started.elapsed();
     fx.busy.1 += 1;
+    // `COD4RW_PERF`: where the time went, every 300 frames.
+    if fx.busy.1 >= 300 {
+        if crate::perf::on() {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / fx.busy.1 as f64;
+            let quads: usize = fx.quad_lists.values().map(Vec::len).sum();
+            info!(
+                "perf: fx {:.3} ms a frame (clouds {:.3}, lighting {:.3}, meshes {:.3}); {} particles, {} quads",
+                ms(fx.busy.0),
+                ms(fx.busy_parts[2]),
+                ms(fx.busy_parts[0]),
+                ms(fx.busy_parts[1]),
+                fx.particles.len(),
+                quads
+            );
+        }
+        fx.busy = Default::default();
+        fx.busy_parts = Default::default();
+    }
 }
 
 impl Effects {

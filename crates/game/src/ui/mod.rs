@@ -31,10 +31,12 @@ pub(crate) mod challenges;
 pub(crate) mod progression;
 mod options;
 mod settings_menu;
+mod game_folders;
 pub use options::{film_tint, lighting};
 mod split;
-mod scope;
-mod scope3d;
+pub(crate) mod scope;
+pub(crate) mod scope3d;
+mod laptop_screen;
 pub use scope::{LENS_OUTER_FOV, ScopeCamera, lens_scopes};
 pub use scope3d::{magnifies as scope_magnifies, scope_3d};
 mod script;
@@ -117,6 +119,7 @@ impl Plugin for UiPlugin {
         pad::build(app);
         scope::build(app);
         scope3d::build(app);
+        laptop_screen::build(app);
         options::build(app);
         if let Ok(dir) = std::env::var("COD4RW_UISHOT") {
             // Debug runs stay quiet.
@@ -250,6 +253,13 @@ pub struct Frontend {
 }
 
 impl Frontend {
+    /// Every menu closed (the session's leave test, starting a match
+    /// without the lobby).
+    pub(crate) fn close_all(&mut self) {
+        self.stack.clear();
+        self.focus = None;
+    }
+
     /// Was the match started from the menus (not the command line or a
     /// simulation)?
     pub fn from_menus(&self) -> bool {
@@ -259,6 +269,12 @@ impl Frontend {
     /// The player's name: the combat record's, with its clan tag.
     pub fn profile_name(&self) -> String {
         combat_record::identity(&self.stats)
+    }
+
+    /// A profile stat, for game code outside the menus (the kill streak
+    /// loadout, [`crate::killstreaks::choice`]).
+    pub fn profile_stat(&self, index: i32) -> i32 {
+        self.stats.get(index)
     }
 }
 
@@ -398,6 +414,19 @@ fn worn_character() -> &'static str {
 
 
 /// Can the mouse focus and click this item?
+/// An [`Op::Gun`] key for just the picture, fitted (`Kit::pic_fit`).
+pub(super) const PICTURE_ONLY: i32 = i32::MIN;
+
+/// `src` (a picture's size) fitted inside `pos`/`size`, centred.
+fn fit(pos: Vec2, size: Vec2, src: Vec2) -> (Vec2, Vec2) {
+    if src.x <= 0.0 || src.y <= 0.0 {
+        return (pos, size);
+    }
+    let k = (size.x / src.x).min(size.y / src.y);
+    let s = src * k;
+    (pos + (size - s) * 0.5, s)
+}
+
 /// `ITEM_TYPE_VALIDFILEFIELD`: a text field for a file name.
 const VALIDFILEFIELD: i32 = 16;
 
@@ -697,7 +726,9 @@ impl Frontend {
             s if s.starts_with("t4") => self.waw_script(args),
             s if s.starts_with("iw4") => self.mw2_script(args),
             s if s.starts_with("lobby") => self.lobby_script(args),
+            s if s.starts_with("mm") => next::join::script(args),
             _ if self.profile_script(args) => {}
+            _ if self.streak_script(args) => {}
             _ if self.browser_script(args) => {}
             _ => debug!("ui: unhandled uiScript {args:?}"),
         }
@@ -715,9 +746,18 @@ impl Frontend {
             self.run(&on_open, &key);
             return;
         }
+        // Join Game: the new UI's Find Match and lobby browser.
+        if key == "pc_join_unranked" && modern::wanted(self) {
+            return self.open(next::join::MENU);
+        }
         // Weapon popups ask which game's weapons first (Black Ops' guns).
         if let Some(choice) = self.bo1_redirect(&key) {
             return self.open(&choice);
+        }
+        // CoD4's stand-in attachment popup (a gun with none) is only a
+        // backdrop for its camo popup: the new UI's pickers don't need it.
+        if key.ends_with("attachment_popup_fake") && modern::wanted(self) {
+            return;
         }
         // The new UI's settings: the Options and Controls lists are their
         // first pages' list.
@@ -729,6 +769,8 @@ impl Frontend {
         let base = self.custom_camo_menu(&key).or_else(|| self.reticle_menu(&key)).or(base);
         let base = if key == next::color::MENU { Some(Arc::new(next::color::menu(self))) } else { base };
         let base = if key == next::modes::MENU { Some(Arc::new(next::modes::menu(self))) } else { base };
+        let base = if key == next::join::MENU { Some(Arc::new(next::join::menu(self))) } else { base };
+        let base = if key == next::streaks::MENU { Some(Arc::new(next::streaks::menu(self))) } else { base };
         let base = if key == hq::PAUSE_MENU { self.assets.menu("class").and_then(|m| hq::pause_menu(&m)).map(Arc::new) } else { base };
         let base = match key.as_str() {
             "class" => base.map(|m| hq::match_pause_menu(&m).map_or(m, Arc::new)),
@@ -1439,10 +1481,13 @@ impl Frontend {
                     }
                 }
                 Op::Gun { pos, size, key, weapon, camo, picture } => {
-                    let image = self.previews.request(key, &weapon, camo, pos, size);
-                    let image = image.or_else(|| self.assets.material(&picture, images).map(|i| i.handle));
-                    if let Some(image) = image {
+                    let preview = (key != PICTURE_ONLY).then(|| self.previews.request(key, &weapon, camo, pos, size)).flatten();
+                    if let Some(image) = preview {
                         out.push(Quad::new(pos, size, image, None, Color::WHITE));
+                    } else if let Some(img) = self.assets.material(&picture, images) {
+                        // The picture meanwhile (or in a match), its shape kept.
+                        let (pos, size) = fit(pos, size, img.size);
+                        out.push(Quad::new(pos, size, img.handle, None, Color::WHITE));
                     }
                 }
             }
@@ -1663,8 +1708,7 @@ fn menu_input(
             fe.stack.clear();
             fe.focus = None;
         }
-        crate::atmos::climate::set_map(&map);
-        commands.insert_resource(MapName(map));
+        commands.insert_resource(MapName(crate::atmos::climate::set_map(&map)));
         next.set(GameState::Loading);
     }
     fe.stats.save_if_changed();
@@ -1725,9 +1769,23 @@ fn draw_menus(fe: &mut Frontend, out: &mut Vec<Quad>, images: &mut Assets<Image>
     fe.emit(ops, images, out);
 }
 
-/// The map's load screen picture over the whole window.
-fn load_screen_ops(map: &str, window: &Window) -> Vec<Op> {
+/// The load screen: the new UI's (map, game type, tip, a bar), or CoD4's
+/// picture over the whole window.
+fn load_screen_ops(fe: &Frontend, map: &str, config: Option<&crate::tdm::MatchConfig>, settling: bool, window: &Window) -> Vec<Op> {
     let size = Vec2::new(window.width(), window.height());
+    if modern::wanted(fe) {
+        // (The campaign and Headquarters aren't a game type's match.)
+        let plain = crate::campaign::active() || crate::hq::active();
+        let m = next::loading::Match {
+            map,
+            mode: config.filter(|_| !plain).map(|c| c.mode),
+            hardcore: config.is_some_and(|c| c.hardcore),
+            time_limit: config.map_or(0.0, |c| c.time_limit),
+            score_limit: config.map_or(0, |c| c.score_limit),
+            settling,
+        };
+        return next::loading::ops(fe, &m, size);
+    }
     vec![
         Op::Fill { pos: Vec2::ZERO, size, color: [0.0, 0.0, 0.0, 1.0] },
         Op::Pic { pos: Vec2::ZERO, size, material: format!("loadscreen_{map}"), color: [1.0; 4] },
@@ -1739,13 +1797,15 @@ fn load_screen_ops(map: &str, window: &Window) -> Vec<Op> {
 fn settling_screen(
     fe: Option<ResMut<Frontend>>,
     map: Res<MapName>,
+    config: Option<Res<crate::tdm::MatchConfig>>,
     mut list: ResMut<DrawList>,
     mut images: ResMut<Assets<Image>>,
     window: Single<&Window, With<PrimaryWindow>>,
 ) {
     list.0.clear();
     if let Some(mut fe) = fe {
-        fe.emit(load_screen_ops(&map.0, &window), &mut images, &mut list.0);
+        let ops = load_screen_ops(&fe, &map.0, config.as_deref(), true, &window);
+        fe.emit(ops, &mut images, &mut list.0);
     }
 }
 
@@ -1754,6 +1814,7 @@ fn settling_screen(
 fn loading_screen(
     fe: Option<ResMut<Frontend>>,
     map: Res<MapName>,
+    config: Option<Res<crate::tdm::MatchConfig>>,
     mut list: ResMut<DrawList>,
     mut images: ResMut<Assets<Image>>,
     window: Single<&Window, With<PrimaryWindow>>,
@@ -1762,7 +1823,8 @@ fn loading_screen(
 ) {
     list.0.clear();
     if let Some(mut fe) = fe {
-        fe.emit(load_screen_ops(&map.0, &window), &mut images, &mut list.0);
+        let ops = load_screen_ops(&fe, &map.0, config.as_deref(), false, &window);
+        fe.emit(ops, &mut images, &mut list.0);
     }
     *frames += 1;
     if *frames >= 3 {

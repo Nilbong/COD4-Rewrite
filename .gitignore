@@ -28,3 +28,8 @@
 /crates/game/assets/ui/*.preview
 /crates/game/assets/ui/headquarters
 /crates/game/assets/ui/joinagame
+
+# CoD4 animation data extracted for the mocap tools (the games' own files).
+/tools/mocap/ref/
+# A debug leftover.
+/crates/game/src/netplay/_keep_report.txt

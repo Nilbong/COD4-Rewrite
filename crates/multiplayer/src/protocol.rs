@@ -1,12 +1,17 @@
 //! Small, fixed-layout packets. Bounds are checked before allocation, no
 //! network-provided strings become file paths, and trailing bytes are rejected.
 
+use crate::matchmaking::{self as mm, Filter, LobbyInfo, Listing};
 use anyhow::{Result, bail, ensure};
 
-pub const VERSION: u16 = 4;
+/// 6: public lobby listings, the lobby browser and quick match
+/// ([`crate::matchmaking`]). 7: best-host election ([`Control::Elect`]).
+pub const VERSION: u16 = 8;
 pub const MAX_PACKET: usize = 1100;
 pub const MAX_PLAYERS: usize = 18;
-pub const INPUT_REDUNDANCY: usize = 3;
+/// Commands per input packet: the newest and the ones before it, so a
+/// few lost in a row cost nothing.
+pub const INPUT_REDUNDANCY: usize = 5;
 pub const MAX_CONTROL: usize = 1400;
 /// Largest relayed message payload (lobby rosters, match start).
 pub const MAX_MESSAGE: usize = 1200;
@@ -98,6 +103,11 @@ pub enum Hello {
     Join { room: u64, invite: Invite },
     /// Join by the host's short code.
     JoinCode(LobbyCode),
+    /// Look at the public lobbies without joining one: the relay answers
+    /// [`Control::List`] and [`Control::QuickMatch`] with [`Control::Lobbies`].
+    Browse,
+    /// Join a public lobby from the list: only a listed, open room.
+    JoinListed { room: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +121,27 @@ pub enum Control {
     /// host; the host messages a player or [`EVERYONE`]. Delivered, `peer`
     /// is the sender, stamped by the relay.
     Message { peer: PeerId, data: Vec<u8> },
+    /// Host to relay: list the room publicly (`None`: take it off). Sent
+    /// again at least every few seconds: a listing not refreshed for
+    /// [`mm::LISTING_TTL`] is hidden.
+    Publish(Option<Listing>),
+    /// Browser to relay: the public lobbies, best first.
+    List(Filter),
+    /// Browser to relay: the few best open lobbies for this filter to join
+    /// now, best first ([`mm::sort_for_quick_match`]). The answer's
+    /// `total` counts the open ones at any ping.
+    QuickMatch(Filter),
+    /// Relay to browser: an answer, in frames; `last` ends it. `total` is
+    /// how many matched (more than are sent past [`mm::MAX_LOBBIES`]).
+    Lobbies { total: u16, last: bool, lobbies: Vec<LobbyInfo> },
+    /// Host to relay, as its match is about to start: make the player
+    /// nearest the relay the host (the one everyone's shots reach soonest).
+    Elect,
+    /// Relay to everyone in the room: the election's result. `swap`: the
+    /// player who's now the host, who swapped IDs with the old one ([`HOST`]
+    /// is always the host; the old host is now `swap`). `None`: the host
+    /// stays. The host then starts the match.
+    Elected { swap: Option<PeerId> },
 }
 
 /// Only controls are accepted from clients: never positions, damage, health,
@@ -125,6 +156,14 @@ pub struct InputCommand {
     pub buttons: u16,
     /// 0 stand, 1 crouch, 2 prone.
     pub stance: u8,
+    /// How long the player's game ran these controls for (ms, 1..=250):
+    /// the host runs them for as long, so its movement matches the
+    /// player's own prediction.
+    pub msec: u8,
+    /// The host tick the player's game was showing everyone else at when
+    /// these controls were made (its interpolated view): the host rewinds
+    /// shots to it (lag compensation).
+    pub view_tick: u32,
 }
 
 pub mod button {
@@ -149,6 +188,7 @@ impl InputCommand {
         ensure!(self.yaw.is_finite() && self.yaw.abs() <= std::f32::consts::PI, "invalid yaw");
         ensure!(self.pitch.is_finite() && self.pitch.abs() <= 1.55, "invalid pitch");
         ensure!(self.buttons & !button::ALL == 0 && self.stance <= 2, "invalid input flags");
+        ensure!(self.msec <= 250, "invalid command duration");
         Ok(())
     }
 }
@@ -179,7 +219,9 @@ pub mod pawn_flags {
     /// In cover (3rd Person TDM), and the cover is a tall one.
     pub const IN_COVER: u8 = 16;
     pub const COVER_HIGH: u8 = 32;
-    pub const ALL: u8 = 63;
+    /// Held still (round or match over, picking a class): no moving.
+    pub const FROZEN: u8 = 64;
+    pub const ALL: u8 = 127;
 }
 
 impl PawnState {
@@ -194,12 +236,20 @@ impl PawnState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     pub tick: u32,
+    /// Counts up by one per snapshot sent to this player: gaps are loss.
+    pub sequence: u16,
     /// Last input consumed for the receiving player, not the last received.
     pub acknowledged_input: u32,
+    /// How long (ms, capped) the acknowledged input waited on the host
+    /// before this snapshot left: the player takes it off its round trip.
+    pub ack_age: u8,
     pub pawns: Vec<PawnState>,
+    /// Everything else that moves (killstreaks' aircraft, sentries...),
+    /// encoded and checked by the game; it must fit the datagram.
+    pub extra: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -223,20 +273,33 @@ fn header(kind: u8) -> Vec<u8> {
     out.push(kind);
     out
 }
-fn u16_out(out: &mut Vec<u8>, v: u16) {
+pub(crate) fn u16_out(out: &mut Vec<u8>, v: u16) {
     out.extend(v.to_le_bytes());
 }
 fn u32_out(out: &mut Vec<u8>, v: u32) {
     out.extend(v.to_le_bytes());
 }
-fn u64_out(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn u64_out(out: &mut Vec<u8>, v: u64) {
     out.extend(v.to_le_bytes());
 }
 fn f32_out(out: &mut Vec<u8>, v: f32) {
     out.extend(v.to_le_bytes());
 }
 
-fn map_out(out: &mut Vec<u8>, map: &str) -> Result<()> {
+/// A snapshot's velocity resolution (m/s) and angle resolution (radians).
+const VELOCITY_STEP: f32 = 0.02;
+const ANGLE_STEP: f32 = std::f32::consts::PI / 32767.0;
+
+/// `v` in steps of `step`, as an i16 (clamped to its range).
+fn quantize(v: f32, step: f32) -> u16 {
+    (v / step).round().clamp(-32767.0, 32767.0) as i16 as u16
+}
+
+fn dequantize(v: u16, step: f32) -> f32 {
+    v as i16 as f32 * step
+}
+
+pub(crate) fn map_out(out: &mut Vec<u8>, map: &str) -> Result<()> {
     ensure!(
         !map.is_empty() && map.len() <= 48 && map.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
         "invalid map identifier"
@@ -246,7 +309,7 @@ fn map_out(out: &mut Vec<u8>, map: &str) -> Result<()> {
     Ok(())
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     rest: &'a [u8],
 }
 impl<'a> Reader<'a> {
@@ -258,33 +321,36 @@ impl<'a> Reader<'a> {
         let kind = r.u8()?;
         Ok((r, kind))
     }
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
         ensure!(self.rest.len() >= len, "truncated packet");
         let (head, tail) = self.rest.split_at(len);
         self.rest = tail;
         Ok(head)
     }
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into()?))
     }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
     }
-    fn u64(&mut self) -> Result<u64> {
+    pub(crate) fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
     }
     fn float(&mut self) -> Result<f32> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into()?))
     }
-    fn map(&mut self) -> Result<String> {
+    pub(crate) fn map(&mut self) -> Result<String> {
         let len = self.u8()? as usize;
         ensure!(len > 0 && len <= 48, "invalid map length");
         let map = std::str::from_utf8(self.take(len)?)?.to_owned();
         map_out(&mut Vec::new(), &map)?;
         Ok(map)
+    }
+    pub(crate) fn peek(&self) -> Option<u8> {
+        self.rest.first().copied()
     }
     fn done(&self) -> Result<()> {
         ensure!(self.rest.is_empty(), "trailing packet bytes");
@@ -298,6 +364,8 @@ impl Hello {
             Self::Create { .. } => 1,
             Self::Join { .. } => 2,
             Self::JoinCode(_) => 6,
+            Self::Browse => 8,
+            Self::JoinListed { .. } => 9,
         });
         match self {
             Self::Create { map } => map_out(&mut out, map)?,
@@ -309,6 +377,8 @@ impl Hello {
                 code.check()?;
                 out.extend(code.0);
             }
+            Self::Browse => {}
+            Self::JoinListed { room } => u64_out(&mut out, *room),
         }
         Ok(out)
     }
@@ -322,6 +392,8 @@ impl Hello {
                 code.check()?;
                 Self::JoinCode(code)
             }
+            8 => Self::Browse,
+            9 => Self::JoinListed { room: r.u64()? },
             _ => bail!("invalid hello"),
         };
         r.done()?;
@@ -336,6 +408,12 @@ impl Control {
             Self::PeerJoined(_) => 4,
             Self::PeerLeft(_) => 5,
             Self::Message { .. } => 7,
+            Self::Publish(_) => 13,
+            Self::List(_) => 14,
+            Self::QuickMatch(_) => 15,
+            Self::Lobbies { .. } => 16,
+            Self::Elect => 17,
+            Self::Elected { .. } => 18,
         });
         match self {
             Self::Welcome { room, peer, map, invite, code } => {
@@ -357,6 +435,19 @@ impl Control {
                 ensure!(!data.is_empty() && data.len() <= MAX_MESSAGE, "invalid message length");
                 u16_out(&mut out, *peer);
                 out.extend(data);
+            }
+            Self::Publish(listing) => {
+                out.push(listing.is_some() as u8);
+                if let Some(l) = listing {
+                    mm::listing_out(&mut out, l)?;
+                }
+            }
+            Self::List(f) | Self::QuickMatch(f) => mm::filter_out(&mut out, f)?,
+            Self::Lobbies { total, last, lobbies } => mm::lobbies_out(&mut out, *total, *last, lobbies)?,
+            Self::Elect => {}
+            Self::Elected { swap } => {
+                ensure!(*swap != Some(HOST), "the host can't swap with itself");
+                u16_out(&mut out, swap.unwrap_or(HOST));
             }
         }
         ensure!(out.len() <= MAX_CONTROL, "control too large");
@@ -393,6 +484,19 @@ impl Control {
                 ensure!(!data.is_empty() && data.len() <= MAX_MESSAGE, "invalid message length");
                 Self::Message { peer, data }
             }
+            13 => Self::Publish(match r.u8()? {
+                0 => None,
+                1 => Some(mm::listing_in(&mut r)?),
+                _ => bail!("invalid listing flag"),
+            }),
+            14 => Self::List(mm::filter_in(&mut r)?),
+            15 => Self::QuickMatch(mm::filter_in(&mut r)?),
+            16 => {
+                let (total, last, lobbies) = mm::lobbies_in(&mut r)?;
+                Self::Lobbies { total, last, lobbies }
+            }
+            17 => Self::Elect,
+            18 => Self::Elected { swap: Some(r.u16()?).filter(|p| *p != HOST) },
             _ => bail!("invalid relay control"),
         };
         r.done()?;
@@ -410,7 +514,8 @@ fn commands_out(out: &mut Vec<u8>, commands: &[InputCommand]) -> Result<()> {
         f32_out(out, c.yaw);
         f32_out(out, c.pitch);
         u16_out(out, c.buttons);
-        out.push(c.stance);
+        out.extend([c.stance, c.msec]);
+        u32_out(out, c.view_tick);
     }
     Ok(())
 }
@@ -427,6 +532,8 @@ fn commands_in(r: &mut Reader<'_>) -> Result<Vec<InputCommand>> {
             pitch: r.float()?,
             buttons: r.u16()?,
             stance: r.u8()?,
+            msec: r.u8()?,
+            view_tick: r.u32()?,
         };
         c.validate()?;
         commands.push(c);
@@ -451,20 +558,30 @@ impl Packet {
                 ensure!(state.pawns.len() <= MAX_PLAYERS, "too many pawns");
                 u16_out(&mut out, *recipient);
                 u32_out(&mut out, state.tick);
+                u16_out(&mut out, state.sequence);
                 u32_out(&mut out, state.acknowledged_input);
+                out.push(state.ack_age);
                 out.push(state.pawns.len() as u8);
                 let mut ids = std::collections::HashSet::new();
                 for p in &state.pawns {
                     p.validate()?;
                     ensure!(ids.insert(p.id), "duplicate pawn ID");
                     u16_out(&mut out, p.id);
-                    for v in p.position.into_iter().chain(p.velocity) {
+                    // Position exact; velocity to 2 cm/s and the angles to
+                    // a 10000th of a half turn (small packets at 40 Hz).
+                    for v in p.position {
                         f32_out(&mut out, v);
                     }
-                    f32_out(&mut out, p.yaw);
-                    f32_out(&mut out, p.pitch);
+                    for v in p.velocity {
+                        u16_out(&mut out, quantize(v, VELOCITY_STEP));
+                    }
+                    u16_out(&mut out, quantize(p.yaw, ANGLE_STEP));
+                    u16_out(&mut out, quantize(p.pitch, ANGLE_STEP));
                     out.extend([p.health, p.stance, p.life, p.shots, p.flags]);
                 }
+                ensure!(state.extra.len() <= MAX_PACKET, "snapshot extra too large");
+                u16_out(&mut out, state.extra.len() as u16);
+                out.extend(&state.extra);
             }
         }
         ensure!(out.len() <= MAX_PACKET, "packet too large");
@@ -478,7 +595,9 @@ impl Packet {
             12 => {
                 let recipient = r.u16()?;
                 let tick = r.u32()?;
+                let sequence = r.u16()?;
                 let acknowledged_input = r.u32()?;
+                let ack_age = r.u8()?;
                 let count = r.u8()? as usize;
                 ensure!(count <= MAX_PLAYERS, "too many pawns");
                 let mut pawns = Vec::with_capacity(count);
@@ -487,9 +606,10 @@ impl Packet {
                     let p = PawnState {
                         id: r.u16()?,
                         position: [r.float()?, r.float()?, r.float()?],
-                        velocity: [r.float()?, r.float()?, r.float()?],
-                        yaw: r.float()?,
-                        pitch: r.float()?,
+                        velocity: [r.u16()?, r.u16()?, r.u16()?].map(|v| dequantize(v, VELOCITY_STEP)),
+                        // (Rounding can't take them out of range.)
+                        yaw: dequantize(r.u16()?, ANGLE_STEP).clamp(-std::f32::consts::PI, std::f32::consts::PI),
+                        pitch: dequantize(r.u16()?, ANGLE_STEP).clamp(-1.55, 1.55),
                         health: r.u8()?,
                         stance: r.u8()?,
                         life: r.u8()?,
@@ -500,7 +620,9 @@ impl Packet {
                     ensure!(ids.insert(p.id), "duplicate pawn ID");
                     pawns.push(p);
                 }
-                Self::Snapshot { recipient, state: Snapshot { tick, acknowledged_input, pawns } }
+                let n = r.u16()? as usize;
+                let extra = r.take(n)?.to_vec();
+                Self::Snapshot { recipient, state: Snapshot { tick, sequence, acknowledged_input, ack_age, pawns, extra } }
             }
             _ => bail!("invalid gameplay packet"),
         };
@@ -521,8 +643,11 @@ mod tests {
                 recipient: 1,
                 state: Snapshot {
                     tick: 99,
+                    sequence: 4,
                     acknowledged_input: 45,
+                    ack_age: 12,
                     pawns: (0..18).map(|id| PawnState { id, ..Default::default() }).collect(),
+                    extra: vec![5; 300],
                 },
             },
         ];
@@ -536,8 +661,8 @@ mod tests {
     fn cover_flags_roundtrip() {
         let state = PawnState { id: 3, flags: pawn_flags::ADS | pawn_flags::IN_COVER | pawn_flags::COVER_HIGH, ..Default::default() };
         assert!(state.validate().is_ok());
-        assert!(PawnState { flags: 64, ..Default::default() }.validate().is_err());
-        let p = Packet::Snapshot { recipient: 1, state: Snapshot { tick: 1, acknowledged_input: 0, pawns: vec![state] } };
+        assert!(PawnState { flags: 128, ..Default::default() }.validate().is_err());
+        let p = Packet::Snapshot { recipient: 1, state: Snapshot { tick: 1, sequence: 1, acknowledged_input: 0, ack_age: 0, pawns: vec![state], extra: Vec::new() } };
         assert_eq!(Packet::decode(&p.encode().unwrap()).unwrap(), p);
     }
     #[test]

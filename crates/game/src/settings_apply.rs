@@ -58,7 +58,7 @@ static FX_DENSITY: Value = Value::new(1.0);
 static CORPSES: Value = Value::new(8.0);
 static OVERLAY: Value = Value::new(0.0);
 /// The HUD's switches, in [`Hud`] order.
-static HUD: [AtomicBool; 8] = [const { AtomicBool::new(true) }; 8];
+static HUD: [AtomicBool; 9] = [const { AtomicBool::new(true) }; 9];
 
 /// The HUD's switches.
 #[derive(Clone, Copy, Debug)]
@@ -71,9 +71,10 @@ pub enum Hud {
     ScorePopups,
     HitMarkerSound,
     MapEffects,
+    XpBar,
 }
 
-const HUD_DVARS: [(Hud, &str); 8] = [
+const HUD_DVARS: [(Hud, &str); 9] = [
     (Hud::Crosshair, "cg_crosshair"),
     (Hud::HitMarkers, "cg_hitmarkers"),
     (Hud::KillFeed, "cg_killfeed"),
@@ -82,6 +83,7 @@ const HUD_DVARS: [(Hud, &str); 8] = [
     (Hud::ScorePopups, "cg_xp_popups"),
     (Hud::HitMarkerSound, "cg_hitmarker_sound"),
     (Hud::MapEffects, "fx_mapfx"),
+    (Hud::XpBar, "cg_xpbar"),
 ];
 
 /// A HUD switch (and the map effects').
@@ -293,6 +295,26 @@ fn window(
     let present = if settings.on("r_vsync") && !debug_novsync { PresentMode::AutoVsync } else { PresentMode::AutoNoVsync };
     if window.present_mode != present && !debug_novsync {
         window.present_mode = present;
+    }
+    present_overrides(&mut window);
+}
+
+/// Test overrides for presentation (normal play and sims alike):
+/// `COD4RW_FRAMELATENCY=n` frames the GPU may queue (wgpu's default 2),
+/// `COD4RW_PRESENT=immediate|mailbox|fifo` the presentation mode.
+pub fn present_overrides(window: &mut Window) {
+    let latency = std::env::var("COD4RW_FRAMELATENCY").ok().and_then(|v| v.parse::<u32>().ok()).and_then(std::num::NonZero::new);
+    if latency.is_some() && window.desired_maximum_frame_latency != latency {
+        window.desired_maximum_frame_latency = latency;
+    }
+    let forced = match std::env::var("COD4RW_PRESENT").as_deref() {
+        Ok("immediate") => Some(PresentMode::Immediate),
+        Ok("mailbox") => Some(PresentMode::Mailbox),
+        Ok("fifo") => Some(PresentMode::Fifo),
+        _ => None,
+    };
+    if let Some(mode) = forced.filter(|m| window.present_mode != *m) {
+        window.present_mode = mode;
     }
 }
 

@@ -25,8 +25,9 @@ pub(super) fn register(app: &mut App) {
     if let Ok(dir) = std::env::var("COD4RW_STREAKTEST") {
         app.insert_resource(StreakTest(dir.into()))
             .init_resource::<Clicking>()
+            .init_resource::<Nudging>()
             .add_systems(Update, drive.run_if(crate::state::in_game))
-            .add_systems(PreUpdate, click.after(bevy::input::InputSystems));
+            .add_systems(PreUpdate, (click, nudge).after(bevy::input::InputSystems));
     }
 }
 
@@ -49,6 +50,17 @@ fn click(mut clicking: ResMut<Clicking>, mut mouse: ResMut<ButtonInput<MouseButt
     }
 }
 
+/// Moving the mouse (down and right) until then (seconds in), as a player
+/// moves the laptop's cursor.
+#[derive(Resource, Default)]
+struct Nudging(f32);
+
+fn nudge(time: Res<Time>, nudging: Res<Nudging>, mut motion: ResMut<bevy::input::mouse::AccumulatedMouseMotion>) {
+    if time.elapsed_secs() < nudging.0 {
+        motion.delta += Vec2::new(6.0, 3.0);
+    }
+}
+
 /// What happens when: credit kills, press 5, or take a screenshot.
 enum Act {
     Kills(u32),
@@ -57,6 +69,8 @@ enum Act {
     UseAt(f32),
     /// Put the mouse on the map, a little off its centre.
     Mouse,
+    /// Move the mouse for this long (seconds).
+    Nudge(f32),
     /// Keep behind the helicopter (held there in the air), looking at it.
     Follow,
     /// An enemy's rocket hits the helicopter for this much.
@@ -68,6 +82,7 @@ enum Act {
     /// Call in this one, looking a little down ahead.
     UseItem(super::Hardpoint),
     /// Keep looking at the care package's helicopter, then its crate.
+    WatchMarker,
     WatchCourier,
     WatchCrate,
     /// Stand at the crate looking at it, and hold Use on it (or let go).
@@ -75,6 +90,8 @@ enum Act {
     HoldUse(bool),
     /// Click the map where the mouse is (until the map closes).
     ClickMap,
+    /// Walk the player straight through the sentry (it doesn't block).
+    WalkThrough,
     /// Plant the carried sentry.
     Place,
     /// Put an enemy this far in front of the sentry, and watch from beside
@@ -92,8 +109,9 @@ const MW2_SCRIPT: &[(f32, Act)] = &[
     (5.6, Act::Shot("cp_earned")),
     (6.5, Act::UseItem(super::Hardpoint::CarePackage)),
     (6.9, Act::Shot("cp_throw")),
-    (9.0, Act::Shot("cp_marker")),
-    (10.0, Act::WatchCourier),
+    (8.5, Act::WatchMarker),
+    (9.6, Act::Shot("cp_flare")),
+    (10.4, Act::WatchCourier),
     (12.0, Act::Shot("cp_inbound")),
     (14.6, Act::Shot("cp_hover")),
     (15.6, Act::WatchCrate),
@@ -110,13 +128,15 @@ const MW2_SCRIPT: &[(f32, Act)] = &[
     (24.2, Act::Shot("sentry_carry")),
     (25.0, Act::Place),
     (25.6, Act::Shot("sentry_planted")),
-    (26.5, Act::EnemyBeforeSentry(400.0)),
-    (26.6, Act::ShotSentryFiring("sentry_firing")),
-    (29.0, Act::Shot("sentry_after_fire")),
-    (30.0, Act::HitSentry(1200.0)),
-    (30.3, Act::Shot("sentry_destroyed")),
-    (32.5, Act::Shot("sentry_wreck")),
-    (34.0, Act::Exit),
+    (25.8, Act::WalkThrough),
+    (27.6, Act::Shot("sentry_walked_through")),
+    (28.0, Act::EnemyBeforeSentry(400.0)),
+    (28.1, Act::ShotSentryFiring("sentry_firing")),
+    (30.5, Act::Shot("sentry_after_fire")),
+    (31.5, Act::HitSentry(1200.0)),
+    (31.8, Act::Shot("sentry_destroyed")),
+    (34.0, Act::Shot("sentry_wreck")),
+    (35.5, Act::Exit),
 ];
 
 const SCRIPT: &[(f32, Act)] = &[
@@ -130,27 +150,33 @@ const SCRIPT: &[(f32, Act)] = &[
     (12.5, Act::Use),
     (12.8, Act::Mouse),
     (13.0, Act::Shot("airstrike_map")),
-    (13.5, Act::UseAt(1200.0)),
-    (19.3, Act::Shot("airstrike_burst")),
-    (19.9, Act::Shot("airstrike_bomblets")),
-    (21.0, Act::Shot("airstrike_after")),
-    (22.5, Act::Kills(2)),
-    (23.1, Act::Shot("heli_earned")),
-    (23.5, Act::Use),
-    (23.6, Act::Follow),
-    (24.0, Act::ShotFiring("heli_firing")),
-    (27.0, Act::Shot("heli_inbound")),
-    (31.0, Act::Shot("heli_2")),
-    (35.0, Act::Shot("heli_3")),
-    (39.0, Act::Shot("heli_4")),
-    (42.0, Act::HitHeli(600.0)),
-    (44.0, Act::Shot("heli_smoking")),
-    (46.0, Act::HitHeli(600.0)),
-    (46.4, Act::Shot("heli_hit")),
-    (48.0, Act::Shot("heli_crashing")),
-    (50.5, Act::Shot("heli_crash")),
-    (53.0, Act::Shot("heli_after")),
-    (54.0, Act::Exit),
+    // (The laptop up in the hands, its screen showing the map; settled
+    // before the eye; its cursor moved.)
+    (14.4, Act::Shot("airstrike_laptop")),
+    (15.2, Act::Shot("airstrike_laptop_held")),
+    (15.3, Act::Nudge(0.5)),
+    (16.0, Act::Shot("airstrike_laptop_cursor")),
+    (16.2, Act::UseAt(1200.0)),
+    (22.0, Act::Shot("airstrike_burst")),
+    (22.6, Act::Shot("airstrike_bomblets")),
+    (23.7, Act::Shot("airstrike_after")),
+    (24.1, Act::Kills(2)),
+    (24.7, Act::Shot("heli_earned")),
+    (25.1, Act::Use),
+    (25.2, Act::Follow),
+    (25.6, Act::ShotFiring("heli_firing")),
+    (28.6, Act::Shot("heli_inbound")),
+    (32.6, Act::Shot("heli_2")),
+    (36.6, Act::Shot("heli_3")),
+    (40.6, Act::Shot("heli_4")),
+    (43.6, Act::HitHeli(600.0)),
+    (45.6, Act::Shot("heli_smoking")),
+    (47.6, Act::HitHeli(600.0)),
+    (48.0, Act::Shot("heli_hit")),
+    (49.6, Act::Shot("heli_crashing")),
+    (52.1, Act::Shot("heli_crash")),
+    (54.6, Act::Shot("heli_after")),
+    (55.6, Act::Exit),
 ];
 
 fn drive(
@@ -179,19 +205,29 @@ fn drive(
         Query<&mut Transform, (Without<LocalPlayer>, Without<super::sentry::Sentry>, Without<super::helicopter::Helicopter>, With<Pawn>)>,
         Local<u8>,
         Local<Option<&'static str>>,
-        Option<Res<crate::mw2guns::MatchContent>>,
+        Res<super::models::StreakProps>,
         Local<Option<f32>>,
         Local<Option<(Entity, Vec3, f32)>>,
         ResMut<Clicking>,
+        Query<(&crate::grenades::LiveGrenade, &Transform), (Without<LocalPlayer>, Without<Pawn>)>,
+        Query<&mut crate::combat::Health, With<LocalPlayer>>,
+        ResMut<Nudging>,
+        Local<Option<(Vec3, Vec3, f32)>>,
     ),
 ) {
-    let (couriers, crates, sentries, mut others, mut watching, mut sentry_shot, mw2_content, mut started, mut pinned, mut clicking) = mw2;
+    let (couriers, crates, sentries, mut others, mut watching, mut sentry_shot, mw2_content, mut started, mut pinned, mut clicking, markers, mut health, mut nudging, mut walk) = mw2;
     let mw2_test = std::env::var_os("COD4RW_STREAKTEST_MW2").is_some();
+    // MW2's script walks about among the bots: kept alive for it.
+    if mw2_test {
+        for mut h in &mut health {
+            h.current = h.current.max(5000.0);
+        }
+    }
     let script = if mw2_test { MW2_SCRIPT } else { SCRIPT };
     let t = time.elapsed_secs();
-    // MW2's script waits for MW2's models to load (or a minute).
+    // MW2's script waits for the props to load (or a minute).
     let t = if mw2_test {
-        let ready = mw2_content.as_ref().is_none_or(|c| !c.busy()) || t > 60.0;
+        let ready = !mw2_content.busy() || t > 60.0;
         match *started {
             Some(at) => t - at + 4.0,
             None if ready => {
@@ -228,9 +264,20 @@ fn drive(
             _ => *pinned = None,
         }
     }
+    // Walking through the sentry: on along its line, then how far past it.
+    if let Some((at, forward, until)) = *walk {
+        if t < until {
+            mover.velocity = forward * crate::units::u(200.0) + Vec3::Y * mover.velocity.y;
+        } else {
+            let past = (feet.translation - at).dot(forward) / crate::units::u(1.0);
+            info!("streak test: walked through the sentry: {past:.0} units past it (started 90 before)");
+            *walk = None;
+        }
+    }
     // Watching the care package come in and fall.
     match *watching {
         1 => *look_at = couriers.iter().next().map(|g| g.translation()).or(*look_at),
+        3 => *look_at = markers.iter().find(|(g, _)| g.how == crate::grenades::How::Marker).map(|(_, tf)| tf.translation).or(*look_at),
         2 => *look_at = crates.iter().next().map(|(_, g, _)| g.translation()).or(*look_at),
         _ => {}
     }
@@ -256,13 +303,22 @@ fn drive(
                 input.item = Some(*item);
                 let ahead = (view.rotation() * Vec3::NEG_Z).with_y(0.0).normalize_or_zero();
                 // (The marker thrown up and out, the sentry looked down at.)
-                *look_at = Some(eye + ahead * crate::units::u(300.0) + Vec3::Y * crate::units::u(if *item == super::Hardpoint::Sentry { -140.0 } else { 90.0 }));
+                *look_at = Some(eye + ahead * crate::units::u(300.0) + Vec3::Y * crate::units::u(if *item == super::Hardpoint::Sentry { -140.0 } else { 20.0 }));
             }
             Act::WatchCourier => *watching = 1,
+            Act::WatchMarker => {
+                *watching = 3;
+                // Back off a few metres to see it (and not our own legs).
+                if let Some((_, m)) = markers.iter().find(|(g, _)| g.how == crate::grenades::How::Marker) {
+                    let away = (feet.translation - m.translation).with_y(0.0).normalize_or(Vec3::X);
+                    feet.translation = m.translation.with_y(feet.translation.y) + away * crate::units::u(260.0);
+                    mover.velocity = Vec3::ZERO;
+                }
+            }
             Act::WatchCrate => *watching = 2,
             Act::ToCrate => {
                 *watching = 0;
-                if let Some((_, g, _)) = crates.iter().find(|c| c.2.landed()) {
+                if let Some((_, g, _)) = crates.iter().find(|c| c.2.landed() && c.2.owner == me) {
                     let c = g.translation();
                     let away = (feet.translation - c).with_y(0.0).normalize_or(Vec3::X);
                     feet.translation = c.with_y(feet.translation.y.max(c.y - crate::units::u(10.0))) + away * crate::units::u(60.0);
@@ -276,6 +332,15 @@ fn drive(
             // `COD4RW_STREAKTEST_CLICK=1`: click the map instead, as a
             // player does.
             Act::ClickMap => clicking.0 = true,
+            Act::WalkThrough => {
+                if let Some((_, stf, _)) = sentries.iter().next() {
+                    let forward = (stf.rotation * Vec3::X).with_y(0.0).normalize_or(Vec3::X);
+                    feet.translation = stf.translation - forward * crate::units::u(90.0);
+                    *walk = Some((stf.translation, forward, t + 1.6));
+                    *look_at = Some(stf.translation + forward * crate::units::u(400.0) + Vec3::Y * crate::units::u(50.0));
+                }
+            }
+            Act::Nudge(secs) => nudging.0 = time.elapsed_secs() + secs,
             Act::UseAt(_) if std::env::var_os("COD4RW_STREAKTEST_CLICK").is_some() => clicking.0 = true,
             Act::Place => {
                 commands.entity(me).insert(super::sentry::PlaceNow);

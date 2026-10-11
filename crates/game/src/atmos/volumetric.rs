@@ -10,6 +10,10 @@
 //! distance fog carries on. The pass adds the sun's light scattered in
 //! the air and takes away very little, so it doesn't fog the view twice.
 //!
+//! The pass runs before the transparent one ([`FogBeforeTransparents`]):
+//! Bevy runs it after, and smoke (which writes no depth) had the fog of
+//! the wall behind it, shadowed shafts and all, drawn over it.
+//!
 //! One fog volume follows player 1's camera. Not in splitscreen: Bevy's
 //! pass draws over the whole target, not a camera's viewport.
 
@@ -28,18 +32,24 @@ impl Plugin for VolumetricPlugin {
             std::path::Path::new("bevy_pbr/volumetric_fog/volumetric_fog.wgsl"),
             include_bytes!("volumetric_fog.wgsl").as_slice(),
         );
+        if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
+            render_app.edit_schedule(bevy::core_pipeline::schedule::Core3d, |s| {
+                s.add_build_pass(FogBeforeTransparents);
+            });
+        }
         app.add_systems(Update, (apply, tune).chain().run_if(crate::state::in_game))
             .add_systems(PostUpdate, follow.after(TransformSystems::Propagate).run_if(crate::state::in_game));
         // Its GPU time in `crate::perf`'s log ("volumetric_fog").
         if std::env::var("COD4RW_PERF").is_ok() {
             use bevy::core_pipeline::schedule::{Core3d, Core3dSystems};
-            use bevy::core_pipeline::core_3d::main_transparent_pass_3d;
+            use bevy::core_pipeline::core_3d::main_opaque_pass_3d;
             if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {
                 render_app.add_systems(
                     Core3d,
                     (
-                        // (Bevy's `volumetric_fog` runs between these sets.)
-                        span_begin.in_set(Core3dSystems::MainPass).after(main_transparent_pass_3d),
+                        // (Bevy's `volumetric_fog` runs between these, with
+                        // the transparent pass: `FogBeforeTransparents`.)
+                        span_begin.in_set(Core3dSystems::MainPass).after(main_opaque_pass_3d),
                         span_end.in_set(Core3dSystems::EarlyPostProcess),
                     ),
                 );
@@ -232,5 +242,70 @@ fn tune(
         if (a.light_intensity - want).abs() > 1e-3 * want.max(1e-3) {
             a.light_intensity = want;
         }
+    }
+}
+
+/// Moves Bevy's `volumetric_fog` render system from after the main pass to
+/// before its transparent part (after the opaque one, the sky and the
+/// transmissive pass, as before), so smoke, glass and particles draw over
+/// the fog instead of the fog of what's behind them over them. (Bevy's
+/// system isn't public: found by name in the flattened graph.)
+#[derive(Debug)]
+struct FogBeforeTransparents;
+
+impl bevy::ecs::schedule::ScheduleBuildPass for FogBeforeTransparents {
+    type EdgeOptions = ();
+
+    fn add_dependency(&mut self, _from: bevy::ecs::schedule::NodeId, _to: bevy::ecs::schedule::NodeId, _options: Option<&Self::EdgeOptions>) {}
+
+    fn collapse_set(
+        &mut self,
+        _set: bevy::ecs::schedule::SystemSetKey,
+        _systems: &indexmap::IndexSet<bevy::ecs::schedule::SystemKey, bevy::platform::hash::FixedHasher>,
+        _dependency_flattening: &bevy::ecs::schedule::graph::DiGraph<bevy::ecs::schedule::NodeId>,
+    ) -> impl Iterator<Item = (bevy::ecs::schedule::NodeId, bevy::ecs::schedule::NodeId)> {
+        std::iter::empty()
+    }
+
+    fn build(
+        &mut self,
+        _world: &mut World,
+        graph: &mut bevy::ecs::schedule::ScheduleGraph,
+        mut deps: bevy::ecs::schedule::FlattenedDependencies<'_>,
+    ) -> Result<(), bevy::ecs::schedule::ScheduleBuildError> {
+        use bevy::ecs::schedule::NodeId;
+        let name = |k| graph.get_node_name(&NodeId::System(k));
+        let (fog, transparent) = {
+            let Ok((order, _)) = deps.toposort_and_graph() else { return Ok(()) };
+            let order = order.to_vec();
+            let fog = order.iter().copied().find(|&k| {
+                let n = name(k);
+                n.contains("volumetric_fog::render") && n.ends_with("::volumetric_fog")
+            });
+            let transparent = order.iter().copied().find(|&k| name(k).ends_with("::main_transparent_pass_3d"));
+            (fog, transparent)
+        };
+        let (Some(fog), Some(transparent)) = (fog, transparent) else { return Ok(()) };
+        // The transparent pass and everything after it lose their edge to
+        // the fog; the fog goes before the transparent pass.
+        let after: Vec<_> = {
+            let Ok((_, g)) = deps.toposort_and_graph() else { return Ok(()) };
+            let mut seen = vec![transparent];
+            let mut i = 0;
+            while i < seen.len() {
+                for n in g.neighbors_directed(seen[i], bevy::ecs::schedule::graph::Direction::Outgoing) {
+                    if n != fog && !seen.contains(&n) {
+                        seen.push(n);
+                    }
+                }
+                i += 1;
+            }
+            seen.into_iter().filter(|&k| g.contains_edge(k, fog)).collect()
+        };
+        for k in after {
+            deps.remove_edge(k, fog);
+        }
+        deps.add_edge(fog, transparent);
+        Ok(())
     }
 }

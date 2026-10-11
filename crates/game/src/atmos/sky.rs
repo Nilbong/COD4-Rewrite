@@ -74,6 +74,8 @@ pub struct DynamicSky {
     faces: u32,
     rows: u32,
     frames: u32,
+    /// The cube's face size ([`size`]: the showcase's is smaller).
+    size: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, ShaderType)]
@@ -142,7 +144,8 @@ fn dynamic(settings: &crate::settings::Settings) -> bool {
 
 fn create(mut commands: Commands, classic: Option<Res<crate::world::MapSky>>, sky: Option<Res<DynamicSky>>, mut images: ResMut<Assets<Image>>) {
     let Some(classic) = classic else { return };
-    if sky.is_some_and(|s| s.classic == classic.0) {
+    // (Anew for a showcase match after a normal one, and back: their sizes differ.)
+    if sky.is_some_and(|s| s.classic == classic.0 && s.size == size()) {
         return;
     }
     let mut image = Image::new_fill(
@@ -163,6 +166,7 @@ fn create(mut commands: Commands, classic: Option<Res<crate::world::MapSky>>, sk
         faces: 6,
         rows: size(),
         frames: 0,
+        size: size(),
     });
 }
 

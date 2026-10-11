@@ -247,30 +247,34 @@ fn body_layout(stance: Stance) -> (Vec3, Vec3, Vec3, bool) {
     }
 }
 
+/// A hitbox's place on its pawn (pawn space) for a stance and lean.
+pub(crate) fn hitbox_local(location: HitLocation, stance: Stance, lean: f32) -> Transform {
+    let (mut head, mut torso, legs, prone) = body_layout(stance);
+    // Leaning moves the head and upper body sideways (pawn space: +X is right).
+    let l = lean * crate::movement::LEAN_DISTANCE;
+    head += Vec3::new(l, -lean.abs() * u(2.0), 0.0);
+    torso.x += l * 0.4;
+    let translation = match location {
+        HitLocation::Head => head,
+        // A third of the way from the head to the chest.
+        HitLocation::Neck => head.lerp(torso, NECK_ALONG),
+        // Each half along the line from the torso to the head
+        // (up standing, forward lying down).
+        HitLocation::Torso => torso + (head - torso).normalize_or_zero() * u(TORSO_LOWER * 0.5),
+        HitLocation::TorsoLower => torso - (head - torso).normalize_or_zero() * u(TORSO_UPPER * 0.5),
+        HitLocation::Legs => legs,
+    };
+    let rotation = if prone && location != HitLocation::Head { Quat::from_rotation_x(std::f32::consts::FRAC_PI_2) } else { Quat::IDENTITY };
+    Transform { translation, rotation, ..default() }
+}
+
 fn update_hitboxes(pawns: Query<(&Mover, &Children), With<Pawn>>, mut hitboxes: Query<(&Hitbox, &mut Transform)>) {
     for (mover, children) in &pawns {
-        let (mut head, mut torso, legs, prone) = body_layout(mover.stance);
-        // Leaning moves the head and upper body sideways (pawn space: +X is right).
-        let lean = mover.lean * crate::movement::LEAN_DISTANCE;
-        head += Vec3::new(lean, -mover.lean.abs() * u(2.0), 0.0);
-        torso.x += lean * 0.4;
         for child in children.iter() {
             if let Ok((hb, mut tf)) = hitboxes.get_mut(child) {
-                tf.translation = match hb.location {
-                    HitLocation::Head => head,
-                    // A third of the way from the head to the chest.
-                    HitLocation::Neck => head.lerp(torso, NECK_ALONG),
-                    // Each half along the line from the torso to the head
-                    // (up standing, forward lying down).
-                    HitLocation::Torso => torso + (head - torso).normalize_or_zero() * u(TORSO_LOWER * 0.5),
-                    HitLocation::TorsoLower => torso - (head - torso).normalize_or_zero() * u(TORSO_UPPER * 0.5),
-                    HitLocation::Legs => legs,
-                };
-                tf.rotation = if prone && hb.location != HitLocation::Head {
-                    Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)
-                } else {
-                    Quat::IDENTITY
-                };
+                let local = hitbox_local(hb.location, mover.stance, mover.lean);
+                tf.translation = local.translation;
+                tf.rotation = local.rotation;
             }
         }
     }
@@ -397,7 +401,7 @@ fn respawn(
     grenades: Query<&GlobalTransform, With<crate::grenades::LiveGrenade>>,
     objectives: Option<Res<crate::modes::Objectives>>,
     strikes: Option<Res<crate::killstreaks::airstrike::Airstrikes>>,
-    mut recent: Local<Vec<(Vec3, f32, Entity)>>,
+    mut recent: Local<Vec<(Vec3, f32, Entity, Team)>>,
     mut last: Local<std::collections::HashMap<Entity, Vec3>>,
 ) {
     let Some(map) = map else { return };
@@ -412,22 +416,36 @@ fn respawn(
     // hostile damage.
     let first_hurt = f32::from_bits(LAST_HOSTILE_DAMAGE.load(std::sync::atomic::Ordering::Relaxed));
     let grace = state.as_ref().is_some_and(|s| first_hurt < s.started);
+    // Those spawned this frame: `alive` doesn't have them yet, and without
+    // them pawns respawning together all took the same best spawn, stacked
+    // inside each other (9v9, where deaths bunch up).
+    let mut placed: Vec<(Pawn, Vec3, Vec3)> = Vec::new();
     for (e, d, pawn, mut tf, mut health, mut mover, mut view, mut weapon) in &mut dead {
         if now < d.respawn_at {
             continue;
         }
-        let allies: Vec<Vec3> = alive.iter().filter(|(o, p, ..)| *o != e && !hostile(p, pawn)).map(|(_, _, t, _)| t.translation).collect();
-        let enemies: Vec<(Vec3, Vec3)> =
-            alive.iter().filter(|(_, p, ..)| hostile(p, pawn)).map(|(_, _, t, v)| (t.translation, v.forward())).collect();
-        let occupied: Vec<Vec3> = alive.iter().map(|(_, _, t, _)| t.translation).collect();
+        let allies: Vec<Vec3> = alive
+            .iter()
+            .filter(|(o, p, ..)| *o != e && !hostile(p, pawn))
+            .map(|(_, _, t, _)| t.translation)
+            .chain(placed.iter().filter(|(p, ..)| !hostile(p, pawn)).map(|(_, at, _)| *at))
+            .collect();
+        let enemies: Vec<(Vec3, Vec3)> = alive
+            .iter()
+            .filter(|(_, p, ..)| hostile(p, pawn))
+            .map(|(_, _, t, v)| (t.translation, v.forward()))
+            .chain(placed.iter().filter(|(p, ..)| hostile(p, pawn)).map(|(_, at, look)| (*at, *look)))
+            .collect();
+        let occupied: Vec<Vec3> = alive.iter().map(|(_, _, t, _)| t.translation).chain(placed.iter().map(|(_, at, _)| *at)).collect();
         // Spawns enemies used lately, and how far from them they still are.
         let reused: Vec<(Vec3, f32, f32)> = recent
             .iter()
-            .filter_map(|&(at, when, who)| {
+            .filter_map(|&(at, when, who, _)| {
                 let (_, p, t, _) = alive.get(who).ok()?;
                 hostile(p, pawn).then(|| (at, now - when, t.translation.distance(at)))
             })
             .collect();
+        let team_reused: Vec<(Vec3, f32)> = recent.iter().filter(|r| r.2 != e && r.3 == pawn.team).map(|r| (r.0, now - r.1)).collect();
         let anchors = objectives.as_ref().map(|o| o.spawn_anchors(pawn.team)).unwrap_or_default();
         let spawning = Spawning {
             team: pawn.team,
@@ -438,6 +456,7 @@ fn respawn(
             anchors: &anchors,
             last: last.get(&e).copied(),
             reused,
+            team_reused,
             grenades: bombs.clone(),
             airstrike: &|at| strikes.as_ref().map_or(0.0, |s| s.danger(at, now)),
             sees: &sees,
@@ -445,10 +464,23 @@ fn respawn(
         let spawn = pick_spawn(&map, &spawning);
         if std::env::var_os("COD4RW_SIM").is_some() {
             let nearest = spawning.enemies.iter().map(|(p, _)| p.distance(spawn.pos) / u(1.0)).fold(f32::MAX, f32::min);
+            let mate = spawning.allies.iter().map(|p| p.distance(spawn.pos) / u(1.0)).fold(f32::MAX, f32::min);
             let seen = spawning.enemies.iter().filter(|(p, _)| sees(*p + Vec3::Y * u(50.0), spawn.pos + Vec3::Y * u(50.0))).count();
-            info!("spawn: {} {:?} nearest enemy {:.0}u, seen by {seen}{}", pawn.name, spawn.kind, nearest, if grace { " (grace period)" } else { "" });
+            // Anyone spawned at this very point in the last 10 s.
+            let repeat = recent.iter().filter(|r| r.0.distance(spawn.pos) < u(1.0)).count();
+            info!(
+                "spawn: {} {:?} {:?} at {:?} nearest enemy {:.0}u, nearest teammate {:.0}u, seen by {seen}, used {repeat}x in 10 s{}",
+                pawn.name,
+                pawn.team,
+                spawn.kind,
+                crate::units::to_cod(spawn.pos).map(|c| c.round()),
+                nearest,
+                mate,
+                if grace { " (grace period)" } else { "" }
+            );
         }
-        recent.push((spawn.pos, now, e));
+        placed.push((pawn.clone(), spawn.pos, Quat::from_rotation_y(spawn.yaw) * Vec3::NEG_Z));
+        recent.push((spawn.pos, now, e, pawn.team));
         last.insert(e, spawn.pos);
         tf.translation = spawn.pos + Vec3::Y * u(1.0);
         *view = ViewAngles { yaw: spawn.yaw, pitch: 0.0 };
@@ -509,6 +541,16 @@ const FAVORED: f32 = 25_000.0;
 /// `getSpawnpoint_NearTeam`: teammates' distance counts this much against a
 /// spawn, enemies' for it.
 const ALLIED_DISTANCE_WEIGHT: f32 = 2.0;
+/// Ours, not CoD4's (which only stops spawning inside someone): a teammate
+/// standing within this many units of a spawn counts this much against it,
+/// less the further they are, so a side spawns spread over its area rather
+/// than piled on the one point nearest the team.
+const CROWD_DIST: f32 = 160.0;
+const CROWD_PENALTY: f32 = 1000.0;
+/// Ours too: a spawn a teammate used in the last 10 s counts up to this
+/// much against it (fading), so a side's spawns vary between the points in
+/// its area instead of the same one or two over and over.
+const TEAM_REUSE_PENALTY: f32 = 400.0;
 /// `getSpawnpoint_DM`: most players about this far away; nearer than this,
 /// a spawn counts against.
 const DM_IDEAL_DIST: f32 = 1600.0;
@@ -530,6 +572,8 @@ pub struct Spawning<'a> {
     pub last: Option<Vec3>,
     /// Spawns enemies used lately: where, how long ago, how far they are now.
     pub reused: Vec<(Vec3, f32, f32)>,
+    /// Spawns teammates used lately, and how long ago.
+    pub team_reused: Vec<(Vec3, f32)>,
     /// Live grenades.
     pub grenades: Vec<Vec3>,
     /// An airstrike under way's danger to a point (0 none, 1 full).
@@ -550,6 +594,7 @@ impl Spawning<'_> {
             anchors: &[],
             last: None,
             reused: Vec::new(),
+            team_reused: Vec::new(),
             grenades: Vec::new(),
             airstrike: &|_| 0.0,
             sees: &|_, _| false,
@@ -571,7 +616,9 @@ impl Spawning<'_> {
 /// last 10 s while they're still within 800 units of it, each live grenade
 /// within 250 units (-100000) and each enemy that can see it (-100000; not
 /// one facing away from a spawn facing away from them) count against. The
-/// best wins (ties at random); nobody is spawned inside anyone. Each game
+/// best wins (ties at random); nobody is spawned inside anyone. Ours on
+/// top: teammates within 160 units of a spawn count against it (up to
+/// -1000 each), so a side spreads over its spawns. Each game
 /// type has its own spawns (`mp_tdm_spawn`, `mp_dm_spawn`, `mp_dom_spawn`,
 /// ...), where the map has them.
 pub fn pick_spawn(map: &MapInfo, sp: &Spawning) -> SpawnPoint {
@@ -648,6 +695,9 @@ pub fn pick_spawn(map: &MapInfo, sp: &Spawning) -> SpawnPoint {
                 (enemy_sum - ALLIED_DISTANCE_WEIGHT * ally_sum) / players as f32
             }
         };
+        if !ffa {
+            w -= sp.allies.iter().map(|p| CROWD_PENALTY * (1.0 - cod(p.distance(s.pos)) / CROWD_DIST).max(0.0)).sum::<f32>();
+        }
         // Domination: the spawns by the team's flags.
         if dom {
             let pull: f32 = sp.anchors.iter().map(|(at, wt)| wt * (1.0 - at.distance(s.pos) / u(1500.0)).max(0.0)).sum();
@@ -655,6 +705,11 @@ pub fn pick_spawn(map: &MapInfo, sp: &Spawning) -> SpawnPoint {
         }
         if sp.last.is_some_and(|l| l.distance(s.pos) < u(1.0)) {
             w -= SAME_SPAWN_PENALTY;
+        }
+        for &(at, age) in &sp.team_reused {
+            if at.distance(s.pos) < u(1.0) {
+                w -= TEAM_REUSE_PENALTY * (1.0 - age / SPAWN_REUSE_TIME).max(0.0);
+            }
         }
         for &(at, age, dist) in &sp.reused {
             if at.distance(s.pos) < u(1.0) && cod(dist) < SPAWN_REUSE_DIST {

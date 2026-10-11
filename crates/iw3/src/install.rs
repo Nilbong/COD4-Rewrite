@@ -9,32 +9,15 @@ pub struct Install {
 }
 
 impl Install {
-    /// Use `COD4_PATH` if set, otherwise probe common install locations.
+    /// The install `gamepaths` finds: its environment variable, the
+    /// player's chosen folder (Game Folders), Steam's libraries, then the
+    /// usual places.
     pub fn locate() -> Result<Install> {
-        if let Ok(p) = std::env::var("COD4_PATH") {
-            let root = PathBuf::from(p);
-            if Self::looks_valid(&root) {
-                return Ok(Install { root });
-            }
-            bail!("COD4_PATH={} does not look like a CoD4 install (expected main/ and zone/)", root.display());
+        let game = gamepaths::Game::Cod4;
+        match gamepaths::find(game) {
+            Some(root) => Ok(Install { root }),
+            None => bail!("could not find a CoD4 install; pick its folder (the one with {}) in the launcher's or Options' Game Folders, or set {}", game.exe(), game.env_var()),
         }
-        let mut candidates = Vec::new();
-        for drive in ["C", "D", "E", "F", "G", "H"] {
-            for sub in [
-                r"SteamLibrary\steamapps\common\Call of Duty 4",
-                r"Steam\steamapps\common\Call of Duty 4",
-                r"Program Files (x86)\Steam\steamapps\common\Call of Duty 4",
-                r"Program Files (x86)\Activision\Call of Duty 4 - Modern Warfare",
-            ] {
-                candidates.push(PathBuf::from(format!(r"{drive}:\{sub}")));
-            }
-        }
-        for c in candidates {
-            if Self::looks_valid(&c) {
-                return Ok(Install { root: c });
-            }
-        }
-        bail!("could not find a CoD4 install; set COD4_PATH to the folder containing iw3mp.exe")
     }
 
     pub fn at(root: impl Into<PathBuf>) -> Result<Install> {

@@ -340,7 +340,7 @@ fn overview(k: &mut Kit, fe: &Frontend) {
         grid_panel(k, r, 26.0, 0.6);
         let picture = fe.table_lookup("mp/statstable.csv", 4, key, 6);
         if !picture.is_empty() {
-            k.pic(R::new(r.right() - 168.0, r.y + 10.0, 144.0, 72.0), &picture, [1.0; 4]);
+            k.pic_fit(R::new(r.right() - 168.0, r.y + 10.0, 144.0, 72.0), &picture);
         }
         k.text(r.x + 20.0, r.y + 16.0, Type { size: 26.0, ..t::H2 }, &gun_name(fe, key), t::INK, 0);
         k.text(r.x + 20.0, r.y + 54.0, t::MICRO, &format!("{} kills", metric(&fe.stats, key, "kills")), t::INK_DIM, 0);
@@ -369,7 +369,7 @@ fn weapons(k: &mut Kit, fe: &Frontend, om: &OpenMenu, is_hot: &dyn Fn(&Item) -> 
         let picture = fe.table_lookup("mp/statstable.csv", 4, &key, 6);
         if !picture.is_empty() {
             let ph = r.h - 16.0;
-            k.pic(R::new(r.x + 20.0, r.y + 8.0, ph * 2.0, ph), &picture, [1.0; 4]);
+            k.pic_fit(R::new(r.x + 20.0, r.y + 8.0, ph * 2.0, ph), &picture);
         }
         k.text_mid(r.x + 228.0, r.cy(), Type { size: 26.0, ..t::H2 }, &gun_name(fe, &key), t::INK, 0);
         let cols_x = [r.x + 560.0, r.x + 670.0, r.x + 780.0, r.x + 890.0];

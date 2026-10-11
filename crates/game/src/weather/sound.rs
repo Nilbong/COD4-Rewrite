@@ -43,11 +43,12 @@ fn bed(
     camera: Query<&GlobalTransform, With<crate::player::MainCamera>>,
     mut beds: Query<&mut Bed>,
     mut sinks: Query<(&ChildOf, &mut AudioSink), With<crate::audio::FlatSound>>,
-    mut started: Local<bool>,
+    // (The match the beds were started in: each match's are its own.)
+    mut started: Local<u32>,
 ) {
     let Some(eye) = camera.iter().next().map(|c| c.translation()) else { return };
-    if !*started {
-        *started = true;
+    if *started != crate::atmos::climate::match_id() {
+        *started = crate::atmos::climate::match_id();
         for (alias, open) in [("emt_rain_metal", true), ("emt_rain_roof", false)] {
             // (A transform: a sound plays only on an entity that has one.)
             let e = commands.spawn((Name::new(alias), Bed { open, level: 0.0 }, Transform::default())).id();

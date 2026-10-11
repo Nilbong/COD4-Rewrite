@@ -34,9 +34,7 @@ impl Plugin for WetPlugin {
             images.add(blank_map())
         };
         WET_MAP.set(image).ok();
-        if crate::atmos::climate::enabled() {
-            app.add_systems(Update, (copy_rain_map, tag_world).run_if(crate::state::in_game).run_if(crate::atmos::climate::on));
-        }
+        app.add_systems(Update, (copy_rain_map, tag_world).run_if(crate::state::in_game).run_if(crate::atmos::climate::on));
     }
 }
 

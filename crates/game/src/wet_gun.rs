@@ -36,13 +36,13 @@ impl Plugin for WetGunPlugin {
             include_bytes!("wet_gun.wgsl").as_slice(),
         );
         app.add_plugins(MaterialPlugin::<WetLayer>::default());
-        if !crate::atmos::climate::enabled() {
-            return;
-        }
-        app.init_resource::<Wetness>().add_systems(
-            Update,
-            (soak, layer, drive).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
-        );
+        // (Always added: the showcase is picked per match. Each starts dry.)
+        app.init_resource::<Wetness>()
+            .add_systems(OnEnter(crate::state::GameState::InGame), |mut w: ResMut<Wetness>| *w = Wetness::default())
+            .add_systems(
+                Update,
+                (soak, layer, drive).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game).run_if(crate::atmos::climate::on),
+            );
     }
 }
 
@@ -144,7 +144,7 @@ fn layer(
         if !roots.contains(parent.parent()) {
             continue;
         }
-        let mut layer = commands.spawn((
+        let bundle = (
             Layer,
             Mesh3d(mesh.0.clone()),
             MeshMaterial3d(handle(!gun)),
@@ -153,12 +153,18 @@ fn layer(
             NotShadowCaster,
             Transform::IDENTITY,
             Visibility::Hidden,
-            ChildOf(e),
-        ));
-        if let Some(l) = layers {
-            layer.insert(l.clone());
-        }
-        commands.entity(e).insert(Layered);
+        );
+        let layers = layers.cloned();
+        // (A gun swapped at a respawn can take the surface away before
+        // this lands: then there's nothing to layer.)
+        commands.entity(e).queue_silenced(move |mut surface: EntityWorldMut| {
+            surface.insert(Layered).with_children(|c| {
+                let mut layer = c.spawn(bundle);
+                if let Some(l) = layers {
+                    layer.insert(l);
+                }
+            });
+        });
     }
 }
 

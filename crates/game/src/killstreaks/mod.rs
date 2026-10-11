@@ -3,9 +3,10 @@
 //! helicopter paths); and Modern Warfare 2's care package at 4 and sentry
 //! gun at 6 ([`carepackage`], [`sentry`]). Unlike CoD4 (one at a time, a
 //! better one replacing a worse) every one earned is held, each kept through
-//! death until it's used: [`HardpointInput`], which the player's keys set (5
-//! UAV, 6 airstrike, 7 helicopter, 8 care package, 9 sentry), or a pad's
-//! d-pad picker (right opens it, up and down choose, right calls in, left
+//! death until it's used. Each player earns only the three they chose
+//! ([`choice`]; CoD4's by default). [`HardpointInput`] calls one in: the
+//! player's keys set it (5, 6 and 7: the first, second and third chosen), or
+//! a pad's d-pad picker (right opens it, up and down choose, right calls in, left
 //! closes), and bots set themselves. Each hardpoint lives in its own module;
 //! what the local player should hear about comes out as [`StreakNotice`]s
 //! for the HUD, and what they're asked to do (place the sentry, open a
@@ -13,10 +14,13 @@
 
 pub mod airstrike;
 pub mod carepackage;
+pub mod choice;
 pub mod hands;
 pub mod helicopter;
-mod models;
+pub mod mocap;
+pub(crate) mod models;
 pub mod sentry;
+mod cratetest;
 mod test;
 pub mod uav;
 
@@ -48,23 +52,28 @@ impl Plugin for KillstreaksPlugin {
                 (
                     equip,
                     publish_keys,
-                    count_streaks,
+                    // (An online guest's streaks are the host's: it asks
+                    // for them and sees them, [`crate::netplay`].)
+                    count_streaks.run_if(crate::netplay::authority),
                     player_input,
-                    use_hardpoints,
+                    use_hardpoints.run_if(crate::netplay::authority),
                     selecting_cursor,
                     airstrike::run,
-                    helicopter::spawn,
-                    helicopter::take_damage,
-                    helicopter::fly,
-                    helicopter::fight,
+                    helicopter::spawn.run_if(crate::netplay::authority),
+                    helicopter::take_damage.run_if(crate::netplay::authority),
+                    helicopter::fly.run_if(crate::netplay::authority),
+                    helicopter::fight.run_if(crate::netplay::authority),
                 )
                     .chain()
                     .run_if(in_game),
             );
         hands::build(app);
+        mocap::build(app);
+        models::build(app);
         carepackage::build(app);
         sentry::build(app);
         test::register(app);
+        cratetest::register(app);
     }
 }
 
@@ -92,7 +101,8 @@ impl Hardpoint {
     }
 
     /// Its weapon's `hudIcon` (`radar_mp`, `airstrike_mp`, `helicopter_mp`;
-    /// CoD4 has none for MW2's two, so they keep the HD ones).
+    /// CoD4 has none for the care package and the sentry, so they keep the
+    /// HD ones).
     pub fn icon(self) -> &'static str {
         match self {
             Hardpoint::Uav => "compass_objpoint_satallite",
@@ -124,34 +134,28 @@ impl Hardpoint {
         }
     }
 
-    /// `level.hardpointInforms`: the sound on earning it (MW2's for its
-    /// two, from its sounds under `iw4/`).
+    /// `level.hardpointInforms`: the sound on earning it (CoD4 has three:
+    /// the care package comes by helicopter, the sentry gets the UAV's).
     fn inform(self) -> &'static str {
         match self {
-            Hardpoint::Uav => "mp_killstreak_radar",
-            Hardpoint::CarePackage => "iw4/mp_killstreak_carepackage",
+            Hardpoint::Uav | Hardpoint::Sentry => "mp_killstreak_radar",
             Hardpoint::Airstrike => "mp_killstreak_jet",
-            Hardpoint::Sentry => "iw4/mp_killstreak_sentrygun",
-            Hardpoint::Helicopter => "mp_killstreak_heli",
+            Hardpoint::CarePackage | Hardpoint::Helicopter => "mp_killstreak_heli",
         }
     }
 
     /// `game["dialog"][hardpoint]`: the announcer's line on earning it, in
-    /// the side's `voice` (MW2's lines for its two, where its announcers
-    /// share CoD4's prefix).
-    fn leader(self, voice: &str) -> String {
+    /// the side's `voice` (CoD4's announcers have none for the care package
+    /// and the sentry).
+    fn leader(self, voice: &str) -> Option<String> {
         match self {
-            Hardpoint::Uav => format!("{voice}_1mc_uavrecon"),
-            Hardpoint::CarePackage => format!("iw4/{}_1mc_achieve_carepackage", voice.to_ascii_lowercase()),
-            Hardpoint::Airstrike => format!("{voice}_1mc_airstrike"),
-            Hardpoint::Sentry => format!("iw4/{}_1mc_achieve_sentrygun", voice.to_ascii_lowercase()),
-            Hardpoint::Helicopter => format!("{voice}_1mc_helisupport"),
+            Hardpoint::Uav => Some(format!("{voice}_1mc_uavrecon")),
+            Hardpoint::Airstrike => Some(format!("{voice}_1mc_airstrike")),
+            Hardpoint::Helicopter => Some(format!("{voice}_1mc_helisupport")),
+            Hardpoint::CarePackage | Hardpoint::Sentry => None,
         }
     }
 
-    fn for_streak(kills: u32) -> Option<Hardpoint> {
-        Hardpoint::ALL.into_iter().find(|h| h.kills() == kills)
-    }
 }
 
 impl Hardpoint {
@@ -166,23 +170,6 @@ impl Hardpoint {
             Hardpoint::Sentry => "Sentry Gun",
             Hardpoint::Helicopter => "Helicopter",
         }
-    }
-
-    /// Its key's place among the kill streak keys: 5 UAV, 6 airstrike, 7
-    /// helicopter (as before MW2's two came), 8 care package, 9 sentry.
-    fn slot(self) -> usize {
-        match self {
-            Hardpoint::Uav => 0,
-            Hardpoint::Airstrike => 1,
-            Hardpoint::Helicopter => 2,
-            Hardpoint::CarePackage => 3,
-            Hardpoint::Sentry => 4,
-        }
-    }
-
-    /// The key (as the game reads it) that calls it in.
-    fn key(self) -> KeyCode {
-        [KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9][self.slot()]
     }
 }
 
@@ -219,7 +206,13 @@ pub struct Killstreak {
     pub kills: u32,
     pub held: Held,
     pub picker: Option<(usize, f32)>,
+    /// The (up to) three it can earn, fewest kills first ([`choice`]).
+    pub chosen: Vec<Hardpoint>,
 }
+
+/// The kill streak keys (as the game reads them): the first, second and
+/// third of a player's chosen streaks.
+const KEYS_READ: [KeyCode; choice::MAX] = [KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7];
 
 /// Use a held hardpoint now: `item`, or the best held; an airstrike also
 /// wants where (Bevy space; the player's is picked on the map, bots give
@@ -250,10 +243,15 @@ pub fn picker_open() -> bool {
 
 /// The keyboard's kill streak keys' names (`5`, `6`, `7` unless rebound),
 /// for the HUD.
-static KEYS: std::sync::Mutex<[String; 5]> = std::sync::Mutex::new([const { String::new() }; 5]);
+static KEYS: std::sync::Mutex<[String; choice::MAX]> = std::sync::Mutex::new([const { String::new() }; choice::MAX]);
+/// Player 1's chosen streaks, for [`key_name`].
+static LOCAL_CHOSEN: std::sync::Mutex<Vec<Hardpoint>> = std::sync::Mutex::new(Vec::new());
 
+/// The key that calls `h` in for player 1: by its place among their chosen
+/// streaks (5, 6, 7); empty if it isn't one of them.
 pub fn key_name(h: Hardpoint) -> String {
-    KEYS.lock().ok().map(|k| k[h.slot()].clone()).filter(|k| !k.is_empty()).unwrap_or_else(|| (5 + h.slot()).to_string())
+    let Some(slot) = LOCAL_CHOSEN.lock().ok().and_then(|c| c.iter().position(|&x| x == h)) else { return String::new() };
+    KEYS.lock().ok().map(|k| k[slot].clone()).filter(|k| !k.is_empty()).unwrap_or_else(|| (5 + slot).to_string())
 }
 
 fn publish_keys(bindings: Option<Res<crate::bindings::Bindings>>) {
@@ -261,7 +259,7 @@ fn publish_keys(bindings: Option<Res<crate::bindings::Bindings>>) {
     let Some(b) = bindings.filter(|b| b.is_changed()) else { return };
     crate::bindings::publish_key_names(&b);
     if let Ok(mut k) = KEYS.lock() {
-        *k = [Action::Killstreak1, Action::Killstreak2, Action::Killstreak3, Action::Killstreak4, Action::Killstreak5].map(|a| b.key_name(a));
+        *k = [Action::Killstreak1, Action::Killstreak2, Action::Killstreak3].map(|a| b.key_name(a));
     }
 }
 
@@ -326,6 +324,15 @@ fn reset(
     commands.remove_resource::<airstrike::Selecting>();
 }
 
+/// The first of `names` the sound bank has (CoD4 aliases, best first).
+/// With no bank (silent test runs) the first.
+pub(crate) fn alias(bank: Option<&crate::audio::Bank>, names: &[&str]) -> Option<String> {
+    match bank {
+        Some(b) => names.iter().find(|n| b.has(n)).map(|n| n.to_string()),
+        None => names.first().map(|n| n.to_string()),
+    }
+}
+
 /// A hardpoint weapon's kill icon and its width over height, for the kill
 /// feed.
 /// A kill streak's weapon as the kill feed names it ("Airstrike",
@@ -385,10 +392,38 @@ pub(crate) fn spawn_static_model(
 /// Every pawn gets a streak and a hardpoint input. Debug aid:
 /// `COD4RW_STREAKS_GIVE=1` hands the player all of them to start with, or
 /// those named (`uav,carepackage,sentrygun`).
-fn equip(mut commands: Commands, pawns: Query<(Entity, Has<LocalPlayer>), (With<Pawn>, Without<Killstreak>)>) {
+#[allow(clippy::type_complexity)]
+fn equip(
+    mut commands: Commands,
+    pawns: Query<(Entity, Has<LocalPlayer>, Has<crate::splitscreen::LocalSlot>, Has<crate::bots::Bot>), (With<Pawn>, Without<Killstreak>)>,
+    fe: Option<Res<crate::ui::Frontend>>,
+) {
     let give = std::env::var("COD4RW_STREAKS_GIVE").ok();
-    for (e, local) in &pawns {
-        let mut streak = Killstreak::default();
+    // The profile's three (`COD4RW_STREAKS=carepackage,sentrygun,...` for
+    // tests).
+    let profile = match std::env::var("COD4RW_STREAKS") {
+        Ok(list) => {
+            let mut v: Vec<Hardpoint> = list.split(',').filter_map(Hardpoint::from_id).collect();
+            v.dedup();
+            v.sort_by_key(|h| h.kills());
+            v.truncate(choice::MAX);
+            v
+        }
+        Err(_) => fe.as_deref().map_or(choice::DEFAULT.to_vec(), |fe| choice::chosen(|i| fe.profile_stat(i))),
+    };
+    let mut rng = rand::rng();
+    for (e, local, slot, bot) in &pawns {
+        let chosen = if slot {
+            profile.clone()
+        } else if bot {
+            choice::for_bot(&mut rng)
+        } else {
+            choice::DEFAULT.to_vec()
+        };
+        if local && let Ok(mut c) = LOCAL_CHOSEN.lock() {
+            *c = chosen.clone();
+        }
+        let mut streak = Killstreak { chosen, ..default() };
         if let Some(give) = give.as_deref().filter(|_| local) {
             Hardpoint::ALL.into_iter().filter(|h| give == "1" || give.split(',').any(|n| n.eq_ignore_ascii_case(&h.name().replace(' ', "")) || n.eq_ignore_ascii_case(h.name()))).for_each(|h| streak.held.add(h));
         }
@@ -408,6 +443,7 @@ fn count_streaks(
     mut sfx: ResMut<Sfx>,
     sides: Option<Res<Sides>>,
     heli_paths: Res<helicopter::HeliPaths>,
+    bank: Option<Res<crate::audio::Bank>>,
 ) {
     // Dying, or a new round's respawn (the script's `map_restart` keeps
     // only the held hardpoint), ends a streak.
@@ -429,17 +465,21 @@ fn count_streaks(
             continue;
         }
         streak.kills += 1;
-        let Some(item) = Hardpoint::for_streak(streak.kills) else { continue };
+        let Some(item) = streak.chosen.iter().copied().find(|h| h.kills() == streak.kills) else { continue };
         if streak.held.has(item) || item == Hardpoint::Helicopter && !heli_paths.available() {
             continue;
         }
         streak.held.add(item);
         if local {
             notices.write(StreakNotice::Earned { streak: streak.kills, item });
-            sfx.play(item.inform(), None);
+            if let Some(a) = alias(bank.as_deref(), &[item.inform()]) {
+                sfx.play(a, None);
+            }
             if let Some(sides) = &sides {
                 let now = time.elapsed_secs();
-                sfx.play_later(item.leader(&sides.of(pawn.team).voice), None, now, 1.0);
+                if let Some(line) = item.leader(&sides.of(pawn.team).voice) {
+                    sfx.play_later(line, None, now, 1.0);
+                }
             }
         }
     }
@@ -478,8 +518,8 @@ fn player_input(
         // A pad has no cursor on the map: its button calls it where the
         // player aims.
         let mut aimed = crate::splitscreen::active();
-        for item in Hardpoint::ALL {
-            if keys.just_pressed(item.key()) {
+        for (key, item) in KEYS_READ.into_iter().zip(streak.chosen.clone()) {
+            if keys.just_pressed(key) {
                 want = Some(item);
                 streak.picker = None;
             }
@@ -656,7 +696,14 @@ fn selecting_cursor(
     if selecting.is_some() && !active {
         commands.remove_resource::<airstrike::Selecting>();
     }
-    if active {
+    if active && hands::laptop_open() {
+        // The laptop's own cursor takes the mouse's movement
+        // (`crate::ui::laptop_screen`).
+        if cursor.grab_mode == CursorGrabMode::None {
+            cursor.grab_mode = CursorGrabMode::Locked;
+            cursor.visible = false;
+        }
+    } else if active {
         if cursor.grab_mode != CursorGrabMode::None {
             cursor.grab_mode = CursorGrabMode::None;
             cursor.visible = false;

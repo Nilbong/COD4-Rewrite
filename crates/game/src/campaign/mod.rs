@@ -36,7 +36,7 @@ impl Plugin for CampaignPlugin {
             let name = parts.next().unwrap_or_default().trim().to_owned();
             let mission = missions::find(&name).unwrap_or(&MISSIONS[0]);
             let v: Vec<f32> = parts.filter_map(|x| x.trim().parse().ok()).collect();
-            app.insert_resource(crate::world::MapName(mission.map.into())).insert_resource(config()).insert_resource(Campaign::new(mission));
+            app.insert_resource(crate::world::MapName(crate::atmos::climate::set_map(mission.map))).insert_resource(config()).insert_resource(Campaign::new(mission));
             if let [x, y, z, yaw] = v[..] {
                 app.insert_resource(StartAt([x, y, z], yaw));
             }

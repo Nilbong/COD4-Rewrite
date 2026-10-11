@@ -40,9 +40,15 @@ const SHOWCASE_RAIN: f32 = 0.85;
 #[derive(Clone, Copy, Debug)]
 pub struct Profile {
     pub map: &'static str,
+    /// The map's look in a normal launch: true, the showcase's always (the
+    /// map moved over to it); false, only with `COD4RW_SHOWCASE=1`.
+    pub on_by_default: bool,
     /// The clock runs (`COD4RW_TOD`, `COD4RW_TOD_SPEED`); otherwise it holds
     /// at the map's own hour, as CoD4 lit it.
     pub clock: bool,
+    /// Where a running clock starts without `COD4RW_TOD` (hours; `None`:
+    /// the map's own hour). Wet Work: its storm by night.
+    pub start_hour: Option<f32>,
     /// The rain without `COD4RW_RAIN` (which only clocked maps take).
     pub rain: f32,
     /// The physical sky (Rayleigh/Mie, stars, moon) in place of the map's
@@ -72,22 +78,25 @@ pub struct Profile {
 
 /// The maps the showcase is tuned for; elsewhere it stays off.
 pub const PROFILES: &[Profile] = &[
-    Profile { map: "mp_cargoship", clock: true, rain: SHOWCASE_RAIN, physical_sky: true, ocean: true, storm_dims: 1.0, snow: false, exposure_ev: 0.0, fog_reach: 1.0, fog_tone: 1.0, severity: 1.4 },
+    Profile { map: "mp_cargoship", on_by_default: true, clock: true, start_hour: Some(23.0), rain: SHOWCASE_RAIN, physical_sky: true, ocean: true, storm_dims: 1.0, snow: false, exposure_ev: 0.0, fog_reach: 1.0, fog_tone: 1.0, severity: 1.4 },
     // Downpour: CoD4's own rainy afternoon, its light and sky kept; our
     // rain, wet surfaces, ripples, reflections and now and then lightning.
-    Profile { map: "mp_farm", clock: false, rain: 0.7, physical_sky: false, ocean: false, storm_dims: 0.0, snow: false, exposure_ev: -0.7, fog_reach: 6.0, fog_tone: 0.6, severity: 1.35 },
+    Profile { map: "mp_farm", on_by_default: true, clock: false, start_hour: None, rain: 0.7, physical_sky: false, ocean: false, storm_dims: 0.0, snow: false, exposure_ev: -0.7, fog_reach: 6.0, fog_tone: 0.6, severity: 1.35 },
     // Winter Crash: CoD4's snowy night, its light kept; our falling snow
     // (drifting with the wind, kept off under roofs), snow on upward
     // faces, frosty fog. No lightning.
-    Profile { map: "mp_crash_snow", clock: false, rain: 0.6, physical_sky: false, ocean: false, storm_dims: 0.0, snow: true, exposure_ev: 0.0, fog_reach: 1.0, fog_tone: 1.0, severity: 1.0 },
+    // Bog: its hot night under a heavy storm. CoD4's light and hour kept;
+    // clearer air than its orange haze, rain sheeting through the lamps,
+    // the swamp's water dark, muddy and rippled, everything wet and
+    // reflecting (SSR), lightning over the city.
+    Profile { map: "mp_bog", on_by_default: true, clock: false, start_hour: None, rain: 0.9, physical_sky: false, ocean: false, storm_dims: 0.0, snow: false, exposure_ev: -0.8, fog_reach: 3.0, fog_tone: 0.45, severity: 1.4 },
+    Profile { map: "mp_crash_snow", on_by_default: false, clock: false, start_hour: None, rain: 0.6, physical_sky: false, ocean: false, storm_dims: 0.0, snow: true, exposure_ev: 0.0, fog_reach: 1.0, fog_tone: 1.0, severity: 1.0 },
 ];
 
 /// The showcase's profile for the map being played, if it runs here.
 pub fn profile() -> Option<&'static Profile> {
-    if !enabled() {
-        return None;
-    }
-    PROFILES.get(SHOWCASE_MAP.load(std::sync::atomic::Ordering::Relaxed).checked_sub(1)?)
+    let p = PROFILES.get(SHOWCASE_MAP.load(std::sync::atomic::Ordering::Relaxed).checked_sub(1)?)?;
+    ((p.on_by_default || enabled()) && !forced_off()).then_some(p)
 }
 
 static SHOWCASE_MAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -101,11 +110,25 @@ pub fn exposure_offset() -> f32 {
     }
 }
 
-/// Whether the showcase is switched on at all (`COD4RW_SHOWCASE=1`): for
-/// plugins deciding at startup what to add.
+/// Whether the showcase is forced on for every map that has a profile
+/// (`COD4RW_SHOWCASE=1`; `0` forces it off, even where it's the default).
+/// The showcase's plugins are always added and gate at run time on [`on`].
 pub fn enabled() -> bool {
     std::env::var("COD4RW_SHOWCASE").is_ok_and(|v| v != "0")
 }
+
+/// `COD4RW_SHOWCASE=0`: every map as CoD4 had it (for A/B shots).
+fn forced_off() -> bool {
+    std::env::var("COD4RW_SHOWCASE").is_ok_and(|v| v == "0")
+}
+
+/// Bumped each time a map is chosen ([`set_map`]): for state kept across
+/// frames (a system's `Local`) that belongs to one match.
+pub fn match_id() -> u32 {
+    MATCH_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static MATCH_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The map being loaded, for [`showcase`]. Called wherever `MapName` is set.
 /// How a map looks in normal play (not the showcase), where CoD4's own needs
@@ -158,12 +181,18 @@ pub fn look_knob(name: &str, default: impl Fn(&MapLook) -> f32, otherwise: f32) 
     crate::tune::get(&format!("{name}.{map}"), look().map_or(otherwise, default))
 }
 
-pub fn set_map(map: &str) {
+/// Sets the map being loaded (returned, for `MapName`): its showcase, if
+/// it has one on, and a fresh start for state kept per match.
+pub fn set_map(map: &str) -> String {
+    MATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STORM_VEIL.store(false, std::sync::atomic::Ordering::Relaxed);
+    LIGHT_SHARE.store(1.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut m) = MAP.write() {
         *m = map.to_owned();
     }
     let index = PROFILES.iter().position(|p| p.map == map).map_or(0, |i| i + 1);
     SHOWCASE_MAP.store(index, std::sync::atomic::Ordering::Relaxed);
+    map.to_owned()
 }
 
 /// Whether the showcase (time of day, weather) runs on this map: switched
@@ -335,7 +364,7 @@ fn learn_map_sun(
     };
     info!("climate: map sun at {:.1} h on the path (turned {:.0} degrees), {:.0} lux", hour, azimuth_offset.to_degrees(), light.illuminance);
     let clock = profile().is_some_and(|p| p.clock);
-    let start = if tod.enabled && clock { env_f32("COD4RW_TOD").map(|h| h.rem_euclid(24.0)).unwrap_or(hour) } else { hour };
+    let start = if tod.enabled && clock { env_f32("COD4RW_TOD").or(profile().and_then(|p| p.start_hour)).map(|h| h.rem_euclid(24.0)).unwrap_or(hour) } else { hour };
     tod.hours = start;
     tod.map = Some(map);
     apply_clock(&mut tod);

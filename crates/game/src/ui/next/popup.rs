@@ -32,7 +32,25 @@ pub(in crate::ui) fn wanted(menu: &Menu) -> bool {
         return false;
     }
     let buttons: Vec<&Item> = menu.items.iter().filter(|it| choice(it)).collect();
-    !buttons.is_empty() && buttons.len() <= 5 && buttons.iter().all(|it| centred(it))
+    if buttons.is_empty() || buttons.len() > 5 {
+        return false;
+    }
+    // Not a screen of its own: no lists, sliders, choices or owner draws.
+    let screen = menu.items.iter().any(|it| matches!(it.ty, item_type::LISTBOX | item_type::OWNERDRAW | item_type::SLIDER | item_type::YESNO | item_type::MULTI | item_type::DVARENUM | item_type::BIND));
+    // (Nor an info card built from many texts: CoD4's challenge tiers.)
+    let texts = menu.items.iter().filter(|it| it.ty == item_type::TEXT && (!it.text.is_empty() || !it.text_exp.is_empty())).count();
+    if screen || texts > 4 {
+        return false;
+    }
+    // Centred buttons (most popups), or any placed close together (the
+    // restart and confirm popups anchor theirs to a corner).
+    if buttons.iter().all(|it| centred(it)) {
+        return true;
+    }
+    let same_anchor = buttons.iter().all(|it| (it.window.rect.horz_align, it.window.rect.vert_align) == (buttons[0].window.rect.horz_align, buttons[0].window.rect.vert_align));
+    let (x0, x1) = buttons.iter().fold((f32::MAX, f32::MIN), |(a, b), it| (a.min(it.window.rect.x), b.max(it.window.rect.x + it.window.rect.w)));
+    let (y0, y1) = buttons.iter().fold((f32::MAX, f32::MIN), |(a, b), it| (a.min(it.window.rect.y), b.max(it.window.rect.y + it.window.rect.h)));
+    same_anchor && x1 - x0 < 480.0 && y1 - y0 < 200.0
 }
 
 fn text_of(fe: &Frontend, it: &Item) -> String {
@@ -40,18 +58,50 @@ fn text_of(fe: &Frontend, it: &Item) -> String {
     fe.assets.localize(&raw).trim().to_owned()
 }
 
+/// Debug aid (`COD4RW_UIDUMP`, once): the popups the dialog doesn't take,
+/// and why.
+pub(in crate::ui) fn dump_rejected(fe: &Frontend) {
+    let mut names: Vec<&String> = fe.assets.menus.keys().collect();
+    names.sort();
+    for name in names {
+        let m = &fe.assets.menus[name];
+        if !m.full_screen && wanted(m) && !m.items.iter().filter(|it| choice(it)).all(|it| centred(it)) {
+            let labels: Vec<String> = m.items.iter().filter(|it| choice(it)).map(|it| text_of(fe, it)).collect();
+            info!("UIDUMP popup+ {name}: {}", labels.join(" | "));
+        }
+        if m.full_screen || wanted(m) {
+            continue;
+        }
+        let buttons: Vec<&Item> = m.items.iter().filter(|it| choice(it)).collect();
+        if buttons.is_empty() {
+            continue;
+        }
+        let labels: Vec<String> = buttons.iter().map(|it| format!("{}[{}/{} {:.0}x{:.0}]", text_of(fe, it), it.window.rect.horz_align, it.window.rect.vert_align, it.window.rect.w, it.window.rect.h)).collect();
+        let other: Vec<i32> = m.items.iter().filter(|it| it.ty != item_type::BUTTON && it.ty != item_type::TEXT).map(|it| it.ty).collect();
+        info!("UIDUMP popup? {name} ({} buttons, other types {other:?}): {}", buttons.len(), labels.join(" | "));
+    }
+}
+
 /// The panel for `n` choices and `lines` lines of message.
+/// The message's height (none without one).
+fn message_h(lines: usize) -> f32 {
+    if lines == 0 { 0.0 } else { lines as f32 * 38.0 + 30.0 }
+}
+
 fn panel(n: usize, lines: usize) -> R {
-    let h = 44.0 + lines as f32 * 38.0 + 30.0 + n as f32 * PITCH + 30.0;
+    let h = 44.0 + message_h(lines) + n as f32 * PITCH + 30.0;
     R::new(960.0 - W * 0.5, 540.0 - h * 0.5, W, h)
 }
 
 fn row_rect(p: R, lines: usize, i: usize) -> R {
-    R::new(p.x + 40.0, p.y + 44.0 + lines as f32 * 38.0 + 30.0 + i as f32 * PITCH, p.w - 80.0, ROW_H)
+    R::new(p.x + 40.0, p.y + 44.0 + message_h(lines) + i as f32 * PITCH, p.w - 80.0, ROW_H)
 }
 
 /// The message's lines (wrapped later); here, how many it'll take, roughly.
 fn line_count(s: &str) -> usize {
+    if s.trim().is_empty() {
+        return 0;
+    }
     (s.len() / 46 + 1).clamp(1, 4)
 }
 

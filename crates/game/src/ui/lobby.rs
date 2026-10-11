@@ -143,6 +143,8 @@ pub(in crate::ui) struct LobbyView {
     pub host_name: Option<String>,
     pub note: String,
     pub split: bool,
+    /// A public match's lobby (matchmaking's): settings locked.
+    pub public: bool,
 }
 
 /// The classic screen's team rows: where row `row` of side `s` is, so the
@@ -487,6 +489,10 @@ impl Frontend {
             self.rebuild_lobby();
             return;
         }
+        // A public match's settings are matchmaking's.
+        if self.lobby.online.public.is_some() && self.lobby.online.host() && cmd != "lobbyteam" {
+            return;
+        }
         // In a friend's lobby, the host sets everything; you can only ask
         // to switch teams.
         if self.lobby.online.guest() {
@@ -502,7 +508,10 @@ impl Frontend {
             // A game type picked (the new UI's mode screen).
             "lobbymode" => {
                 let m = n(1).min(GameMode::ALL.len() - 1);
-                if GameMode::ALL[m].offered() && (!online || matches!(GameMode::ALL[m], GameMode::Tdm | GameMode::Ffa | GameMode::Tdm3)) {
+                // (Online plays every game type: [`crate::netplay`] carries
+                // objectives and rounds.)
+                let _ = online;
+                if GameMode::ALL[m].offered() {
                     l.mode = m;
                     l.score = l.mode().score_limits().1;
                     let minutes = l.mode().default_time_limit();
@@ -511,10 +520,9 @@ impl Frontend {
             }
             "lobbynext" => match a(1) {
                 "mode" => {
-                    // Each game type starts on its own default limit. Online,
-                    // only the modes friends can play yet (no objectives).
+                    // Each game type starts on its own default limit.
                     l.mode = (l.mode + 1) % GameMode::ALL.len();
-                    while !l.mode().offered() || online && !matches!(l.mode(), GameMode::Tdm | GameMode::Ffa | GameMode::Tdm3) {
+                    while !l.mode().offered() {
                         l.mode = (l.mode + 1) % GameMode::ALL.len();
                     }
                     l.score = l.mode().score_limits().1;
@@ -540,7 +548,16 @@ impl Frontend {
                 roster_changed = true;
             }
             "lobbyteam" => {
-                l.switch_team();
+                if online {
+                    // Online: past a bot on a full side, and in a public
+                    // lobby only while the humans stay even.
+                    let here = side(l.teams[0]);
+                    if l.online_switch(here) {
+                        l.teams = [SIDES[1 - here]; MAX_PLAYERS];
+                    }
+                } else {
+                    l.switch_team();
+                }
                 roster_changed = true;
             }
             "lobbyswitch" => {
@@ -558,11 +575,7 @@ impl Frontend {
                 }
                 roster_changed = true;
             }
-            "lobbystart" if !l.online.connecting => {
-                l.starting = true;
-                l.online.start = l.online.host();
-                self.start = Some(l.map_id().to_string());
-            }
+            "lobbystart" if !l.online.connecting => self.online_start(),
             _ => {}
         }
         self.sync_lobby();
@@ -572,9 +585,10 @@ impl Frontend {
         }
     }
 
-    /// In a friend's online lobby.
+    /// In a friend's online lobby, or a public one (it starts on its
+    /// countdown): not this game's to start.
     pub(super) fn lobby_guest(&self) -> bool {
-        self.lobby.online.guest()
+        self.lobby.online.guest() || self.lobby.online.public.is_some()
     }
 
     /// The lobby screen again, if it's up, for a changed roster.
@@ -582,8 +596,19 @@ impl Frontend {
         self.sync_lobby();
         if self.stack.iter().any(|m| m.name == LOBBY_MENU) {
             let top = self.stack.last().is_some_and(|m| m.name == LOBBY_MENU);
+            // The same screen with new rows: no fade in again, and the
+            // focus stays on what does the same (Add Bot moves down a row).
+            let focused = self.focus.as_ref().filter(|(m, _)| m == LOBBY_MENU).and_then(|(m, i)| self.menu_item(m)?.items.get(*i).map(|it| it.action.clone()));
+            super::next::lobby::rebuilding(true);
             self.close(LOBBY_MENU);
             self.open(LOBBY_MENU);
+            super::next::lobby::rebuilding(false);
+            if let Some(action) = focused {
+                let at = self.menu_item(LOBBY_MENU).and_then(|m| m.items.iter().position(|it| it.action == action));
+                if let Some(i) = at {
+                    self.focus = Some((LOBBY_MENU.to_owned(), i));
+                }
+            }
             // Kept under whatever was open over it (the map list).
             if !top && let Some(i) = self.stack.iter().position(|m| m.name == LOBBY_MENU) {
                 let lobby = self.stack.remove(i);
@@ -606,9 +631,12 @@ impl Frontend {
             (202.0, "ui_pm_split", script(&[&ui_script("lobbyNext splitscreen")])),
             (236.0, "", script(&[&ui_script("lobbyStart")])),
         ];
-        let guest = self.lobby.online.guest();
+        let public = self.lobby.online.public.is_some();
+        let guest = self.lobby.online.guest() || public;
         for (i, (y, dvar, action)) in rows.iter().enumerate() {
             let label = match (dvar.is_empty(), guest) {
+                // A public match starts on its countdown.
+                (true, _) if public => dvar_exp(online::START_DVAR),
                 (true, false) => str_exp("Start Match"),
                 (true, true) => str_exp("Waiting for the host"),
                 _ => dvar_exp(dvar),
@@ -881,8 +909,8 @@ impl Frontend {
             teams,
             team_names: TEAM_NAMES,
             team_icons: TEAM_ICONS,
-            team_size: TEAM_SIZE,
-            guest: o.guest(),
+            team_size: l.public_team_size().unwrap_or(TEAM_SIZE),
+            guest: o.guest() || o.public.is_some(),
             modes: GameMode::ALL
                 .iter()
                 .enumerate()
@@ -896,6 +924,7 @@ impl Frontend {
             host_name: o.members.iter().find(|m| m.peer == crate::online::HOST).map(|m| m.profile.name.clone()),
             note: o.note.clone(),
             split: l.players > 1,
+            public: o.public.is_some(),
         }
     }
 

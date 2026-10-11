@@ -58,6 +58,14 @@ const CALM_FRAMES: u32 = 10;
 const MOST: f32 = 5.0;
 
 static SETTLING: AtomicBool = AtomicBool::new(false);
+/// How far settling has got, 0..1 (an `f32`'s bits), for the load screen's bar.
+static PROGRESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// How far the match is from being shown, 0..1: calm frames so far, or the
+/// time waited against [`MOST`], whichever is further.
+pub fn progress() -> f32 {
+    f32::from_bits(PROGRESS.load(Ordering::Relaxed))
+}
 
 /// The match is still settling: the load screen shows, the clock is held.
 pub fn settling() -> bool {
@@ -74,6 +82,7 @@ struct Settle {
 fn start(real: Res<Time<Real>>, mut virt: ResMut<Time<Virtual>>, mut settle: ResMut<Settle>) {
     let _ = real;
     *settle = Settle::default();
+    PROGRESS.store(0f32.to_bits(), Ordering::Relaxed);
     SETTLING.store(true, Ordering::Relaxed);
     virt.pause();
 }
@@ -87,6 +96,8 @@ fn watch(real: Res<Time<Real>>, mut virt: ResMut<Time<Virtual>>, mut settle: Res
     // A slow frame is loading: only up to a calm frame's worth counts.
     settle.waited += real.delta_secs().min(CALM_MS / 1000.0);
     let waited = settle.waited;
+    let p = (settle.calm as f32 / CALM_FRAMES as f32).max(waited / MOST).clamp(0.0, 1.0);
+    PROGRESS.store(p.to_bits(), Ordering::Relaxed);
     if settle.calm >= CALM_FRAMES || waited >= MOST {
         SETTLING.store(false, Ordering::Relaxed);
         virt.unpause();

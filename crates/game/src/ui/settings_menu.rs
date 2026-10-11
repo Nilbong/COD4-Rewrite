@@ -49,6 +49,17 @@ pub(super) fn build(menus: &mut HashMap<String, Arc<Menu>>) {
             bevy::log::warn!("settings: {} has no rows to copy", page.menu);
             continue;
         }
+        // Game Folders is Voice Chat's page: without its microphone level.
+        if page.menu == "options_voice" {
+            let voice = |t: &str| {
+                let t = t.to_ascii_uppercase();
+                t.contains("LEVEL") || t.contains("INDICATOR") || t.contains("MIC")
+            };
+            menu.items.retain(|it| {
+                let text = it.text_exp.iter().any(|t| matches!(t, Token::Str(s) if voice(s))) || voice(&it.text);
+                !(it.window.rect.x > -200.0 && (it.ty == item_type::OWNERDRAW || text))
+            });
+        }
         if let Some(mut d) = desc_template.clone() {
             d.window.name = DESC.into();
             d.text.clear();
@@ -88,7 +99,7 @@ pub(super) fn build(menus: &mut HashMap<String, Arc<Menu>>) {
 fn parent_of(page: &str) -> Option<&'static str> {
     match page {
         "options_look" | "options_move" | "options_shoot" | "options_misc" | "controls_multi" | "options_control_defaults" => Some("main_controls"),
-        "options_graphics" | "options_graphics_texture" | "options_sound" | "options_game" | "options_graphics_defaults" | "options_defaults" => {
+        "options_graphics" | "options_graphics_texture" | "options_sound" | "options_game" | "options_voice" | "options_graphics_defaults" | "options_defaults" => {
             Some("main_options")
         }
         _ => None,
@@ -197,22 +208,22 @@ pub(super) fn value_item(it: &mut Item, s: &Setting, index: i32) {
             it.ty = item_type::SLIDER;
             it.data = ItemData::EditField(EditField { min, max, default: s.default.parse().unwrap_or(min), max_chars: 0, max_paint_chars: 0 });
         }
-        Kind::Bind(_) => {
+        Kind::Bind(_) | Kind::Folder(_) => {
             it.ty = item_type::BIND;
             it.data = ItemData::None;
         }
     }
 }
 
-/// The left-hand lists: our pages' names, the resets ours, and no Voice
-/// Chat or Cheats.
+/// The left-hand lists: our pages' names (Voice Chat's is Game Folders),
+/// the resets ours, and no Cheats.
 fn fix_nav(menu: &mut Menu) {
     let label = |it: &Item| match it.text_exp.as_slice() {
         [_, Token::Str(s)] => s.to_ascii_uppercase(),
         _ => String::new(),
     };
     // Out go the pages we don't have, and the list closes up after them.
-    let gone = |l: &str| matches!(l, "@MENU_VOICECHAT" | "@MENU_CHEATS_LOWCASE" | "@MENU_MULTIPLAYER_OPTIONS");
+    let gone = |l: &str| matches!(l, "@MENU_CHEATS_LOWCASE" | "@MENU_MULTIPLAYER_OPTIONS");
     let mut gone_ys: Vec<f32> =
         menu.items.iter().filter(|it| it.window.rect.x < -200.0 && gone(&label(it))).map(|it| it.window.rect.y).collect();
     gone_ys.sort_by(|a, b| a.total_cmp(b));
@@ -238,6 +249,7 @@ fn fix_nav(menu: &mut Menu) {
                 match s.to_ascii_uppercase().as_str() {
                     "@MENU_TEXTURE_SETTINGS" => *s = "Quality...".into(),
                     "@MENU_MULTIPLAYER_CONTROLS" => *s = "Controller...".into(),
+                    "@MENU_VOICECHAT" | "@MENU_VOICE_CHAT" | "@MENU_VOICECHAT_OPTIONS" => *s = "Game Folders".into(),
                     _ => {}
                 }
             }
@@ -248,6 +260,20 @@ fn fix_nav(menu: &mut Menu) {
         let rename = |it: &mut Item, to: &str| it.text_exp = vec![Token::Op(16), Token::Str(to.into())];
         match l.as_str() {
             "QUALITY..." => {}
+            // (Renamed above with the headers.)
+            // (Renamed above with the headers.) CoD4 shows its button only
+            // in multiplayer (`ui_multiplayer`), else a greyed copy: always
+            // the button here, and the copy blank.
+            "GAME FOLDERS" if it.ty == item_type::BUTTON => {
+                rename(it, "Game Folders");
+                it.visible_exp.clear();
+            }
+            "GAME FOLDERS" => {
+                it.text_exp.clear();
+                it.text.clear();
+                it.window.rect.w = 0.0;
+                it.window.rect.h = 0.0;
+            }
             "CONTROLLER..." => {
                 it.visible_exp.clear();
             }
@@ -281,6 +307,7 @@ impl Frontend {
             }
             Kind::Bind(action) if self.capturing == Some(action) => Some("Press a key...".into()),
             Kind::Bind(_) => Some(bindings::display_value(&self.dvar(&item.dvar), "", "or")),
+            Kind::Folder(game) => Some(super::game_folders::shown(game)),
             _ => None,
         }
     }
@@ -339,6 +366,10 @@ impl Frontend {
             Kind::Bind(action) => {
                 self.capturing = Some(action);
                 self.capture_armed = false;
+                true
+            }
+            Kind::Folder(game) => {
+                super::game_folders::pick(game);
                 true
             }
             Kind::Slider { min, max, step, .. } => {
@@ -403,7 +434,10 @@ impl Frontend {
     pub(super) fn setting_desc(&self) -> String {
         let Some((menu, i)) = &self.focus else { return String::new() };
         let Some(m) = self.menu_item(menu) else { return String::new() };
-        m.items.get(*i).and_then(Self::setting_of).map_or(String::new(), |s| s.desc.to_owned())
+        m.items.get(*i).and_then(Self::setting_of).map_or(String::new(), |s| match s.kind {
+            Kind::Folder(game) => super::game_folders::about(game, s.desc),
+            _ => s.desc.to_owned(),
+        })
     }
 
     /// Is this the description item?

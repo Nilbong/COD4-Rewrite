@@ -175,7 +175,7 @@ pub(in crate::ui) fn preview(row: &str) -> (&'static str, &'static str, &str, &'
         "Campaign" => ("next:preview_campaign", "Story", "Call of Duty 4's campaign, from Crew Expendable to Game Over."),
         "Headquarters" => ("next:preview_headquarters", "Social hub", "Make classes, open supply drops and gather your squad between matches."),
         "Private Match" => ("next:preview_private_match", "Host a match", "Bots, splitscreen for up to four, and lobby codes to invite friends."),
-        "Join Game" => ("next:preview_join_game", "Online", "Browse servers and join a match in progress."),
+        "Server Browser" => ("next:preview_join_game", "Online", "Find a server on the relay and join the match in progress."),
         "Create a Class" => ("next:preview_create_a_class", "Loadout", "Build five custom classes: weapons, attachments, camos, reticles and perks."),
         "Character" => ("next:preview_character", "Loadout", "Choose the soldier you play as on each side."),
         "Supply Drops" => ("next:preview_supply_drops", "Rewards", "Open drops for weapon variants, camos and characters."),

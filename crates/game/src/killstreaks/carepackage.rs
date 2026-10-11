@@ -1,7 +1,9 @@
-//! Modern Warfare 2's care package (`_airdrop.gsc`), the 4 kill streak.
+//! The care package, after Modern Warfare 2's (`_airdrop.gsc`), built from
+//! CoD4's assets: the 4 kill streak.
 //! Called in, its owner throws a marker (a smoke canister, thrown as the
 //! smoke grenade is: [`crate::grenades::How::Marker`]). Once it lies
-//! smoking, a Little Bird flies in over it, hovers, lets a crate go and
+//! smoking, a helicopter (the team's, as the heli streak's: a Cobra or a
+//! Hind) flies in over it, hovers, lets a crate (CoD4's plastic case) go and
 //! flies off; the crate falls, bounces and settles as clutter does
 //! ([`crate::clutter`]), then stands solid for 90 s. Holding Use on it
 //! opens it: its owner in half a second, a teammate in two, an enemy in
@@ -24,7 +26,7 @@ use rand::Rng;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-/// The Little Bird: in from this far away (CoD units), this far above the
+/// The helicopter: in from this far away (CoD units), this far above the
 /// marker, at this speed (u/s); it hovers this long and drops the crate
 /// this far into it.
 const APPROACH: f32 = 7000.0;
@@ -40,8 +42,12 @@ const CRATE_TIME: f32 = 90.0;
 const USE_OWNER: f32 = 0.5;
 const USE_TEAM: f32 = 2.0;
 const USE_ENEMY: f32 = 3.0;
-/// Within reach of it (CoD units from its middle, as `Player_GetUseList`).
-const REACH: f32 = 100.0;
+/// In reach of it: this near its box whichever way one looks, as far as
+/// this looking at it (CoD units, flat); letting go of Use this long keeps
+/// the progress (s).
+const USE_GAP: f32 = 40.0;
+const REACH: f32 = 90.0;
+const USE_GRACE: f32 = 0.35;
 /// Bots go for their own crate, and after this long anyone's near them
 /// (CoD units).
 const BOT_OWN: f32 = 4000.0;
@@ -56,7 +62,7 @@ const THROW_WAIT: f32 = 10.0;
 pub(super) fn build(app: &mut App) {
     app.init_resource::<Calls>()
         .add_systems(OnEnter(crate::state::GameState::InGame), clear)
-        .add_systems(Update, (throw_markers, watch_markers, fly, land, open).chain().after(super::use_hardpoints).run_if(crate::state::in_game));
+        .add_systems(Update, (throw_markers, watch_markers, flares, fly, crate_bodies, land, open).chain().after(super::use_hardpoints).run_if(crate::state::in_game.and_then(crate::netplay::authority)));
 }
 
 /// Pawns who've called in a care package and are to throw its marker.
@@ -82,14 +88,16 @@ impl Contents {
         }
     }
 
-    /// `getRandomCrateType`: by weight.
-    fn roll(rng: &mut impl Rng, helicopter: bool) -> Contents {
+    /// `getRandomCrateType`: by weight, among the caller's chosen kill
+    /// streaks (never another care package).
+    fn roll(rng: &mut impl Rng, helicopter: bool, chosen: &[Hardpoint]) -> Contents {
+        let has = |h: Hardpoint| chosen.contains(&h);
         let table = [
-            (Contents::Streak(Hardpoint::Uav), 30),
+            (Contents::Streak(Hardpoint::Uav), if has(Hardpoint::Uav) { 30 } else { 0 }),
             (Contents::Ammo, 20),
-            (Contents::Streak(Hardpoint::Airstrike), 20),
-            (Contents::Streak(Hardpoint::Sentry), 22),
-            (Contents::Streak(Hardpoint::Helicopter), if helicopter { 8 } else { 0 }),
+            (Contents::Streak(Hardpoint::Airstrike), if has(Hardpoint::Airstrike) { 20 } else { 0 }),
+            (Contents::Streak(Hardpoint::Sentry), if has(Hardpoint::Sentry) { 22 } else { 0 }),
+            (Contents::Streak(Hardpoint::Helicopter), if helicopter && has(Hardpoint::Helicopter) { 8 } else { 0 }),
         ];
         let total: u32 = table.iter().map(|t| t.1).sum();
         let mut pick = rng.random_range(0..total);
@@ -103,7 +111,7 @@ impl Contents {
     }
 }
 
-/// The Little Bird bringing a crate.
+/// The helicopter bringing a crate.
 #[derive(Component)]
 pub struct Courier {
     from: Vec3,
@@ -128,14 +136,26 @@ pub struct CarePackage {
     /// Its box (the model's space, metres: middle and half size).
     centre: Vec3,
     half: Vec3,
-    /// Who's opening it, since when.
-    opening: Option<(Entity, f32)>,
+    /// Who's opening it, how far along (s), and when they last held Use.
+    opening: Option<(Entity, f32, f32)>,
+    /// Falling: let go when, where it was last frame, and since when it's
+    /// been all but still.
+    released: f32,
+    last: Option<Vec3>,
+    still_since: Option<f32>,
+    /// Its solid box is up (once no one stands in it).
+    solid: bool,
 }
 
 impl CarePackage {
     /// Down and openable.
     pub fn landed(&self) -> bool {
         self.landed.is_some()
+    }
+
+    /// Half its longest side across (metres).
+    pub fn half_extent(&self) -> f32 {
+        self.half.x.max(self.half.z)
     }
 }
 
@@ -189,13 +209,59 @@ fn throw_markers(
     });
 }
 
-/// A marker smoking: send the Little Bird.
+/// The marker burning as a red signal flare: a thin red smoke column off
+/// it and a small red glow on the ground round it (CoD4 has no signal
+/// smoke: its thin ambient smoke tinted red).
+const FLARE_SMOKE: &str = "smoke/thin_light_smoke_m";
+/// The column's wider wisps, as often.
+const FLARE_WISPS: &str = "smoke/thin_light_smoke_l";
+const FLARE_WISPS_EVERY: f32 = 0.7;
+const FLARE_RED: [f32; 3] = [1.0, 0.12, 0.08];
+/// A puff of the column this often (s).
+const FLARE_PUFF: f32 = 0.25;
+
+#[allow(clippy::type_complexity)]
+fn flares(
+    mut commands: Commands,
+    time: Res<Time>,
+    markers: Query<(Entity, &LiveGrenade, &Transform)>,
+    mut fx: Option<ResMut<crate::fx::Effects>>,
+    mut lit: Local<std::collections::HashMap<Entity, (f32, f32)>>,
+) {
+    use crate::fx::{Anchor, Frame, FxLayer};
+    let now = time.elapsed_secs();
+    lit.retain(|e, _| markers.contains(*e));
+    for (e, g, tf) in &markers {
+        if g.how != How::Marker || !(g.popped() || now > g.explode_at) {
+            continue;
+        }
+        let (puff, fizz) = lit.entry(e).or_insert_with(|| {
+            commands.entity(e).with_child((
+                PointLight { color: Color::srgb(1.0, 0.15, 0.08), intensity: 5_000.0, range: 2.0, shadow_maps_enabled: false, ..default() },
+                Transform::from_translation(Vec3::Y * u(8.0)),
+            ));
+            (now, now)
+        });
+        let Some(fx) = fx.as_deref_mut() else { continue };
+        let at = Frame::facing(tf.translation + Vec3::Y * u(2.0), Vec3::Y, 0.0);
+        if now >= *puff {
+            *puff = now + FLARE_PUFF;
+            fx.play_tinted(FLARE_SMOKE, Anchor::Fixed(at), FxLayer::World, FLARE_RED);
+        }
+        if now >= *fizz {
+            *fizz = now + FLARE_WISPS_EVERY;
+            fx.play_tinted(FLARE_WISPS, Anchor::Fixed(at), FxLayer::World, FLARE_RED);
+        }
+    }
+}
+
+/// A marker smoking: send the helicopter.
 #[allow(clippy::too_many_arguments)]
 fn watch_markers(
     mut commands: Commands,
     time: Res<Time>,
     markers: Query<(Entity, &LiveGrenade, &Transform)>,
-    pawns: Query<&Pawn>,
+    pawns: Query<(&Pawn, Option<&Killstreak>)>,
     heli_paths: Res<super::helicopter::HeliPaths>,
     mut models: StreakModels,
     mut sfx: ResMut<crate::audio::Sfx>,
@@ -211,7 +277,8 @@ fn watch_markers(
             continue;
         }
         sent.insert(e);
-        let team = pawns.get(g.thrower).map_or(Team::Allies, |p| p.team);
+        let team = pawns.get(g.thrower).map_or(Team::Allies, |p| p.0.team);
+        let chosen = pawns.get(g.thrower).ok().and_then(|p| p.1).map_or_else(Vec::new, |k| k.chosen.clone());
         let target = tf.translation;
         let over = target + Vec3::Y * u(HEIGHT);
         let a = rng.random_range(0.0..std::f32::consts::TAU);
@@ -223,9 +290,11 @@ fn watch_markers(
         let heli = commands
             .spawn((Name::new("care package helicopter"), Transform::from_translation(from).with_rotation(Quat::from_rotation_y(yaw)), Visibility::default()))
             .id();
-        let model = models.spawn(&mut commands, &["vehicle_little_bird_armed", "vehicle_cobra_helicopter_fly"], heli, true);
+        // CoD4's helicopters: the allies' Cobra, the axis' Hind.
+        let (model_name, rotor) = if team == Team::Allies { COURIER[0] } else { COURIER[1] };
+        let model = models.spawn(&mut commands, &[model_name, COURIER[0].0], heli, true);
         // The crate, slung under it.
-        let contents = Contents::roll(&mut rng, heli_paths.available());
+        let contents = Contents::roll(&mut rng, heli_paths.available(), &chosen);
         let load = spawn_crate(&mut commands, &mut models, g.thrower, team, contents, heli);
         commands.entity(heli).insert(Courier {
             from,
@@ -237,7 +306,7 @@ fn watch_markers(
             dropped: false,
             load: Some(load),
         });
-        sfx.play_on("mp_cobra_helicopter", heli);
+        sfx.play_on(rotor, heli);
         info!(
             "care package: {} ({:?}) to CoD {:?}, {contents:?}",
             model.as_ref().map_or("no model", |m| m.name.as_str()),
@@ -247,21 +316,47 @@ fn watch_markers(
     }
 }
 
-/// The crate model for a team: MW2's (Task Force 141's for the allies,
-/// the militia's for the axis), else CoD4's plastic case.
+/// The helicopters bringing crates, and their rotors' sounds: the heli
+/// streak's (`common_mp`).
+const COURIER: [(&str, &str); 2] = [("vehicle_cobra_helicopter_fly", "mp_cobra_helicopter"), ("vehicle_mi24p_hind_desert", "mp_hind_helicopter")];
+/// The crate: CoD4's big plastic case (the map's, or
+/// [`super::models::PROPS_ZONE`]'s).
+pub const CRATE_MODEL: &str = "com_plasticcase_beige_big";
+
+/// The crate, slung under `under`.
 fn spawn_crate(commands: &mut Commands, models: &mut StreakModels, owner: Entity, team: Team, contents: Contents, under: Entity) -> Entity {
-    let [ours, theirs] = crate::mw2guns::CRATE_MODELS;
-    let first = if team == Team::Allies { ours } else { theirs };
-    let names = [first, if team == Team::Allies { theirs } else { ours }, "com_plasticcase_beige_big"];
+    let names = [CRATE_MODEL];
     let e = commands.spawn((Name::new("care package"), Transform::from_translation(-Vec3::Y * u(SLUNG)), Visibility::default(), ChildOf(under))).id();
     let (centre, half) = match models.spawn(commands, &names, e, true) {
         Some(m) if (m.bounds.1 - m.bounds.0).max_element() < 4.0 => {
             ((m.bounds.0 + m.bounds.1) * 0.5, ((m.bounds.1 - m.bounds.0) * 0.5).max(Vec3::splat(u(4.0))))
         }
-        _ => (Vec3::ZERO, units::dir([30.0, 16.0, 15.0]).abs() * units::INCH),
+        // (The case not loaded yet: a plain olive box its size.)
+        _ => {
+            let (centre, half) = (Vec3::Y * u(15.0), units::dir([30.0, 16.0, 15.0]).abs() * units::INCH);
+            models.spawn_box(commands, e, centre, half, Color::srgb(0.33, 0.36, 0.24));
+            (centre, half)
+        }
     };
-    commands.entity(e).insert(CarePackage { owner, team, contents, landed: None, centre, half, opening: None });
+    commands.entity(e).insert(CarePackage { owner, team, contents, landed: None, centre, half, opening: None, released: 0.0, last: None, still_since: None, solid: false });
     e
+}
+
+/// A crate let go at `at` (Bevy space), falling (the crate test's drops).
+pub(super) fn drop_crate(commands: &mut Commands, models: &mut StreakModels, owner: Entity, team: Team, at: Vec3) -> Entity {
+    let holder = commands.spawn((Transform::from_translation(at), Visibility::default())).id();
+    let e = spawn_crate(commands, models, owner, team, Contents::Ammo, holder);
+    let spin = Vec3::new(rand::random_range(-0.6..0.6), rand::random_range(-0.4..0.4), rand::random_range(-0.6..0.6));
+    commands.entity(e).remove::<ChildOf>().insert((Transform::from_translation(at), MovingCrate, Moving::thrown(Vec3::new(0.0, -0.5, 0.0), spin)));
+    commands.entity(holder).despawn();
+    e
+}
+
+/// Give falling crates their body to fall with (their box, once spawned).
+fn crate_bodies(mut commands: Commands, crates: Query<(Entity, &CarePackage), (With<MovingCrate>, Without<Body>)>) {
+    for (e, cp) in &crates {
+        commands.entity(e).insert(Body::loose(cp.centre, cp.half, MASS, "physics_wood"));
+    }
 }
 
 /// Fly in, hover, let the crate go, fly away.
@@ -271,7 +366,6 @@ fn fly(
     mut couriers: Query<(Entity, &mut Courier, &mut Transform)>,
     globals: Query<&GlobalTransform>,
     crates: Query<&CarePackage>,
-    mut sfx: ResMut<crate::audio::Sfx>,
 ) {
     let now = time.elapsed_secs();
     for (e, mut c, mut tf) in &mut couriers {
@@ -311,7 +405,6 @@ fn fly(
                     .entity(load)
                     .remove::<ChildOf>()
                     .insert((g, MovingCrate, Body::loose(centre, half, MASS, "physics_wood"), Moving::thrown(velocity * 0.5 - Vec3::Y * 0.5, spin)));
-                sfx.play("iw4/sentry_drop", Some(at));
             }
         }
     }
@@ -323,9 +416,18 @@ struct MovingCrate;
 
 /// A falling crate's weapon, as kills name it.
 pub const CRUSH: &str = "care_package";
+/// Crushing takes falling at least this fast (CoD units/s); slower than
+/// this for a moment, or this long after it was let go, it has landed.
+const CRUSH_SPEED: f32 = 150.0;
+const SETTLE_SPEED: f32 = 8.0;
+const SETTLE_TIME: f32 = 6.0;
 
-/// Crates once they've settled: solid, and openable; and gone in time. A
-/// falling one crushes whoever it comes down on (`crateDamage`).
+/// Crates once they've settled: openable, solid once no one stands in
+/// them, and gone in time. A falling one crushes whoever it comes down on
+/// (`crateDamage`): only while it's coming down fast, onto them from above.
+/// It counts as settled when the physics puts it to sleep, or once it has
+/// all but stopped (a crate wedged on a ledge or slope can creep for ever),
+/// or a few seconds after it was let go.
 #[allow(clippy::type_complexity)]
 fn land(
     mut commands: Commands,
@@ -334,43 +436,70 @@ fn land(
     pawns: Query<(Entity, &Transform), (With<Pawn>, Without<Dead>, Without<CarePackage>)>,
     mut damage: MessageWriter<crate::combat::Damage>,
     mut crushed: Local<HashSet<(Entity, Entity)>>,
+    (mut sfx, bank): (ResMut<crate::audio::Sfx>, Option<Res<crate::audio::Bank>>),
 ) {
-    let now = time.elapsed_secs();
-    for (e, cp, tf, moving, falling) in &crates {
-        if !(falling && moving) {
-            continue;
-        }
+    let (now, dt) = (time.elapsed_secs(), time.delta_secs().max(1e-4));
+    for (e, mut cp, tf, moving, falling) in &mut crates {
         let middle = tf.transform_point(cp.centre);
-        let reach = cp.half.x.max(cp.half.z) + u(12.0);
-        for (p, ptf) in &pawns {
-            let feet = ptf.translation;
-            let over = (middle - feet).with_y(0.0).length() < reach;
-            let height = middle.y - cp.half.y < feet.y + u(70.0) && middle.y + cp.half.y > feet.y;
-            if over && height && crushed.insert((e, p)) {
-                info!("care package: crushed a pawn at CoD {:?} (crate at {:?}, half {:?})", units::to_cod(feet).map(f32::round), units::to_cod(middle).map(f32::round), cp.half);
-                damage.write(crate::combat::Damage { target: p, attacker: Some(cp.owner), amount: 1000.0, location: crate::combat::HitLocation::Head, weapon: CRUSH });
+        if falling {
+            let last = cp.last.replace(middle);
+            if last.is_none() {
+                cp.released = now;
             }
-        }
-    }
-    crushed.retain(|(c, _)| crates.contains(*c));
-    for (e, mut cp, _, moving, falling) in &mut crates {
-        if falling && !moving {
-            commands.entity(e).remove::<MovingCrate>();
+            let velocity = last.map_or(Vec3::ZERO, |l| (middle - l) / dt);
+            // Crushing: coming down fast, its underside onto someone's head
+            // and shoulders.
+            if velocity.y < -u(CRUSH_SPEED) {
+                let reach = cp.half.x.max(cp.half.z) + u(10.0);
+                let bottom = middle.y - cp.half.y;
+                for (p, ptf) in &pawns {
+                    let feet = ptf.translation;
+                    let over = (middle - feet).with_y(0.0).length() < reach;
+                    let onto = bottom > feet.y + u(30.0) && bottom < feet.y + u(76.0);
+                    if over && onto && crushed.insert((e, p)) {
+                        info!("care package: crushed a pawn at CoD {:?}", units::to_cod(feet).map(f32::round));
+                        damage.write(crate::combat::Damage { target: p, attacker: Some(cp.owner), amount: 1000.0, location: crate::combat::HitLocation::Head, weapon: CRUSH });
+                    }
+                }
+            }
+            // Settled?
+            let still = velocity.length() < u(SETTLE_SPEED);
+            cp.still_since = if still { cp.still_since.or(Some(now)) } else { None };
+            let settled = !moving || cp.still_since.is_some_and(|t| now - t > 0.4) || now - cp.released > SETTLE_TIME;
+            if !settled {
+                continue;
+            }
+            commands.entity(e).remove::<(MovingCrate, Moving)>();
             cp.landed = Some(now);
-            // Solid now: players walk round it, bullets stop on it.
-            commands.spawn((
-                RigidBody::Static,
-                Collider::cuboid(cp.half.x * 2.0, cp.half.y * 2.0, cp.half.z * 2.0),
-                CollisionLayers::new(Layer::World, LayerMask::NONE),
-                Transform::from_translation(cp.centre),
-                ChildOf(e),
-            ));
+            info!("care package: landed at CoD {:?}", units::to_cod(middle).map(f32::round));
+            if let Some(a) = super::alias(bank.as_deref(), &["crate_impact"]) {
+                sfx.play(a, Some(tf.translation));
+            }
             continue;
+        }
+        // Solid once no one's inside it (so no one is trapped in it).
+        if cp.landed.is_some() && !cp.solid {
+            let inside = pawns.iter().any(|(_, ptf)| {
+                let local = tf.rotation.inverse() * (ptf.translation + Vec3::Y * u(36.0) - middle);
+                local.abs().cmplt(cp.half + Vec3::new(u(16.0), u(36.0), u(16.0))).all()
+            });
+            if !inside {
+                cp.solid = true;
+                // Players walk round it, bullets stop on it.
+                commands.spawn((
+                    RigidBody::Static,
+                    Collider::cuboid(cp.half.x * 2.0, cp.half.y * 2.0, cp.half.z * 2.0),
+                    CollisionLayers::new(Layer::World, LayerMask::NONE),
+                    Transform::from_translation(cp.centre),
+                    ChildOf(e),
+                ));
+            }
         }
         if cp.landed.is_some_and(|t| now - t > CRATE_TIME) {
             commands.entity(e).despawn();
         }
     }
+    crushed.retain(|(c, _)| crates.contains(*c));
 }
 
 /// Holding Use on a landed crate opens it; and the bots' crates to go for.
@@ -379,6 +508,7 @@ fn open(
     mut commands: Commands,
     time: Res<Time>,
     mut crates: Query<(Entity, &mut CarePackage, &GlobalTransform)>,
+    spatial: SpatialQuery,
     mut pawns: Query<
         (
             Entity,
@@ -400,6 +530,7 @@ fn open(
     mut sfx: ResMut<crate::audio::Sfx>,
     sides: Option<Res<crate::audio::Sides>>,
     locals: Query<(), With<crate::player::LocalPlayer>>,
+    bank: Option<Res<crate::audio::Bank>>,
 ) {
     let now = time.elapsed_secs();
     let dt = time.delta_secs();
@@ -412,8 +543,19 @@ fn open(
         let mut user = None;
         for (pe, pawn, tf, mover, view, .., player, slot, bot_use, is_bot) in &pawns {
             let eye = mover.eye(tf.translation);
-            let near = (middle - tf.translation).with_y(0.0).length() < u(REACH) && (middle.y - tf.translation.y).abs() < u(90.0);
-            let looking = player.is_none() || view.forward().dot((middle - eye).normalize_or_zero()) > 0.6;
+            // In reach: within a stride of its box (as MW2's use trigger,
+            // whichever way one looks), or further off looking at it; and
+            // not through a wall.
+            let local = g.rotation().inverse() * (tf.translation - middle);
+            let gap = (local.with_y(0.0).abs() - cp.half.with_y(0.0)).max(Vec3::ZERO).length();
+            let level = (middle.y - tf.translation.y) < u(90.0) && (tf.translation.y - middle.y) < u(80.0);
+            let to = middle - eye;
+            let facing = view.forward().dot(to.normalize_or_zero());
+            let near = level && (gap < u(USE_GAP) || (gap < u(REACH) && (player.is_none() || facing > 0.5)));
+            let looking = near && {
+                let reach = to.length() - cp.half.max_element() - u(6.0);
+                Dir3::new(to).ok().is_none_or(|d| spatial.cast_ray(eye, d, reach.max(0.0), true, &crate::collision::sight_filter()).is_none())
+            };
             let owner_side = pawns.get(cp.owner).map(|o| !hostile(o.1, pawn)).unwrap_or(pawn.team == cp.team);
             let time_needed = if pe == cp.owner {
                 USE_OWNER
@@ -447,21 +589,29 @@ fn open(
         match user {
             Some((pe, needed)) => {
                 let t = cp.opening.filter(|o| o.0 == pe).map_or(0.0, |o| o.1) + dt;
-                cp.opening = Some((pe, t));
+                cp.opening = Some((pe, t, now));
                 if t >= needed {
                     opened.push((ce, pe, cp.contents, cp.owner));
                 }
             }
-            None => cp.opening = None,
+            // Let go: a moment's slip keeps the progress, longer starts over.
+            None => {
+                if cp.opening.is_some_and(|o| now - o.2 > USE_GRACE) {
+                    cp.opening = None;
+                }
+            }
         }
     }
     for (ce, pe, contents, owner) in opened {
         commands.entity(ce).despawn();
         let Ok((_, pawn, tf, _, _, mut streak, mut weapon, grenades, ..)) = pawns.get_mut(pe) else { continue };
         info!("care package: {} opened {owner:?}'s: {}", pawn.name, contents.name());
-        sfx.play("iw4/ammo_crate_use", Some(tf.translation));
+        if let Some(a) = super::alias(bank.as_deref(), &["weap_pickup"]) {
+            sfx.play(a, Some(tf.translation));
+        }
         let got = match contents {
-            Contents::Streak(h) if !streak.held.has(h) => {
+            // (One the opener didn't choose: ammo instead.)
+            Contents::Streak(h) if !streak.held.has(h) && streak.chosen.contains(&h) => {
                 streak.held.add(h);
                 Some(h)
             }
@@ -480,7 +630,9 @@ fn open(
         if locals.contains(pe) {
             notices.write(StreakNotice::Opened { item: got });
             if let (Some(h), Some(sides)) = (got, &sides) {
-                sfx.play_later(super::Hardpoint::leader(h, &sides.of(pawn.team).voice), None, now, 0.5);
+                if let Some(line) = super::Hardpoint::leader(h, &sides.of(pawn.team).voice) {
+                    sfx.play_later(line, None, now, 0.5);
+                }
             }
         }
     }

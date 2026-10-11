@@ -193,7 +193,13 @@ fn drive(
     mut materials: ResMut<Assets<RainMaterial>>,
     content: Option<Res<crate::content::Content>>,
     mut map_lamps: Local<Option<Vec<(Vec3, f32, Vec3)>>>,
+    mut lamps_match: Local<u32>,
 ) {
+    // (Each match its own map's lamps.)
+    if *lamps_match != crate::atmos::climate::match_id() {
+        *lamps_match = crate::atmos::climate::match_id();
+        *map_lamps = None;
+    }
     let Some(eye) = camera.iter().next().map(|c| c.translation()) else { return };
     // Snowing: the map's lamps nearest the camera, for the flakes passing
     // them to glow by.
@@ -289,7 +295,8 @@ fn drive(
             m.velocity = Vec4::new(storm.wind.x * SNOW_DRIFT, -SNOW_FALL, storm.wind.y * SNOW_DRIFT, 0.0);
         }
         m.light = light.extend(flash);
-        m.key_dir = key_dir.extend(0.0);
+        // (Live knob: how opaque the rain is; snow keeps its own.)
+        m.key_dir = key_dir.extend(crate::tune::get("rain.opacity", 0.35).max(0.0));
         // The curtains' strength: full by night, a third by day (the day's
         // light is far brighter, and a haze by day is greyer, not lit).
         if draw.0 == 4 {

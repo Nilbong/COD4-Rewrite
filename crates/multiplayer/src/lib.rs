@@ -6,6 +6,7 @@
 pub mod client;
 pub mod hosting;
 pub mod lobby;
+pub mod matchmaking;
 pub mod netcode;
 pub mod protocol;
 pub mod relay;

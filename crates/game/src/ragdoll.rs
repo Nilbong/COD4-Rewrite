@@ -115,6 +115,31 @@ const LINKS: [(usize, usize); 22] = [
 /// Kept at least this share of the limb's length apart (knees and elbows
 /// don't fold flat; the neck doesn't fold the head into the chest).
 const SPREADS: [(usize, usize, usize, f32); 4] = [(9, 10, 11, 0.55), (12, 13, 14, 0.55), (3, 4, 5, 0.4), (6, 7, 8, 0.4)];
+/// Kept out of each other (a point, and a bone from point to point with
+/// its radius, CoD units): the knees and feet out of the torso and the
+/// other leg, which they otherwise passed through, ending up inside the
+/// body.
+const APART: [(usize, usize, usize, f32); 16] = [
+    (10, ROOT, SPINE, 7.0),
+    (11, ROOT, SPINE, 7.0),
+    (13, ROOT, SPINE, 7.0),
+    (14, ROOT, SPINE, 7.0),
+    (10, 12, 13, 4.5),
+    (10, 13, 14, 3.0),
+    (11, 12, 13, 4.5),
+    (11, 13, 14, 3.0),
+    (13, 9, 10, 4.5),
+    (13, 10, 11, 3.0),
+    (14, 9, 10, 4.5),
+    (14, 10, 11, 3.0),
+    (11, HEAD, SPINE, 5.0),
+    (14, HEAD, SPINE, 5.0),
+    (10, HEAD, SPINE, 5.0),
+    (13, HEAD, SPINE, 5.0),
+];
+/// How far a thigh may come up in front: its share of length along the
+/// body's up (0.5: 30 degrees above square to the spine).
+const HIP_FLEX: f32 = 0.5;
 
 /// The bones turned to follow the points: by the hips' frame, the chest's,
 /// or a segment's direction (from point, to point).
@@ -185,6 +210,8 @@ struct Ragdoll {
     radius: Vec<f32>,
     links: Vec<(usize, usize, f32)>,
     spreads: Vec<(usize, usize, f32)>,
+    /// [`APART`], each with its least distance (no more than it started at).
+    apart: Vec<(usize, usize, usize, f32)>,
     /// Every joint: its parent's index (None: the body itself), its pose's
     /// local transform, its world rotation then, and what drives it.
     order: Vec<usize>,
@@ -474,6 +501,7 @@ fn start(
     let dist = |a: usize, b: usize| points[a].distance(points[b]);
     let links = LINKS.iter().map(|&(a, b)| (a, b, dist(a, b))).collect();
     let spreads = SPREADS.iter().map(|&(a, m, b, f)| (a, b, (dist(a, m) + dist(m, b)) * f)).collect();
+    let apart = APART.iter().map(|&(p, a, b, r)| (p, a, b, (u(r) + radius[p]).min(segment_distance(points[p], points[a], points[b])))).collect();
     let seg0 = DRIVES
         .iter()
         .map(|(_, d)| match d {
@@ -489,6 +517,7 @@ fn start(
         radius,
         links,
         spreads,
+        apart,
         order,
         parent,
         rot0: world.iter().map(|w| w.rotation).collect(),
@@ -533,10 +562,38 @@ fn simulate(d: &mut Ragdoll, spatial: &SpatialQuery, filter: &SpatialQueryFilter
                 d.pos[b] -= fix;
             }
         }
+        keep_apart(&mut d.pos, &d.apart);
         limit_joints(&mut d.pos);
     }
     // The constraints may have pushed points into the world.
     collide(d, &before, spatial, filter, false);
+}
+
+/// How far `p` is from the segment `a`-`b`, and where along it (0 to 1).
+fn segment_closest(p: Vec3, a: Vec3, b: Vec3) -> (f32, f32) {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-8)).clamp(0.0, 1.0);
+    (p.distance(a + ab * t), t)
+}
+
+fn segment_distance(p: Vec3, a: Vec3, b: Vec3) -> f32 {
+    segment_closest(p, a, b).0
+}
+
+/// Push points out of the bones they mustn't pass through: most of the
+/// way the point, the rest the bone's ends, by how near each is.
+fn keep_apart(pos: &mut [Vec3], apart: &[(usize, usize, usize, f32)]) {
+    for &(p, a, b, min) in apart {
+        let (dist, t) = segment_closest(pos[p], pos[a], pos[b]);
+        if dist >= min || dist < 1e-5 {
+            continue;
+        }
+        let on = pos[a] + (pos[b] - pos[a]) * t;
+        let fix = (pos[p] - on) * ((min - dist) / dist);
+        pos[p] += fix * 0.6;
+        pos[a] -= fix * 0.4 * (1.0 - t);
+        pos[b] -= fix * 0.4 * t;
+    }
 }
 
 /// Knees bend forward and elbows back, and thighs don't swing far behind
@@ -566,6 +623,17 @@ fn limit_joints(pos: &mut [Vec3]) {
             pos[m] += fix * 0.5;
             pos[a] -= fix * 0.25;
             pos[b] -= fix * 0.25;
+        }
+    }
+    // Thighs: not folded up into the chest.
+    let up_dir = up.normalize_or_zero();
+    for (hip, knee) in [(9, 10), (12, 13)] {
+        let thigh = pos[knee] - pos[hip];
+        let len = thigh.length();
+        if up_dir != Vec3::ZERO && thigh.dot(up_dir) > len * HIP_FLEX {
+            // Swung back down to the limit, its length kept.
+            let flat = (thigh - up_dir * thigh.dot(up_dir)).normalize_or(hips_front);
+            pos[knee] = pos[hip] + (flat * (1.0 - HIP_FLEX * HIP_FLEX).sqrt() + up_dir * HIP_FLEX) * len;
         }
     }
     // Thighs: at most about 20 degrees behind the hips.
@@ -743,4 +811,40 @@ fn find_stairs(spatial: &SpatialQuery, eye: Vec3) -> Option<Vec3> {
         }
     }
     best.map(|b| b.1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A knee folded into the chest is put back out of it.
+    #[test]
+    fn knees_stay_out_of_the_torso() {
+        let mut pos = vec![Vec3::ZERO; POINTS.len()];
+        pos[ROOT] = Vec3::ZERO;
+        pos[SPINE] = Vec3::Y * 0.5;
+        pos[10] = Vec3::new(0.02, 0.25, 0.0);
+        let apart = [(10, ROOT, SPINE, 0.25)];
+        for _ in 0..10 {
+            keep_apart(&mut pos, &apart);
+        }
+        assert!(segment_distance(pos[10], pos[ROOT], pos[SPINE]) > 0.24);
+    }
+
+    /// A thigh swung up past the hip's reach is brought back down.
+    #[test]
+    fn thighs_dont_fold_into_the_chest() {
+        let mut pos = vec![Vec3::ZERO; POINTS.len()];
+        pos[SPINE] = Vec3::Y * 0.5;
+        pos[3] = Vec3::new(0.2, 0.45, 0.0);
+        pos[6] = Vec3::new(-0.2, 0.45, 0.0);
+        pos[HIPS.0] = Vec3::X * 0.1;
+        pos[HIPS.1] = Vec3::NEG_X * 0.1;
+        // Left thigh straight up the front of the body.
+        pos[10] = Vec3::new(0.1, 0.4, 0.1);
+        pos[12 + 1] = Vec3::new(-0.1, -0.4, 0.0);
+        limit_joints(&mut pos);
+        let thigh = pos[10] - pos[HIPS.0];
+        assert!(thigh.dot(Vec3::Y) <= thigh.length() * HIP_FLEX + 1e-4);
+    }
 }

@@ -29,7 +29,7 @@ impl Plugin for KothPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(GameState::InGame), setup.in_set(Setup::Spawn)).add_systems(
             Update,
-            (headquarters, kill_awards, hold_respawns, show_radio).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
+            (headquarters.run_if(crate::netplay::authority), kill_awards.run_if(crate::netplay::authority), hold_respawns.run_if(crate::netplay::authority), show_radio).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
         );
     }
 }

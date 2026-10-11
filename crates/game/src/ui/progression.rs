@@ -27,7 +27,7 @@ use std::collections::HashMap;
 pub(super) fn setup(app: &mut App) {
     app.add_message::<Award>().init_resource::<Progress>().add_systems(
         Update,
-        (assists, award, award_slots, match_bonus, rank_up).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+        (assists, award, award_slots, match_bonus, rank_up, other_attachment_unlocks).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
     )
     .add_systems(OnEnter(crate::state::GameState::InGame), |mut p: ResMut<Progress>| *p = Progress::default());
     if let Ok(dir) = std::env::var("COD4RW_CHALLENGETEST") {
@@ -630,7 +630,7 @@ pub(super) fn apply_unlocks(stats: &mut Stats, assets: &UiAssets) {
                 let gun = index - 3000;
                 let in_class = (0..5).any(|c| [201, 203].iter().any(|k| stats.get(k + 10 * c) == gun));
                 let old = stats.get(index);
-                let v = if rank + 1 >= level || in_class { OTHER_GAME_UNLOCKED } else { 0 };
+                let v = if rank + 1 >= level || in_class { 1 | other_attachments(stats, name, gun) } else { 0 };
                 // Newly unlocked: the menus' "new" mark.
                 let new = if old & 1 == 0 && v & 1 != 0 && stats.get(stat::RANKXP) > 0 { 65536 } else { old & 65536 };
                 stats.set(index, v | new);
@@ -662,8 +662,100 @@ pub(super) fn apply_unlocks(stats: &mut Stats, assets: &UiAssets) {
     }
 }
 
-/// A Black Ops or World at War gun, unlocked: every attachment and camo.
-const OTHER_GAME_UNLOCKED: i32 = 1 | 2 | 4 | 8 | 16 | 32 | 256 | 512 | 1024 | 2048 | 4096 | (((1 << 28) - (1 << 6)) & !65536);
+/// Kills with a Black Ops or World at War gun that earn its attachments,
+/// one each, in its game's order (as CoD4's Marksman challenges earn a
+/// gun's sights); past the list's end, one every 100 more.
+const ATTACHMENT_KILLS: [u64; 8] = [10, 25, 50, 75, 100, 150, 200, 300];
+
+fn attachment_kills(k: usize) -> u64 {
+    ATTACHMENT_KILLS.get(k).copied().unwrap_or(ATTACHMENT_KILLS[ATTACHMENT_KILLS.len() - 1] + 100 * (k + 1 - ATTACHMENT_KILLS.len()) as u64)
+}
+
+/// A Black Ops or World at War gun's attachments (`t5_ak47`), in its
+/// game's order, with the kills each one takes.
+fn other_attachment_list(gun: &str) -> Vec<(String, u64)> {
+    let list = crate::bo1::data()
+        .and_then(|d| d.gun(gun))
+        .map(|g| g.attachments.clone())
+        .or_else(|| crate::waw::data().and_then(|d| d.gun(gun)).map(|g| g.attachments.clone()))
+        .unwrap_or_default();
+    list.into_iter().filter(|a| super::attachments::bit(a) != 0).enumerate().map(|(k, a)| (a, attachment_kills(k))).collect()
+}
+
+/// The attachments (stat bits) a Black Ops or World at War gun has earned
+/// by its kills, and those a custom class already has on it (so no class
+/// loses one).
+/// `weapon` is its number in the classes' weapon stats (its stat less
+/// 3000).
+fn other_attachments(stats: &Stats, gun: &str, weapon: i32) -> i32 {
+    let kills = super::combat_record::metric(stats, gun, "kills");
+    let mut bits = other_attachment_list(gun).iter().filter(|(_, need)| kills >= *need).fold(0, |b, (a, _)| b | super::attachments::bit(a));
+    for c in 0..5 {
+        for k in [201, 203] {
+            if stats.get(k + 10 * c) == weapon {
+                bits |= stats.get(super::attachments::SET_STATS + k + 10 * c);
+            }
+        }
+    }
+    bits & !1 & !65536
+}
+
+/// Black Ops' and World at War's guns' attachments kept to what their
+/// kills have earned: the first pass in a match quietly (a profile from
+/// before, with them all, or one whose guns' data came after its unlocks
+/// were worked out); after that one earned says "New Attachment" with its
+/// name and picture.
+fn other_attachment_unlocks(time: Res<Time>, fe: Option<ResMut<Frontend>>, mut hud: ResMut<HudState>, mut next: Local<f32>, mut synced: Local<bool>) {
+    let now = time.elapsed_secs();
+    let Some(mut fe) = fe else { return };
+    if now < *next || !cod4_unlocks(&fe.stats) {
+        return;
+    }
+    *next = now + 0.5;
+    let fe = &mut *fe;
+    let Some(t) = fe.assets.table("mp/statsTable.csv") else { return };
+    let guns: Vec<(i32, String)> = (0..t.rows)
+        .filter_map(|r| Some((cell(t, r, 1).parse::<i32>().ok()?, cell(t, r, 4).to_owned())))
+        .filter(|(index, name)| *index >= 3000 + crate::bo1::FIRST_INDEX && !name.is_empty())
+        .collect();
+    for (stat_index, gun) in guns {
+        let have = fe.stats.get(stat_index);
+        // Only a gun that's unlocked earns them.
+        if have & 1 == 0 || other_attachment_list(&gun).is_empty() {
+            continue;
+        }
+        let earned = other_attachments(&fe.stats, &gun, stat_index - 3000);
+        let want = (have & (1 | 65536)) | earned;
+        if want != have {
+            fe.stats.set(stat_index, want);
+        }
+        if !*synced && let kills @ 1.. = super::combat_record::metric(&fe.stats, &gun, "kills") {
+            let list = other_attachment_list(&gun);
+            let n = list.iter().filter(|(a, _)| earned & super::attachments::bit(a) != 0).count();
+            info!("progression: {gun}: {kills} kills, {n} of {} attachments", list.len());
+        }
+        let new = earned & !have;
+        if new == 0 || !*synced {
+            continue;
+        }
+        let gun_name = crate::bo1::data()
+            .and_then(|d| d.gun(&gun))
+            .map(|g| g.display.clone())
+            .or_else(|| crate::waw::data().and_then(|d| d.gun(&gun)).map(|g| g.display.clone()))
+            .unwrap_or_else(|| gun.clone());
+        for (a, _) in other_attachment_list(&gun).into_iter().filter(|(a, _)| new & super::attachments::bit(a) != 0) {
+            let row = fe.assets.table(super::attachments::TABLE).and_then(|t| (0..t.rows).find(|&r| cell(t, r, 4).eq_ignore_ascii_case(&a)).map(|r| (cell(t, r, 3).to_owned(), cell(t, r, 6).to_owned())));
+            let (key, icon) = row.unwrap_or_default();
+            let name = if key.is_empty() { a.clone() } else { fe.assets.localize(&format!("@{key}")) };
+            info!("progression: {gun} earned {a}");
+            hud.notify("New Attachment".into(), format!("{name} for the {gun_name}"), icon, now);
+        }
+    }
+    // (Only once the guns' data is in: the statsTable has their rows.)
+    if crate::bo1::data().is_some() || crate::waw::data().is_some() {
+        *synced = true;
+    }
+}
 
 /// The level each Black Ops and World at War gun unlocks at (CoD4's tables
 /// don't know them). Each game's guns by class, in their own order: the

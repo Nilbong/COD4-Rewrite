@@ -731,6 +731,29 @@ fn lowest_axis(rotation: Quat, down: Vec3) -> Vec3 {
     axes.into_iter().max_by(|a, b| (rotation * *a).dot(down).total_cmp(&(rotation * *b).dot(down))).unwrap_or(Vec3::NEG_Y)
 }
 
+/// A box stood on an end this narrow (it tips past it this many degrees
+/// off upright) falls over rather than settling on it.
+const TOPPLE_BELOW: f32 = 15.0;
+
+/// The local axis a box of `half` size comes to rest on: the lowest one,
+/// unless that stands it on a narrow end (a dropped gun on its muzzle),
+/// when it falls onto the lowest of the others, the way it leans.
+fn resting_axis(rotation: Quat, down: Vec3, half: Vec3) -> Vec3 {
+    let low = lowest_axis(rotation, down);
+    let along = (low.abs() * half).max_element();
+    // Its narrower side: how far off upright it may lean before its middle
+    // is past that edge.
+    let across = (half + low.abs() * f32::MAX).min_element();
+    if across.atan2(along.max(1e-6)).to_degrees() >= TOPPLE_BELOW {
+        return low;
+    }
+    let axes = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+    axes.into_iter()
+        .filter(|a| a.abs() != low.abs())
+        .max_by(|a, b| (rotation * *a).dot(down).total_cmp(&(rotation * *b).dot(down)))
+        .unwrap_or(low)
+}
+
 /// Moving pieces: fall, hit the world, bounce and slide, settle and sleep.
 #[allow(clippy::too_many_arguments)]
 fn step(
@@ -762,7 +785,7 @@ fn step(
         }
         // Tip onto the nearest face when on the ground and slow.
         if let Some(n) = m.ground.filter(|_| m.velocity.length() < 1.5) {
-            let low = tf.rotation * lowest_axis(tf.rotation, -n);
+            let low = tf.rotation * resting_axis(tf.rotation, -n, body.half);
             let settle = Quat::from_rotation_arc(low, -n);
             let rate = (6.0 * dt).min(1.0);
             tf.rotation = (Quat::IDENTITY.slerp(settle, rate) * tf.rotation).normalize();
@@ -923,5 +946,12 @@ mod tests {
         assert_eq!(lowest_axis(tipped, Vec3::NEG_Y), Vec3::NEG_Y);
         let on_side = Quat::from_rotation_z(1.4);
         assert_eq!(lowest_axis(on_side, Vec3::NEG_Y), Vec3::NEG_X);
+        // A gun (long along x) landing on its muzzle falls the way it leans.
+        let gun = Vec3::new(0.45, 0.08, 0.04);
+        let on_end = Quat::from_rotation_z(-1.5);
+        assert_eq!(lowest_axis(on_end, Vec3::NEG_Y), Vec3::X);
+        assert_ne!(resting_axis(on_end, Vec3::NEG_Y, gun).abs(), Vec3::X);
+        // A crate on any face stays.
+        assert_eq!(resting_axis(on_side, Vec3::NEG_Y, Vec3::splat(0.3)), Vec3::NEG_X);
     }
 }

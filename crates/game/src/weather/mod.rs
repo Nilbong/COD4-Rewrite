@@ -24,10 +24,13 @@ pub struct WeatherPlugin;
 
 impl Plugin for WeatherPlugin {
     fn build(&self, app: &mut App) {
-        if !crate::atmos::climate::enabled() {
-            return;
-        }
+        // (Always added: the showcase is picked per match, `climate::on`.
+        // Each match starts dry: nothing of the last one's storm.)
         app.init_resource::<Storm>()
+            .add_systems(OnEnter(crate::state::GameState::InGame), |mut c: Commands| {
+                c.insert_resource(Storm::default());
+                c.remove_resource::<occlusion::RainMap>();
+            })
             .add_systems(Update, update_storm.after(crate::atmos::climate::ClimateSet).run_if(crate::state::in_game).run_if(crate::atmos::climate::on));
         occlusion::build(app);
         rain::build(app);

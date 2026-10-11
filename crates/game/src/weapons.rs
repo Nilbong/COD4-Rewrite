@@ -161,6 +161,9 @@ pub struct Gunplay {
     pub gun_kick: [GunKick; 2],
     /// `fGunMaxPitch`, `fGunMaxYaw`: how far it can kick (degrees).
     pub gun_max: (f32, f32),
+    /// `shotCount`: a shotgun's pellets a shot (`Bullet_Fire`: spread
+    /// weapons only; 0 or 1 is one bullet).
+    pub shot_count: u32,
 }
 
 /// The gun's own kick in the hands (`BG_CalculateWeaponPosition_GunRecoil`):
@@ -215,6 +218,7 @@ impl Default for Gunplay {
             fire_delay: 0.0,
             gun_kick: [GunKick::default(), GunKick::default()],
             gun_max: (0.0, 0.0),
+            shot_count: 1,
         }
     }
 }
@@ -460,6 +464,7 @@ impl WeaponDef {
                 fire_delay: ms("iFireDelay"),
                 gun_kick: [GunKick::read(&|k| w.float(&format!("f{k}")), "Hip"), GunKick::read(&|k| w.float(&format!("f{k}")), "Ads")],
                 gun_max: (w.float("fGunMaxPitch"), w.float("fGunMaxYaw")),
+                shot_count: w.int("shotCount").clamp(1, 32) as u32,
             },
         }
     }
@@ -1016,6 +1021,7 @@ fn update_weapons(
     mut launches: MessageWriter<crate::explosives::Launch>,
     penetration: Res<Penetration>,
     surfaces: Query<&collision::Surfaces>,
+    trace: crate::netplay::lagcomp::ShotTrace,
 ) {
     let now = time.elapsed_secs();
     let dt = time.delta_secs();
@@ -1134,10 +1140,22 @@ fn update_weapons(
             continue;
         }
 
+        // A shotgun fires its pellets (`Bullet_Fire`: spread weapons'
+        // `shotCount`, each its own way within the spread, none further than
+        // the minimum damage range); the shot's events are the first's.
+        let pellets = if def.class == 3 { def.gunplay.shot_count.max(1) } else { 1 };
+        let max_dist = if pellets > 1 { u(def.min_damage_range.max(1.0)) } else { u(8192.0) };
+        let deep = if loadout.is_some_and(|l| l.class.perks.iter().any(|p| p == "specialty_bulletpenetration")) { DEEP_IMPACT } else { 1.0 };
+        for pellet in 0..pellets {
+        let dir = if pellet == 0 {
+            dir
+        } else {
+            let r = spread * rng.random::<f32>();
+            let theta = rng.random_range(0.0..std::f32::consts::TAU);
+            (base * Quat::from_euler(EulerRot::YXZ, r * theta.cos(), r * theta.sin(), 0.0)) * Vec3::NEG_Z
+        };
         // The bullet: through players and thin surfaces, damage dwindling by
         // the depth each uses, each player hit once ([`Penetration`]).
-        let max_dist = u(8192.0);
-        let deep = if loadout.is_some_and(|l| l.class.perks.iter().any(|p| p == "specialty_bulletpenetration")) { DEEP_IMPACT } else { 1.0 };
         let mut passed: Vec<Entity> = vec![shooter];
         let (mut origin, mut travelled, mut strength) = (eye, 0.0f32, 1.0f32);
         let mut first: Option<(Vec3, Vec3, bool, bool)> = None;
@@ -1145,7 +1163,9 @@ fn update_weapons(
         let Ok(ray) = Dir3::new(dir) else { continue };
         for _ in 0..=MAX_PENETRATIONS {
             let skip = |e: Entity| hitboxes.get(e).map_or(true, |h| !passed.contains(&h.owner));
-            let Some(h) = spatial.cast_ray_predicate(origin, ray, max_dist - travelled, true, &filter, &skip) else { break };
+            // (A friend's shot on the host meets everyone where they saw
+            // them: [`crate::netplay::lagcomp`].)
+            let Some(h) = trace.cast(&spatial, shooter, origin, ray, max_dist - travelled, &filter, &skip) else { break };
             let point = origin + dir * h.distance;
             travelled += h.distance;
             let hitbox = hitboxes.get(h.entity).ok();
@@ -1189,7 +1209,7 @@ fn update_weapons(
             }
             let beyond = point + dir * u(depth);
             let entry = h.entity;
-            let back = spatial.cast_ray_predicate(beyond, -ray, u(depth), true, &filter, &|e| e == entry);
+            let back = trace.back(&spatial, shooter, beyond, -ray, u(depth), &filter, entry);
             let Some(exit) = back.filter(|b| b.distance > 0.0).map(|b| beyond - dir * b.distance) else { break };
             let thickness = (exit - point).length() / crate::units::INCH;
             strength -= thickness / depth;
@@ -1200,8 +1220,11 @@ fn update_weapons(
             travelled += (exit - point).length() + u(0.5);
             origin = exit + dir * u(0.5);
         }
-        let (to, normal, hit_pawn, hit_world) = first.unwrap_or((eye + dir * max_dist, Vec3::Y, false, false));
-        shots.write(ShotFired { shooter, weapon: Some(def), from: eye, to, hit_pawn, normal, hit_world });
+        if pellet == 0 {
+            let (to, normal, hit_pawn, hit_world) = first.unwrap_or((eye + dir * max_dist, Vec3::Y, false, false));
+            shots.write(ShotFired { shooter, weapon: Some(def), from: eye, to, hit_pawn, normal, hit_world });
+        }
+        }
     }
 }
 

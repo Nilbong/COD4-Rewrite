@@ -28,9 +28,7 @@ impl Plugin for SsrPlugin {
             images.add(Image::new_target_texture(1920, 1080, TextureFormat::Rgba16Float, None))
         };
         HISTORY.set(image).ok();
-        if !crate::atmos::climate::enabled() {
-            return;
-        }
+        // (Always added: the showcase is picked per match, `climate::on`.)
         app.add_plugins(ExtractComponentPlugin::<SsrSource>::default())
             .add_systems(Update, (mark_camera, size_history).run_if(crate::atmos::climate::on));
         if let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) {

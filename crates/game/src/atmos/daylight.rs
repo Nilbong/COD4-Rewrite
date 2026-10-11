@@ -32,8 +32,14 @@ fn drive(
     mut fogs: Query<&mut DistanceFog>,
     mut exposures: Query<&mut bevy::post_process::auto_exposure::AutoExposure>,
     mut frost: Local<Option<(LinearRgba, FogFalloff)>>,
+    mut frost_match: Local<u32>,
 ) {
     let (true, Some(map)) = (tod.enabled, tod.map) else { return };
+    // (The map's own fog, per match.)
+    if *frost_match != super::climate::match_id() {
+        *frost_match = super::climate::match_id();
+        *frost = None;
+    }
     let tod = &mut *tod;
     // A held clock (Downpour): CoD4's own light, sky and fog stand; only
     // lightning flashes, and the horizon is the map's fog's.

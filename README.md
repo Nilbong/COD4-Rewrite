@@ -17,6 +17,13 @@ card with Vulkan, and your own installed copy of CoD4 (Steam or retail, patch 1.
 models and sounds from it, and none of them are downloaded. `Launcher.exe --build` builds from this folder's
 source instead (needs Rust, see below).
 
+**Your games' folders.** CoD4 is needed; *Black Ops*, *Modern Warfare 2* and *World at War* are optional and add their
+guns, maps and characters. Each is found automatically in your Steam libraries (any drive, any library folder) and
+the usual retail folders. The launcher lists what it found each time it starts; if one isn't found, choose its
+folder there (`Launcher.exe --folders` opens the list any time) or in the game's **Options > Game Folders**. MW2
+counts only with *Modern Warfare 2 Multiplayer* installed (on Steam it's a separate download). Changes apply the next
+time the game starts.
+
 For maintainers: pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) makes the `Release`
 workflow (`.github/workflows/release.yml`) build `cod4rw.exe` and `Launcher.exe` and attach them to the release.
 
@@ -24,10 +31,12 @@ workflow (`.github/workflows/release.yml`) build `cod4rw.exe` and `Launcher.exe`
 
 You need a Rust toolchain and an installed copy of CoD4 (Steam or retail, patch 1.7).
 
-Installs of *Call of Duty: Black Ops* (`BLACKOPS_PATH`, the folder with `BlackOps.exe`) and *Call of Duty: World at
-War* (`WAW_PATH`, the folder with `CoDWaWmp.exe`) are optional. When found, their weapons and characters are added to
-the game; without them it runs with CoD4's content alone. Like CoD4, they are found automatically in common Steam
-library locations.
+Installs of *Call of Duty: Black Ops*, *Modern Warfare 2* and *World at War* are optional. When found, their content
+is added to the game; without them it runs with CoD4's content alone. Like CoD4, they are found in your Steam
+libraries (Steam's `libraryfolders.vdf`) and the usual retail folders, or where you chose them (launcher or Options >
+Game Folders, saved in `%LOCALAPPDATA%\cod4rw\game_paths.txt`). The environment variables `COD4_PATH`,
+`BLACKOPS_PATH`, `MW2_PATH` and `WAW_PATH` (each the folder with the game's exe) take precedence;
+`cargo run -p gamepaths --example status` prints what's found.
 
 ```bash
 cargo run --release -p game
@@ -40,8 +49,8 @@ straight into a match:
 cargo run --release -p game -- --map mp_killhouse --bots 6
 ```
 
-The install is found automatically in common Steam library locations. If it isn't, set `COD4_PATH` to
-the folder containing `iw3mp.exe`.
+If the CoD4 install isn't found, choose its folder in the launcher, or set `COD4_PATH` to the folder containing
+`iw3mp.exe`.
 
 Options:
 

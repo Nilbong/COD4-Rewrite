@@ -28,7 +28,7 @@ impl Plugin for DomPlugin {
         app.add_systems(OnEnter(GameState::InGame), setup.in_set(Setup::Spawn))
             .add_systems(
                 Update,
-                (capture, defends, score, show_flags).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
+                (capture.run_if(crate::netplay::authority), defends.run_if(crate::netplay::authority), score.run_if(crate::netplay::authority), show_flags).chain().after(crate::movement::MovementSet).run_if(in_game.and_then(playing)),
             );
     }
 }

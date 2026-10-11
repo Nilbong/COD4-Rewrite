@@ -14,6 +14,13 @@ use crate::online::{EVERYONE, Event, HOST, Online, Status};
 use crate::state::GameState;
 use bevy::prelude::{Commands, Res, ResMut, State};
 use cod4rw_multiplayer::protocol::{LobbyCode, MAX_PLAYERS as MAX_ONLINE, PeerId};
+use crate::matchmaking::{AcceptsJoinInProgress, JoinInProgress, Matchmaker};
+
+/// Public matches (Find Match, the lobby browser).
+#[path = "lobby_public.rs"]
+mod public;
+pub(super) use public::START_DVAR;
+use public::PublicLobby;
 
 /// The Join with Code text field's dvar.
 pub(super) const CODE_DVAR: &str = "ui_pm_code";
@@ -48,6 +55,18 @@ pub(super) struct OnlineLobby {
     sent: Vec<u8>,
     /// The match is starting online: for [`crate::netplay`].
     begin: bool,
+    /// Start Match pressed with friends here: ask the relay for the best
+    /// host first ([`Online::elect`]), and since when we've waited.
+    elect: bool,
+    pub(super) electing: Option<std::time::Instant>,
+    /// The election moved the host role to or from this game.
+    role_changed: bool,
+    /// A public lobby (matchmaking's), not a private one.
+    pub(super) public: Option<PublicLobby>,
+    /// Netplay takes players in a match ([`AcceptsJoinInProgress`]).
+    accepts_jip: bool,
+    /// Players joining the match, for netplay.
+    jip: Vec<JoinInProgress>,
 }
 
 impl OnlineLobby {
@@ -146,6 +165,51 @@ impl Frontend {
         }
     }
 
+    /// Start Match (or a public lobby's countdown ending). With friends
+    /// here the relay first chooses the host: the one nearest it, whose
+    /// game runs the match ([`Frontend::elected`] starts it).
+    pub(super) fn online_start(&mut self) {
+        let l = &mut self.lobby;
+        if l.online.electing.is_some() || l.starting {
+            return;
+        }
+        if l.online.host() && l.online.members.len() > 1 {
+            l.online.elect = true;
+            l.online.electing = Some(std::time::Instant::now());
+            return;
+        }
+        l.starting = true;
+        l.online.start = l.online.host();
+        self.start = Some(l.map_id().to_string());
+    }
+
+    /// The relay chose the host: `swap`, the player who took the host's ID
+    /// (the old host takes theirs). Whoever is the host now starts.
+    fn elected(&mut self, swap: Option<PeerId>) -> bool {
+        let l = &mut self.lobby;
+        l.online.electing = None;
+        if let Some(new) = swap {
+            let flip = |p: PeerId| if p == HOST { new } else if p == new { HOST } else { p };
+            for m in &mut l.online.members {
+                m.peer = flip(m.peer);
+            }
+            l.online.me = l.online.me.map(flip);
+            l.online.role_changed = true;
+            l.online.sent.clear();
+            let host = l.online.host();
+            if let Some(p) = &mut l.online.public {
+                p.playlist = host.then(|| p.playlist.unwrap_or(crate::matchmaking::Playlist::Tdm));
+            }
+            bevy::log::info!("online: {} the match's host (the nearest the relay)", if host { "this game is now" } else { "a friend is now" });
+        }
+        if l.online.host() && !l.starting {
+            l.starting = true;
+            l.online.start = true;
+            self.start = Some(l.map_id().to_string());
+        }
+        true
+    }
+
     /// A friend's Join Team: ask the host.
     pub(super) fn ask_switch(&mut self) {
         self.lobby.online.switch = true;
@@ -155,7 +219,7 @@ impl Frontend {
     /// building again.
     fn online_event(&mut self, event: Event, online: &Online, in_frontend: bool) -> bool {
         match event {
-            Event::Ready { peer, code } => {
+            Event::Ready { peer, code, .. } => {
                 let profile = self.online_profile();
                 let l = &mut self.lobby;
                 l.online.connecting = false;
@@ -164,11 +228,6 @@ impl Frontend {
                 // Online lobbies are one player per game.
                 l.players = 1;
                 if peer == HOST {
-                    // Objective modes aren't online yet.
-                    if !matches!(l.mode(), GameMode::Tdm | GameMode::Ffa | GameMode::Tdm3) {
-                        l.mode = 0;
-                        l.score = l.mode().score_limits().1;
-                    }
                     l.online.code = code.map(|c| c.to_string());
                     l.online.members = vec![Member { peer, profile, team: side(l.teams[0]) as u8 }];
                 } else {
@@ -179,12 +238,17 @@ impl Frontend {
             }
             Event::PeerJoined | Event::Inputs(..) | Event::Snapshot(_) => false,
             Event::PeerLeft(peer) => {
-                let o = &mut self.lobby.online;
-                let before = o.members.len();
-                o.members.retain(|m| m.peer != peer);
-                o.members.len() != before
+                let l = &mut self.lobby;
+                let Some(at) = l.online.members.iter().position(|m| m.peer == peer) else { return false };
+                let gone = l.online.members.remove(at);
+                // Mid-match a bot takes their place (netplay spawns it).
+                if !in_frontend && l.online.host() {
+                    l.add_bot(gone.team as usize);
+                }
+                true
             }
             Event::Message(from, msg) => self.online_message(from, msg, online, in_frontend),
+            Event::Elected(swap) => self.elected(swap),
             Event::Closed(reason) => {
                 self.lobby.online.reset(reason);
                 true
@@ -193,6 +257,19 @@ impl Frontend {
     }
 
     fn online_message(&mut self, from: PeerId, msg: LobbyMsg, online: &Online, in_frontend: bool) -> bool {
+        // The host seats joiners on the side short of humans (in a match,
+        // in place of a bot).
+        if self.lobby.online.host()
+            && let LobbyMsg::Join { build, profile } = &msg
+            && *build == BUILD
+            && !self.lobby.online.members.iter().any(|m| m.peer == from)
+        {
+            if let Some(refusal) = self.public_join(from, profile.clone(), in_frontend, online) {
+                online.send(from, &LobbyMsg::Refused(refusal));
+                return false;
+            }
+            return true;
+        }
         let l = &mut self.lobby;
         if l.online.host() {
             match msg {
@@ -222,11 +299,11 @@ impl Frontend {
                 }
                 LobbyMsg::SwitchTeam => {
                     let Some(i) = l.online.members.iter().position(|m| m.peer == from) else { return false };
-                    let other = 1 - l.online.members[i].team as usize;
-                    if l.count(other) >= TEAM_SIZE {
+                    let here = l.online.members[i].team as usize;
+                    if !l.online_switch(here) {
                         return false;
                     }
-                    l.online.members[i].team = other as u8;
+                    l.online.members[i].team = 1 - here as u8;
                     true
                 }
                 _ => false,
@@ -269,19 +346,28 @@ impl Frontend {
 
 /// The menus' requests to [`Online`], what it reports back into the lobby,
 /// and the host's lobby to everyone when it changes.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::ui) fn online_lobby(
     mut commands: Commands,
     mut fe: ResMut<Frontend>,
     mut online: ResMut<Online>,
     state: Res<State<GameState>>,
+    mut mm: ResMut<Matchmaker>,
+    accepts: Option<Res<AcceptsJoinInProgress>>,
+    real: Res<bevy::time::Time<bevy::time::Real>>,
+    time: Res<bevy::time::Time>,
+    match_state: Option<Res<crate::tdm::MatchState>>,
+    mut joining: bevy::prelude::MessageWriter<JoinInProgress>,
 ) {
     let fe = &mut *fe;
+    fe.lobby.online.accepts_jip = accepts.is_some();
     match fe.lobby.online.request.take() {
         Some(Request::Host) => online.host(),
         Some(Request::Join(code)) => online.join(code),
         Some(Request::Leave) => {
             let note = std::mem::take(&mut fe.lobby.online.note);
             online.leave();
+            mm.left();
             fe.lobby.online.reset(note);
             fe.rebuild_lobby();
         }
@@ -291,6 +377,11 @@ pub(in crate::ui) fn online_lobby(
     let mut rebuild = false;
     for event in online.poll() {
         rebuild |= fe.online_event(event, &online, in_frontend);
+    }
+    let clock = match_state.filter(|_| !in_frontend).map(|m| (m.time_left(time.elapsed_secs()), m.ended.is_some()));
+    rebuild |= fe.public_lobby(&mut online, &mut mm, public::Now { real: real.elapsed_secs(), in_frontend, clock });
+    for j in fe.lobby.online.jip.drain(..) {
+        joining.write(j);
     }
     let o = &mut fe.lobby.online;
     let connecting = online.status == Status::Connecting;
@@ -315,10 +406,22 @@ pub(in crate::ui) fn online_lobby(
             online.send(EVERYONE, &msg);
             l.online.sent = data;
         }
+        // (After the lobby: the new host must have it before it's chosen.)
+        if std::mem::take(&mut l.online.elect) {
+            online.elect();
+        }
         if std::mem::take(&mut l.online.start) {
             online.send(EVERYONE, &LobbyMsg::Start);
             l.online.begin = true;
         }
+    }
+    // No answer from the relay: start as we are.
+    if fe.lobby.online.electing.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(5)) {
+        bevy::log::warn!("online: no host election from the relay; starting as host");
+        rebuild |= fe.elected(None);
+    }
+    if std::mem::take(&mut fe.lobby.online.role_changed) {
+        mm.role_changed(fe.lobby.online.host(), online.room);
     }
     let o = &mut fe.lobby.online;
     if std::mem::take(&mut o.begin)

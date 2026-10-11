@@ -26,7 +26,7 @@ pub const PREFIX: &str = "next_settings|";
 
 /// The list on the left: its groups and their pages (by CoD4 menu).
 const GROUPS: [(&str, &[&str]); 2] = [
-    ("Options", &["options_graphics", "options_graphics_texture", "options_sound", "options_game"]),
+    ("Options", &["options_graphics", "options_graphics_texture", "options_sound", "options_game", "options_voice"]),
     ("Controls", &["options_look", "options_move", "options_shoot", "options_misc", "controls_multi"]),
 ];
 
@@ -224,6 +224,7 @@ fn page_icon(menu: &str) -> Option<(&'static str, usize)> {
         "options_graphics_texture" => (MENU_ICONS, icons::STAR),
         "options_sound" => (HUD_ICONS, 14),
         "options_game" => (MENU_ICONS, icons::HELMET),
+        "options_voice" => (MENU_ICONS, icons::STAR),
         "options_look" => (MENU_ICONS, icons::CROSSHAIR),
         "options_move" => (MENU_ICONS, icons::KEYBOARD),
         "options_shoot" => (MENU_ICONS, icons::RIFLE),
@@ -241,6 +242,7 @@ fn page_about(menu: &str) -> &'static str {
         "options_graphics_texture" => "Shadows, anti-aliasing, effects and the detail drawn.",
         "options_sound" => "Volumes for everything you hear.",
         "options_game" => "The HUD, the scope, your gun's feel and the menus' style.",
+        "options_voice" => "Where your Call of Duty games are installed: each one found adds its guns, maps and characters.",
         "options_look" => "Mouse sensitivity and leaning.",
         "options_move" => "Movement keys, and how crouch, prone and sprint behave.",
         "options_shoot" => "Firing, aiming, weapons, grenades and kill streaks.",
@@ -310,7 +312,8 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
     if fe.capturing.is_some() {
         prompts = vec![(Button::Back, "Cancel")];
     } else {
-        prompts.push((Button::Confirm, if binding { "Bind" } else if on_row { "Change" } else { "Select" }));
+        let folder = focused.and_then(Frontend::setting_of).is_some_and(|s| matches!(s.kind, Kind::Folder(_)));
+        prompts.push((Button::Confirm, if binding { "Bind" } else if folder { "Choose Folder" } else if on_row { "Change" } else { "Select" }));
         prompts.push((Button::Back, "Back"));
     }
     footer(&mut k, "", &prompts);
@@ -378,6 +381,13 @@ fn setting_row(k: &mut Kit, fe: &Frontend, it: &Item, s: &Setting, r: R, hot: bo
                 let shown = if keys.trim().is_empty() { "Unbound" } else { keys.as_str() };
                 k.text_mid(box_r.cx(), r.cy(), regular, shown, if keys.trim().is_empty() { t::INK_MUTE } else { ink }, 1);
             }
+        }
+        Kind::Folder(_) => {
+            let shown = fe.setting_value(it).unwrap_or_default();
+            let missing = shown == "Not found";
+            let box_r = R::new(v.x + 12.0, r.y + 6.0, v.w - 24.0, r.h - 12.0);
+            k.frame(box_r, 1.0, if hot { t::LINE_STRONG } else { t::HAIRLINE });
+            k.text_mid(box_r.cx(), r.cy(), regular, &shown, if missing { t::INK_MUTE } else { ink }, 1);
         }
     }
 }

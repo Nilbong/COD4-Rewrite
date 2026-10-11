@@ -181,6 +181,23 @@ pub(super) fn add(
             *menu = Arc::new(patched);
             let _ = key;
         }
+        // A primary with no attachments (the MP44) opens CoD4's fake
+        // attachment popup and `camo2` for its camo; `camo2` is the
+        // sidearm's now, so it opens the primary's camo instead.
+        let fake = format!("\"open\" \"{class}_attachment_popup_fake\" ; \"open\" \"{class}_popup_cac_camo2\"");
+        for (_, menu) in menus.iter_mut().filter(|(key, _)| key.starts_with(&format!("{class}_popup_cac_"))) {
+            if !menu.items.iter().any(|it| it.action.contains(&fake)) {
+                continue;
+            }
+            let mut patched = (**menu).clone();
+            for item in &mut patched.items {
+                // (The row's second button picks for the secondary: left be.)
+                if item.action.contains(&format!("\"{primary}\"")) {
+                    item.action = item.action.replace(&fake, &format!("\"open\" \"{primary_key}\""));
+                }
+            }
+            *menu = Arc::new(patched);
+        }
     }
 }
 

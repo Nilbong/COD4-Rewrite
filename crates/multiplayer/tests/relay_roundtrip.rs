@@ -60,6 +60,7 @@ async fn encrypted_inputs_snapshots_and_disconnects() {
         tick: 3,
         acknowledged_input: q.acknowledged(),
         pawns: vec![PawnState { id: peer, health: 100, ..Default::default() }],
+        ..Default::default()
     };
     host.send_snapshot(peer, state.clone()).unwrap();
     assert_eq!(
@@ -73,7 +74,7 @@ async fn encrypted_inputs_snapshots_and_disconnects() {
     drop(player);
     assert_eq!(timeout(Duration::from_secs(2), host.next_control()).await.unwrap(), Some(Control::PeerLeft(id)));
     // An in-flight snapshot for someone who just left cannot kill the host.
-    host.send_snapshot(id, Snapshot { tick: 6, acknowledged_input: 1, pawns: vec![] }).unwrap();
+    host.send_snapshot(id, Snapshot { tick: 6, acknowledged_input: 1, ..Default::default() }).unwrap();
     let next = f.join(&host).await;
     assert_ne!(next.peer, id);
     drop(next);
@@ -142,7 +143,7 @@ async fn malicious_player_cannot_send_snapshots_or_spoof_another_player() {
     transport::read_frame(&mut recv).await.unwrap();
     connection
         .send_datagram(
-            Packet::Snapshot { recipient: HOST, state: Snapshot { tick: 1, acknowledged_input: 0, pawns: vec![] } }
+            Packet::Snapshot { recipient: HOST, state: Snapshot { tick: 1, ..Default::default() } }
                 .encode()
                 .unwrap()
                 .into(),

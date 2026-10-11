@@ -16,7 +16,7 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    let id = zone.find(&model).expect("model not found");
+    let id = zone.assets.iter().position(|a| matches!(a, iw3::zone::Asset::XModel(m) if m.name == model)).expect("model not found");
     let x = zone.xmodel(id).unwrap();
     println!("{}: bones {} (root {}), surfs {}, lods {:?}", x.name, x.num_bones, x.num_root_bones, x.surfs.len(), x.lods);
     for (i, name) in x.bone_names.iter().enumerate() {

@@ -55,6 +55,16 @@ impl Radar {
         self.sweep_side(Side::of(team, player), now)
     }
 
+    /// The UAVs up: whose, from and until when ([`crate::netplay`]).
+    pub(crate) fn entries(&self) -> &[(Side, f32, f32)] {
+        &self.up
+    }
+
+    /// The host's UAVs, on an online guest ([`crate::netplay`]).
+    pub(crate) fn replace(&mut self, up: Vec<(Side, f32, f32)>) {
+        self.up = up;
+    }
+
     fn sweep_side(&self, side: Side, now: f32) -> Option<(u32, f32)> {
         let &(_, start, until) = self.up.iter().find(|u| u.0 == side)?;
         if now < start || now >= until {

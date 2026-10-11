@@ -31,7 +31,8 @@ pub struct ScatterPlugin;
 impl Plugin for ScatterPlugin {
     fn build(&self, app: &mut App) {
         // (`COD4RW_NOSCATTER`: without it, for telling its pieces from the map's.)
-        if !crate::atmos::climate::enabled() || std::env::var_os("COD4RW_NOSCATTER").is_some() {
+        // (Always added otherwise: the showcase is picked per match.)
+        if std::env::var_os("COD4RW_NOSCATTER").is_some() {
             return;
         }
         app.add_systems(OnEnter(crate::state::GameState::InGame), start.in_set(crate::state::Setup::Spawn).run_if(crate::atmos::climate::on))
@@ -362,12 +363,14 @@ fn model_bounds(content: &Content) -> Vec<(Vec3, Vec3)> {
 
 /// Puddles as wet as the weather (`crate::atmos::climate::Weather`):
 /// gone when the deck is dry.
-fn wet_puddles(weather: Option<Res<crate::atmos::climate::Weather>>, mut puddles: Query<&mut Visibility, With<Puddle>>, mut was: Local<Option<bool>>) {
+fn wet_puddles(weather: Option<Res<crate::atmos::climate::Weather>>, mut puddles: Query<&mut Visibility, With<Puddle>>, mut was: Local<Option<(u32, bool)>>) {
     let wet = weather.map_or(true, |w| !w.enabled || w.wetness > 0.15);
-    if *was == Some(wet) {
+    // (Per match: a new map's puddles start shown.)
+    let now = (crate::atmos::climate::match_id(), wet);
+    if *was == Some(now) {
         return;
     }
-    *was = Some(wet);
+    *was = Some(now);
     for mut v in &mut puddles {
         *v = if wet { Visibility::Inherited } else { Visibility::Hidden };
     }

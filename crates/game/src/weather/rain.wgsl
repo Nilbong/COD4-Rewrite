@@ -19,6 +19,7 @@
 // The rain map: how high rain gets in each cell.
 @group(#{MATERIAL_BIND_GROUP}) @binding(5) var heights: texture_2d<f32>;
 // Toward the key light (the moon by night), and its light on the drops.
+// xyz: towards the key light; w: the rain's opacity (`rain.opacity`).
 @group(#{MATERIAL_BIND_GROUP}) @binding(6) var<uniform> key_dir: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(7) var<uniform> key_light: vec4<f32>;
 // Snow: lamps near the camera, two each: (where, reach), (colour, -).
@@ -292,7 +293,7 @@ fn fragment(in: Out) -> @location(0) vec4<f32> {
         // Faint, lit by the air's light only (no moon glow): dark at night.
         strength = 0.0012;
         let lum = dot(light.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-        return vec4<f32>(vec3<f32>(lum) * max(a * in.fade, 0.0) * strength, 0.0);
+        return vec4<f32>(vec3<f32>(lum) * max(a * in.fade, 0.0) * strength * key_dir.w, 0.0);
     } else if k == 3 {
         let across = 1.0 - abs(in.uv.x);
         a = across * across * sin(in.uv.y * PI);
@@ -313,7 +314,7 @@ fn fragment(in: Out) -> @location(0) vec4<f32> {
         // Grey: rain haze takes the light's brightness more than its hue.
         let lit = light.rgb + key_light.rgb * 0.15;
         let tint = vec3<f32>(dot(lit, vec3<f32>(0.2126, 0.7152, 0.0722)));
-        return vec4<f32>(tint * max(a * in.fade, 0.0) * strength, 0.0);
+        return vec4<f32>(tint * max(a * in.fade, 0.0) * strength * key_dir.w, 0.0);
     } else {
         let across = 1.0 - abs(in.uv.x);
         a = across * across * sin(in.uv.y * PI);
@@ -327,8 +328,8 @@ fn fragment(in: Out) -> @location(0) vec4<f32> {
         let hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cs, 1.5) / (4.0 * PI);
         let tinted = light.rgb + key_light.rgb * (0.25 + 3.0 * hg);
         let lit = vec3<f32>(dot(tinted, vec3<f32>(0.2126, 0.7152, 0.0722))) * vec3<f32>(0.95, 0.97, 1.0);
-        return vec4<f32>(lit * max(a * in.fade, 0.0) * strength, 0.0);
+        return vec4<f32>(lit * max(a * in.fade, 0.0) * strength * key_dir.w, 0.0);
     }
     // Alpha 0: added to what's behind, never covering it.
-    return vec4<f32>(light.rgb * max(a * in.fade, 0.0) * strength, 0.0);
+    return vec4<f32>(light.rgb * max(a * in.fade, 0.0) * strength * key_dir.w, 0.0);
 }
