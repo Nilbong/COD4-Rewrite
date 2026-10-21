@@ -79,6 +79,12 @@ fn lines(stats: &NetStats, guest: bool, names: &HashMap<PeerId, String>) -> Stri
 
 /// Show (and log) the net graph.
 #[allow(clippy::too_many_arguments)]
+fn rgba(c: [f32; 4]) -> Color {
+    Color::srgba(c[0], c[1], c[2], c[3])
+}
+
+use crate::ui::next::theme as t;
+
 pub(super) fn show(
     mut commands: Commands,
     time: Res<Time>,
@@ -117,10 +123,21 @@ pub(super) fn show(
             commands.spawn((
                 GraphText,
                 Text::new(s),
-                TextFont { font_size: FontSize::Px(15.0), ..default() },
-                TextColor(Color::srgb(0.6, 1.0, 0.6)),
+                // (The new UI's type and colours: ink on a panel, an accent
+                // edge.)
+                crate::hud::menu_font(15.0),
+                TextColor(rgba(t::INK)),
                 TextShadow::default(),
-                Node { position_type: PositionType::Absolute, right: px(8), top: px(64), ..default() },
+                Node {
+                    position_type: PositionType::Absolute,
+                    right: px(8),
+                    top: px(64),
+                    padding: UiRect::new(px(10), px(8), px(6), px(6)),
+                    border: UiRect::left(px(2)),
+                    ..default()
+                },
+                BackgroundColor(rgba(t::PANEL)),
+                BorderColor::all(rgba(t::ACCENT)),
                 GlobalZIndex(1000),
                 DespawnOnExit(crate::state::GameState::InGame),
             ));

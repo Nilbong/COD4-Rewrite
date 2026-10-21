@@ -11,6 +11,7 @@ mod attachments;
 mod bo1;
 mod browser;
 mod camos;
+pub(crate) mod chat;
 mod combat_record;
 mod custom_camo;
 mod reticle_menu;
@@ -21,6 +22,8 @@ mod hud;
 mod ingame;
 mod hq;
 mod lobby;
+/// CoD4's maps (for [`crate::netplay`]: which players can load which).
+pub use lobby::MAPS;
 mod modern;
 pub(crate) mod next;
 mod mastery;
@@ -97,12 +100,28 @@ impl Plugin for UiPlugin {
                     ingame::paint,
                 )
                     .chain()
+                    // (The fly camera (F8) hides only the HUD, in
+                    // `hud::paint`: the menus and the match's flow go on.)
                     .run_if(in_game.and_then(resource_exists::<Frontend>).and_then(|| !crate::perf::no_hud())),
             )
             // The load screen stays over the match while it settles
             // (`crate::settle`).
             .add_systems(Update, settling_screen.after(ingame::paint).run_if(in_game.and_then(crate::settle::settling)))
             .add_systems(PostUpdate, draw::sync_nodes.run_if(in_game))
+            // Nothing over a cinematic (`crate::cinematic`).
+            .add_systems(
+                PostUpdate,
+                (|cin: Option<Res<crate::cinematic::Cinematic>>, mut list: ResMut<DrawList>| {
+                    // (A mission's script hiding the HUD hides only the HUD,
+                    // in `hud::paint`: its pause menu and the load screen
+                    // still draw.)
+                    if cin.is_some() {
+                        list.0.clear();
+                    }
+                })
+                .before(draw::sync_nodes)
+                .before(draw::sync_sprites),
+            )
             // Headquarters' supply drop cards' 3D pictures.
             .add_systems(Update, update_previews.after(MenuInput).run_if(in_game.and_then(|| crate::hq::active()).and_then(resource_exists::<Frontend>)))
             // The match's UI nodes go with it (`crate::session`).
@@ -114,6 +133,7 @@ impl Plugin for UiPlugin {
         combat_record::setup(app);
         modern::build(app);
         next::build(app);
+        chat::build(app);
         mastery::setup(app);
         hud::build(app);
         pad::build(app);
@@ -596,10 +616,13 @@ impl Frontend {
     fn command(&mut self, args: &[String], owner: &str) {
         let a = |i: usize| args.get(i).map_or("", String::as_str);
         match a(0).to_ascii_lowercase().as_str() {
-            "open" => self.open(a(1)),
+            "open" => {
+                let name = self.sp_name(a(1), owner);
+                self.open(&name);
+            }
             "close" => {
-                let name = if a(1).eq_ignore_ascii_case("self") { owner } else { a(1) };
-                self.close(&name.to_owned());
+                let name = if a(1).eq_ignore_ascii_case("self") { owner.to_owned() } else { self.sp_name(a(1), owner) };
+                self.close(&name);
             }
             "setlocalvarint" | "setlocalvarbool" | "setlocalvarfloat" | "setlocalvarstring" => {
                 self.locals.insert(a(1).to_ascii_lowercase(), a(2).to_owned());
@@ -630,6 +653,12 @@ impl Frontend {
                 self.stats.set(stat, if a(0).eq_ignore_ascii_case("statclearbitmask") { v & !mask } else { v | mask });
             }
             "uiscript" => self.ui_script(&args[1..]),
+            // The SP menus' items for a game in progress (Resume) or not
+            // (New Game without the overwrite warning): campaign progress.
+            "savegameshow" | "savegamehide" => {
+                let saved = crate::campaign::progress::load().get("mis_01").is_some_and(|v| v.trim() != "0" && !v.trim().is_empty());
+                self.show_item(owner, a(1), saved == a(0).eq_ignore_ascii_case("savegameshow"));
+            }
             "show" | "fadein" => self.show_item(owner, a(1), true),
             "hide" | "fadeout" => self.show_item(owner, a(1), false),
             "setfocus" => {
@@ -683,6 +712,27 @@ impl Frontend {
                 }
             }
             "quit" => self.quit = true,
+            // The SP menus' level starts (`devmap killhouse`) and difficulty.
+            "devmap" | "map" if crate::modes::test_features() && crate::campaign::missions_find(a(1)).is_some() => {
+                self.close("sp:main_text");
+                self.close("sp:main");
+                self.start = Some(a(1).to_ascii_lowercase());
+                self.start_campaign = true;
+            }
+            // Resume: the level the campaign got to.
+            "loadgame_continue" if crate::modes::test_features() => {
+                let at = crate::campaign::progress::load().get("mis_01").and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+                let m = &crate::campaign::MISSIONS[at.min(crate::campaign::MISSIONS.len() - 1)];
+                self.close("sp:main_text");
+                self.close("sp:main");
+                self.start = Some(m.map.into());
+                self.start_campaign = true;
+            }
+            "difficultyeasy" | "difficultymedium" | "difficultyhard" | "difficultyfu" => {
+                let skill = ["difficultyeasy", "difficultymedium", "difficultyhard", "difficultyfu"].iter().position(|d| a(0).eq_ignore_ascii_case(d)).unwrap_or(1);
+                self.set_dvar("g_gameskill", &skill.to_string());
+                crate::campaign::progress::set("g_gameskill", &skill.to_string());
+            }
             // Leave Game's "yes".
             "disconnect" => self.leave = true,
             _ => debug!("ui: unhandled console command {args:?}"),
@@ -712,8 +762,21 @@ impl Frontend {
             }
             // (CoD4's Single Player switched to its other exe: our campaign.)
             // (The test build's only: `crate::modes::test_features`.)
+            // No mission named: CoD4's own campaign menus (`ui.ff`).
+            "startcampaign" | "startsingleplayer" if crate::modes::test_features() && a(1).is_empty() && self.assets.menu("sp:main").is_some() => {
+                for (k, v) in crate::campaign::progress::load() {
+                    self.set_dvar(&k, &v);
+                }
+                // (A profile is in use: the SP menus don't ask for one.)
+                self.set_dvar("com_playerProfile", "player");
+                self.set_dvar("ui_playerProfileCount", "1");
+                self.set_dvar("ui_playerProfileAlreadyChosen", "1");
+                self.open("sp:main");
+            }
             "startcampaign" | "startsingleplayer" if crate::modes::test_features() => {
-                self.start = Some(crate::campaign::MISSIONS[0].map.into());
+                // `startCampaign [map]`: that mission, or the first.
+                let m = crate::campaign::MISSIONS.iter().find(|m| m.map.eq_ignore_ascii_case(a(1))).unwrap_or(&crate::campaign::MISSIONS[0]);
+                self.start = Some(m.map.into());
                 self.start_campaign = true;
             }
             "quit" => self.quit = true,
@@ -729,6 +792,7 @@ impl Frontend {
             s if s.starts_with("mm") => next::join::script(args),
             _ if self.profile_script(args) => {}
             _ if self.streak_script(args) => {}
+            _ if self.laser_script(args) => {}
             _ if self.browser_script(args) => {}
             _ => debug!("ui: unhandled uiScript {args:?}"),
         }
@@ -771,6 +835,7 @@ impl Frontend {
         let base = if key == next::modes::MENU { Some(Arc::new(next::modes::menu(self))) } else { base };
         let base = if key == next::join::MENU { Some(Arc::new(next::join::menu(self))) } else { base };
         let base = if key == next::streaks::MENU { Some(Arc::new(next::streaks::menu(self))) } else { base };
+        let base = if key == next::summary::MENU { Some(Arc::new(next::summary::menu())) } else { base };
         let base = if key == hq::PAUSE_MENU { self.assets.menu("class").and_then(|m| hq::pause_menu(&m)).map(Arc::new) } else { base };
         let base = match key.as_str() {
             "class" => base.map(|m| hq::match_pause_menu(&m).map_or(m, Arc::new)),
@@ -795,6 +860,19 @@ impl Frontend {
                 modern::opened(self);
             }
         }
+        // The campaign's main menu in the new style.
+        if key == next::campaign::CLASSIC && modern::wanted(self) {
+            if let Some(m) = next::campaign::menu(self, &menu) {
+                menu = Arc::new(m);
+                next::campaign::opened(self);
+            }
+        }
+        // The campaign's Mission Select in the new style: acts, then tiles.
+        if modern::wanted(self) && next::missions::wanted(&key) {
+            if let Some(m) = next::missions::menu(self, &menu, &key) {
+                menu = Arc::new(m);
+            }
+        }
         // Create a Class in the new style: the class select and the editor.
         if modern::wanted(self) && key == "pc_cac_popup" {
             if let Some(m) = next::cac::select_menu(self, &menu) {
@@ -806,6 +884,14 @@ impl Frontend {
             if let Some(m) = next::cac::editor_menu(self, &menu) {
                 menu = Arc::new(m);
                 next::cac::editor_opened(self);
+            }
+        }
+        // Reset to Default (a template copied over the class) takes its IR
+        // lasers off too.
+        if key.contains("_popup_cac_defaultclasswarning") {
+            let m = Arc::make_mut(&mut menu);
+            for it in m.items.iter_mut().filter(|it| it.ty == item_type::BUTTON && it.action.to_ascii_lowercase().contains("statset")) {
+                it.action.push_str(" \"uiScript\" \"cacLaserReset\" ; ");
             }
         }
         // Attachment rows toggle (several per weapon), so the list needs a
@@ -854,6 +940,12 @@ impl Frontend {
                 next::picker::opened(self);
             }
         }
+        // A class weapon's variants in the new style: a full-screen picker.
+        if modern::wanted(self) && key == supply::VARIANTS_MENU {
+            if let Some(m) = next::variants::menu(&menu) {
+                menu = Arc::new(m);
+            }
+        }
         // The match's menus in the new style.
         if modern::wanted(self) && next::match_menus::wanted(&key) {
             if let Some(m) = next::match_menus::menu(self, &menu, &key) {
@@ -887,6 +979,19 @@ impl Frontend {
             self.audio.music = Some(menu.sound_name.clone());
         }
         self.run(&menu.on_open, &key);
+    }
+
+    /// A menu named from inside one of the campaign's (`sp:`) menus is
+    /// its `sp:` one, where there is one (MP's menus are untouched).
+    fn sp_name(&self, name: &str, owner: &str) -> String {
+        // The options and controls are the game's own (the settings
+        // overhaul's pages), not CoD4's single-player copies of them.
+        let key = name.to_ascii_lowercase();
+        if next::settings::wanted(&key) || next::settings::redirect(&key).is_some() || matches!(key.as_str(), "main_options" | "main_controls") {
+            return name.to_owned();
+        }
+        let sp = format!("sp:{}", name.to_ascii_lowercase());
+        if owner.starts_with("sp:") && self.assets.menu(&sp).is_some() { sp } else { name.to_owned() }
     }
 
     fn close(&mut self, name: &str) {
@@ -1245,7 +1350,6 @@ impl Frontend {
             self.paint_reticle(om, pl, ops);
             self.paint_modern(om, pl, ops);
         }
-        self.paint_next(pl.w, pl.h, ops);
     }
 
     /// One menu, if visible (returns whether it was), with the class figure
@@ -1681,8 +1785,14 @@ fn menu_input(
     } else if keys.just_pressed(KeyCode::Escape) {
         if let Some(top) = fe.stack.last() {
             let (name, esc) = (top.name.clone(), top.menu.on_esc.clone());
-            fe.esc_used = true;
-            fe.run(&esc, &name);
+            // (The campaign's main menu has no Esc of its own here: back.)
+            if name == "sp:main_text" || name == "sp:main" {
+                fe.close("sp:main_text");
+                fe.close("sp:main");
+            } else {
+                fe.esc_used = true;
+                fe.run(&esc, &name);
+            }
         }
     }
     // Started from the Private Match lobby: its teams, limits and bots, and
@@ -1695,7 +1805,8 @@ fn menu_input(
     // A campaign mission ([`crate::campaign`]).
     if std::mem::take(&mut fe.start_campaign) {
         commands.insert_resource(crate::campaign::config());
-        commands.insert_resource(crate::campaign::Campaign::new(&crate::campaign::MISSIONS[0]));
+        let m = fe.start.as_deref().and_then(|map| crate::campaign::MISSIONS.iter().find(|m| m.map == map)).unwrap_or(&crate::campaign::MISSIONS[0]);
+        commands.insert_resource(crate::campaign::Campaign::new(m));
     }
     if std::mem::take(&mut fe.start_hq) {
         commands.insert_resource(crate::hq::config());
@@ -1792,8 +1903,11 @@ fn load_screen_ops(fe: &Frontend, map: &str, config: Option<&crate::tdm::MatchCo
     ]
 }
 
-/// The load screen in place of the match's HUD while it settles
-/// (`crate::settle`): the match is drawn under it but not seen.
+/// The load screen over the match's HUD while it settles
+/// (`crate::settle`): the match and its HUD are drawn under it but not
+/// seen (so the HUD's materials and pipelines are ready when it lifts,
+/// rather than first drawn then). It goes on the top layer, over the
+/// minimap too.
 fn settling_screen(
     fe: Option<ResMut<Frontend>>,
     map: Res<MapName>,
@@ -1802,10 +1916,16 @@ fn settling_screen(
     mut images: ResMut<Assets<Image>>,
     window: Single<&Window, With<PrimaryWindow>>,
 ) {
-    list.0.clear();
+    if crate::perf::old("hudunder") {
+        list.0.clear();
+    }
+    let start = list.0.len();
     if let Some(mut fe) = fe {
         let ops = load_screen_ops(&fe, &map.0, config.as_deref(), true, &window);
         fe.emit(ops, &mut images, &mut list.0);
+    }
+    for q in &mut list.0[start..] {
+        q.layer = 1;
     }
 }
 
@@ -1822,6 +1942,11 @@ fn loading_screen(
     mut next: ResMut<NextState<GameState>>,
 ) {
     list.0.clear();
+    // A mission's briefing movie is on instead (`crate::campaign`).
+    if crate::campaign::hold_loading() {
+        *frames = 0;
+        return;
+    }
     if let Some(mut fe) = fe {
         let ops = load_screen_ops(&fe, &map.0, config.as_deref(), false, &window);
         fe.emit(ops, &mut images, &mut list.0);

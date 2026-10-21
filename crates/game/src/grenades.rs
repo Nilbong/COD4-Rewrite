@@ -59,7 +59,7 @@ impl Plugin for GrenadesPlugin {
                 Update,
                 (
                     keys.in_set(crate::player::InputSet),
-                    (throw, spawn_grenades).chain().after(crate::player::InputSet).before(crate::weapons::WeaponSet),
+                    (throw, spawn_grenades).chain().after(crate::player::InputSet).after(crate::killstreaks::hands::CallInGate).before(crate::weapons::WeaponSet),
                     (stock, martyrdom, fly, explode, wear_off).chain().after(crate::weapons::WeaponSet),
                     stun_controls.after(crate::player::InputSet).before(crate::movement::MovementSet),
                     stun_controls_done.after(crate::weapons::WeaponSet),
@@ -311,6 +311,15 @@ pub(crate) struct Pending {
     blasts: Vec<(Kind, Entity, Vec3, How)>,
 }
 
+impl Pending {
+    /// A grenade thrown by someone not playing with the offhand keys (a
+    /// campaign actor's animscript): from `at`, at `velocity` (Bevy space),
+    /// going off at `explode_at`.
+    pub(crate) fn throw(&mut self, kind: Kind, thrower: Entity, at: Vec3, velocity: Vec3, explode_at: f32) {
+        self.throws.push((kind, thrower, at, velocity, explode_at, How::Thrown));
+    }
+}
+
 /// How a grenade came to go off (for the challenges).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum How {
@@ -385,9 +394,9 @@ pub const FLASH_FADE: f32 = 3.5;
 /// A stun's slowing (`concussion_grenade_mp.shock`, `PM_CmdScale`): moving
 /// at 0.4, the mouse at a tenth and turning at most 35°/s, easing off over
 /// the last 2 s.
-const STUN_MOVE: f32 = 0.4;
+pub(crate) const STUN_MOVE: f32 = 0.4;
 const STUN_TURN: f32 = 0.1;
-const STUN_MAX_TURN: f32 = 35.0;
+pub(crate) const STUN_MAX_TURN: f32 = 35.0;
 const STUN_FADE: f32 = 2.0;
 /// Martyrdom's grenade (`G_PlayerDie`): from 40 units up, tossed up to 160
 /// u/s each way.

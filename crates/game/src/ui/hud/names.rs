@@ -108,6 +108,18 @@ pub(super) fn update(
             }
             let enemy = hostile(pawn, mine);
             let head = tf.translation + Vec3::Y * (mover.eye_height + u(OVER_HEAD));
+            // Debug (`COD4RW_MOTIVES=1`): every bot's persona and motive.
+            if let Some(b) = bot.filter(|_| crate::bots::motive::overlay()) {
+                tags.push(Tag {
+                    slot: slot.0,
+                    head,
+                    name: format!("{} - {}", pawn.name, b.motive_line()),
+                    color: if enemy { ENEMY } else { FRIENDLY },
+                    rank: Some(b.rank),
+                    alpha: 1.0,
+                });
+                continue;
+            }
             let visible = if enemy {
                 !crate::tdm::hardcore() && aimed == Some(e)
             } else {

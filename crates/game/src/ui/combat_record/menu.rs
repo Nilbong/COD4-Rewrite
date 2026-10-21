@@ -14,6 +14,7 @@ use std::sync::Arc;
 mod style;
 #[path = "next_view.rs"]
 mod next_view;
+pub(in crate::ui) use next_view::on_top;
 
 const RECORD: &str = "combat_record";
 const EDITOR: &str = "combat_emblem";

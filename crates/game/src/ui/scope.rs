@@ -306,7 +306,9 @@ fn show(
         // The gun goes while looking through the classic scope, and CoD4's
         // through a lens once fully aimed.
         let lens_hides = lens_style && cod4_gun && scoped.as_ref().is_some_and(|(ads, ..)| *ads >= SHOWN_AT);
-        let layers = if on || lens_hides { RenderLayers::none() } else { RenderLayers::layer(crate::splitscreen::viewmodel_layer(slot)) };
+        // (And while the fly camera has player 1's view, `crate::flycam`.)
+        let flying = slot == 0 && crate::flycam::active();
+        let layers = if on || lens_hides || flying { RenderLayers::none() } else { RenderLayers::layer(crate::splitscreen::viewmodel_layer(slot)) };
         for (_, mut l) in vm_cameras.iter_mut().filter(|c| c.0.0 == slot) {
             l.set_if_neq(layers.clone());
         }

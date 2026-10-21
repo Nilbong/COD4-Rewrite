@@ -327,6 +327,10 @@ impl Frontend {
             l.online.jip.push(JoinInProgress { member, replaces_bot: bot });
             // Their game loads the match as it is now.
             online.send(from, &LobbyMsg::Lobby { settings: l.settings(), members: l.online.members.clone(), bots: l.bots.clone() });
+            // (And the map editor layout the match is played with.)
+            for part in crate::netplay::layout_sync::messages(l.map_id()) {
+                online.send(from, &part);
+            }
             online.send(from, &LobbyMsg::Start);
         }
         None
@@ -339,7 +343,7 @@ mod tests {
     use crate::online::lobby::Profile;
 
     fn friend(peer: PeerId, team: u8) -> Member {
-        Member { peer, profile: Profile { name: format!("f{peer}"), rank: 0, prestige: 0 }, team }
+        Member { peer, profile: Profile { name: format!("f{peer}"), ..Default::default() }, team }
     }
 
     fn public_lobby() -> Lobby {

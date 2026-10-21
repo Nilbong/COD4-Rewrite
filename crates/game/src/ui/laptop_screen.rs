@@ -44,7 +44,8 @@ pub(super) fn build(app: &mut App) {
         .add_systems(Update, (aim, screen, pick).chain().run_if(crate::state::in_game.and_then(resource_exists::<super::Frontend>)));
 }
 
-/// The cursor on the laptop's screen (picture pixels), while it's open.
+/// The cursor on the laptop's screen's map (picture pixels), while it's
+/// open.
 #[derive(Resource, Default)]
 struct LaptopCursor(Option<Vec2>);
 
@@ -138,7 +139,11 @@ fn aim(
     // the screen's height a second.)
     let mouse = if input.is_some_and(|i| i.live) { motion.delta * crate::tune::get("laptop.mouse", 0.5) * crate::settings_apply::mouse_scale(0.0) } else { Vec2::ZERO };
     let stick = input.map_or(Vec2::ZERO, |i| i.pad.look) * Vec2::new(1.0, -1.0) * crate::tune::get("laptop.stick", 1.0) * H * time.delta_secs();
-    cursor.0 = Some((c + mouse + stick).clamp(Vec2::ZERO, Vec2::new(W, H)));
+    // Kept on the map, so the strike's reach always shows round it (in the
+    // margins beside the map it was a lone cross over the words, at the
+    // screen's edge half off it; a jump of the mouse, coming back to the
+    // window, put it there).
+    cursor.0 = Some((c + mouse + stick).clamp(MAP_AT, MAP_AT + MAP));
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -159,11 +164,18 @@ fn screen(
     let active = laptop_in_hand(&hands) && minimap.is_some();
     set_laptop_open(active && selecting.is_some());
     let Some(image) = crate::killstreaks::hands::SCREEN_IMAGE.get() else { return };
+    // The match's end clears its entities, the screen's camera and UI with
+    // them: the next match's laptop builds its own (else it showed the last
+    // one's last picture, its map and a cursor that no longer moved).
+    if scene.as_ref().is_some_and(|s| cameras.get(s.camera).is_err()) {
+        *scene = None;
+    }
     if scene.is_none() {
         if !active {
             return;
         }
         *scene = Some(spawn_scene(&mut commands, image.clone()));
+        info!("laptop screen: built");
         return;
     }
     let Some(s) = scene.as_mut() else { return };
@@ -192,7 +204,7 @@ fn screen(
         Vec2::new(cod.cos(), cod.sin())
     };
     // An icon at a pawn's place, turned to its facing (or hidden).
-    let mut place = |nodes: &mut Query<(&mut Node, &mut Visibility, Option<&mut UiTransform>, Option<&mut ImageNode>)>, e: Entity, at: Option<(Vec3, f32)>, size: f32, pic: Option<Handle<Image>>| {
+    let place = |nodes: &mut Query<(&mut Node, &mut Visibility, Option<&mut UiTransform>, Option<&mut ImageNode>)>, e: Entity, at: Option<(Vec3, f32)>, size: f32, pic: Option<Handle<Image>>| {
         let Ok((mut node, mut vis, turn, img)) = nodes.get_mut(e) else { return };
         let Some((pos, yaw)) = at else {
             vis.set_if_neq(Visibility::Hidden);

@@ -42,6 +42,10 @@ struct Blended {
     mix: (usize, f32),
     atlases: Vec<Option<Vec<u8>>>,
     grid: Option<Vec<u8>>,
+    /// The grid's cells' mean light and its points' cubes, for the
+    /// viewmodel's (`crate::model_lighting::LightGridLookup`).
+    means: Option<Vec<[f32; 3]>>,
+    cubes: Vec<[[f32; 3]; 6]>,
 }
 
 #[derive(Resource)]
@@ -91,26 +95,60 @@ fn blend_job(keys: &[Keyframe], mix: (usize, f32), volume: Option<&crate::model_
             _ => None,
         })
         .collect();
-    let grid = volume.map(|v| {
-        v.data(|p| {
-            let (ca, cb) = (a.grid.get(p)?.1, b.grid.get(p)?.1);
-            Some(std::array::from_fn(|f| std::array::from_fn(|c| ca[f][c] * (1.0 - t) + cb[f][c] * t)))
-        })
-    });
-    Blended { mix, atlases, grid }
+    let cube = |p: usize| -> Option<[[f32; 3]; 6]> {
+        let (ca, cb) = (a.grid.get(p)?.1, b.grid.get(p)?.1);
+        Some(std::array::from_fn(|f| std::array::from_fn(|c| ca[f][c] * (1.0 - t) + cb[f][c] * t)))
+    };
+    let grid = volume.map(|v| v.data(cube));
+    let means = volume.map(|v| v.means(cube));
+    let cubes = (0..a.grid.len()).map(|p| cube(p).unwrap_or_default()).collect();
+    Blended { mix, atlases, grid, means, cubes }
 }
 
 /// The showcase's keyframe bakes of `map`, if all are cached: the lighting
 /// to start with (`crate::lightmaps::Rebaked`) and the blending state.
 pub fn load(map: &str, zone_path: &std::path::Path, images: &mut Assets<Image>, hour: f32) -> Option<(crate::lightmaps::Rebaked, TodLight)> {
     let stamp = cache::source_stamp(zone_path);
+    let read = |key: &tod::Key| cache::dir_for(map, Some(&tod::variant(key))).and_then(|d| cache::load_in(&d, stamp));
+    // The keyframes read (and inflated) side by side: one after another
+    // they took ~9.5 s of Wet Work's load. `COD4RW_SERIALTOD=1`: in turn.
+    let t = std::time::Instant::now();
+    // At most four at once (two on Android), leaving two cores to the rest
+    // of the load: each in flight holds its file and inflated copy.
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let width = if std::env::var("COD4RW_SERIALTOD").is_ok_and(|v| v == "1") {
+        1
+    } else if cfg!(target_os = "android") {
+        2
+    } else {
+        cores.saturating_sub(2).clamp(1, 4)
+    };
+    let mut read_all: Vec<Option<_>> = Vec::new();
+    for batch in tod::KEYS.chunks(width) {
+        std::thread::scope(|s| {
+            let jobs: Vec<_> = batch.iter().map(|key| s.spawn(move || read(key))).collect();
+            read_all.extend(jobs.into_iter().map(|j| j.join().ok().flatten()));
+        });
+    }
+    let read = read_all;
     let mut keys = Vec::new();
-    for key in &tod::KEYS {
-        let Some(baked) = cache::dir_for(map, Some(&tod::variant(key))).and_then(|d| cache::load_in(&d, stamp)) else {
+    for (key, baked) in tod::KEYS.iter().zip(read) {
+        let Some(baked) = baked else {
             info!("showcase lighting: no {} bake of {map} (rebake --showcase {map} makes them)", key.name);
             return None;
         };
         keys.push(Keyframe { hour: key.hour, baked });
+    }
+    info!("showcase lighting: keyframes read in {:?} ({width} at a time)", t.elapsed());
+    // Debug aid: `COD4RW_TODGRID_STATS` logs each keyframe grid's light
+    // (median and 90th percentile of its cubes' mean).
+    if std::env::var_os("COD4RW_TODGRID_STATS").is_some() {
+        for k in &keys {
+            let mut m: Vec<f32> = k.baked.grid.iter().map(|(_, c)| c.iter().map(|f| (f[0] + f[1] + f[2]) / 3.0).sum::<f32>() / 6.0).collect();
+            m.sort_by(f32::total_cmp);
+            let q = |f: f32| m.get(((m.len() as f32 - 1.0) * f) as usize).copied().unwrap_or(0.0);
+            info!("showcase lighting: {:.1}h grid: {} points, 10% {:.5}, median {:.5}, 90% {:.5}", k.hour, m.len(), q(0.1), q(0.5), q(0.9));
+        }
     }
     let mix = mix_at(&keys, hour);
     let first = blend_job(&keys, mix, None);
@@ -150,6 +188,7 @@ fn blend(
     tod: Option<ResMut<TodLight>>,
     volume: Option<Res<crate::model_lighting::GridVolume>>,
     mut images: ResMut<Assets<Image>>,
+    mut lookup: Option<ResMut<crate::model_lighting::LightGridLookup>>,
 ) {
     let Some(mut tod) = tod else { return };
     // (The clock starts once the map's sun is learnt.)
@@ -170,6 +209,10 @@ fn blend(
             if let Some(mut image) = images.get_mut(&v.image) {
                 image.data = Some(data);
             }
+        }
+        if let (Some(l), Some(means)) = (lookup.as_deref_mut(), done.means) {
+            l.set_means(means);
+            l.set_cubes(done.cubes);
         }
         tod.shown = done.mix;
         tod.pending = None;

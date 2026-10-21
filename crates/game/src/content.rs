@@ -12,6 +12,10 @@ use iw3::zone::{self, generic::GNode, Asset, AssetId, AssetType, TextureSemantic
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Materials of CoD4's objective shimmer (`mc_objective`), whose glow
+/// pulses ([`crate::campaign::pulse_objective_glow`]).
+pub static OBJECTIVE_GLOW: std::sync::Mutex<Vec<bevy::asset::AssetId<StandardMaterial>>> = std::sync::Mutex::new(Vec::new());
+
 /// Zone indices in [`Content::zones`].
 pub const MAP_ZONE: usize = 0;
 pub const COMMON_ZONE: usize = 1;
@@ -45,6 +49,9 @@ pub struct PreparedModel {
     pub extent: Vec3,
     /// Those bounds' corners, for the same reason.
     pub bounds: (Vec3, Vec3),
+    /// A gun's (a model with a `tag_flash`) bind-pose vertex positions, for
+    /// fitting the IR laser to its side ([`crate::laser`]).
+    pub shape: Option<Arc<Vec<Vec3>>>,
 }
 
 /// Ambient-only techniques' colour scale (see `build_material`).
@@ -165,6 +172,49 @@ impl Content {
         Some((self.textures.get(&name, false, &self.vfs, images)?, scale))
     }
 
+    /// A 2D material's picture (a HUD overlay, an icon): its first
+    /// texture, by the material's name.
+    pub fn material_image(&mut self, material: &str, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+        let (zi, id) = self.zones.iter().enumerate().find_map(|(zi, z)| {
+            z.assets.iter().enumerate().find_map(|(i, a)| match a {
+                Asset::Material(m) if m.name.trim_start_matches(',') == material => Some((zi, i as AssetId)),
+                _ => None,
+            })
+        })?;
+        let zone = &self.zones[zi];
+        let image = zone.material(id)?.textures.iter().find_map(|t| t.image)?;
+        let name = zone.image(image)?.name.clone();
+        self.textures.get(&name, true, &self.vfs, images)
+    }
+
+    /// An image by its own name (from the install's `.iwd`s or a loaded
+    /// zone), e.g. `laser`.
+    /// A material's `surfaceTypeBits` (`,name` references resolved).
+    pub fn material_surface_bits(&self, zi: usize, id: AssetId) -> u32 {
+        let (zi, id) = self.resolve_material(zi, id);
+        self.zones[zi].material(id).map_or(0, |m| m.surface_type_bits)
+    }
+
+    /// The CoD4 material a converted one was made from.
+    pub fn material_key(&self, handle: bevy::asset::AssetId<StandardMaterial>) -> Option<(usize, AssetId)> {
+        self.materials.iter().find_map(|(k, v)| v.as_ref().filter(|m| m.handle.id() == handle).map(|_| *k))
+    }
+
+    /// A model material's own normal map (raw, IW3's slopes) and specular
+    /// map (sRGB), `,name` references resolved and the engine's flat
+    /// `$` images left out.
+    pub fn model_maps(&mut self, zi: usize, id: AssetId, images: &mut Assets<Image>) -> (Option<Handle<Image>>, Option<Handle<Image>>) {
+        let (zi, id) = self.resolve_material(zi, id);
+        let name = |c: &Self, sem: TextureSemantic| c.material_texture_name(zi, id, sem).filter(|n| !n.trim_start_matches(',').starts_with('$'));
+        let normal = name(self, TextureSemantic::Normal).and_then(|n| self.textures.get(&n, false, &self.vfs, images));
+        let specular = name(self, TextureSemantic::Specular).and_then(|n| self.textures.get(&n, true, &self.vfs, images));
+        (normal, specular)
+    }
+
+    pub fn image(&mut self, name: &str, srgb: bool, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+        self.textures.get(name, srgb, &self.vfs, images)
+    }
+
     /// One of a material's textures by semantic, e.g. its normal map.
     pub fn material_texture(
         &mut self,
@@ -216,6 +266,14 @@ impl Content {
         }
 
         let mut m = StandardMaterial { base_color_texture, perceptual_roughness: 0.85, reflectance: 0.2, ..default() };
+        // Remastered textures' roughness (`crate::upscaled`, green channel).
+        if crate::upscaled::on()
+            && let Some(rough) = color.as_ref().and_then(|n| self.textures.get(&format!("{}.rough", n.trim_start_matches(',')), false, &self.vfs, images))
+        {
+            m.metallic_roughness_texture = Some(rough);
+            m.perceptual_roughness = 1.0;
+            m.metallic = 0.0;
+        }
         // Ambient-only techniques (`*_ambient_*`: tree canopies, bushes) take
         // no sun in IW3, only the light grid. Here the sun lights them too,
         // both sides of every card, and distant trees read as pale ghosts:
@@ -266,15 +324,45 @@ impl Content {
                 m.unlit = true;
             }
         }
+        // A lamp's lit shade or bulb (`mtl_cafe_light_on`, `..._on`: drawn
+        // unlit, the texture as is): brighter than white, so it glows and
+        // blooms instead of reading as a grey shape beside the light it
+        // gives (Crossfire's cafe, 2026-10-18 reports). Knob `lamps.glow`
+        // (1: as CoD4).
+        let name = mat.name.to_ascii_lowercase();
+        if m.unlit
+            && matches!(m.alpha_mode, AlphaMode::Opaque | AlphaMode::Mask(_))
+            && name.contains("_on")
+            && ["light", "lamp", "bulb", "fluo", "lantern"].iter().any(|k| name.contains(k))
+        {
+            let glow = crate::tune::get("lamps.glow", 3.0);
+            let c = m.base_color.to_linear();
+            m.base_color = Color::linear_rgba(c.red * glow, c.green * glow, c.blue * glow, c.alpha);
+        }
         if techset.contains("nofog") || techset.contains("distfalloff") {
             m.fog_enabled = false;
+        }
+        // The objective shimmer (`mc_objective`: a pickup the level points
+        // out): the model solid, glowing yellow, pulsed by
+        // `crate::campaign::pulse_objective_glow`.
+        let objective = techset.contains("objective");
+        if objective {
+            m.alpha_mode = AlphaMode::Opaque;
+            m.unlit = false;
+            m.emissive = LinearRgba::rgb(1.0, 0.75, 0.15);
         }
         // Debug aid: `COD4RW_MATLOG=<part>` logs how materials whose name
         // contains it are drawn.
         if std::env::var("COD4RW_MATLOG").is_ok_and(|v| !v.is_empty() && mat.name.contains(&v)) {
             info!("matlog: {} [{techset}] bits {:x?} alpha {:?} depth bias {} colour {:?}", mat.name, bits, m.alpha_mode, m.depth_bias, color);
         }
-        Some(MatInfo { handle: materials.add(m), sky })
+        let handle = materials.add(m);
+        if objective && let Ok(mut glow) = OBJECTIVE_GLOW.lock() {
+            glow.push(handle.id());
+        }
+        let env = mat.constants.iter().find(|c| c.name == "envMapParms").map(|c| c.literal);
+        crate::character_look::register(handle.id(), &mat.name, techset, image_name(TextureSemantic::Specular), env, &self.vfs);
+        Some(MatInfo { handle, sky })
     }
 
     /// Unskinned mesh for one surface (used for static world models).
@@ -287,6 +375,19 @@ impl Content {
             .xmodel(model)
             .and_then(|xm| {
                 let mut mesh = surface_mesh(xm, surf, false)?;
+                // Tangents, for the props' normal maps (`crate::world`'s
+                // static model materials), as the characters' (`crate::wardrobe`).
+                if crate::world::prop_materials() && mesh.count_vertices() == xm.surfs[surf].verts.len() {
+                    let tangents: Vec<[f32; 4]> = xm.surfs[surf]
+                        .verts
+                        .iter()
+                        .map(|v| {
+                            let t = crate::units::dir(iw3::unpack::unit_vec(v.tangent)).normalize_or(Vec3::X);
+                            [t.x, t.y, t.z, if v.binormal_sign < 0.0 { -1.0 } else { 1.0 }]
+                        })
+                        .collect();
+                    mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
+                }
                 let effect = xm.materials.get(surf).copied().flatten().is_some_and(|m| self.is_effect(zi, m));
                 if effect {
                     // In gamma space, as the world's (`crate::world`).
@@ -352,7 +453,7 @@ impl Content {
         // The model by that name (a material can share it: CoD4's phone,
         // `com_cellphone_on`, is both, the material first).
         let (zi, id) = self.zones.iter().enumerate().find_map(|(zi, z)| {
-            z.assets.iter().position(|a| matches!(a, iw3::zone::Asset::XModel(m) if m.name == name)).map(|id| (zi, id))
+            z.assets.iter().position(|a| matches!(a, iw3::zone::Asset::XModel(m) if m.name.eq_ignore_ascii_case(name))).map(|id| (zi, id))
         })?;
         let xm = self.zones[zi].xmodel(id)?;
         let n = xm.num_bones as usize;
@@ -403,13 +504,20 @@ impl Content {
         }
         let extent = (hi - lo).max(Vec3::ZERO);
         let bounds = (lo.min(hi), hi.max(lo));
+        let shape = bones.iter().any(|b| b.name == "tag_flash").then(|| {
+            let points = surf_meshes.iter().flatten().filter_map(|m| match m.attribute(Mesh::ATTRIBUTE_POSITION) {
+                Some(VertexAttributeValues::Float32x3(ps)) => Some(ps.iter().map(|p| Vec3::from_array(*p))),
+                _ => None,
+            });
+            Arc::new(points.flatten().collect::<Vec<Vec3>>())
+        });
         let mut surfaces = Vec::new();
         for (mesh, mat) in surf_meshes.into_iter().zip(mats) {
             let (Some(mesh), Some(mat)) = (mesh, mat) else { continue };
             let Some(info) = self.material(zi, mat, materials, images) else { continue };
             surfaces.push((crate::mesh_bounds::add(meshes, mesh), info.handle));
         }
-        Some(PreparedModel { name: name.to_owned(), bones, surfaces, inverse_bindposes, extent, bounds })
+        Some(PreparedModel { name: name.to_owned(), bones, surfaces, inverse_bindposes, extent, bounds, shape })
     }
 
     /// Decode an animation by name.

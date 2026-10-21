@@ -113,14 +113,12 @@ fn carries(loadout: &Loadout, weapon: &WeaponState, def: &WeaponDef) -> bool {
 }
 
 /// For the bots: would walking over `item` give this pawn rounds?
-#[allow(dead_code)] // (until the bots use it)
 pub fn would_take_ammo(item: &Pickup, loadout: &Loadout, weapon: &WeaponState) -> bool {
     loadout.carried(weapon).iter().any(|&(_, d, _, reserve)| std::ptr::eq(d, item.def) && reserve < d.max_ammo) && item.clip + item.reserve > 0
 }
 
 /// For the bots: could this pawn swap for `item` (it doesn't carry it, and
 /// the weapon in hand may go)?
-#[allow(dead_code)] // (until the bots use it)
 pub fn may_swap_for(item: &Pickup, loadout: &Loadout, weapon: &WeaponState) -> bool {
     !carries(loadout, weapon, item.def) && loadout.may_swap() && droppable(loadout)
 }

@@ -644,6 +644,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_atmos"
+version = "0.2.0"
+source = "git+https://github.com/Nilbong/bevy_atmos?tag=v0.2.0#5719b1309f2f3bcd008f999f564983fbe8395c74"
+dependencies = [
+ "bevy",
+ "indexmap",
+]
+
+[[package]]
 name = "bevy_audio"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1968,6 +1977,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bink"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3028,6 +3045,8 @@ dependencies = [
  "anyhow",
  "avian3d",
  "bevy",
+ "bevy_atmos",
+ "bink",
  "cod4rw-multiplayer",
  "cod4rw-net",
  "flate2",

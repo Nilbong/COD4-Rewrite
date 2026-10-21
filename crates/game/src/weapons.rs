@@ -15,6 +15,7 @@ pub struct WeaponsPlugin;
 impl Plugin for WeaponsPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<ShotFired>()
+            .add_message::<BulletPath>()
             .add_message::<HitConfirmed>()
             .add_message::<Penetrated>()
             .init_resource::<Penetration>()
@@ -80,6 +81,10 @@ pub struct WeaponDef {
     /// (`quickDropTime`, `quickRaiseTime`).
     pub quick_drop_time: f32,
     pub quick_raise_time: f32,
+    /// Putting it away and raising it with an empty magazine
+    /// (`iEmptyDropTime`, `iEmptyRaiseTime`; 0: the normal times).
+    pub empty_drop_time: f32,
+    pub empty_raise_time: f32,
     /// Hip spread in degrees: (stand, crouch, prone) minimum and maximum.
     pub hip_spread_min: [f32; 3],
     pub hip_spread_max: [f32; 3],
@@ -273,6 +278,29 @@ pub fn player_anim_named(name: &str) -> u8 {
 }
 
 impl WeaponDef {
+    /// How long putting it away takes, the way a switch does it.
+    pub fn drop_time_for(&self, how: crate::loadout::SwitchAnim) -> f32 {
+        use crate::loadout::SwitchAnim::*;
+        let t = match how {
+            Quick => self.quick_drop_time,
+            Empty => self.empty_drop_time,
+            Normal | First => self.drop_time,
+        };
+        (if t > 0.0 { t } else { self.drop_time }).max(0.05)
+    }
+
+    /// How long raising it takes, the way a switch does it.
+    pub fn raise_time_for(&self, how: crate::loadout::SwitchAnim) -> f32 {
+        use crate::loadout::SwitchAnim::*;
+        let t = match how {
+            Quick => self.quick_raise_time,
+            First => self.first_raise_time,
+            Empty => self.empty_raise_time,
+            Normal => self.raise_time,
+        };
+        (if t > 0.0 { t } else { self.raise_time }).max(0.05)
+    }
+
     /// Shots per pull for burst weapons, 0 otherwise.
     pub fn burst(&self) -> u32 {
         if (2..=4).contains(&self.fire_type) { self.fire_type as u32 } else { 0 }
@@ -320,6 +348,8 @@ impl WeaponDef {
             first_raise_time: 1.4,
             quick_drop_time: 0.25,
             quick_raise_time: 0.75,
+            empty_drop_time: 0.0,
+            empty_raise_time: 0.0,
             hip_spread_min: [3.0, 2.5, 2.0],
             hip_spread_max: [7.0, 6.0, 5.0],
             hip_spread_fire_add: 0.6,
@@ -400,6 +430,8 @@ impl WeaponDef {
             first_raise_time: ms("iFirstRaiseTime"),
             quick_drop_time: ms("quickDropTime"),
             quick_raise_time: ms("quickRaiseTime"),
+            empty_drop_time: ms("iEmptyDropTime"),
+            empty_raise_time: ms("iEmptyRaiseTime"),
             hip_spread_min: [w.float("fHipSpreadStandMin"), w.float("fHipSpreadDuckedMin"), w.float("fHipSpreadProneMin")],
             hip_spread_max: [w.float("hipSpreadStandMax"), w.float("hipSpreadDuckedMax"), w.float("hipSpreadProneMax")],
             hip_spread_fire_add: w.float("fHipSpreadFireAdd"),
@@ -605,6 +637,9 @@ pub struct WeaponState {
     pub fire_held: bool,
     /// 0 = hip, 1 = fully aimed down sights.
     pub ads: f32,
+    /// 0 = hip, 1 = fully in the laser aim (an IR laser through night
+    /// vision: [`crate::laser`]), which takes the place of the sights.
+    pub laser_aim: f32,
     /// CoD4's `aimSpreadScale` (0 to 1): where the spread is between its
     /// minimum and maximum ([`WeaponState::spread`]).
     pub bloom: f32,
@@ -646,6 +681,7 @@ impl Default for WeaponState {
             reload_add_at: None,
             fire_held: false,
             ads: 0.0,
+            laser_aim: 0.0,
             bloom: 0.0,
             pending_kick: Vec2::ZERO,
             kick_angles: Vec2::ZERO,
@@ -758,7 +794,14 @@ impl WeaponState {
             Stance::Prone => 2,
         };
         let (min, max) = (d.hip_spread_min[i], d.hip_spread_max[i]);
-        if self.ads >= 1.0 { d.ads_spread + (max - d.ads_spread) * self.bloom } else { min + (max - min) * self.bloom }
+        let aimed = d.ads_spread + (max - d.ads_spread) * self.bloom;
+        if self.ads >= 1.0 {
+            return aimed;
+        }
+        let hip = min + (max - min) * self.bloom;
+        // The laser aim: between the two (`lasergun.spread`, 0 the hip's, 1
+        // the sights').
+        hip + (aimed - hip) * self.laser_aim * crate::laser::spread_share()
     }
 
     /// `PM_AdjustAimSpreadScale`: the scale grows while not fully aimed
@@ -892,7 +935,9 @@ impl WeaponState {
     pub fn speed_scale(&self) -> f32 {
         let d = self.def;
         let ads = if d.ads_move_speed_scale > 0.0 { ADS_WALK_SCALE * d.ads_move_speed_scale } else { ADS_WALK_SCALE };
-        d.move_speed_scale + (ads - d.move_speed_scale) * self.ads
+        // The laser aim walks nearly as slowly as the sights (`lasergun.speed`).
+        let aimed = self.ads.max(self.laser_aim * crate::laser::speed_share());
+        d.move_speed_scale + (ads - d.move_speed_scale) * aimed
     }
 }
 
@@ -977,6 +1022,15 @@ pub struct ShotFired {
     pub hit_world: bool,
 }
 
+/// A bullet's whole way: from the eye to where it stopped, through what it
+/// went through (the campaign's script brushes are hit along it).
+#[derive(Message, Clone, Copy)]
+pub struct BulletPath {
+    pub shooter: Entity,
+    pub from: Vec3,
+    pub end: Vec3,
+}
+
 /// Sent to the shooter's HUD when a shot hurts a live enemy (not a teammate,
 /// with friendly fire off, nor a body).
 #[derive(Message, Clone, Copy)]
@@ -1007,6 +1061,9 @@ fn update_weapons(
             Has<crate::grenades::Offhand>,
             Option<&crate::loadout::Loadout>,
             Has<crate::splitscreen::LocalSlot>,
+            Has<crate::laser::LaserMode>,
+            Option<&crate::laser::LaserRay>,
+            Has<crate::player::LocalPlayer>,
         ),
         Without<Dead>,
     >,
@@ -1016,19 +1073,20 @@ fn update_weapons(
     mut damage: MessageWriter<Damage>,
     mut shots: MessageWriter<ShotFired>,
     mut hits: MessageWriter<HitConfirmed>,
-    mut penetrated: MessageWriter<Penetrated>,
+    (mut penetrated, mut paths): (MessageWriter<Penetrated>, MessageWriter<BulletPath>),
     explosives: Res<crate::explosives::ExplosiveDefs>,
     mut launches: MessageWriter<crate::explosives::Launch>,
     penetration: Res<Penetration>,
     surfaces: Query<&collision::Surfaces>,
     trace: crate::netplay::lagcomp::ShotTrace,
+    scope_aim: Res<crate::ui::scope3d::ScopeAim>,
 ) {
     let now = time.elapsed_secs();
     let dt = time.delta_secs();
     let filter = collision::bullet_filter();
     let mut rng = rand::rng();
     let idle = WeaponInput::default();
-    for (shooter, tf, mover, mut view, mut w, input, free_aim, throwing, loadout, player) in &mut shooters {
+    for (shooter, tf, mover, mut view, mut w, input, free_aim, throwing, loadout, player, laser_mode, laser_ray, player_one) in &mut shooters {
         // Throwing a grenade: the gun is down.
         let input = if throwing { &idle } else { input };
         // C4 in a player's hand: aim (`+speed_throw`) throws it, fire is the
@@ -1047,11 +1105,12 @@ fn update_weapons(
 
         // Nothing to aim with C4 or claymores (no zoom).
         let wants_ads = input.ads && def.ads_fov > 0.0 && !w.reloading() && !mover.sprinting && !blocked;
-        w.ads = if wants_ads {
-            (w.ads + dt / def.ads_trans_in.max(0.01)).min(1.0)
-        } else {
-            (w.ads - dt / def.ads_trans_out.max(0.01)).max(0.0)
-        };
+        // With a laser through night vision, aiming is the laser aim
+        // instead ([`crate::laser`]), in the same times.
+        let (wants_sights, wants_laser) = (wants_ads && !laser_mode, wants_ads && laser_mode);
+        let ease = |v: f32, on: bool| if on { (v + dt / def.ads_trans_in.max(0.01)).min(1.0) } else { (v - dt / def.ads_trans_out.max(0.01)).max(0.0) };
+        w.ads = ease(w.ads, wants_sights);
+        w.laser_aim = ease(w.laser_aim, wants_laser);
         w.adjust_spread(mover, Vec2::new(view.pitch, view.yaw), dt);
         w.restrict_kick = (w.restrict_kick - dt).max(0.0);
 
@@ -1100,7 +1159,24 @@ fn update_weapons(
         let spread = free_aim.map_or_else(|| w.spread(mover), |a| a.spread).to_radians();
         let r = spread * rng.random::<f32>();
         let theta = rng.random_range(0.0..std::f32::consts::TAU);
-        let (eye, base) = free_aim.map_or_else(|| (mover.eye(tf.translation), view.rotation()), |a| (a.origin, a.rotation));
+        // (From the leaning eye: CoD4's view origin has the lean.)
+        let (eye, base) = free_aim.map_or_else(|| (mover.eye(tf.translation) + mover.lean_offset(view.yaw), view.rotation()), |a| (a.origin, a.rotation));
+        // The laser aim fires along the laser, out of the gun: its shots
+        // land on the dot ([`crate::laser`]).
+        // Aimed through a 3D scope: along the scope (where its reticle is),
+        // not the eye's line, which the gun's sway can turn it off.
+        let base = match scope_aim.0.filter(|_| player_one && free_aim.is_none() && w.ads >= 0.99) {
+            Some(axis) => Quat::from_rotation_arc(Vec3::NEG_Z, axis),
+            None => base,
+        };
+        let (eye, base) = match laser_ray.filter(|_| w.laser_aim >= 0.5) {
+            Some(r) => {
+                // (From the eye if the gun's poked through a wall.)
+                let clear = Dir3::new(r.from - eye).ok().is_none_or(|d| spatial.cast_ray(eye, d, eye.distance(r.from), true, &collision::movement_filter()).is_none());
+                (if clear { r.from } else { eye }, Quat::from_rotation_arc(Vec3::NEG_Z, r.dir.normalize_or(Vec3::NEG_Z)))
+            }
+            None => (eye, base),
+        };
         let aim = base * Quat::from_euler(EulerRot::YXZ, r * theta.cos(), r * theta.sin(), 0.0);
         let dir = aim * Vec3::NEG_Z;
 
@@ -1161,12 +1237,17 @@ fn update_weapons(
         let mut first: Option<(Vec3, Vec3, bool, bool)> = None;
         let mut walls = 0;
         let Ok(ray) = Dir3::new(dir) else { continue };
+        let mut end = eye + dir * max_dist;
         for _ in 0..=MAX_PENETRATIONS {
             let skip = |e: Entity| hitboxes.get(e).map_or(true, |h| !passed.contains(&h.owner));
             // (A friend's shot on the host meets everyone where they saw
             // them: [`crate::netplay::lagcomp`].)
-            let Some(h) = trace.cast(&spatial, shooter, origin, ray, max_dist - travelled, &filter, &skip) else { break };
+            let Some(h) = trace.cast(&spatial, shooter, origin, ray, max_dist - travelled, &filter, &skip) else {
+                end = origin + dir * (max_dist - travelled).max(0.0);
+                break;
+            };
             let point = origin + dir * h.distance;
+            end = point;
             travelled += h.distance;
             let hitbox = hitboxes.get(h.entity).ok();
             first.get_or_insert((point, h.normal, hitbox.is_some(), hitbox.is_none()));
@@ -1221,6 +1302,7 @@ fn update_weapons(
             origin = exit + dir * u(0.5);
         }
         if pellet == 0 {
+            paths.write(BulletPath { shooter, from: eye, end });
             let (to, normal, hit_pawn, hit_world) = first.unwrap_or((eye + dir * max_dist, Vec3::Y, false, false));
             shots.write(ShotFired { shooter, weapon: Some(def), from: eye, to, hit_pawn, normal, hit_world });
         }

@@ -284,12 +284,28 @@ pub(super) fn location_from(b: u8) -> crate::combat::HitLocation {
 
 /// Host: what friends ask of it beyond their controls.
 pub(super) fn host_requests(
+    mut commands: Commands,
+    time: Res<Time>,
     mut inbox: ResMut<HostInbox>,
     mut remotes: Query<(&RemotePlayer, &mut crate::killstreaks::HardpointInput, &mut Killstreak)>,
+    locks: Query<(Entity, &RemotePlayer, Option<&crate::killstreaks::hands::CallingIn>)>,
     mut stats: ResMut<super::graph::NetStats>,
+    (speakers, mut chat, mut echo): (Query<(Entity, &RemotePlayer, &Pawn, Has<crate::combat::Dead>)>, MessageWriter<crate::bots::chat::ChatMessage>, ResMut<ChatEcho>),
 ) {
+    use crate::killstreaks::hands::{CallStage, CallingIn};
+    let now = time.elapsed_secs();
     for (peer, msg) in inbox.0.drain(..) {
         match msg {
+            // Their laptop up: their gun out of hand until it's picked (the
+            // call's lock goes on from its press) or put away.
+            GameMsg::Picking(on) => {
+                let Some((e, _, lock)) = locks.iter().find(|(_, r, _)| r.peer == peer) else { continue };
+                if on {
+                    commands.entity(e).insert(CallingIn::staged(Hardpoint::Airstrike, now, CallStage::Picking));
+                } else if lock.is_some_and(|l| l.stage() == CallStage::Picking) {
+                    commands.entity(e).insert(CallingIn::staged(Hardpoint::Airstrike, now, CallStage::PutAway));
+                }
+            }
             GameMsg::UseStreak { item, target } => {
                 let Some((_, mut input, _)) = remotes.iter_mut().find(|(r, ..)| r.peer == peer) else { continue };
                 input.use_now = true;
@@ -306,6 +322,16 @@ pub(super) fn host_requests(
             }
             GameMsg::Ping(ms) => {
                 stats.peer_ping.insert(peer, ms);
+            }
+            // A friend said something: in this match's chat as them (their
+            // soldier's name and side, not what the message claims), and so
+            // to everyone ([`host_chat`]).
+            GameMsg::Chat { text, team_only, .. } => {
+                if let Some((e, _, p, dead)) = speakers.iter().find(|(_, r, _, _)| r.peer == peer) {
+                    let team = (!crate::combat::free_for_all()).then_some(p.team);
+                    echo.from_peer.push((p.name.clone(), text.clone(), peer));
+                    chat.write(chat_line(Some(e), p.name.clone(), team, team_only, dead, text));
+                }
             }
             _ => debug!("netplay: ignoring a host's message from player {peer}"),
         }
@@ -520,6 +546,7 @@ pub(super) fn guest_news(
     (mut awards, mut notices, mut damage): (MessageWriter<Award>, MessageWriter<StreakNotice>, MessageWriter<crate::combat::Damage>),
     mut strikes: ResMut<crate::killstreaks::airstrike::Airstrikes>,
     mut blasts: Query<(&Transform, &mut crate::explosives::Explosive)>,
+    (mut chat, mut echo): (MessageWriter<crate::bots::chat::ChatMessage>, ResMut<ChatEcho>),
 ) {
     let now = time.elapsed_secs();
     let mine = me.single().ok().map(|(e, _)| e);
@@ -586,7 +613,13 @@ pub(super) fn guest_news(
                     weapon: "",
                 });
             }
-            GameMsg::UseStreak { .. } | GameMsg::Ping(_) | GameMsg::Chosen(_) => {}
+            // A chat line from the match (the host's bots, other players).
+            GameMsg::Chat { pawn, name, team, text, team_only, dead } => {
+                let sender = if pawn == BOT { None } else { map(pawn) };
+                echo.received.push((name.clone(), text.clone()));
+                chat.write(chat_line(sender, name, team_from(team), team_only, dead, text));
+            }
+            GameMsg::UseStreak { .. } | GameMsg::Ping(_) | GameMsg::Chosen(_) | GameMsg::Picking(_) => {}
         }
     }
 }
@@ -600,7 +633,16 @@ pub(super) fn guest_streaks(
     mut commands: Commands,
     mut told: Local<Option<Vec<u8>>>,
     me_entity: Query<Entity, With<LocalPlayer>>,
+    mut picking: Local<bool>,
 ) {
+    // Our airstrike's map up (the laptop in hand) or gone: the host holds
+    // our gun meanwhile. (Picked, the call follows first: the host goes on
+    // from its press.)
+    let now_picking = selecting.as_ref().is_some_and(|s| me_entity.single().is_ok_and(|e| e == s.owner));
+    if now_picking != *picking {
+        *picking = now_picking;
+        online.send(HOST, &LobbyMsg::Game(GameMsg::Picking(now_picking).encode()));
+    }
     let Ok((mut input, streak)) = me.single_mut() else { return };
     let chosen: Vec<u8> = streak.chosen.iter().map(|h| hardpoint_index(*h)).collect();
     if told.as_ref() != Some(&chosen) {
@@ -631,4 +673,74 @@ pub(super) fn guest_streaks(
     }
     info!("netplay: calling in {}", item.name());
     online.send(HOST, &LobbyMsg::Game(GameMsg::UseStreak { item: hardpoint_index(item), target }.encode()));
+}
+
+/// Host: the match's chat (bots' banter, friends' lines) to friends; a
+/// team's line only to that team.
+pub(super) fn host_chat(
+    online: Res<Online>,
+    mut lines: MessageReader<crate::bots::chat::ChatMessage>,
+    remotes: Query<(&RemotePlayer, &Pawn)>,
+    pawns: Query<&Pawn>,
+    mut echo: ResMut<ChatEcho>,
+) {
+    for line in lines.read() {
+        let (sender, name, team, team_only, dead, text) = chat_parts(line);
+        // A friend's own line: to everyone but them (they have it).
+        let from = echo.from_peer.iter().position(|(n, t, _)| *n == name && *t == text).map(|i| echo.from_peer.remove(i).2);
+        if let Some(from) = from {
+            let msg = LobbyMsg::Game(GameMsg::Chat { pawn: BOT, name: crate::online::lobby::clean_name(&name), team: team_byte(team), text, team_only, dead }.encode());
+            for (r, p) in &remotes {
+                if r.peer != from && (!team_only || Some(p.team) == team) {
+                    online.send(r.peer, &msg);
+                }
+            }
+            continue;
+        }
+        let pawn = sender.and_then(|e| pawns.get(e).ok()).map_or(BOT, |p| p.id as u16);
+        let msg = LobbyMsg::Game(GameMsg::Chat { pawn, name: crate::online::lobby::clean_name(&name), team: team_byte(team), text, team_only, dead }.encode());
+        if team_only {
+            for (r, p) in &remotes {
+                if Some(p.team) == team {
+                    online.send(r.peer, &msg);
+                }
+            }
+        } else {
+            online.send(EVERYONE, &msg);
+        }
+    }
+}
+/// A chat line for the match's chat bus, from what the network carries (the
+/// one place that knows [`crate::bots::chat::ChatMessage`]'s fields).
+fn chat_line(_sender: Option<Entity>, name: String, team: Option<Team>, team_only: bool, _dead: bool, text: String) -> crate::bots::chat::ChatMessage {
+    crate::bots::chat::ChatMessage { sender: name, team: team.unwrap_or(Team::Allies), text, team_only }
+}
+
+/// A chat line's speaker (pawn, name), side, team-only, dead and text.
+fn chat_parts(line: &crate::bots::chat::ChatMessage) -> (Option<Entity>, String, Option<Team>, bool, bool, String) {
+    (None, line.sender.clone(), Some(line.team), line.team_only, false, line.text.clone())
+}
+/// Chat lines that crossed the network, so they don't go back where they
+/// came from: on the host, friends' own lines (by name and text, with who
+/// said them); on a guest, the lines received.
+#[derive(Resource, Default)]
+pub(crate) struct ChatEcho {
+    from_peer: Vec<(String, String, PeerId)>,
+    received: Vec<(String, String)>,
+}
+
+/// Guest: our own lines (the chat box's T/Y) to the host, which passes them
+/// on to everyone else as ours.
+pub(super) fn guest_chat(online: Res<Online>, mut lines: MessageReader<crate::bots::chat::ChatMessage>, mut echo: ResMut<ChatEcho>) {
+    for line in lines.read() {
+        let (_, name, team, team_only, dead, text) = chat_parts(line);
+        if let Some(i) = echo.received.iter().position(|(n, t)| *n == name && *t == text) {
+            echo.received.remove(i);
+            continue;
+        }
+        online.send(HOST, &LobbyMsg::Game(GameMsg::Chat { pawn: BOT, name: crate::online::lobby::clean_name(&name), team: team_byte(team), text, team_only, dead }.encode()));
+    }
+    // (Never let it grow: a line not seen back within a few is stale.)
+    let n = echo.received.len();
+    echo.received.drain(..n.saturating_sub(16));
 }

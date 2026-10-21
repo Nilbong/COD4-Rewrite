@@ -39,6 +39,15 @@ fn load_hint_font(mut fonts: ResMut<Assets<Font>>) {
 
 static HINT_FONT: std::sync::OnceLock<Handle<Font>> = std::sync::OnceLock::new();
 
+/// The menus' typeface at `size` pixels for Bevy UI text (the tool
+/// overlays: map editor, net graph); Bevy's own font where the PC lacks it.
+pub fn menu_font(size: f32) -> TextFont {
+    match HINT_FONT.get() {
+        Some(font) => TextFont { font: bevy::text::FontSource::Handle(font.clone()), font_size: FontSize::Px(size), ..default() },
+        None => TextFont { font_size: FontSize::Px(size), ..default() },
+    }
+}
+
 fn text(s: &str, size: f32) -> (Text, TextFont, TextColor, TextShadow) {
     (
         Text::new(s),
@@ -118,7 +127,10 @@ fn update_hint(
         && !crate::splitscreen::active();
     let (visibility, text) = &mut *hint;
     // Headquarters says what to do where it matters (its prompts).
-    let free = free && !crate::hq::active();
+    // (Nor the campaign: its levels have their own.)
+    let free = free && !crate::hq::active() && !crate::campaign::active();
+    // (Nor in screenshot runs, `COD4RW_SHOT`: it covered the views.)
+    let free = free && std::env::var_os("COD4RW_SHOT").is_none();
     visibility.set_if_neq(if free { Visibility::Inherited } else { Visibility::Hidden });
     // Headquarters has nothing to fight with.
     let wanted = if crate::hq::active() { HQ_HINT } else { MATCH_HINT };
@@ -129,5 +141,5 @@ fn update_hint(
 
 const MATCH_HINT: &str = "Click to play  |  WASD move, Shift sprint, Space jump, C crouch, Ctrl prone
 LMB fire, RMB aim, R reload, Tab scores, Esc release mouse
-B switch Bodycam / CoD4 gunplay, Q/E lean (Bodycam)";
+B switch Bodycam / CoD4 gunplay";
 const HQ_HINT: &str = "Click to play  |  WASD move, Shift sprint, Space jump, C crouch, Ctrl prone  |  Esc menu";

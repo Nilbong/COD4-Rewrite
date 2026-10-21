@@ -18,6 +18,9 @@ pub struct Mission {
     pub objectives: &'static [Objective],
     /// The death quote's localized string, and its English if missing.
     pub failed: (&'static str, &'static str),
+    /// The level's own scripts run it (its actors staged as they animate
+    /// them, not fighting pawns).
+    pub scripted: bool,
 }
 
 pub struct Objective {
@@ -28,7 +31,7 @@ pub struct Objective {
     pub waypoints: &'static [[f32; 3]],
 }
 
-pub const MISSIONS: [Mission; 1] = [Mission {
+pub const MISSIONS: [Mission; 21] = [scripted("killhouse", "F.N.G."), Mission {
     map: "cargoship",
     title: "Crew Expendable",
     // The deck aft of the bridge, where the Black Hawk's ropes come down.
@@ -53,7 +56,46 @@ pub const MISSIONS: [Mission; 1] = [Mission {
         ],
     }],
     failed: ("", "You were killed in action."),
-}];
+    // (Its own scripts and original AI, as every level now.)
+    scripted: true,
+},
+Mission {
+    map: "coup",
+    title: "The Coup",
+    // Al-Fulani, in the back of the car (the level's own start; its script
+    // carries him from here).
+    start: [48.0, -618.0, 0.0],
+    yaw: 90.0,
+    // No weapon: he's a prisoner.
+    guns: &[],
+    special: None,
+    objectives: &[],
+    failed: ("", ""),
+    scripted: true,
+},
+scripted("blackout", "Blackout"),
+scripted("armada", "Charlie Don't Surf"),
+scripted("bog_a", "The Bog"),
+scripted("hunted", "Hunted"),
+scripted("ac130", "Death From Above"),
+scripted("bog_b", "War Pig"),
+scripted("airlift", "Shock and Awe"),
+scripted("aftermath", "Aftermath"),
+scripted("village_assault", "Safehouse"),
+scripted("scoutsniper", "All Ghillied Up"),
+scripted("sniperescape", "One Shot, One Kill"),
+scripted("village_defend", "Heat"),
+scripted("ambush", "The Sins of the Father"),
+scripted("icbm", "Ultimatum"),
+scripted("launchfacility_a", "All In"),
+scripted("launchfacility_b", "No Fighting in the War Room"),
+scripted("jeepride", "Game Over"),
+scripted("airplane", "Mile High Club")];
+
+/// A level its own scripts run from its `info_player_start` (NaN start).
+const fn scripted(map: &'static str, title: &'static str) -> Mission {
+    Mission { map, title, start: [f32::NAN; 3], yaw: 0.0, guns: &[], special: None, objectives: &[], failed: ("", ""), scripted: true }
+}
 
 /// A mission by its level's name.
 pub fn find(map: &str) -> Option<&'static Mission> {
@@ -116,4 +158,59 @@ pub fn actor_class(spec: &str) -> ClassLoadout {
 pub fn rank_name(i: usize) -> &'static str {
     const NAMES: [&str; 4] = ["Mercenary", "Sentry", "Gunner", "Rifleman"];
     NAMES[i % NAMES.len()]
+}
+
+/// A single-player weapon (`giveweapon` name: `g36c`, `m4m203_silencer_reflex`,
+/// `m14_scoped_silencer_woodland`...) as the multiplayer gun closest to it
+/// (`weapon:attachment+attachment`), with its HUD name; None for grenades
+/// and equipment.
+pub fn sp_gun(name: &str) -> Option<(String, String)> {
+    const BASES: [(&str, &str, &str); 29] = [
+        ("m14_scoped", "m21", "M21"),
+        ("m4m203", "m4", "M4A1"),
+        ("m4_", "m4", "M4A1"),
+        ("m40a3", "m40a3", "R700"),
+        ("m16", "m16", "M16A4"),
+        ("m4", "m4", "M4A1"),
+        ("ak74u", "ak74u", "AK-74u"),
+        ("ak47", "ak47", "AK-47"),
+        ("g36c", "g36c", "G36C"),
+        ("g3", "g3", "G3"),
+        ("m14", "m14", "M14"),
+        ("m21", "m21", "M21"),
+        ("mp5", "mp5", "MP5"),
+        ("mp44", "mp44", "MP44"),
+        ("p90", "p90", "P90"),
+        ("uzi", "uzi", "Mini-Uzi"),
+        ("skorpion", "skorpion", "Skorpion"),
+        ("rpd", "rpd", "RPD"),
+        ("saw", "saw", "M249 SAW"),
+        ("m60", "m60e4", "M60E4"),
+        ("dragunov", "dragunov", "Dragunov"),
+        ("barrett", "barrett", "Barrett .50cal"),
+        ("remington700", "remington700", "R700"),
+        ("winchester1200", "winchester1200", "W1200"),
+        ("m1014", "m1014", "M1014"),
+        ("usp", "usp", "USP .45"),
+        ("beretta", "beretta", "M9"),
+        ("colt45", "colt45", "M1911 .45"),
+        ("deserteagle", "deserteagle", "Desert Eagle"),
+    ];
+    let n = name.to_ascii_lowercase();
+    let (_, base, hud) = BASES.iter().find(|(k, ..)| n.starts_with(k))?;
+    let mut atts = Vec::new();
+    if n.contains("m203") || n.contains("grenadier") || n.contains("_gl") {
+        atts.push("gl");
+    }
+    for a in ["silencer", "reflex", "acog", "grip"] {
+        if n.contains(a) {
+            atts.push(a);
+        }
+    }
+    // (Single-player guns whose own model carries a red dot, as F.N.G.'s
+    // G36C: the MP gun with its reflex sight, which aims down it right.)
+    if n == "g36c" && !atts.contains(&"reflex") {
+        atts.push("reflex");
+    }
+    Some((format!("{base}:{}", atts.join("+")), (*hud).to_owned()))
 }

@@ -52,6 +52,8 @@ pub struct Feel {
     /// down) and shift (CoD inches: forward, left, up).
     pub gun_angles: Vec3,
     pub gun_shift: Vec3,
+    /// The view's field of view kicked in by a heavy shot (degrees).
+    pub fov_punch: f32,
     state: State,
 }
 
@@ -61,9 +63,11 @@ struct State {
     /// Velocity last frame (inches a second, view frame: forward, left, up).
     last_vel: Option<Vec3>,
     last_eye: Option<f32>,
+    /// The steps taken so far ([`Mover::steps_total`]), last frame.
+    last_steps: Option<f32>,
     was_on_ground: bool,
     last_vy: f32,
-    last_shots: Option<u32>,
+    last_shots: Option<(usize, u32)>,
     /// The gun's springs: where it sits (forward, left, up inches) and how
     /// it's turned (pitch down, yaw left, roll degrees), and their speeds.
     pos: Vec3,
@@ -78,6 +82,16 @@ struct State {
     land_vel: f32,
     last_step: i32,
     kick_side: f32,
+    /// The camera's shove from each shot (pitch, yaw, roll degrees; and the
+    /// field of view), and which way the last rolled.
+    shot: Vec3,
+    shot_v: Vec3,
+    fov: f32,
+    fov_v: f32,
+    shot_side: f32,
+    /// The stride's bob, set apart from the springs (in step with the feet).
+    bob_pos: Vec3,
+    bob_rot: Vec3,
 }
 
 /// The springs' natural frequency for a gun of mass 1 (radians a second)
@@ -89,17 +103,12 @@ const RUN_SPEED: f32 = 190.0;
 
 /// A gun's mass by its class (`weapClass`): how slowly it answers.
 fn mass(w: &WeaponState) -> f32 {
-    if w.def.ads_overlay.is_some() {
-        return 1.35; // sniper rifles
+    // (A rocket launcher: heavy, whatever its file says.)
+    if w.def.class == 6 {
+        return 1.5;
     }
-    match w.def.class {
-        4 => 0.6,  // pistol
-        2 => 0.8,  // SMG
-        3 => 1.1,  // shotgun
-        1 => 1.45, // machine gun
-        6 => 1.5,  // rocket launcher
-        _ => 1.0,  // rifle
-    }
+    // From the gun's own weapon file ([`super::live_hands::heft`]).
+    super::live_hands::heft(w.def).mass
 }
 
 /// `COD4RW_FP_WEIGHT`: how strongly the gun moves (0..2, default 1).
@@ -198,9 +207,18 @@ fn update(time: Res<Time>, mut players: Query<(&Mover, &ViewAngles, &WeaponState
                 Stance::Prone => 1.2,
             };
             let walk = if mover.on_ground { run.min(1.2) * stance_k } else { 0.0 };
-            let c = mover.bob_angle();
-            pos_target += Vec3::new(0.0, c.sin() * 0.35, (2.0 * c).sin().abs() * -0.45) * walk * amp;
-            rot_target += Vec3::new((2.0 * c).sin() * 0.7, c.sin() * 0.6, c.sin() * 1.3) * walk * amp;
+            // In step with the feet (two steps a bob cycle): one quick dip a
+            // footfall and a slower rise, a little after it (more for a
+            // heavier gun), deeper for a heavier one; added after the
+            // springs, which only smeared it (a running rifle got a seventh
+            // of it, a sprinting machine gun almost none).
+            let lag = (crate::tune::get("feel.bob_lag", 0.03) + 0.02 * m) * std::f32::consts::TAU * 2.0 * (mover.xy_speed_units() / 190.0).max(0.3) * 1.2;
+            let c = mover.bob_angle() - lag;
+            let phase = (c / std::f32::consts::PI).rem_euclid(1.0);
+            let dip = if phase < 0.2 { phase / 0.2 } else { 1.0 - (phase - 0.2) / 0.8 };
+            let up = crate::tune::get("feel.bob_up", 0.45) * (0.6 + 0.4 * m);
+            s.bob_pos = Vec3::new(0.0, c.sin() * 0.35, -dip * up) * walk * amp;
+            s.bob_rot = Vec3::new(dip * 0.9 * m.sqrt(), c.sin() * 0.6, c.sin() * 1.3) * walk * amp;
             if mover.stance == Stance::Prone {
                 rot_target.y += c.sin() * 1.5 * run.min(1.0) * amp;
             }
@@ -222,8 +240,11 @@ fn update(time: Res<Time>, mut players: Query<(&Mover, &ViewAngles, &WeaponState
             }
             if !s.was_on_ground && mover.on_ground {
                 let fall = (-s.last_vy).clamp(0.0, 9.0);
-                s.pos_v.z -= fall * 6.0 * m * amp;
-                s.rot_v.x += fall * 16.0 * amp;
+                // (With live hands the hands brace the gun: theirs.)
+                if !super::live_hands() {
+                    s.pos_v.z -= fall * 6.0 * m * amp;
+                    s.rot_v.x += fall * 16.0 * amp;
+                }
                 s.land_vel -= 28.0 * (fall / 6.0).min(1.5);
             }
             // Crouching and going prone: the gun lags the eye as it drops or
@@ -235,7 +256,17 @@ fn update(time: Res<Time>, mut players: Query<(&Mover, &ViewAngles, &WeaponState
             }
         } else {
             s.breath = 0.0;
+            s.bob_pos = Vec3::ZERO;
+            s.bob_rot = Vec3::ZERO;
         }
+        // A step up or down: the gun lags it (the camera eases over it).
+        if let Some(last) = s.last_steps {
+            let change = (mover.steps_total - last) / INCH;
+            if bob_on && change.abs() >= 1.0 && change.abs() <= 18.0 {
+                s.pos_v.z -= change * crate::tune::get("feel.step_gun", 0.6) * m * 6.0 * amp;
+            }
+        }
+        s.last_steps = Some(mover.steps_total);
         s.last_vel = Some(local);
         s.last_eye = Some(mover.eye_height);
         s.was_on_ground = mover.on_ground;
@@ -243,8 +274,26 @@ fn update(time: Res<Time>, mut players: Query<(&Mover, &ViewAngles, &WeaponState
 
         // Firing: a kick into the same springs, less for a heavier gun.
         let shots = weapon.shots_fired_total;
-        if let Some(last) = s.last_shots {
+        let gun = weapon.def as *const crate::weapons::WeaponDef as usize;
+        // (Another gun's count after a switch isn't new shots; with live
+        // hands the hands take the kick, about the grip.)
+        if let Some((g, last)) = s.last_shots.filter(|(g, _)| *g == gun) {
+            let _ = g;
+            // The camera's shove, every shot: a roll (alternating, a little
+            // random), a dip and, for a heavy gun, the view kicked in.
             if shots > last && (sway_on || bob_on) {
+                let h = super::live_hands::heft(weapon.def);
+                let k = h.energy / h.mass.sqrt() * (1.0 - 0.5 * ads) * weight;
+                s.shot_side = if s.shot_side > 0.0 { -1.0 } else { 1.0 };
+                s.kick_side = (s.kick_side * 7.31 + 1.13).fract();
+                let roll = crate::tune::get("feel.shot_roll", 0.45) * (0.75 + 0.5 * s.kick_side) * s.shot_side;
+                let omega = 30.0;
+                s.shot_v += Vec3::new(crate::tune::get("feel.shot_pitch", 0.25), 0.0, roll) * omega * k;
+                if matches!(weapon.def.class, 3) || weapon.def.ads_overlay.is_some() {
+                    s.fov_v -= crate::tune::get("feel.fov_punch", 0.8) * omega * k;
+                }
+            }
+            if shots > last && (sway_on || bob_on) && !super::live_hands() {
                 let n = (shots - last).min(3) as f32;
                 // Which way it kicks sideways: varied shot to shot.
                 s.kick_side = (s.kick_side * 7.31 + 1.13).fract();
@@ -254,13 +303,15 @@ fn update(time: Res<Time>, mut players: Query<(&Mover, &ViewAngles, &WeaponState
                 s.pos_v.x -= 30.0 * kick;
             }
         }
-        s.last_shots = Some(shots);
+        s.last_shots = Some((gun, shots));
 
         // The springs: heavier is slower; aiming stiffens them.
         let omega = OMEGA / m.sqrt() * (1.0 + 1.5 * ads);
         let k = omega * omega;
         spring3(&mut s.pos, &mut s.pos_v, pos_target, k, ZETA, dt);
         spring3(&mut s.rot, &mut s.rot_v, rot_target, k, ZETA, dt);
+        spring3(&mut s.shot, &mut s.shot_v, Vec3::ZERO, 900.0, 0.5, dt);
+        spring(&mut s.fov, &mut s.fov_v, 900.0, 0.5, dt);
         // Never so far the gun leaves the view.
         s.pos = s.pos.clamp(Vec3::splat(-3.0), Vec3::splat(3.0));
         s.rot = s.rot.clamp(Vec3::splat(-14.0), Vec3::splat(14.0));
@@ -293,10 +344,13 @@ fn update(time: Res<Time>, mut players: Query<(&Mover, &ViewAngles, &WeaponState
             s.land = 0.0;
             s.land_vel = 0.0;
         }
-        let (pos, rot) = (s.pos, s.rot);
+        let (pos, rot) = (s.pos + s.bob_pos, s.rot + s.bob_rot);
+        let (shot, fov) = (s.shot, s.fov);
         feel.cam_up = cam_up;
-        feel.cam_pitch = cam_pitch;
-        feel.cam_roll = cam_roll;
+        // (The shot's dip is CoD degrees, pitch down; the camera's up.)
+        feel.cam_pitch = cam_pitch - shot.x.to_radians();
+        feel.cam_roll = cam_roll + shot.z.to_radians();
+        feel.fov_punch = fov;
         feel.gun_angles = rot;
         feel.gun_shift = pos;
     }

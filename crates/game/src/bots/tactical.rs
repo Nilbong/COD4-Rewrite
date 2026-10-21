@@ -374,11 +374,26 @@ fn learned_spots(nav: &NavGraph, lanes: &[LanePoint], spatial: &SpatialQuery, no
         let eye = pos + Vec3::Y * u(60.0);
         let mut looks: Vec<Look> = Vec::new();
         for &(dir, share) in &h.looks {
+            // Nearly level: the demo's mean pitch (a real player glancing at
+            // the floor, say) made a hold look 46 degrees down at the floor
+            // or at a wall 64u away. (Bot lab `oldlook`: as before.)
+            let old = super::lab::on("oldlook");
+            let dir = if old {
+                dir
+            } else {
+                let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
+                let pitch = dir.y.clamp(-1.0, 1.0).asin().clamp(-15f32.to_radians(), 15f32.to_radians());
+                flat * pitch.cos() + Vec3::Y * pitch.sin()
+            };
             // As far as the view goes that way (a wall, or the lanes beyond).
             let reach = Dir3::new(dir)
                 .ok()
                 .and_then(|d| spatial.cast_ray(eye, d, WATCH_RANGE, true, &collision::sight_filter()))
                 .map_or(WATCH_RANGE, |hit| hit.distance);
+            // A look into a wall or floor right there is nothing to watch.
+            if !old && reach < u(250.0) {
+                continue;
+            }
             let point = eye + dir * reach.max(u(64.0)) - Vec3::Y * u(60.0);
             let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or_zero();
             let lanes: Vec<u16> = lanes

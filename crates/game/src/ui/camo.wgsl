@@ -45,6 +45,27 @@
 // The colour map again, for its local average.
 @group(#{MATERIAL_BIND_GROUP}) @binding(110) var color_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(111) var color_sampler: sampler;
+// Micro-detail (`gunmodel::micro_detail`): x grunge, y edge wear, z grunge
+// scale, w on.
+@group(#{MATERIAL_BIND_GROUP}) @binding(112) var<uniform> micro: vec4<f32>;
+
+fn micro_hash(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// Smooth value noise, 0..1.
+fn micro_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = micro_hash(i);
+    let b = micro_hash(i + vec2(1.0, 0.0));
+    let c = micro_hash(i + vec2(0.0, 1.0));
+    let d = micro_hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
 
 fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3(0.299, 0.587, 0.114));
@@ -177,6 +198,16 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
             }
         } else {
             s = vec4(s.rgb * select(1.0, gold, detail_scale.z > 1.5), mix(s.a, 0.48, gold));
+        }
+        if (micro.w > 0.5 && !diamond_stud) {
+            // Micro-detail: grunge (two octaves over the gun's UVs) dulls
+            // and varies the shine; edges, where the normal map bends hard
+            // from the surface, are worn bright and glossier.
+            let g = micro_noise(in.uv * micro.z) * 0.65 + micro_noise(in.uv * micro.z * 3.1 + 7.0) * 0.35;
+            let grime = mix(1.0, 0.55 + 0.9 * g, micro.x);
+            let bend = 1.0 - dot(normalize(pbr_input.N), normalize(in.world_normal));
+            let edge = smoothstep(0.03, 0.18, bend) * micro.y;
+            s = vec4(s.rgb * grime * (1.0 + 0.9 * edge), saturate(s.a * mix(1.0, 0.75 + 0.5 * g, micro.x) + 0.2 * edge));
         }
         let n = normalize(pbr_input.N);
         let v = normalize(in.world_position.xyz - view.world_position);

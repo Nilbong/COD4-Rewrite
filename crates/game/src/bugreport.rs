@@ -252,14 +252,19 @@ fn show_prompt(
     report: Res<BugReport>,
     prompt: Query<Entity, With<Prompt>>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    mut fonts: ResMut<Assets<Font>>,
 ) {
     if report.stage != Stage::Typing || !prompt.is_empty() {
         return;
     }
     cursor.grab_mode = CursorGrabMode::None;
     cursor.visible = true;
+    // In the new menus' look: their typeface and theme colours, a dark panel
+    // with the accent line along its top.
+    use crate::ui::next::theme as t;
+    let font = ui_font(&mut fonts);
     let text = |s: &str, size: f32, color: Color| {
-        (Text::new(s), TextFont { font_size: FontSize::Px(size), ..default() }, TextColor(color))
+        (Text::new(s), TextFont { font: font.clone(), font_size: FontSize::Px(size), ..default() }, TextColor(color))
     };
     let root = commands
         .spawn((
@@ -272,7 +277,7 @@ fn show_prompt(
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            BackgroundColor(Color::srgba(0.02, 0.025, 0.03, 0.72)),
             // Above the HUD (1000-1002) and menus.
             GlobalZIndex(5000),
         ))
@@ -280,32 +285,64 @@ fn show_prompt(
     let panel = commands
         .spawn((
             Node {
-                width: px(760),
+                width: px(780),
                 flex_direction: FlexDirection::Column,
-                row_gap: px(10),
-                padding: UiRect::all(px(16)),
+                row_gap: px(12),
+                padding: UiRect { left: px(22), right: px(22), top: px(18), bottom: px(18) },
+                border: UiRect { top: px(3), ..UiRect::all(px(1)) },
                 ..default()
             },
-            BackgroundColor(Color::srgb(0.08, 0.09, 0.1)),
+            BackgroundColor(rgba(t::hex(0x0b0e0f, 0.97))),
+            BorderColor { top: rgba(t::ACCENT), ..BorderColor::all(rgba(t::LINE)) },
             ChildOf(root),
         ))
         .id();
-    commands.spawn((text("Bug report: what's wrong in this picture?", 22.0, Color::WHITE), ChildOf(panel)));
+    commands.spawn((text("BUG REPORT", 14.0, rgba(t::ACCENT)), ChildOf(panel)));
+    commands.spawn((text("What's wrong in this picture?", 26.0, rgba(t::INK)), ChildOf(panel)));
     if let Some(shot) = &report.shot {
-        commands.spawn((
-            ImageNode::new(shot.clone()),
-            Node { width: percent(100), aspect_ratio: Some(16.0 / 9.0), ..default() },
-            ChildOf(panel),
-        ));
+        let frame = commands
+            .spawn((Node { width: percent(100), border: UiRect::all(px(1)), ..default() }, BorderColor::all(rgba(t::LINE)), ChildOf(panel)))
+            .id();
+        commands.spawn((ImageNode::new(shot.clone()), Node { width: percent(100), aspect_ratio: Some(16.0 / 9.0), ..default() }, ChildOf(frame)));
     }
     commands.spawn((
         PromptText,
-        text("_", 18.0, Color::srgb(0.95, 0.9, 0.6)),
-        Node { min_height: px(60), padding: UiRect::all(px(8)), ..default() },
-        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.06)),
+        text("_", 19.0, rgba(t::INK)),
+        Node { min_height: px(64), padding: UiRect::all(px(10)), border: UiRect { left: px(3), ..default() }, ..default() },
+        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.05)),
+        BorderColor::all(rgba(t::ACCENT)),
         ChildOf(panel),
     ));
-    commands.spawn((text("Enter: save    Esc: discard    (the game is paused)", 15.0, Color::srgb(0.7, 0.7, 0.7)), ChildOf(panel)));
+    let keys = commands.spawn((Node { column_gap: px(18), align_items: AlignItems::Center, ..default() }, ChildOf(panel))).id();
+    for (key, what) in [("ENTER", "Save"), ("ESC", "Discard")] {
+        let pair = commands.spawn((Node { column_gap: px(8), align_items: AlignItems::Center, ..default() }, ChildOf(keys))).id();
+        commands.spawn((
+            text(key, 13.0, rgba(t::INK)),
+            Node { padding: UiRect::axes(px(7), px(3)), border: UiRect::all(px(1)), ..default() },
+            BorderColor::all(rgba(t::LINE_STRONG)),
+            ChildOf(pair),
+        ));
+        commands.spawn((text(what, 16.0, rgba(t::INK_DIM)), ChildOf(pair)));
+    }
+    commands.spawn((text("The game is paused.", 14.0, rgba(t::INK_MUTE)), ChildOf(keys)));
+}
+
+/// A theme colour (sRGB) as Bevy's.
+fn rgba(c: crate::ui::next::theme::Rgba) -> Color {
+    Color::srgba(c[0], c[1], c[2], c[3])
+}
+
+/// The menus' typeface (Bahnschrift), made once; Bevy's own font where the
+/// PC lacks it.
+fn ui_font(fonts: &mut Assets<Font>) -> bevy::text::FontSource {
+    static FONT: std::sync::OnceLock<Handle<Font>> = std::sync::OnceLock::new();
+    if let Some(h) = FONT.get() {
+        return bevy::text::FontSource::Handle(h.clone());
+    }
+    match crate::ui::next::font::face_bytes() {
+        Some(bytes) => bevy::text::FontSource::Handle(FONT.get_or_init(|| fonts.add(Font::from_bytes(bytes.to_vec()))).clone()),
+        None => bevy::text::FontSource::default(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -376,7 +413,7 @@ fn type_text(
 }
 
 /// A line confirming what happened, for a few seconds.
-fn toast(mut commands: Commands, mut report: ResMut<BugReport>, real: Res<Time<Real>>, shown: Query<Entity, With<Toast>>) {
+fn toast(mut commands: Commands, mut report: ResMut<BugReport>, real: Res<Time<Real>>, shown: Query<Entity, With<Toast>>, mut fonts: ResMut<Assets<Font>>) {
     let Some((message, until)) = report.toast.clone() else { return };
     if real.elapsed_secs() > until {
         report.toast = None;
@@ -387,10 +424,19 @@ fn toast(mut commands: Commands, mut report: ResMut<BugReport>, real: Res<Time<R
         commands.spawn((
             Toast,
             Text::new(message),
-            TextFont { font_size: FontSize::Px(16.0), ..default() },
-            TextColor(Color::srgb(0.6, 1.0, 0.6)),
+            TextFont { font: ui_font(&mut fonts), font_size: FontSize::Px(16.0), ..default() },
+            TextColor(rgba(crate::ui::next::theme::INK)),
             TextShadow::default(),
-            Node { position_type: PositionType::Absolute, right: px(16), top: px(48), ..default() },
+            Node {
+                position_type: PositionType::Absolute,
+                right: px(16),
+                top: px(48),
+                padding: UiRect::axes(px(12), px(7)),
+                border: UiRect { left: px(3), ..default() },
+                ..default()
+            },
+            BackgroundColor(rgba(crate::ui::next::theme::hex(0x0b0e0f, 0.9))),
+            BorderColor::all(rgba(crate::ui::next::theme::ACCENT)),
         ));
     }
 }

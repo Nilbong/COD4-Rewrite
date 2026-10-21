@@ -48,7 +48,12 @@ pub fn vector_to_angles(d: [f32; 3]) -> [f32; 3] {
 pub fn call(vm: &mut Vm, name: &str, _this: Option<&Value>, args: &[Value]) -> Option<Result<Value, String>> {
     Some((|| -> Result<Value, String> {
         Ok(match name {
-            "isdefined" => Value::Int(i32::from(args.first().is_some_and(Value::is_defined))),
+            // (A deleted entity is undefined.)
+            "isdefined" => Value::Int(i32::from(match args.first() {
+                Some(Value::Object(o)) => vm.object(*o).is_some_and(|ob| !matches!(ob.kind, crate::vm::ObjKind::Removed(_))),
+                Some(v) => v.is_defined(),
+                None => false,
+            })),
             "isstring" => Value::Int(i32::from(matches!(args.first(), Some(Value::Str(_))))),
             "isarray" => Value::Int(i32::from(matches!(args.first(), Some(Value::Array(_))))),
             "int" => match args.first() {
@@ -137,7 +142,14 @@ pub fn call(vm: &mut Vm, name: &str, _this: Option<&Value>, args: &[Value]) -> O
                 _ => Value::Array(Rc::new(Array::default())),
             },
             "assert" | "assertex" | "assertmsg" => Value::Undefined,
-            "println" | "print" | "logstring" | "fprintln" | "prof_begin" | "prof_end" => Value::Undefined,
+            // (Debug: `GSC_PRINTLN=1` shows them, on stderr.)
+            "println" | "print" | "logstring" => {
+                if std::env::var_os("GSC_PRINTLN").is_some() {
+                    eprintln!("gsc: {}", args.iter().map(Value::display).collect::<Vec<_>>().join(" "));
+                }
+                Value::Undefined
+            }
+            "fprintln" | "prof_begin" | "prof_end" => Value::Undefined,
             "isint" => Value::Int(i32::from(matches!(args.first(), Some(Value::Int(_))))),
             "isfloat" => Value::Int(i32::from(matches!(args.first(), Some(Value::Float(_))))),
             "isvector" => Value::Int(i32::from(matches!(args.first(), Some(Value::Vector(_))))),

@@ -9,6 +9,21 @@
 //! 4. the usual Steam and retail folders on drives C: to H:.
 //!
 //! A folder counts only if it looks like that game's install.
+//!
+//! Tests can pretend games aren't installed: `COD4RW_NOGAME=mw2,bo1` (keys
+//! as in `game_paths.txt`, or `bo1`/`t5`, `iw4`, `t4`).
+
+/// `COD4RW_NOGAME` names this game: treat it as not installed (tests).
+fn pretend_missing(game: Game) -> bool {
+    let Ok(list) = std::env::var("COD4RW_NOGAME") else { return false };
+    let aliases: &[&str] = match game {
+        Game::Cod4 => &["cod4", "iw3"],
+        Game::BlackOps => &["blackops", "bo1", "bo", "t5"],
+        Game::Mw2 => &["mw2", "iw4"],
+        Game::WaW => &["waw", "t4"],
+    };
+    list.split(',').map(|s| s.trim().to_ascii_lowercase()).any(|s| aliases.contains(&s.as_str()))
+}
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -123,6 +138,9 @@ pub fn find(game: Game) -> Option<PathBuf> {
 
 /// The game's install folder and how it was found.
 pub fn find_with_source(game: Game) -> Option<(PathBuf, Source)> {
+    if pretend_missing(game) {
+        return None;
+    }
     if let Some(p) = std::env::var_os(game.env_var()).map(PathBuf::from).filter(|p| game.looks_valid(p)) {
         return Some((p, Source::EnvVar));
     }

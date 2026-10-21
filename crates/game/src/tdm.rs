@@ -86,6 +86,11 @@ impl MatchConfig {
 
 /// The `i`th bot name ("Bot 17" past the named ones).
 pub fn bot_name(i: usize) -> String {
+    // A public lobby's made-up gamer tags, the same all session
+    // (`crate::bots::lobby`); CoD4's characters with `COD4RW_PERSONAS=0`.
+    if crate::bots::persona::enabled() {
+        return crate::bots::lobby::name(i);
+    }
     BOT_NAMES.get(i).map_or_else(|| format!("Bot {}", i + 1), |n| n.to_string())
 }
 
@@ -255,7 +260,10 @@ fn start_match(
         let fwd = Quat::from_rotation_y(player_spawn.yaw) * Vec3::NEG_Z;
         let right = Quat::from_rotation_y(player_spawn.yaw) * Vec3::X;
         for (i, m) in list.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).enumerate() {
-            let sp = crate::world::SpawnPoint { pos: player_spawn.pos + fwd * m + right * (i as f32 - 1.0) * 1.5, yaw: player_spawn.yaw + std::f32::consts::PI, kind: player_spawn.kind };
+            // `COD4RW_DUMMY_TURN=<degrees>` turns them from facing the player
+            // (anticlockwise seen from above), for lighting their faces.
+            let turn = std::env::var("COD4RW_DUMMY_TURN").ok().and_then(|t| t.parse::<f32>().ok()).unwrap_or(0.0).to_radians();
+            let sp = crate::world::SpawnPoint { pos: player_spawn.pos + fwd * m + right * (i as f32 - 1.0) * 1.5, yaw: player_spawn.yaw + std::f32::consts::PI + turn, kind: player_spawn.kind };
             let d = spawn_pawn(&mut commands, &assets, &format!("dummy {m} m"), Team::Axis, &sp);
             let mut mover = crate::movement::Mover::default();
             mover.on_ground = true;
@@ -305,7 +313,15 @@ fn start_match(
     // A mixed lobby, the sides evened out (the player counting as one at
     // the setting).
     let human = |team: Team| team == config.player_team || (local_count > 1 && locals.teams.contains(&team));
-    let playing = |team: Team| if spectating.is_none() && human(team) { config.bot_skill } else { 0.0 };
+    // (The player as good as their finished matches say, not the setting:
+    // a strong player was balanced as average and won by double.)
+    let rating = if std::env::var_os("COD4RW_SIM").is_some() { None } else { crate::bots::lobby::human_rating() };
+    // (The rating is P1's: other local players' sides count at the setting.)
+    let playing = |team: Team| match (spectating.is_none() && human(team), team == config.player_team) {
+        (true, true) => rating.unwrap_or(config.bot_skill),
+        (true, false) => config.bot_skill,
+        _ => 0.0,
+    };
     let skills = crate::bots::deal_skills(
         config.bot_skill,
         [names[0].len(), names[1].len()],
@@ -332,7 +348,7 @@ fn start_match(
             if let Some(v) = std::env::var("COD4RW_SIDE_SKILLS").ok().and_then(|s| s.split(',').nth(side).and_then(|x| x.trim().parse::<f32>().ok())) {
                 skill = v;
             }
-            commands.entity(bot).insert((Bot::new(skill, profile.as_deref()).with_lane(lane), WeaponInput::default()));
+            commands.entity(bot).insert((Bot::named(&name, skill, profile.as_deref()).with_lane(lane), WeaponInput::default()));
         }
     }
 }
@@ -393,15 +409,15 @@ fn check_end(
                 }
             }
         }
-        // (After the final killcam.)
-        Some((_, at)) if now - at > POST_MATCH && !crate::killcam::busy() && fe.as_ref().is_some_and(|f| f.from_menus()) => {
+        // (After the final killcam, and the end screen after it.)
+        Some((_, at)) if now - at.max(crate::killcam::finished_at()) > POST_MATCH && !crate::killcam::busy() && fe.as_ref().is_some_and(|f| f.from_menus()) => {
             // (Inserted at the end of the frame: once.)
             if over.is_none() && !std::mem::replace(&mut state.left, true) {
                 info!("match: over, back to the lobby");
                 commands.insert_resource(MatchOver);
             }
         }
-        Some((_, at)) if now - at > POST_MATCH => {
+        Some((_, at)) if now - at.max(crate::killcam::finished_at()) > POST_MATCH && !crate::killcam::busy() => {
             // New round: reset scores and kill everyone so they respawn.
             *state = MatchState {
                 started: now,

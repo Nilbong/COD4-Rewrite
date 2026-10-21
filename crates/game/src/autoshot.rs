@@ -62,8 +62,12 @@ fn run(
         }
         return;
     }
-    if *step < SHOTS.len() {
-        let (at, yaw, mut pitch) = SHOTS[*step];
+    // (`COD4RW_WORLDLIGHTS=1`: each view twice, `crate::world`'s A/B
+    // turning the primary lights off and on between them.)
+    const PAIRS: [(f32, f32, f32); 4] = [(6.0, 0.0, 0.0), (7.0, 0.0, 0.0), (8.0, 120.0, 0.0), (9.0, 120.0, 0.0)];
+    let shots: &[(f32, f32, f32)] = if crate::world::world_lights() { &PAIRS } else { &SHOTS };
+    if *step < shots.len() {
+        let (at, yaw, mut pitch) = shots[*step];
         // `COD4RW_SHOT_PITCH=<degrees>` aims every shot there (up is negative).
         if let Some(p) = std::env::var("COD4RW_SHOT_PITCH").ok().and_then(|s| s.parse().ok()) {
             pitch = p;
@@ -82,7 +86,7 @@ fn run(
             commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
             *step += 1;
         }
-    } else if t > SHOTS[SHOTS.len() - 1].0 + 1.5 {
+    } else if t > shots[shots.len() - 1].0 + 1.5 {
         if let Some(fps) =
             diagnostics.get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FPS).and_then(|d| d.smoothed())
         {

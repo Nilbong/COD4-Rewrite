@@ -25,7 +25,15 @@ const HASHES: usize = 0x2000;
 /// Read a fastfile from disk and return its decompressed zone data.
 pub fn load(path: &Path) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    decompress(&raw).with_context(|| format!("decompressing {}", path.display()))
+    decompress(&raw).with_context(|| format!("decompressing {} ({} bytes, {})", path.display(), raw.len(), describe(&raw)))
+}
+
+/// The fastfile's header in words: magic, version, signed or not.
+pub fn describe(raw: &[u8]) -> String {
+    let magic = raw.get(..8).map(|m| String::from_utf8_lossy(m).into_owned()).unwrap_or_default();
+    let version = raw.get(8..12).map(|v| u32::from_le_bytes(v.try_into().unwrap()));
+    let signed = raw.get(AUTH_AT..AUTH_AT + 8).map(|m| String::from_utf8_lossy(m).into_owned()).unwrap_or_default();
+    format!("magic {magic:?}, version {}, then {signed:?}", version.map_or("--".into(), |v| v.to_string()))
 }
 
 pub fn decompress(raw: &[u8]) -> Result<Vec<u8>> {

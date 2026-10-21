@@ -13,6 +13,17 @@ impl super::Frontend {
         self.menu_slot = 0;
         self.run(script, PAUSE_MENU);
     }
+
+    /// A Headquarters record (stats from [`crate::hq::RECORD_STATS`]).
+    pub fn hq_record(&self, stat: i32) -> i32 {
+        self.stats.get(stat)
+    }
+
+    /// A Headquarters record set, and saved.
+    pub fn set_hq_record(&mut self, stat: i32, value: i32) {
+        self.stats.set(stat, value);
+        self.stats.save_if_changed();
+    }
 }
 
 fn str_exp(s: &str) -> Statement {
@@ -50,7 +61,47 @@ pub(super) fn match_pause_menu(class: &Menu) -> Option<Menu> {
             it.window.rect.y -= shift;
         }
     }
+    // A mission's: no class to choose or team to change (the mission's
+    // weapons and side are its own), no End Game; leaving quits the
+    // mission.
+    if crate::campaign::active() {
+        // (End Game shares Leave Game's row, shown to the host: the
+        // mission's player always is.)
+        out.items.retain(|it| !(it.ty == item_type::BUTTON && it.action.contains("popup_endgame")));
+        drop_rows(&mut out, &["changeclass_", "changeteam"]);
+        for it in out.items.iter_mut().filter(|it| it.ty == item_type::BUTTON && it.action.contains("popup_leavegame")) {
+            it.text_exp = str_exp("Quit Mission");
+            it.visible_exp.clear();
+        }
+    }
     Some(out)
+}
+
+/// The left column's rows whose buttons' actions name one of these out
+/// (their bars too), the rows under them moved up to close the gaps.
+fn drop_rows(out: &mut Menu, actions: &[&str]) {
+    let mut ys: Vec<f32> = out.items.iter().filter(|it| it.ty == item_type::BUTTON && left(it)).map(|it| it.window.rect.y).collect();
+    ys.sort_by(|a, b| a.total_cmp(b));
+    ys.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+    let pitch = ys.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.5).fold(f32::MAX, f32::min);
+    // A row goes only if every button at its height is one of these (the
+    // per-team variants of Choose Class share a row).
+    let gone: Vec<f32> = ys
+        .iter()
+        .copied()
+        .filter(|&y| {
+            let mut at = out.items.iter().filter(|it| it.ty == item_type::BUTTON && left(it) && (it.window.rect.y - y).abs() < 0.5);
+            at.all(|it| actions.iter().any(|a| it.action.contains(a)))
+        })
+        .collect();
+    if gone.is_empty() || pitch == f32::MAX {
+        return;
+    }
+    out.items.retain(|it| !(left(it) && gone.iter().any(|&y| (it.window.rect.y - y).abs() < 0.5)));
+    for it in out.items.iter_mut().filter(|it| left(it)) {
+        let above = gone.iter().filter(|&&y| y < it.window.rect.y - 0.5).count();
+        it.window.rect.y -= pitch * above as f32;
+    }
 }
 
 /// CoD4's team menu without Spectator (there's no spectating yet).

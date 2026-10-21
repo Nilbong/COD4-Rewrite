@@ -304,6 +304,10 @@ fn rows_menu(template: &Menu, name: &str, rows: &[Row], stats: Option<&[i32]>) -
             it.window.name.clear();
             // Unlock checks go (or check this row's gun); the highlight
             // follows the row.
+            // A row with nothing to do (locked): its label only.
+            if row.action.is_empty() && it.ty == item_type::BUTTON {
+                it.visible_exp = vec![Token::Op(op::LEFTPAREN), Token::Int(0)];
+            }
             match stat {
                 // The row's button: shown while its gun is unlocked
                 // (CoD4's also asks which weapon slot is being picked).
@@ -469,7 +473,15 @@ impl Frontend {
                         let key = data.attachment(a).map_or(a.clone(), |x| x.key.clone());
                         (a.clone(), format!("@T5_{}", key.to_ascii_uppercase()))
                     }))
-                    .map(|(name, label)| Row { label: str_exp(&label), action: pick(&name), rename: from.clone().map(|f| (f, name)) })
+                    .map(|(name, label)| match super::progression::attachment_requirement(&self.stats, &gun.id(), gun.index, &name) {
+                        // Not earned yet: what it takes, and no pick.
+                        Some((kills, need)) => Row {
+                            label: str_exp(&format!("{}  \u{b7}  {}/{need} kills", self.assets.localize(&label), kills.min(need))),
+                            action: String::new(),
+                            rename: from.clone().map(|f| (f, name)),
+                        },
+                        None => Row { label: str_exp(&label), action: pick(&name), rename: from.clone().map(|f| (f, name)) },
+                    })
                     .collect();
                 with_rows(&t, key, &rows)?
             }

@@ -1,0 +1,73 @@
+# The Android build of the game (see README.md). It compiles the game crate's
+# own sources (crates/game/src/main.rs as a library root) into
+# libcod4rw.so for a NativeActivity APK. It is its own workspace, so nothing
+# here touches the Windows build.
+[package]
+name = "cod4rw-android"
+description = "Android (arm64, Vulkan) build of the CoD4 rewrite."
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "cod4rw"
+path = "../crates/game/src/main.rs"
+crate-type = ["cdylib"]
+
+# Same as crates/game/Cargo.toml, plus Android's NativeActivity for Bevy.
+[dependencies]
+indexmap = "2"
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+iw3 = { path = "../crates/iw3" }
+gamepaths = { path = "../crates/gamepaths" }
+gsc = { path = "../crates/gsc" }
+t5 = { path = "../crates/t5" }
+t4 = { path = "../crates/t4" }
+iw4 = { path = "../crates/iw4" }
+anyhow = "1"
+flate2 = "1.1"
+log = "0.4"
+bevy = { version = "0.19.1", features = ["mp3", "wav", "experimental_pbr_pcss", "android-native-activity"] }
+avian3d = "0.7"
+rand = "0.9"
+serde_json = "1"
+winit = { version = "0.30", default-features = false }
+cod4rw-net = { path = "../crates/net" }
+cod4rw-multiplayer = { path = "../crates/multiplayer" }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+half = "2"
+obvhs = "0.3.3"
+glam33 = { package = "glam", version = "0.33" }
+rayon = "1"
+# The global allocator, as on Windows: Android's own (scudo) caps each small
+# size class at 256 MB, and loading the zones made millions of small
+# allocations ("memory allocation of 280 bytes failed" at the menus' load).
+# local_dynamic_tls: Android loads the game as a library (dlopen), which
+# refuses the static TLS model mimalloc uses by default.
+mimalloc = { version = "0.1", optional = true, default-features = false, features = ["local_dynamic_tls"] }
+
+[features]
+# The game crate's features (cfg names the sources use); only mimalloc on.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+raytracing = []
+diamond = []
+systrace = []
+
+[workspace]
+
+[patch.crates-io]
+# winit with a gamepad hook (patches/winit, see README.md): stock winit turns
+# joystick motion into touches.
+winit = { path = "patches/winit" }
+
+[profile.release]
+# No symbols in the .so (smaller APK, faster install).
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -41,6 +41,14 @@ pub fn busy() -> bool {
     BUSY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// When the last killcam ended (game time; `NEG_INFINITY` none yet): the
+/// match's end screen counts from then.
+static FINISHED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xff80_0000);
+
+pub fn finished_at() -> f32 {
+    f32::from_bits(FINISHED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 impl Plugin for KillcamPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<History>()
@@ -136,6 +144,9 @@ pub struct Ghost;
 fn reset(mut killcam: ResMut<Killcam>, mut history: ResMut<History>) {
     *killcam = Killcam::default();
     *history = History::default();
+    // (A match left mid-killcam leaves nothing waiting on it.)
+    BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
+    FINISHED.store(f32::NEG_INFINITY.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Start, skip and end killcams: the player's own after dying (holding the
@@ -164,10 +175,14 @@ fn flow(
     // (Nor in the campaign: a death there fails the mission.)
     if crate::tdm::hardcore() || crate::splitscreen::active() || crate::campaign::active() {
         killed.clear();
+        BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     let now = time.elapsed_secs();
-    BUSY.store(killcam.replay.is_some() || killcam.pending.is_some(), std::sync::atomic::Ordering::Relaxed);
+    let busy = killcam.replay.is_some() || killcam.pending.is_some();
+    if BUSY.swap(busy, std::sync::atomic::Ordering::Relaxed) && !busy {
+        FINISHED.store(now.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
     let me = pawns.iter().find(|p| p.2).map(|p| p.0);
     let ended = state.as_ref().and_then(|s| s.ended);
     // Killed by someone: the killcam, once the death has sunk in.
@@ -222,7 +237,8 @@ fn flow(
         // To two seconds after the kill: recorded by the time playback
         // gets there (it starts at least 1.3 s before the kill).
         let end = kill.time + replay::AFTER;
-        let mut r = Replay::new(title, kill.clone(), (killer, victim), team, (start, end), now, skippable);
+        // (The final killcam slows down round the kill.)
+        let mut r = Replay::new(title, kill.clone(), (killer, victim), team, (start, end), now, skippable, !skippable);
         // An explosive kill rides the explosive.
         r.projectile = explosive(&history, &kill);
         info!("killcam: {} killed {} with {} ({:.1}s){}", r.killer_name, r.victim_name, kill.weapon, end - start, if r.projectile.is_some() { ", riding the explosive" } else { "" });
@@ -328,8 +344,11 @@ fn test(
             s.ended = Some((None, t));
         }
     }
-    if *step == 0 && t >= 8.0 {
-        if let Some((enemy, _, w)) = pawns.iter().find(|(_, p, _)| crate::combat::hostile(p, pawn)) {
+    // `COD4RW_KILLCAMTEST_ADS=1`: the kill goes to an enemy with sights
+    // fully up at the time (from 12 s on), to see a killer's ADS replayed.
+    let ads_killer = std::env::var_os("COD4RW_KILLCAMTEST_ADS").is_some();
+    if *step == 0 && t >= if ads_killer { 12.0 } else { 8.0 } {
+        if let Some((enemy, _, w)) = pawns.iter().find(|(_, p, w)| crate::combat::hostile(p, pawn) && (!ads_killer || w.ads >= 0.99)) {
             damage.write(crate::combat::Damage {
                 target: me,
                 attacker: Some(enemy),
@@ -353,7 +372,8 @@ fn test(
     match *step {
         1 if t >= s + 1.0 => shot("early", &mut step),
         2 if t >= s + 3.5 => shot("late", &mut step),
-        3 if !killcam.showing() => shot("after", &mut step),
+        // (A moment after it ends: the end screen's banner faded in.)
+        3 if !killcam.showing() && t >= finished_at() + 1.2 => shot("after", &mut step),
         4 if t >= s + 10.0 => {
             exit.write(AppExit::Success);
         }

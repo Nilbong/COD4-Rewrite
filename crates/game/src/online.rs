@@ -589,6 +589,17 @@ async fn run(relay: RelayEntry, target: Target, mut cmds: mpsc::UnboundedReceive
                     Control::Elected { swap } => Event::Elected(swap),
                     Control::Message { peer, data } => match LobbyMsg::decode(&data) {
                         Ok(m) => Event::Message(peer, m),
+                        // Another version of the game: told so plainly, both
+                        // ways (a host answers in the joiner's own format,
+                        // which every version reads as "different version").
+                        Err(_) if data.len() >= 2 && data[0] == b'L' && data[1] != lobby::LOBBY_VERSION => {
+                            info!("online: player {peer} is on another version of the game (lobby format {} here, {} there)", lobby::LOBBY_VERSION, data[1]);
+                            if session.current_peer() == HOST {
+                                let _ = session.send_message(peer, lobby::version_refusal(data[1])).await;
+                                continue;
+                            }
+                            Event::Message(peer, LobbyMsg::Refused(lobby::Refusal::Version))
+                        }
                         Err(e) => {
                             warn!("online: bad lobby message from {peer}: {e}");
                             continue;

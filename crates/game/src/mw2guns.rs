@@ -209,10 +209,16 @@ pub fn data() -> Option<&'static Data> {
 /// Start loading MW2's data in the background, then its guns' sounds.
 pub fn preload() {
     std::thread::spawn(|| {
-        if let Some(d) = data() {
-            let _ = d.sound_aliases();
-        }
+        crate::perf::background_thread();
+        preload_blocking();
     });
+}
+
+/// [`preload`]'s work on this thread (`main` runs the games' in turn).
+pub fn preload_blocking() {
+    if let Some(d) = data() {
+        let _ = d.sound_aliases();
+    }
 }
 
 /// A string table's rows from a parsed MW2 zone.
@@ -225,8 +231,26 @@ fn table(zone: &iw4::zone::Zone, name: &str) -> Vec<Vec<String>> {
     cells.chunks(cols).map(<[String]>::to_vec).collect()
 }
 
+/// A zone parsed from the first of its copies that parses (the install's
+/// language first; a modded or damaged copy falls through to the next).
 fn parse(install: &iw4::Install, name: &str) -> anyhow::Result<iw4::zone::Zone> {
-    Ok(iw4::zone::Zone::parse(&iw4::fastfile::load(&install.zone_path(name))?, Default::default())?)
+    let mut failed = Vec::new();
+    for path in install.zone_candidates(name) {
+        let parsed = iw4::fastfile::load(&path).and_then(|data| iw4::zone::Zone::parse(&data, Default::default()));
+        match parsed {
+            Ok(zone) => {
+                if !failed.is_empty() {
+                    log::warn!("mw2 guns: {name} read from {} after: {}", path.display(), failed.join("; "));
+                }
+                return Ok(zone);
+            }
+            Err(e) => failed.push(format!("{}: {e:#}", path.display())),
+        }
+    }
+    if failed.is_empty() {
+        anyhow::bail!("{name}.ff not found under {}", install.root.join("zone").display());
+    }
+    anyhow::bail!("{name}.ff: no copy parses ({})", failed.join("; "))
 }
 
 impl Data {
@@ -551,6 +575,8 @@ fn def_from_weapon(w: &Weapon, group: Group) -> WeaponDef {
         first_raise_time: ms("iFirstRaiseTime", fb.first_raise_time),
         quick_drop_time: ms("quickDropTime", fb.quick_drop_time),
         quick_raise_time: ms("quickRaiseTime", fb.quick_raise_time),
+        empty_drop_time: ms("iEmptyDropTime", fb.drop_time),
+        empty_raise_time: ms("iEmptyRaiseTime", fb.raise_time),
         hip_spread_min: [fo("fHipSpreadStandMin", 3.0), fo("fHipSpreadDuckedMin", 2.5), fo("fHipSpreadProneMin", 2.0)],
         hip_spread_max: [fo("hipSpreadStandMax", 7.0), fo("hipSpreadDuckedMax", 6.0), fo("hipSpreadProneMax", 5.0)],
         hip_spread_fire_add: fo("fHipSpreadFireAdd", fb.hip_spread_fire_add),
@@ -706,8 +732,21 @@ pub struct Mw2GunsPlugin;
 
 impl Plugin for Mw2GunsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<MatchContent>()
-            .add_systems(OnEnter(crate::state::GameState::InGame), |mut c: ResMut<MatchContent>| c.start());
+        // Started once the map has loaded, not alongside it: parsing and
+        // converting MW2's common_mp peaks at ~3.6 GB, and on top of the map's
+        // own load the process reached ~8.4 GB (2026-10-14). A gun asked for
+        // sooner still starts it (`get`). `COD4RW_MW2EARLY=1`: as before.
+        app.init_resource::<MatchContent>();
+        if std::env::var("COD4RW_MW2EARLY").is_ok_and(|v| v == "1") {
+            app.add_systems(OnEnter(crate::state::GameState::InGame), |mut c: ResMut<MatchContent>| c.start());
+        } else {
+            app.add_systems(
+                Update,
+                (|mut c: ResMut<MatchContent>| c.start())
+                    .run_if(resource_exists::<crate::world::MapInfo>)
+                    .run_if(|c: Res<MatchContent>| matches!(*c, MatchContent::NotStarted)),
+            );
+        }
     }
 }
 

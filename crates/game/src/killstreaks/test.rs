@@ -8,6 +8,12 @@
 //! `COD4RW_STREAKTEST_LEAVE=1`, left to circle the map and leave). Then it
 //! exits. Run with `COD4RW_DUMMY=1` for enemies, outdoors.
 //!
+//! Along the way it tries to fight with the gun out of hand: fire, a
+//! frag and a knife held through the UAV's call-in (none may happen), a
+//! dummy made to call one in with its trigger held (no shot until its
+//! lock ends, then shots), and the trigger held again at the end (shots),
+//! logged as `streak test: fighting ...`.
+//!
 //! With `COD4RW_STREAKTEST_MW2=1`, MW2's two instead: four kills, the care
 //! package's marker thrown ahead, the Little Bird coming in and dropping the
 //! crate, the crate opened; two more kills, the sentry carried and planted,
@@ -26,8 +32,18 @@ pub(super) fn register(app: &mut App) {
         app.insert_resource(StreakTest(dir.into()))
             .init_resource::<Clicking>()
             .init_resource::<Nudging>()
+            .init_resource::<Fighting>()
+            .init_resource::<Clock>()
+            .add_systems(Update, start_clock.before(drive).run_if(crate::state::in_game))
             .add_systems(Update, drive.run_if(crate::state::in_game))
-            .add_systems(PreUpdate, (click, nudge).after(bevy::input::InputSystems));
+            .add_systems(PreUpdate, (click, nudge, fight_keys).after(bevy::input::InputSystems))
+            .add_systems(
+                Update,
+                (
+                    dummy_fights.after(crate::player::InputSet).before(super::hands::CallInGate).run_if(crate::state::in_game),
+                    count_fighting.after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+                ),
+            );
     }
 }
 
@@ -50,14 +66,171 @@ fn click(mut clicking: ResMut<Clicking>, mut mouse: ResMut<ButtonInput<MouseButt
     }
 }
 
+/// The script's clock: from the match's HUD being up (it comes a while
+/// after the map, longer on a busy machine: counted from the start, the
+/// script ran ahead of it, its shots of an unlit world and a blank
+/// laptop), at 4 s, a second before the first step.
+#[derive(Resource, Default)]
+struct Clock(Option<f32>);
+
+impl Clock {
+    fn t(&self, time: &Time) -> Option<f32> {
+        self.0.map(|at| time.elapsed_secs() - at + 4.0)
+    }
+}
+
+fn start_clock(time: Res<Time>, mut clock: ResMut<Clock>, fe: Option<Res<crate::ui::Frontend>>, me: Query<(), With<LocalPlayer>>) {
+    if clock.0.is_none() && fe.is_some() && !me.is_empty() {
+        clock.0 = Some(time.elapsed_secs());
+        info!("streak test: the HUD is up at {:.1} s; the script starts", time.elapsed_secs());
+    }
+}
+
 /// Moving the mouse (down and right) until then (seconds in), as a player
 /// moves the laptop's cursor.
 #[derive(Resource, Default)]
 struct Nudging(f32);
 
-fn nudge(time: Res<Time>, nudging: Res<Nudging>, mut motion: ResMut<bevy::input::mouse::AccumulatedMouseMotion>) {
-    if time.elapsed_secs() < nudging.0 {
+fn nudge(time: Res<Time>, clock: Res<Clock>, nudging: Res<Nudging>, mut motion: ResMut<bevy::input::mouse::AccumulatedMouseMotion>) {
+    if clock.t(&time).is_some_and(|t| t < nudging.0) {
         motion.delta += Vec2::new(6.0, 3.0);
+    }
+}
+
+/// The fighting tried with the gun out of hand (seconds in, while the
+/// script has the UAV called in at 7 s): the player's trigger, frag and
+/// knife held; a dummy's UAV and its trigger; the player's trigger at the
+/// end, the gun in hand.
+const FIGHT_LOCKED: (f32, f32) = (7.15, 8.6);
+const DUMMY_CALL: f32 = 9.0;
+const DUMMY_LOCKED: (f32, f32) = (9.1, 9.8);
+const DUMMY_FREE: (f32, f32) = (17.0, 17.6);
+const FIGHT_FREE: (f32, f32) = (58.6, 59.2);
+
+#[derive(Resource, Default)]
+struct Fighting {
+    dummy: Option<Entity>,
+    /// Frames in the locked window with the hands up, and without.
+    hands_frames: (u32, u32),
+    /// Shots, grenades and knife swings in each window.
+    locked: (u32, u32, u32),
+    free: u32,
+    dummy_locked: u32,
+    dummy_free: u32,
+    /// When the dummy's lock came off.
+    dummy_unlocked: Option<f32>,
+    told: bool,
+}
+
+fn within(t: f32, (a, b): (f32, f32)) -> bool {
+    t >= a && t < b
+}
+
+/// The player's fighting buttons, pressed as the keyboard and mouse would
+/// (the whole way: the bindings, the pad's layer and the call-in's strip).
+fn fight_keys(time: Res<Time>, clock: Res<Clock>, mut keys: ResMut<ButtonInput<KeyCode>>, mut mouse: ResMut<ButtonInput<MouseButton>>) {
+    let Some(t) = clock.t(&time).filter(|_| !laptop_test()) else { return };
+    let locked = within(t, FIGHT_LOCKED);
+    for key in [KeyCode::KeyG, KeyCode::KeyV] {
+        if locked {
+            keys.press(key);
+        } else if within(t - 0.1, FIGHT_LOCKED) {
+            keys.release(key);
+        }
+    }
+    if locked || within(t, FIGHT_FREE) {
+        mouse.press(MouseButton::Left);
+    } else if within(t - 0.1, FIGHT_LOCKED) || within(t - 0.1, FIGHT_FREE) {
+        mouse.release(MouseButton::Left);
+    }
+}
+
+/// A dummy calls a UAV in, its trigger held (as a bot's would be) through
+/// its lock and again once it's off; the player kept alive meanwhile.
+#[allow(clippy::type_complexity)]
+fn dummy_fights(
+    time: Res<Time>,
+    clock: Res<Clock>,
+    mut fighting: ResMut<Fighting>,
+    mut dummies: Query<(Entity, &mut super::Killstreak, &mut HardpointInput, &mut crate::weapons::WeaponInput), (Without<LocalPlayer>, Without<crate::combat::Dead>)>,
+    mut me: Query<&mut crate::combat::Health, With<LocalPlayer>>,
+) {
+    let Some(t) = clock.t(&time).filter(|_| !laptop_test()) else { return };
+    if t >= DUMMY_CALL && fighting.dummy.is_none() {
+        if let Some((e, mut streak, mut input, _)) = dummies.iter_mut().next() {
+            streak.held.add(super::Hardpoint::Uav);
+            input.use_now = true;
+            input.item = Some(super::Hardpoint::Uav);
+            fighting.dummy = Some(e);
+        }
+    }
+    let Some(e) = fighting.dummy else { return };
+    if within(t, DUMMY_LOCKED) || within(t, DUMMY_FREE) {
+        if let Ok((.., mut w)) = dummies.get_mut(e) {
+            w.fire = true;
+        }
+        for mut h in &mut me {
+            h.current = h.current.max(5000.0);
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn count_fighting(
+    time: Res<Time>,
+    clock: Res<Clock>,
+    mut fighting: ResMut<Fighting>,
+    mut shots: MessageReader<crate::weapons::ShotFired>,
+    me: Query<(Entity, Has<super::hands::HardpointHands>), With<LocalPlayer>>,
+    grenades: Query<&crate::grenades::LiveGrenade, Added<crate::grenades::LiveGrenade>>,
+    swings: Query<(), (Added<crate::melee::Melee>, With<LocalPlayer>)>,
+    locks: Query<(), With<super::hands::CallingIn>>,
+) {
+    let Some(t) = clock.t(&time) else { return };
+    let Ok((me, hands)) = me.single() else { return };
+    if within(t, FIGHT_LOCKED) {
+        if hands {
+            fighting.hands_frames.0 += 1;
+        } else {
+            fighting.hands_frames.1 += 1;
+        }
+        fighting.locked.1 += grenades.iter().filter(|g| g.thrower == me).count() as u32;
+        fighting.locked.2 += swings.iter().count() as u32;
+    }
+    if let Some(d) = fighting.dummy {
+        if fighting.dummy_unlocked.is_none() && t > DUMMY_CALL + 0.1 && !locks.contains(d) {
+            fighting.dummy_unlocked = Some(t);
+        }
+    }
+    for s in shots.read() {
+        if s.weapon.is_none() {
+            continue;
+        }
+        if s.shooter == me && within(t, FIGHT_LOCKED) {
+            fighting.locked.0 += 1;
+        } else if s.shooter == me && within(t, FIGHT_FREE) {
+            fighting.free += 1;
+        } else if Some(s.shooter) == fighting.dummy && within(t, DUMMY_LOCKED) {
+            fighting.dummy_locked += 1;
+        } else if Some(s.shooter) == fighting.dummy && within(t, DUMMY_FREE) {
+            fighting.dummy_free += 1;
+        }
+    }
+    if t >= FIGHT_FREE.1 && !fighting.told {
+        fighting.told = true;
+        let f = &*fighting;
+        info!(
+            "streak test: fighting with the call-in's hands up ({} of {} frames): {} shots, {} grenades, {} knife swings (want 0); a dummy's UAV: {} shots while locked (want 0), lock off at {:?} s, {} shots after (want > 0); the gun back in hand: {} shots (want > 0)",
+            f.hands_frames.0,
+            f.hands_frames.0 + f.hands_frames.1,
+            f.locked.0,
+            f.locked.1,
+            f.locked.2,
+            f.dummy_locked,
+            f.dummy_unlocked.map(|t| (t * 10.0).round() / 10.0),
+            f.dummy_free,
+            f.free,
+        );
     }
 }
 
@@ -71,6 +244,13 @@ enum Act {
     Mouse,
     /// Move the mouse for this long (seconds).
     Nudge(f32),
+    /// Despawn the laptop screen's camera and picture, as the match's end
+    /// clears the match's things.
+    ClearLaptop,
+    /// Hold this one too.
+    Give(super::Hardpoint),
+    /// Put the airstrike's map (and laptop) away.
+    CloseMap,
     /// Keep behind the helicopter (held there in the air), looking at it.
     Follow,
     /// An enemy's rocket hits the helicopter for this much.
@@ -139,6 +319,20 @@ const MW2_SCRIPT: &[(f32, Act)] = &[
     (35.5, Act::Exit),
 ];
 
+/// `COD4RW_STREAKTEST_LAPTOP=1`: the airstrike's laptop held up half a
+/// minute, a shot a second (for fitting the hold, its knobs changed in a
+/// `COD4RW_TUNING` file meanwhile).
+const LAPTOP_SCRIPT: &[(f32, Act)] = &[
+    (5.0, Act::Give(super::Hardpoint::Airstrike)),
+    (5.2, Act::Use),
+    (8.0, Act::Shot("hold_00")), (9.0, Act::Shot("hold_01")), (10.0, Act::Shot("hold_02")), (11.0, Act::Shot("hold_03")), (12.0, Act::Shot("hold_04")), (13.0, Act::Shot("hold_05")), (14.0, Act::Shot("hold_06")), (15.0, Act::Shot("hold_07")), (16.0, Act::Shot("hold_08")), (17.0, Act::Shot("hold_09")), (18.0, Act::Shot("hold_10")), (19.0, Act::Shot("hold_11")), (20.0, Act::Shot("hold_12")), (21.0, Act::Shot("hold_13")), (22.0, Act::Shot("hold_14")), (23.0, Act::Shot("hold_15")), (24.0, Act::Shot("hold_16")), (25.0, Act::Shot("hold_17")), (26.0, Act::Shot("hold_18")), (27.0, Act::Shot("hold_19")), (28.0, Act::Shot("hold_20")), (29.0, Act::Shot("hold_21")), (30.0, Act::Shot("hold_22")), (31.0, Act::Shot("hold_23")), (32.0, Act::Shot("hold_24")), (33.0, Act::Shot("hold_25")), (34.0, Act::Shot("hold_26")), (35.0, Act::Shot("hold_27")), (36.0, Act::Shot("hold_28")), (37.0, Act::Shot("hold_29")), (38.0, Act::Shot("hold_30")), (39.0, Act::Shot("hold_31")),
+    (40.5, Act::Exit),
+];
+
+fn laptop_test() -> bool {
+    std::env::var_os("COD4RW_STREAKTEST_LAPTOP").is_some()
+}
+
 const SCRIPT: &[(f32, Act)] = &[
     (5.0, Act::Kills(3)),
     (5.6, Act::Shot("uav_earned")),
@@ -160,33 +354,40 @@ const SCRIPT: &[(f32, Act)] = &[
     (22.0, Act::Shot("airstrike_burst")),
     (22.6, Act::Shot("airstrike_bomblets")),
     (23.7, Act::Shot("airstrike_after")),
-    (24.1, Act::Kills(2)),
-    (24.7, Act::Shot("heli_earned")),
-    (25.1, Act::Use),
-    (25.2, Act::Follow),
-    (25.6, Act::ShotFiring("heli_firing")),
-    (28.6, Act::Shot("heli_inbound")),
-    (32.6, Act::Shot("heli_2")),
-    (36.6, Act::Shot("heli_3")),
-    (40.6, Act::Shot("heli_4")),
-    (43.6, Act::HitHeli(600.0)),
-    (45.6, Act::Shot("heli_smoking")),
+    // (A second airstrike after the laptop's screen is cleared away, as a
+    // match's end clears it: its laptop builds a new one.)
+    (24.0, Act::ClearLaptop),
+    (24.2, Act::Give(super::Hardpoint::Airstrike)),
+    (24.4, Act::Use),
+    (26.8, Act::Shot("airstrike_laptop_again")),
+    (27.0, Act::CloseMap),
+    (28.1, Act::Kills(2)),
+    (28.7, Act::Shot("heli_earned")),
+    (29.1, Act::Use),
+    (29.2, Act::Follow),
+    (29.6, Act::ShotFiring("heli_firing")),
+    (32.6, Act::Shot("heli_inbound")),
+    (36.6, Act::Shot("heli_2")),
+    (40.6, Act::Shot("heli_3")),
+    (44.6, Act::Shot("heli_4")),
     (47.6, Act::HitHeli(600.0)),
-    (48.0, Act::Shot("heli_hit")),
-    (49.6, Act::Shot("heli_crashing")),
-    (52.1, Act::Shot("heli_crash")),
-    (54.6, Act::Shot("heli_after")),
-    (55.6, Act::Exit),
+    (49.6, Act::Shot("heli_smoking")),
+    (51.6, Act::HitHeli(600.0)),
+    (52.0, Act::Shot("heli_hit")),
+    (53.6, Act::Shot("heli_crashing")),
+    (56.1, Act::Shot("heli_crash")),
+    (58.6, Act::Shot("heli_after")),
+    (59.6, Act::Exit),
 ];
 
 fn drive(
     mut commands: Commands,
     time: Res<Time>,
-    test: Res<StreakTest>,
+    (test, clock): (Res<StreakTest>, Res<Clock>),
     mut step: Local<usize>,
     mut look_at: Local<Option<Vec3>>,
     mut player: Query<
-        (Entity, &Pawn, &mut HardpointInput, &mut Transform, &mut ViewAngles, &mut crate::movement::Mover),
+        (Entity, &Pawn, &mut HardpointInput, &mut Transform, &mut ViewAngles, &mut crate::movement::Mover, &mut super::Killstreak),
         (With<LocalPlayer>, Without<super::helicopter::Helicopter>),
     >,
     spatial: SpatialQuery,
@@ -213,9 +414,10 @@ fn drive(
         Query<&mut crate::combat::Health, With<LocalPlayer>>,
         ResMut<Nudging>,
         Local<Option<(Vec3, Vec3, f32)>>,
+        Query<(Entity, &Name)>,
     ),
 ) {
-    let (couriers, crates, sentries, mut others, mut watching, mut sentry_shot, mw2_content, mut started, mut pinned, mut clicking, markers, mut health, mut nudging, mut walk) = mw2;
+    let (couriers, crates, sentries, mut others, mut watching, mut sentry_shot, mw2_content, mut started, mut pinned, mut clicking, markers, mut health, mut nudging, mut walk, names) = mw2;
     let mw2_test = std::env::var_os("COD4RW_STREAKTEST_MW2").is_some();
     // MW2's script walks about among the bots: kept alive for it.
     if mw2_test {
@@ -223,8 +425,14 @@ fn drive(
             h.current = h.current.max(5000.0);
         }
     }
-    let script = if mw2_test { MW2_SCRIPT } else { SCRIPT };
-    let t = time.elapsed_secs();
+    let script = if mw2_test {
+        MW2_SCRIPT
+    } else if laptop_test() {
+        LAPTOP_SCRIPT
+    } else {
+        SCRIPT
+    };
+    let Some(t) = clock.t(&time) else { return };
     // MW2's script waits for the props to load (or a minute).
     let t = if mw2_test {
         let ready = !mw2_content.busy() || t > 60.0;
@@ -239,7 +447,7 @@ fn drive(
     } else {
         t
     };
-    let Ok((me, mine, mut input, mut feet, mut view, mut mover)) = player.single_mut() else { return };
+    let Ok((me, mine, mut input, mut feet, mut view, mut mover, mut streak)) = player.single_mut() else { return };
     if let Some((_, h, _)) = helis.iter().next().filter(|_| *follow) {
         let back = (h.rotation * Vec3::X).with_y(0.0).normalize_or_zero();
         feet.translation = h.translation - back * crate::units::u(1100.0) + Vec3::Y * crate::units::u(60.0);
@@ -298,6 +506,15 @@ fn drive(
                 }
             }
             Act::Use => input.use_now = true,
+            Act::ClearLaptop => {
+                for (e, name) in &names {
+                    if name.as_str() == "laptop screen camera" || name.as_str() == "laptop screen" {
+                        commands.entity(e).try_despawn();
+                    }
+                }
+            }
+            Act::Give(item) => streak.held.add(*item),
+            Act::CloseMap => commands.remove_resource::<super::airstrike::Selecting>(),
             Act::UseItem(item) => {
                 input.use_now = true;
                 input.item = Some(*item);
@@ -340,7 +557,7 @@ fn drive(
                     *look_at = Some(stf.translation + forward * crate::units::u(400.0) + Vec3::Y * crate::units::u(50.0));
                 }
             }
-            Act::Nudge(secs) => nudging.0 = time.elapsed_secs() + secs,
+            Act::Nudge(secs) => nudging.0 = t + secs,
             Act::UseAt(_) if std::env::var_os("COD4RW_STREAKTEST_CLICK").is_some() => clicking.0 = true,
             Act::Place => {
                 commands.entity(me).insert(super::sentry::PlaceNow);

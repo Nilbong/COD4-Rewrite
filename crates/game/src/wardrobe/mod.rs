@@ -127,34 +127,6 @@ impl Wardrobe {
         self.arms.clone()
     }
 
-    /// A character to show in this match (Headquarters' supply drop reveal):
-    /// the map's own are converted now, others' zones start loading and
-    /// are converted as they finish ([`poll`]). Then [`Self::outfit_of`].
-    pub fn request(&mut self, c: &'static Character, map: &str, content: &mut Content, a: &mut ModelAssets) {
-        if self.outfits.contains_key(c.id) || self.extra.iter().any(|o| o.id == c.id) {
-            return;
-        }
-        self.extra.push(c);
-        if in_map(c, map) {
-            dress(&mut self.outfits, c, content, &mut Dressing::default(), a);
-            return;
-        }
-        let src = Source::of(c);
-        if !self.loading.iter().any(|(s, _)| *s == src) {
-            info!("wardrobe: loading {} to show {}", src.zone, c.name);
-            self.loading.push((src.clone(), load(src)));
-        }
-    }
-
-    /// A character's models, once ready.
-    pub fn outfit_of(&self, id: &str) -> Option<&Outfit> {
-        self.outfits.get(id)
-    }
-
-    /// Is a requested character still loading?
-    pub fn loading(&self, c: &Character) -> bool {
-        !self.outfits.contains_key(c.id) && self.loading.iter().any(|(s, _)| *s == Source::of(c))
-    }
 }
 
 fn side_index(team: Team) -> usize {
@@ -358,6 +330,11 @@ fn begin(
             }
             w.casts[side] = cast;
         }
+    }
+    // Debug: `COD4RW_DUMMY_CHAR=<id>`: the debug dummies (`COD4RW_DUMMY_AT`,
+    // not in the line-up) wear that character, bots or none.
+    if let Some(c) = std::env::var("COD4RW_DUMMY_CHAR").ok().and_then(|id| crate::characters::character(&id)) {
+        w.casts = [vec![c], vec![c]];
     }
     let mut sources: Vec<Source> = Vec::new();
     let wanted = w.player.iter().chain(w.casts.iter().flatten()).copied().filter(|c| !in_map(c, map));

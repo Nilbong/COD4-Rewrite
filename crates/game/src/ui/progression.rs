@@ -27,7 +27,7 @@ use std::collections::HashMap;
 pub(super) fn setup(app: &mut App) {
     app.add_message::<Award>().init_resource::<Progress>().add_systems(
         Update,
-        (assists, award, award_slots, match_bonus, rank_up, other_attachment_unlocks).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+        (assists, award, award_slots, match_bonus, rank_up, other_attachment_unlocks).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game.and(|| !crate::campaign::active() && !crate::hq::active())),
     )
     .add_systems(OnEnter(crate::state::GameState::InGame), |mut p: ResMut<Progress>| *p = Progress::default());
     if let Ok(dir) = std::env::var("COD4RW_CHALLENGETEST") {
@@ -228,6 +228,7 @@ fn award(
     if xp > 0 {
         debug!("progression: +{xp} XP");
         give_xp(fe, &mut hud, xp, now);
+        super::next::summary::add(super::next::summary::Source::Combat, xp);
     }
 }
 
@@ -349,6 +350,10 @@ fn catch_up_rank(stats: &mut Stats, assets: &UiAssets) {
 
 /// Add XP: to the stats, and the "+N" by the crosshair.
 pub(super) fn give_xp(fe: &mut Frontend, hud: &mut HudState, xp: i32, now: f32) {
+    // (The campaign earns no multiplayer XP.)
+    if crate::campaign::active() {
+        return;
+    }
     fe.stats.add(stat::RANKXP, xp);
     fe.stats.add(stat::SCORE, xp);
     hud.add_xp(xp.max(0) as u32, now);
@@ -395,7 +400,10 @@ fn match_bonus(
     if bonus > 0 {
         give_xp(fe, &mut hud, bonus, time.elapsed_secs());
         hud.message(format!("Match Bonus: +{bonus}"), time.elapsed_secs());
+        super::next::summary::add(super::next::summary::Source::Bonus, bonus);
     }
+    // (The post-match summary, shown back in the lobby.)
+    super::next::summary::finish(outcome, me.kills, me.deaths, me.assists, state.mode.name());
     fe.stats.save_if_changed();
 }
 
@@ -680,6 +688,18 @@ fn other_attachment_list(gun: &str) -> Vec<(String, u64)> {
         .or_else(|| crate::waw::data().and_then(|d| d.gun(gun)).map(|g| g.attachments.clone()))
         .unwrap_or_default();
     list.into_iter().filter(|a| super::attachments::bit(a) != 0).enumerate().map(|(k, a)| (a, attachment_kills(k))).collect()
+}
+
+/// A Black Ops or World at War gun's attachment it hasn't earned yet (with
+/// CoD4's unlocks): the gun's kills so far and the kills it takes. `index`
+/// is the gun's weapon number (its stat less 3000).
+pub(super) fn attachment_requirement(stats: &Stats, gun: &str, index: i32, attachment: &str) -> Option<(u64, u64)> {
+    let bit = super::attachments::bit(attachment);
+    if !cod4_unlocks(stats) || bit == 0 || stats.get(3000 + index) & bit != 0 {
+        return None;
+    }
+    let need = other_attachment_list(gun).into_iter().find(|(a, _)| a == attachment)?.1;
+    Some((super::combat_record::metric(stats, gun, "kills"), need))
 }
 
 /// The attachments (stat bits) a Black Ops or World at War gun has earned

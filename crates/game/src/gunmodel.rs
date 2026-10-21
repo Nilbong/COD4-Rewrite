@@ -184,6 +184,25 @@ pub struct CamoDetail {
     #[texture(110)]
     #[sampler(111)]
     pub color: Option<Handle<Image>>,
+    /// Micro-detail (`micro_detail`): x grunge strength, y edge wear, z
+    /// grunge scale (per UV unit), w 1 on.
+    #[uniform(112)]
+    pub micro: Vec4,
+}
+
+/// Gun micro-detail (`camo.wgsl`): a grunge pattern varying the specular
+/// map's shine and gloss, and worn bright edges where the normal map
+/// bends hard, both through IW3's specular (never Bevy's roughness: that
+/// greys gold, `gun-materials`). `COD4RW_GUNMICRO=0` off; knobs
+/// `gunmicro.grunge`, `gunmicro.edges`, `gunmicro.scale`.
+pub fn micro_detail() -> Vec4 {
+    let on = GunLook::get() == GunLook::Improved && !std::env::var("COD4RW_GUNMICRO").is_ok_and(|v| v == "0");
+    Vec4::new(
+        crate::tune::get("gunmicro.grunge", 0.35),
+        crate::tune::get("gunmicro.edges", 0.8),
+        crate::tune::get("gunmicro.scale", 9.0),
+        on as u32 as f32,
+    )
 }
 
 /// How gun surfaces look: `COD4RW_GUNLOOK=cod4` keeps CoD4's (no normal
@@ -229,7 +248,8 @@ impl MaterialExtension for CamoDetail {
 /// `ak47:reflex+silencer` -> ("ak47", ["reflex", "silencer"]).
 pub fn parse(spec: &str) -> (&str, Vec<&str>) {
     let (weapon, list) = spec.split_once(':').unwrap_or((spec, ""));
-    (weapon, list.split('+').filter(|a| !a.is_empty()).collect())
+    // (The IR laser is drawn, not modelled: [`crate::laser`].)
+    (weapon, list.split('+').filter(|a| !a.is_empty() && *a != crate::laser::ATTACHMENT).collect())
 }
 
 /// The camo cache third-person guns share: held ([`crate::thirdperson`])
@@ -520,6 +540,10 @@ fn spawn_model_of(
         skeleton,
         SpawnModel { model: &worn, owner, attach_to, layers: layers.clone(), shadows: true },
     );
+    // Its shape, for fitting an IR laser to its side ([`crate::laser`]).
+    if let Some(shape) = worn.shape.clone() {
+        commands.entity(owner).insert(crate::laser::GunShape(shape));
+    }
     let mut spawned = surfaces.clone();
     if let Some((model, keep)) = &suppressor {
         // Joints shared with the base model are reused; drop all but the suppressor.
@@ -635,6 +659,7 @@ fn spawn_model_of(
                         shine: flags,
                         look: GunLook::get().uniform(),
                         color,
+                        micro: micro_detail(),
                     },
                 });
                 camos.camos.insert(key, h.clone());
@@ -753,6 +778,7 @@ fn diamond_model(
         inverse_bindposes: worn.inverse_bindposes.clone(),
         extent: worn.extent,
         bounds: worn.bounds,
+        shape: worn.shape.clone(),
     })
 }
 
@@ -840,11 +866,19 @@ fn shine_surfaces(
 
 /// Guns reflect the probe nearest the camera, as IW3 lights models with the
 /// probe where they are: switched on every gun material when the camera
-/// moves to another probe's area, and given to new ones as they come.
+/// moves to another probe's area, and given to new ones as they come. The
+/// nearest the eye can see ([`PROBES_TRIED`] nearest, through the map's
+/// collision; else the nearest): the nearest by distance alone was often
+/// through a wall or roof, out in the open (Crossfire's alley by the
+/// dumpsters took a rooftop's bright sky probe, and every gun there
+/// turned blue, a gold one cyan).
+#[allow(clippy::too_many_arguments)]
 fn follow_reflection_probe(
     probes: Option<Res<crate::world::ReflectionProbes>>,
     camera: Query<&GlobalTransform, With<crate::player::MainCamera>>,
+    spatial: avian3d::prelude::SpatialQuery,
     mut current: Local<Option<usize>>,
+    mut checked_at: Local<Option<Vec3>>,
     mut added: MessageReader<AssetEvent<CamoMaterial>>,
     mut materials: ResMut<Assets<CamoMaterial>>,
 ) {
@@ -852,8 +886,20 @@ fn follow_reflection_probe(
         added.read().filter_map(|e| if let AssetEvent::Added { id } = e { Some(*id) } else { None }).collect();
     let (Some(probes), Ok(camera)) = (probes, camera.single()) else { return };
     let at = camera.translation();
-    let nearest =
-        probes.0.iter().enumerate().min_by(|a, b| a.1.0.distance(at).total_cmp(&b.1.0.distance(at))).map(|(i, _)| i);
+    // (Looked for again once the eye has moved a little.)
+    let nearest = if current.is_some() && checked_at.is_some_and(|c| c.distance(at) < crate::units::u(16.0)) {
+        *current
+    } else {
+        *checked_at = Some(at);
+        let mut by_distance: Vec<(usize, f32)> = probes.0.iter().enumerate().map(|(i, p)| (i, p.0.distance(at))).collect();
+        by_distance.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let filter = crate::collision::sight_filter();
+        let seen = by_distance.iter().take(PROBES_TRIED).find(|(i, d)| {
+            let Ok(dir) = Dir3::new(probes.0[*i].0 - at) else { return true };
+            spatial.cast_ray(at, dir, *d, true, &filter).is_none()
+        });
+        seen.or(by_distance.first()).map(|(i, _)| *i)
+    };
     let changed = nearest != *current;
     *current = nearest;
     let Some((_, probe, mip)) = nearest.and_then(|i| probes.0.get(i)) else { return };
@@ -870,6 +916,9 @@ fn follow_reflection_probe(
         }
     }
 }
+
+/// How many of the nearest probes are tried for one in sight of the eye.
+const PROBES_TRIED: usize = 8;
 
 /// Black Ops' `colorDetailMap` texture semantic (see [`crate::bo1`]).
 const COLOR_DETAIL_SEMANTIC: u8 = 19;
@@ -1082,6 +1131,11 @@ fn reflex_surfaces(
 
 /// A weapon def's gun (or world) model for a camo (its first one if the
 /// camo has none) and the tags it hides.
+/// A weapon def's world model (`g36c` in a single-player level's zone).
+pub fn world_model_of(content: &Content, def: &str) -> Option<String> {
+    gun_model(content, def, 0, WORLD_MODEL).map(|(m, _)| m)
+}
+
 fn gun_model(content: &Content, def: &str, camo: usize, field: &str) -> Option<(String, BTreeSet<String>)> {
     let (zi, def) = content.generic(AssetType::Weapon, def)?;
     let zone = &content.zones[zi];

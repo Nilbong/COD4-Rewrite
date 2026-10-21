@@ -118,34 +118,42 @@ pub struct Request {
     /// Heard without position even so (a bed of sound round the listener,
     /// its volume kept by whoever asked: [`crate::weather`]'s rain).
     pub flat: bool,
+    /// Playback speed times the alias's pitch (1: as it is; a slow-motion
+    /// replay's lower).
+    pub speed: f32,
 }
 
 impl Sfx {
     /// Play `alias` at `at` (Bevy space), or as the player's own if `None`.
     pub fn play(&mut self, alias: impl Into<String>, at: Option<Vec3>) {
-        self.queue.push(Request { alias: alias.into(), at, gain: 1.0, on: None, flat: false });
+        self.queue.push(Request { alias: alias.into(), at, gain: 1.0, on: None, flat: false, speed: 1.0 });
+    }
+
+    /// The same, played `speed` times as fast (and pitched with it).
+    pub fn play_at_speed(&mut self, alias: impl Into<String>, at: Option<Vec3>, speed: f32) {
+        self.queue.push(Request { alias: alias.into(), at, gain: 1.0, on: None, flat: false, speed });
     }
 
     /// Play `alias` on `entity`, following it (a loop plays until it's
     /// despawned).
     pub fn play_on(&mut self, alias: impl Into<String>, entity: Entity) {
-        self.queue.push(Request { alias: alias.into(), at: None, gain: 1.0, on: Some(entity), flat: false });
+        self.queue.push(Request { alias: alias.into(), at: None, gain: 1.0, on: Some(entity), flat: false, speed: 1.0 });
     }
 
     /// The same, `delay` seconds from `now`.
     pub fn play_later(&mut self, alias: impl Into<String>, at: Option<Vec3>, now: f32, delay: f32) {
-        self.later.push((now + delay, Request { alias: alias.into(), at, gain: 1.0, on: None, flat: false }));
+        self.later.push((now + delay, Request { alias: alias.into(), at, gain: 1.0, on: None, flat: false, speed: 1.0 }));
     }
 
     /// Play `alias` without position, riding on `entity` (its playback a
     /// child of it, its volume for the asker to keep: [`AudioSink`]).
     pub fn play_flat_on(&mut self, alias: impl Into<String>, entity: Entity) {
-        self.queue.push(Request { alias: alias.into(), at: None, gain: 1.0, on: Some(entity), flat: true });
+        self.queue.push(Request { alias: alias.into(), at: None, gain: 1.0, on: Some(entity), flat: true, speed: 1.0 });
     }
 
     /// The same at `gain` of its volume.
     pub fn play_later_at_gain(&mut self, alias: impl Into<String>, at: Option<Vec3>, gain: f32, now: f32, delay: f32) {
-        self.later.push((now + delay, Request { alias: alias.into(), at, gain, on: None, flat: false }));
+        self.later.push((now + delay, Request { alias: alias.into(), at, gain, on: None, flat: false, speed: 1.0 }));
     }
 }
 
@@ -205,6 +213,17 @@ pub struct Bank {
 impl Bank {
     pub fn has(&self, alias: &str) -> bool {
         self.aliases.contains_key(&alias.to_ascii_lowercase())
+    }
+
+    /// How long an alias's (first) sound plays, seconds, for a WAV file
+    /// (the campaign scripts' `playsound( alias, notify )` waits).
+    pub fn length(&mut self, alias: &str, audio: &mut Assets<AudioSource>) -> Option<f32> {
+        let v = self.aliases.get(&alias.to_ascii_lowercase())?.first()?.clone();
+        let vfs = self.vfs.clone();
+        let handle = self.sources.handle(&v.file, &vfs, audio)?;
+        let bytes = audio.get(&handle)?.bytes.clone();
+        let speed = v.pitch.0.max(0.25);
+        wav_seconds(&bytes).map(|s| s / speed)
     }
 
     fn add(&mut self, list: Vec<(String, Vec<Variant>)>) {
@@ -350,7 +369,7 @@ fn play_queued(
         // direction and walls are its ears' ([`spatial`]), kept up to date.
         let settings = PlaybackSettings {
             volume: Volume::Linear(volume * audible()),
-            speed: range(v.pitch).clamp(0.25, 4.0),
+            speed: (range(v.pitch) * req.speed).clamp(0.25, 4.0),
             ..if v.looping { PlaybackSettings::LOOP } else { PlaybackSettings::DESPAWN }
         };
         debug!("audio: {} vol {:.2}{} at {:.1} m{}", req.alias, volume * falloff, if two_d { "" } else { " 3d" }, ear.distance(at), if carrier.is_some() { " (on entity)" } else { "" });
@@ -460,4 +479,24 @@ fn duck(
     for (s, mut sink) in &mut slaves {
         sink.set_volume(Volume::Linear(s.volume * ducking.scale(s.percentage) * audible()));
     }
+}
+
+/// A RIFF WAV's length in seconds (its data size over its byte rate).
+fn wav_seconds(b: &[u8]) -> Option<f32> {
+    if b.len() < 12 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return None;
+    }
+    let (mut at, mut rate, mut data) = (12, None, None);
+    while at + 8 <= b.len() {
+        let id = &b[at..at + 4];
+        let size = u32::from_le_bytes(b[at + 4..at + 8].try_into().ok()?) as usize;
+        if id == b"fmt " && at + 20 <= b.len() {
+            rate = Some(u32::from_le_bytes(b[at + 16..at + 20].try_into().ok()?));
+        } else if id == b"data" {
+            data = Some(size);
+            break;
+        }
+        at += 8 + size + (size & 1);
+    }
+    Some(data? as f32 / rate.filter(|r| *r > 0)? as f32)
 }

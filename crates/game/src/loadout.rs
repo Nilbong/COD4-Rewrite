@@ -57,6 +57,7 @@ impl Plugin for LoadoutPlugin {
             (local_class, equip, local_switch_keys, switch_weapons)
                 .chain()
                 .after(crate::player::InputSet)
+                .after(crate::killstreaks::hands::CallInGate)
                 .before(crate::weapons::WeaponSet)
                 .run_if(crate::state::in_game),
         );
@@ -115,6 +116,9 @@ pub struct Loadout {
     /// The weapons not in hand, with their ammo (none for the one in hand).
     stowed: Vec<Option<WeaponState>>,
     pub switching: Option<Switching>,
+    /// The slots raised this life (`weaponold`): the others' next raise is
+    /// their first. The primary's first raise is the spawn's.
+    drawn: u64,
     extra: Option<Extra>,
     /// The slot to go back to from the extra one.
     previous: usize,
@@ -164,7 +168,8 @@ impl Loadout {
         weapon.reserve = weapon.def.max_ammo;
         weapon.reload_until = None;
         weapon.ads = 0.0;
-        self.switching = Some(Switching { to: slot, raising: true, alt: false, started: now, until: now + weapon.def.raise_time.max(0.05) });
+        self.drawn |= 1 << slot;
+        self.switching = Some(Switching { to: slot, raising: true, alt: false, anim: SwitchAnim::Normal, started: now, until: now + weapon.def.raise_time.max(0.05) });
     }
 
     /// Every weapon carried: its slot, def and clip and reserve (the one in
@@ -222,7 +227,10 @@ impl Loadout {
                 (w.clip, w.reserve) = (0, 0);
             }
         }
-        self.switching = Some(Switching { to: slot, raising: true, alt: false, started: now, until: now + def.raise_time.max(0.05) });
+        // A new weapon: its first raise.
+        self.drawn |= 1 << slot;
+        let anim = if clip == 0 { SwitchAnim::Empty } else { SwitchAnim::First };
+        self.switching = Some(Switching { to: slot, raising: true, alt: false, anim, started: now, until: now + def.raise_time_for(anim) });
         old
     }
 
@@ -257,8 +265,25 @@ pub struct Switching {
     pub to: usize,
     pub raising: bool,
     pub alt: bool,
+    /// Which put-away or raise this phase is (its anim and time).
+    pub anim: SwitchAnim,
     pub started: f32,
     pub until: f32,
+}
+
+/// Which of a weapon's put-away and raise anims (and times) a switch uses,
+/// as CoD4 picks them (`PM_BeginWeaponChange`, `PM_Weapon_FinishWeaponChange`):
+/// with an empty magazine the empty ones; a weapon's first raise in a life
+/// its first raise (the pullout that cocks it); switching to a pistol the
+/// quick ones (the gun in hand quickly away, the pistol quickly up);
+/// otherwise the normal ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SwitchAnim {
+    #[default]
+    Normal,
+    Quick,
+    First,
+    Empty,
 }
 
 // CoD4's perk dvars.
@@ -498,6 +523,13 @@ fn equip(
             continue;
         }
         let mut class = class.0.clone();
+        // Debug aid ([`crate::laser`]): `COD4RW_LASER=1` fits the local
+        // player's guns with the laser.
+        if local && std::env::var_os("COD4RW_LASER").is_some() {
+            for g in class.guns.iter_mut() {
+                g.spec = crate::laser::with_laser(&g.spec, true);
+            }
+        }
         // Without Overkill the second weapon is a pistol (`_class.gsc`): a
         // CoD4 class with another gun there gets the Beretta.
         if !has(&class.perks, "specialty_twoprimaries") {
@@ -512,7 +544,7 @@ fn equip(
         let (guns, defs): (Vec<Gun>, Vec<&'static WeaponDef>) =
             class.guns.iter().filter_map(|g| Some((g.clone(), weapon_def(&content, g, &class.perks)?))).unzip();
         if defs.is_empty() {
-            warn!("class {}: none of its weapons were found", class.name);
+            warn_once!("class {}: none of its weapons were found", class.name);
             continue;
         }
         let perks = &class.perks;
@@ -570,7 +602,7 @@ fn equip(
             }
         }
         commands.entity(entity).insert((
-            Loadout { class, guns, defs, current: 0, stowed, switching: None, extra, previous: 0 },
+            Loadout { class, guns, defs, current: 0, stowed, switching: None, drawn: 1, extra, previous: 0 },
             DamageScale(armor),
             SwitchInput::default(),
         ));
@@ -607,6 +639,36 @@ fn local_switch_keys(mut players: Query<(&crate::splitscreen::PlayerInput, &Load
     }
 }
 
+/// How the weapon in hand is put away for `to` (`PM_BeginWeaponChange`):
+/// empty, its empty put-away; for a pistol, quickly; otherwise normally.
+fn drop_anim(in_hand: &WeaponState, to: &WeaponDef) -> SwitchAnim {
+    if in_hand.clip == 0 && in_hand.def.clip_size > 0 {
+        SwitchAnim::Empty
+    } else if to.class == PISTOL {
+        SwitchAnim::Quick
+    } else {
+        SwitchAnim::Normal
+    }
+}
+
+/// How a weapon comes up (`PM_Weapon_FinishWeaponChange`): empty, its empty
+/// raise; its first time this life, its first raise; a pistol (the switch
+/// was quick), quickly; otherwise normally.
+fn raise_anim(next: &WeaponState, first: bool) -> SwitchAnim {
+    if next.clip == 0 && next.def.clip_size > 0 {
+        SwitchAnim::Empty
+    } else if first {
+        SwitchAnim::First
+    } else if next.def.class == PISTOL {
+        SwitchAnim::Quick
+    } else {
+        SwitchAnim::Normal
+    }
+}
+
+/// `WEAPCLASS_PISTOL`.
+const PISTOL: i32 = 4;
+
 /// Switch weapons for every pawn with a class, as its [`SwitchInput`] asks:
 /// put the one in hand away, then raise the other. Neither can fire, aim or
 /// reload meanwhile.
@@ -639,11 +701,14 @@ fn switch_weapons(
                 let done = ((now - s.started) / span).clamp(0.0, 1.0);
                 if s.raising && to != loadout.current {
                     loadout.previous = loadout.current;
-                    let drop = weapon.def.drop_time.max(0.05) * done;
-                    loadout.switching = Some(Switching { to, raising: false, alt: false, started: now - (weapon.def.drop_time.max(0.05) - drop), until: now + drop });
+                    let anim = drop_anim(&weapon, loadout.defs[to]);
+                    let full = weapon.def.drop_time_for(anim);
+                    let drop = full * done;
+                    loadout.switching = Some(Switching { to, raising: false, alt: false, anim, started: now - (full - drop), until: now + drop });
                 } else if !s.raising && to == loadout.current {
+                    // (Back up from part way down: its normal raise.)
                     let raise = weapon.def.raise_time.max(0.05);
-                    loadout.switching = Some(Switching { to, raising: true, alt: false, started: now - raise * (1.0 - done), until: now + raise * done });
+                    loadout.switching = Some(Switching { to, raising: true, alt: false, anim: SwitchAnim::Normal, started: now - raise * (1.0 - done), until: now + raise * done });
                 } else if !s.raising && to != s.to {
                     loadout.switching = Some(Switching { to, ..s });
                 }
@@ -656,8 +721,9 @@ fn switch_weapons(
                 }
                 // A rifle to its launcher and back: no drop.
                 let alt = extra.is_some_and(|x| x.alt_raise.is_some() && (to == x.slot || on_extra) && (to == 0 || loadout.current == 0));
-                let drop = if alt { 0.05 } else { weapon.def.drop_time.max(0.05) };
-                loadout.switching = Some(Switching { to, raising: false, alt, started: now, until: now + drop });
+                let anim = if alt { SwitchAnim::Normal } else { drop_anim(&weapon, loadout.defs[to]) };
+                let drop = if alt { 0.05 } else { weapon.def.drop_time_for(anim) };
+                loadout.switching = Some(Switching { to, raising: false, alt, anim, started: now, until: now + drop });
                 weapon.reload_until = None;
             }
         }
@@ -678,14 +744,46 @@ fn switch_weapons(
         next.bloom = 0.0;
         next.pending_kick = Vec2::ZERO;
         next.reload_until = None;
+        let first = loadout.drawn & (1 << s.to) == 0;
+        let anim = raise_anim(&next, first);
         let raise = match (s.alt, loadout.extra.and_then(|x| x.alt_raise)) {
-            (true, Some(alt)) => alt,
-            _ => next.def.raise_time,
-        }
-        .max(0.05);
+            (true, Some(alt)) => alt.max(0.05),
+            _ => next.def.raise_time_for(anim),
+        };
+        loadout.drawn |= 1 << s.to;
         let current = loadout.current;
         loadout.stowed[current] = Some(std::mem::replace(&mut *weapon, next));
         loadout.current = s.to;
-        loadout.switching = Some(Switching { to: s.to, raising: true, alt: s.alt, started: now, until: now + raise });
+        loadout.switching = Some(Switching { to: s.to, raising: true, alt: s.alt, anim, started: now, until: now + raise });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CoD4's numbers (`ak47_mp`, `beretta_mp`, ms).
+    fn defs() -> (&'static WeaponDef, &'static WeaponDef) {
+        let ak = WeaponDef { drop_time: 0.6, raise_time: 0.949, first_raise_time: 1.399, quick_drop_time: 0.25, quick_raise_time: 0.75, empty_drop_time: 0.6, empty_raise_time: 0.949, class: 0, ..WeaponDef::fallback() };
+        let m9 = WeaponDef { drop_time: 0.449, raise_time: 0.55, first_raise_time: 0.25, quick_drop_time: 0.25, quick_raise_time: 0.25, empty_drop_time: 0.449, empty_raise_time: 0.25, class: PISTOL, clip_size: 15, ..WeaponDef::fallback() };
+        (Box::leak(Box::new(ak)), Box::leak(Box::new(m9)))
+    }
+
+    /// AK-47 to the pistol is quick, 250 + 250 ms (it was 600 + 550); back
+    /// to the AK is the pistol's drop and the AK's raise.
+    #[test]
+    fn switching_to_a_pistol_is_quick() {
+        let (ak, m9) = defs();
+        let in_hand = fresh(ak, false);
+        let pistol = fresh(m9, false);
+        let to_pistol = ak.drop_time_for(drop_anim(&in_hand, m9)) + m9.raise_time_for(raise_anim(&pistol, false));
+        assert!((to_pistol - 0.5).abs() < 1e-4, "{to_pistol}");
+        // Its first time out this life: its first raise (also 250).
+        assert_eq!(raise_anim(&pistol, true), SwitchAnim::First);
+        let back = m9.drop_time_for(drop_anim(&pistol, ak)) + ak.raise_time_for(raise_anim(&in_hand, false));
+        assert!((back - (0.449 + 0.949)).abs() < 1e-4, "{back}");
+        // An empty pistol comes out with its empty raise.
+        let empty = WeaponState { clip: 0, ..fresh(m9, false) };
+        assert_eq!(raise_anim(&empty, true), SwitchAnim::Empty);
     }
 }

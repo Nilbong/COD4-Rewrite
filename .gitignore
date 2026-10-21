@@ -33,3 +33,4 @@
 /tools/mocap/ref/
 # A debug leftover.
 /crates/game/src/netplay/_keep_report.txt
+__pycache__/

@@ -62,9 +62,21 @@ fn start(content: Res<Content>, map: Res<crate::world::MapName>, effects: Option
         }
         info!("map fx placed: {counts:?}");
     }
+    // CoD4's ambient fog, mist and smoke banks: flat camera-facing cards
+    // drifting between buildings. Off everywhere since 2026-10-16 (the user
+    // found them dated next to the volumetric air); `mapfx.fog.<map>` (the
+    // Map Look Editor's "CoD4 fog effects") turns them back on per map,
+    // read as the match starts.
+    let fog_cards = crate::tune::get(&format!("mapfx.fog.{}", map.0), 0.0) > 0.5;
+    let is_fog = is_fog_card;
+    let mut dropped: std::collections::BTreeMap<&str, usize> = Default::default();
     for p in &placed {
         // The showcase's storm brings its own rain (`crate::weather`).
         let effect = p.effect.to_ascii_lowercase();
+        if !fog_cards && is_fog(&effect) {
+            *dropped.entry(p.effect.as_str()).or_default() += 1;
+            continue;
+        }
         if crate::weather::showcase() && (effect.contains("rain") || (crate::atmos::climate::profile().is_some_and(|q| q.snow) && effect.contains("snow"))) {
             continue;
         }
@@ -74,7 +86,10 @@ fn start(content: Res<Content>, map: Res<crate::world::MapName>, effects: Option
         effects.play_ambient(&p.effect, frame(p.origin, p.angles), p.delay as f64 * 1000.0);
     }
     if !placed.is_empty() {
-        info!("map fx: {} effects placed", placed.len());
+        info!("map fx: {} effects placed", placed.len() - dropped.values().sum::<usize>());
+    }
+    if !dropped.is_empty() {
+        info!("map fx: CoD4 fog effects left out: {dropped:?}");
     }
 }
 
@@ -169,4 +184,21 @@ mod tests {
         let f = frame([0.0; 3], [0.0, 90.0, 0.0]);
         assert!((f.axis.col(0) - Vec3::NEG_Z).length() < 1e-5 && (f.axis.col(2) - Vec3::Y).length() < 1e-5);
     }
+}
+
+/// One of CoD4's ambient fog, mist or smoke-bank card effects.
+pub fn is_fog_card(effect: &str) -> bool {
+    // (And the hangars' hanging dust and light-shaft dust banks, and low
+    // ground smoke: the same flat cards, the haze Killhouse's hall still
+    // showed, 2026-10-19.)
+    // (And Crash's blowing dust and hallway smoke: big cards that popped
+    // in at their spawn distance, 2026-10-20.)
+    ["fog", "mist", "haze", "smokebank", "light_shaft_dust", "amb_dust", "ground_smoke", "dust_wind", "dust_spiral", "hallway_smoke"].iter().any(|k| effect.contains(k))
+}
+
+/// Is this effect a fog card left out on this map (unless the Map Look
+/// Editor's "CoD4 fog effects", `mapfx.fog.<map>`, turns them back on)?
+/// The campaign's scripted ambient effects go by it too.
+pub fn fog_card_dropped(effect: &str, map: &str) -> bool {
+    is_fog_card(&effect.to_ascii_lowercase()) && crate::tune::get(&format!("mapfx.fog.{map}"), 0.0) <= 0.5
 }

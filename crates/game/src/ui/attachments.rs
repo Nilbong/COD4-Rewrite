@@ -235,8 +235,15 @@ pub fn with_accept_row(menu: &Menu) -> Option<Menu> {
         .filter(|(_, it)| it.ty == item_type::BUTTON)
         .filter_map(|(i, it)| row_selects(&it.action).map(|(_, name)| (i, name, it.window.rect.y)))
         .collect();
-    let none_y = rows.iter().find(|r| r.1 == "none")?.2;
-    let mut ys: Vec<f32> = rows.iter().map(|r| r.2).collect();
+    let (none_i, _, none_y) = rows.iter().find(|r| r.1 == "none")?.clone();
+    // Every row of the list, those with nothing to pick (locked) too.
+    let none_x = menu.items[none_i].window.rect.x;
+    let mut ys: Vec<f32> = menu
+        .items
+        .iter()
+        .filter(|it| it.ty == item_type::BUTTON && (it.window.rect.x - none_x).abs() < 0.5)
+        .map(|it| it.window.rect.y)
+        .collect();
     ys.sort_by(f32::total_cmp);
     ys.dedup_by(|a, b| (*a - *b).abs() < 0.5);
     let pitch = ys.windows(2).map(|w| w[1] - w[0]).reduce(f32::min)?;

@@ -171,7 +171,7 @@ pub(super) fn respond(
                     }
                     fe.stack.clear();
                     fe.focus = None;
-                    if equipped && !dead && !crate::tdm::in_grace_period(now) {
+                    if equipped && !dead && !crate::tdm::in_grace_period(now) && !crate::hq::active() {
                         let text = fe.assets.localize("@MP_CHANGE_CLASS_NEXT_SPAWN");
                         hud.message(text, now);
                     }
@@ -251,12 +251,7 @@ pub(super) fn paint(
     devices: Res<crate::splitscreen::LocalPlayers>,
 ) {
     list.0.clear();
-    let mut ops = std::mem::take(&mut hud.ops);
-    // The new HUD's mock-up in place of CoD4's.
-    if super::next::hud_replaced() {
-        ops.clear();
-        fe.paint_next_hud(window.width(), window.height(), hud.minimap_rect(), &mut ops);
-    }
+    let ops = std::mem::take(&mut hud.ops);
     fe.emit(ops, &mut images, &mut list.0);
     if !fe.stack.is_empty() {
         super::draw_menus(&mut fe, &mut list.0, &mut images, &window);
@@ -305,8 +300,11 @@ impl Frontend {
             // A supply drop variant: its name, and an Elite's camo unless the
             // class picks one.
             let variant = custom.and_then(|_| crate::supply::inventory().equipped(base + k, &weapon));
+            let spec = format!("{weapon}:{}", attachments::names_of(set, &weapon).join("+"));
+            // The IR laser, on top of the attachments (Create a Class's row).
+            let spec = if custom.is_some() && self.stat(super::next::cac::LASER_STATS + base + k) != 0 { crate::laser::with_laser(&spec, true) } else { spec };
             Some(Gun {
-                spec: format!("{weapon}:{}", attachments::names_of(set, &weapon).join("+")),
+                spec,
                 // The red dot's reticle rides on the camo number.
                 camo: crate::reticles::with_camo(
                     variant.filter(|_| camo == 0).map_or(camo, |v| v.camo),

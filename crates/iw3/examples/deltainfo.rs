@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 for f in [0.0, 0.25, 0.5, 0.75, 1.0] {
-                    println!("delta at {f}: {:?}", x.delta_at(f));
+                    println!("delta at {f}: {:?} yaw {:.1}", x.delta_at(f), x.delta_yaw_at(f).to_degrees());
                 }
             }
         }

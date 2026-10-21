@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod body;
 pub mod feel;
+pub mod live_hands;
 
 pub struct FirstPersonPlugin;
 
@@ -16,6 +17,7 @@ impl Plugin for FirstPersonPlugin {
     fn build(&self, app: &mut App) {
         body::build(app);
         feel::build(app);
+        live_hands::build(app);
         if std::env::var_os("COD4RW_FP_PITCH").is_some() || std::env::var_os("COD4RW_FP_TURN").is_some() {
             app.add_systems(Update, test_view.before(crate::movement::MovementSet));
         }
@@ -49,6 +51,9 @@ static FULL_BODY: AtomicBool = AtomicBool::new(true);
 static WORLD_LIGHTING: AtomicBool = AtomicBool::new(true);
 static SWAY: AtomicBool = AtomicBool::new(true);
 static RICH_BOB: AtomicBool = AtomicBool::new(true);
+static LIVE_HANDS: AtomicBool = AtomicBool::new(true);
+/// The live hands' A/B test's own switch (0: none, 1: off, 2: on).
+static LIVE_HANDS_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// A switch, unless a test run overrides it (`COD4RW_FP_<NAME>=0|1`).
 fn switch(flag: &AtomicBool, name: &str) -> bool {
@@ -80,12 +85,26 @@ pub fn rich_bob() -> bool {
     switch(&RICH_BOB, "BOB")
 }
 
+/// The hands working the gun ([`live_hands`]).
+pub fn live_hands() -> bool {
+    match LIVE_HANDS_TEST.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => switch(&LIVE_HANDS, "HANDS"),
+    }
+}
+
+pub(crate) fn set_live_hands_test(on: bool) {
+    LIVE_HANDS_TEST.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+}
+
 /// From the settings ([`crate::settings_apply`]).
 pub fn apply(s: &crate::settings::Settings) {
     FULL_BODY.store(s.on("cg_fullbody"), Ordering::Relaxed);
     WORLD_LIGHTING.store(s.text("cg_vmlighting") != "classic", Ordering::Relaxed);
     SWAY.store(s.on("cg_weaponsway"), Ordering::Relaxed);
     RICH_BOB.store(s.text("cg_bobstyle") != "classic", Ordering::Relaxed);
+    LIVE_HANDS.store(s.on("cg_livehands"), Ordering::Relaxed);
 }
 
 /// Test runs: keep moving (`COD4RW_FP_MOVE=walk|sprint|crouch|course`, `+jump`

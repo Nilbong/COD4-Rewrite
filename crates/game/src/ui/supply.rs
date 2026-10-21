@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 /// The screen that opens drops, and Create a Class's variant popup.
 pub(in crate::ui) const DROPS_MENU: &str = "supply_drops";
-const VARIANTS_MENU: &str = "supply_variants";
+pub(in crate::ui) const VARIANTS_MENU: &str = "supply_variants";
 /// The screen that picks the character worn.
 const CHARACTER_MENU: &str = "supply_character";
 /// Its page of the collection, and the character under the mouse.
@@ -33,7 +33,7 @@ pub(in crate::ui) const CAN_OPEN_DVAR: &str = "ui_supply_can_open";
 /// When the last drop was opened ([`Env::millis`]), for the reveal.
 pub(in crate::ui) const OPENED_DVAR: &str = "ui_supply_opened";
 /// The class weapon stat the variant popup is for.
-const SLOT_DVAR: &str = "ui_supply_slot";
+pub(in crate::ui) const SLOT_DVAR: &str = "ui_supply_slot";
 /// The variant under the mouse in the popup ("none": standard issue).
 const HIGHLIGHT_DVAR: &str = "ui_variant_highlighted";
 /// Preview keys for the three cards and the character screen's figure (0
@@ -599,7 +599,8 @@ impl Frontend {
             self.paint_drops(pl, ops);
         } else if om.name == CHARACTER_MENU && om.menu.window.name != super::next::character::MENU {
             self.paint_characters(om, pl, ops);
-        } else if om.name == VARIANTS_MENU {
+        } else if om.name == VARIANTS_MENU && om.menu.window.name == VARIANTS_MENU {
+            // (The classic popup only: the new one draws itself.)
             self.paint_variants(om, pl, ops);
         } else if om.name.starts_with("menu_cac_") && om.menu.window.name != super::next::cac::EDITOR {
             if let Some(base) = class_base(&om.menu) {
@@ -613,15 +614,11 @@ impl Frontend {
     /// seconds since; `None`, not yet), face down until it lands, then
     /// turned over.
     pub(super) fn paint_reveal_cards(&self, pl: &Placement, ops: &mut Vec<Op>, cards: &[(DropItem, bool, Option<f32>)], since: f32) {
-        /// Bigger than the menu's, centred.
-        const SCALE: f32 = 1.15;
-        const RISE_FROM: f32 = 260.0;
         // Dealt face down, then a beat, then turned.
         let deal = crate::hq::DEAL;
         let hold = crate::hq::FACE_DOWN;
         // The stage: the world dimmed behind, darker at the edges.
         let dim = (since / 0.5).clamp(0.0, 1.0);
-        let start = ops.len();
         let mut p = Painter { fe: self, pl, ops, horz_align: 4, dy: 0.0 };
         p.fill(0.0, 0.0, 640.0, 480.0, [0.0, 0.0, 0.0, 0.5 * dim]);
         p.fill(0.0, 0.0, 640.0, 60.0, [0.0, 0.0, 0.0, 0.35 * dim]);
@@ -638,46 +635,52 @@ impl Frontend {
                 p.fill(0.0, 0.0, 640.0, 480.0, with_alpha(item.rarity().color(), strength * (1.0 - t / 0.6).powi(2)));
             }
         }
-        let back = p.ops.len();
-        p.horz_align = 2;
-        p.text(0.0, CARD_Y - 16.0, 1, 0.55, "SUPPLY DROP", [1.0, 0.85, 0.45, dim]);
-        let total = 3.0 * CARD_W + 2.0 * CARD_GAP;
+        // The cards in the new UI's look (`next::drops`' card and sealed
+        // crate), dealt up from below, turned over one by one.
+        use super::next::kit::{Kit, R, View};
+        use super::next::theme::{self as t, Type};
+        let mut k = Kit::new(self, ops, View::new(Vec2::ZERO, Vec2::new(pl.w, pl.h)));
+        const W: f32 = 440.0;
+        const H: f32 = 700.0;
+        const GAP: f32 = 36.0;
+        const TOP: f32 = 200.0;
+        let x0 = 960.0 - (3.0 * W + 2.0 * GAP) * 0.5;
+        k.alpha = dim;
+        k.text(960.0, 112.0, t::LABEL, "Headquarters", t::INK_DIM, 1);
+        k.text(960.0, 136.0, Type { size: 56.0, ..t::DISPLAY }, "SUPPLY DROP", t::INK, 1);
+        k.alpha = 1.0;
         let now = self.millis();
         let mut out = 0;
         for (i, &(item, new, age)) in cards.iter().enumerate() {
             let Some(age) = age else { continue };
-            let x = -total * 0.5 + i as f32 * (CARD_W + CARD_GAP);
-            let k = (age / deal).min(1.0);
-            p.dy = RISE_FROM * (1.0 - k).powi(3);
+            let r = R::new(x0 + i as f32 * (W + GAP), TOP, W, H);
+            let rise = (age / deal).min(1.0);
+            k.shift = Vec2::new(0.0, 580.0 * (1.0 - rise).powi(3));
             // Solid cards: nothing of the world shows through.
-            p.fill(x, CARD_Y, CARD_W, CARD_H, [0.045, 0.045, 0.05, 1.0]);
+            k.fill(r, t::hex(0x0b0d0e, 1.0));
             if age < deal + hold {
-                p.sealed(x, now, age >= deal);
+                super::next::drops::sealed(&mut k, r, now, age >= deal);
             } else {
                 let turned = age - deal - hold;
                 // Turning over: narrow to an edge and open out again.
                 let w = (turned / 0.18).clamp(0.0, 1.0);
-                let before = p.ops.len();
-                p.card(x, item, new, i, (turned * 1000.0) as i64);
+                let before = k.ops.len();
+                super::next::drops::card(&mut k, self, r, item, new, i, (turned * 1000.0) as i64);
                 if w < 1.0 {
-                    let c = p.r(x + CARD_W * 0.5, CARD_Y, 0.0, 0.0).0.x;
-                    squash(&mut p.ops[before..], c, w.max(0.05));
+                    let c = k.v.px(r.cx() + k.shift.x, r.y).x;
+                    squash(&mut k.ops[before..], c, w.max(0.05));
                 }
                 out += 1;
             }
         }
+        k.shift = Vec2::ZERO;
         // What came out, once it all has.
         if out == cards.len() && out > 0 {
             let new = cards.iter().filter(|c| c.1).count();
             let best = cards.iter().map(|c| c.0.rarity()).max_by_key(|r| *r as u8).unwrap_or(Rarity::Enlisted);
-            let line = if new > 0 { format!("{new} new for your collection  ·  best: {}", best.name()) } else { format!("All duplicates  ·  best: {}", best.name()) };
-            p.dy = 0.0;
-            p.text(0.0, CARD_Y + CARD_H + 26.0, 1, 0.34, &line, with_alpha(GREY, 0.95));
+            let line = if new > 0 { format!("{new} new for your collection  \u{b7}  best: {}", best.name()) } else { format!("All duplicates  \u{b7}  best: {}", best.name()) };
+            k.text(960.0, TOP + H + 40.0, Type { size: 24.0, ..t::BODY }, &line, t::INK_DIM, 1);
         }
-        // Bigger, in the screen's middle (the stage itself stays put).
-        let _ = start;
-        let middle = (CARD_Y + CARD_H * 0.5) / 480.0 * pl.h;
-        scale_ops(&mut ops[back..], Vec2::new(pl.w * 0.5, middle), SCALE, Vec2::new(pl.w * 0.5, pl.h * 0.5));
     }
 
     fn paint_drops(&self, pl: &Placement, ops: &mut Vec<Op>) {

@@ -25,19 +25,6 @@ pub const MAX: usize = 3;
 /// CoD4's three.
 pub const DEFAULT: [Hardpoint; 3] = [Hardpoint::Uav, Hardpoint::Airstrike, Hardpoint::Helicopter];
 
-/// A kill streak for the menu.
-#[derive(Clone, Copy, Debug)]
-pub struct StreakInfo {
-    pub hardpoint: Hardpoint,
-    /// Its id (`"sentry_gun"`, for saved strings and the UI's rows).
-    pub id: &'static str,
-    pub name: &'static str,
-    /// Its HUD picture (`ks:...`, drawable by the UI's image ops).
-    pub icon: &'static str,
-    /// Kills in a row that earn it.
-    pub kills: u32,
-}
-
 impl Hardpoint {
     pub fn id(self) -> &'static str {
         match self {
@@ -53,11 +40,6 @@ impl Hardpoint {
         let id = id.trim().to_ascii_lowercase().replace([' ', '-'], "_");
         Hardpoint::ALL.into_iter().find(|h| h.id() == id || h.id().replace('_', "") == id.replace('_', ""))
     }
-}
-
-/// Every kill streak, fewest kills first.
-pub fn available() -> Vec<StreakInfo> {
-    Hardpoint::ALL.into_iter().map(|h| StreakInfo { hardpoint: h, id: h.id(), name: h.name(), icon: h.hud_icon(), kills: h.kills() }).collect()
 }
 
 /// The profile's chosen kill streaks, fewest kills first.
@@ -81,6 +63,7 @@ pub fn set(set_stat: &mut impl FnMut(i32, i32), picks: &[Hardpoint]) {
 
 /// Take `h` off if it's chosen, else add it when there's room. Whether it's
 /// chosen now.
+#[cfg(test)]
 pub fn toggle(stat: impl Fn(i32) -> i32, set_stat: &mut impl FnMut(i32, i32), h: Hardpoint) -> bool {
     let mut now = chosen(stat);
     let on = if let Some(i) = now.iter().position(|&x| x == h) {

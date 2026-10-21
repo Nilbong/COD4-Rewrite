@@ -575,6 +575,8 @@ fn com_world(c: &GNode) -> z3::ComWorld {
         .iter()
         .map(|l| z3::PrimaryLight {
             kind: l.data[0],
+            can_shadow: l.data[1] != 0,
+            exponent: l.data[2],
             color: vec3_at(&l.data, 4),
             dir: vec3_at(&l.data, 16),
             origin: vec3_at(&l.data, 28),

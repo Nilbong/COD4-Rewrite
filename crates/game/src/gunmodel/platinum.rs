@@ -208,6 +208,7 @@ pub(super) fn material(
             ),
             look: Vec4::new(1.0, 1.0, 0.0, 1.4),
             color,
+            micro: super::micro_detail(),
         },
     }
 }

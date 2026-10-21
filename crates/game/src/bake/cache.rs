@@ -69,7 +69,35 @@ pub fn dir_for(map: &str, variant: Option<&str>) -> Option<PathBuf> {
         Some(v) => format!("v{VERSION}-{v}"),
         None => format!("v{VERSION}"),
     };
-    Some(root()?.join(map).join(name))
+    let own = root()?.join(map).join(&name);
+    // The player's own bake, else the one shipped with the game
+    // ([`shipped_root`]); new bakes are written to the player's own.
+    if own.join("light.bin").exists() {
+        return Some(own);
+    }
+    Some(shipped_root().map(|r| r.join(map).join(&name)).filter(|d| d.join("light.bin").exists()).unwrap_or(own))
+}
+
+/// Whether any map has a bake (the player's own or shipped): without one,
+/// Map Lighting's Rebaked and Live would do nothing, so Options leaves the
+/// setting out.
+pub fn any_bakes() -> bool {
+    let has = |root: Option<PathBuf>| {
+        root.and_then(|r| std::fs::read_dir(r).ok())
+            .is_some_and(|maps| maps.flatten().any(|m| m.path().join(format!("v{VERSION}")).join("light.bin").exists()))
+    };
+    has(root()) || has(shipped_root())
+}
+
+/// Bakes shipped with a release: `bake/` beside the game's exe.
+pub fn shipped_root() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.join("bake"))
+}
+
+/// Whether `dir` is a shipped bake: made on another PC, whose zone files
+/// have other dates, so only their size is checked.
+fn shipped(dir: &std::path::Path) -> bool {
+    shipped_root().is_some_and(|r| dir.starts_with(r))
 }
 
 /// What the bake was made from: the zone file's size and time, so a
@@ -78,7 +106,10 @@ pub fn source_stamp(zone: &std::path::Path) -> (u64, u64) {
     let meta = std::fs::metadata(zone).ok();
     let len = meta.as_ref().map_or(0, |m| m.len());
     let time = meta.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-    (len, time)
+    // And the map editor's layout (`super::layout`): a bake of another
+    // layout is stale. (No layout: 0, so older bakes still match.)
+    let layout = zone.file_stem().and_then(|m| m.to_str()).map_or(0, |m| super::layout::Layout::load(m).hash);
+    (len, time ^ layout)
 }
 
 fn colour_code(v: f32) -> i32 {
@@ -201,7 +232,11 @@ pub fn load_in(dir: &std::path::Path, stamp: (u64, u64)) -> Option<Baked> {
     let mut raw = Vec::new();
     flate2::read::DeflateDecoder::new(file).read_to_end(&mut raw).ok()?;
     let mut r = Reader { b: &raw, at: 0 };
-    if r.take(4)? != MAGIC || r.u32()? != VERSION || r.u64()? != stamp.0 || r.u64()? != stamp.1 {
+    if r.take(4)? != MAGIC || r.u32()? != VERSION {
+        return None;
+    }
+    let (len, time) = (r.u64()?, r.u64()?);
+    if len != stamp.0 || (time != stamp.1 && !shipped(dir)) {
         return None;
     }
     let n = r.u32()? as usize;

@@ -143,10 +143,27 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
     drop(inv);
     cac::back_button(&mut k, hot.as_deref() == Some("cac_back"));
     footer(&mut k, "", &[(Button::Confirm, "Open"), (Button::Back, "Back")]);
+    drop(k);
+    // Debug aid: `COD4RW_REVEALTEST=1` plays Headquarters' supply drop
+    // reveal over this screen (three characters, dealt and turned on HQ's
+    // timing, again every 8 s), to see its cards without HQ.
+    if std::env::var_os("COD4RW_REVEALTEST").is_some() {
+        let since = (fe.millis() as f32 / 1000.0) % 8.0;
+        let cards: Vec<_> = crate::characters::CHARACTERS
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(i, c)| {
+                let age = since - 1.6 - i as f32;
+                (crate::supply::Item::Character(c), i == 0, (age >= 0.0).then_some(age))
+            })
+            .collect();
+        fe.paint_reveal_cards(pl, ops, &cards, since);
+    }
 }
 
 /// A card face down: the crate, waiting (pulsing while it's being dealt).
-fn sealed(k: &mut Kit, r: R, now: i64, dealing: bool) {
+pub(in crate::ui) fn sealed(k: &mut Kit, r: R, now: i64, dealing: bool) {
     grid_panel(k, r, 60.0, 0.6);
     let pulse = if dealing { 0.5 + 0.5 * (now as f32 * 0.01).sin() } else { 0.0 };
     let c = Vec2::new(r.cx(), r.cy() - 30.0);
@@ -154,7 +171,7 @@ fn sealed(k: &mut Kit, r: R, now: i64, dealing: bool) {
     k.text(r.cx(), c.y + 90.0, t::LABEL, "Supply drop", t::INK_MUTE, 1);
 }
 
-fn card(k: &mut Kit, fe: &Frontend, r: R, item: DropItem, new: bool, index: usize, age: i64) {
+pub(in crate::ui) fn card(k: &mut Kit, fe: &Frontend, r: R, item: DropItem, new: bool, index: usize, age: i64) {
     let rarity = item.rarity();
     let colour = rgba(rarity.color());
     // Elite cards glow.

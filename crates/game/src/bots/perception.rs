@@ -146,7 +146,12 @@ pub fn look(
         let dir = to / dist.max(1e-3);
         let cos = dir.dot(forward);
         let mut visible = false;
-        if dist < SIGHT_RANGE && cos > FOV_COS {
+        // (Bot lab `narrowfov`: 60 degrees either side, about what a screen at
+        // cg_fov 65 shows. Tried 2026-10-20: contact to first hit 1.56 ->
+        // 1.88 s, hits 22 -> 20%, so not the default while bots are the
+        // weaker side.)
+        let fov_cos = if super::lab::on("narrowfov") { 0.5 } else { FOV_COS };
+        if dist < SIGHT_RANGE && cos > fov_cos {
             visible = [e.head(), e.chest()].iter().any(|&p| {
                 let d = p - eye;
                 let len = d.length();
@@ -169,7 +174,7 @@ pub fn look(
         if visible {
             // Seconds to notice, from a quick glance in the centre of view
             // to a slow realisation at the edge, far away.
-            let off_axis = (1.0 - cos.clamp(-1.0, 1.0)) / (1.0 - FOV_COS);
+            let off_axis = (1.0 - cos.clamp(-1.0, 1.0)) / (1.0 - fov_cos);
             let mut t = 0.12 * (1.0 + 5.0 * off_axis * off_axis) * (1.0 + dist / u(2500.0));
             t *= match e.stance {
                 Stance::Stand => 1.0,
@@ -271,8 +276,18 @@ pub fn listen(
             last_visible: f32::MIN,
             eye_height: STAND_EYE,
         });
-        if !c.visible && (c.source != Source::Seen || c.age(now) > 1.0) {
-            c.pos = e.feet + noise;
+        if super::lab::on("oldlisten") {
+            if !c.visible && (c.source != Source::Seen || c.age(now) > 1.0) {
+                c.pos = e.feet + noise;
+                c.vel = Vec3::ZERO;
+                c.time = now;
+                c.source = Source::Heard;
+            }
+        } else if !c.visible && (c.source != Source::Seen || c.age(now) > 3.0) {
+            // Blended in, not a fresh guess every tick (the old way jittered
+            // the remembered spot by 120u several times a second, and the
+            // pre-aim with it); a sighting stays for 3 s.
+            c.pos = if c.source == Source::Heard && c.age(now) < 2.0 { c.pos.lerp(e.feet + noise, 0.2) } else { e.feet + noise };
             c.vel = Vec3::ZERO;
             c.time = now;
             c.source = Source::Heard;

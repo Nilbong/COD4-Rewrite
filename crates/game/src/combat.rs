@@ -81,13 +81,6 @@ impl Team {
             Team::Axis => "OpFor",
         }
     }
-
-    pub fn color(self) -> Color {
-        match self {
-            Team::Allies => Color::srgb(0.35, 0.6, 1.0),
-            Team::Axis => Color::srgb(1.0, 0.35, 0.3),
-        }
-    }
 }
 
 #[derive(Component, Clone, Debug)]
@@ -309,9 +302,14 @@ fn apply_damage(
     mut feed: ResMut<KillFeed>,
     last_stand: Query<(Option<&crate::loadout::Loadout>, Has<crate::perks::Downed>)>,
     downed_at: Query<&crate::perks::Downed>,
+    local: Query<(), With<crate::player::LocalPlayer>>,
 ) {
     let now = time.elapsed_secs();
     for d in damage.read() {
+        // Player 1 is out of it while editing the map (`crate::map_editor`).
+        if crate::map_editor::open() && local.contains(d.target) {
+            continue;
+        }
         // Friendly fire is off, as in CoD4's default TDM rules; Hardcore's
         // `scr_team_fftype 1` hurts the teammate.
         let friendly = d

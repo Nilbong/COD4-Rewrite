@@ -223,6 +223,35 @@ pub enum Event {
     Disconnected { id: u32 },
 }
 
+/// Options > Controller's PlayStation Controller Features: off, no pad is
+/// opened over HID (Windows' own driver, through gilrs, reads them as any
+/// pad). Until the settings are known ([`set_enabled`]) none is either, so a
+/// player who turned it off never has a pad opened for a moment at startup.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KNOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The setting, from the settings (live: pads open or close next frame).
+pub fn set_enabled(on: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let was = enabled();
+    ENABLED.store(on, Relaxed);
+    if !KNOWN.swap(true, Relaxed) || was != on {
+        log::info!("playstation pads: HID {}", if on { "on" } else { "off (PlayStation pads read like any pad)" });
+    }
+}
+
+fn enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    KNOWN.load(Relaxed) && ENABLED.load(Relaxed)
+}
+
+/// How long a pad that failed (to open, or dropped soon after it did) waits
+/// before it's tried again: 5 s, doubling to a minute.
+#[cfg(windows)]
+fn backoff(failures: u32) -> Duration {
+    Duration::from_secs((5u64 << failures.saturating_sub(1).min(4)).min(60))
+}
+
 /// The HID thread: Sony pads' input comes out of [`Link::events`], rumble
 /// goes to every one of them.
 pub struct Link {
@@ -297,6 +326,7 @@ fn run(rumbles: Receiver<Rumble>, events: Sender<Event>) {
         last: Option<Input>,
         /// The motors as last sent.
         sent: (u8, u8),
+        opened: Instant,
     }
     let Ok(api) = hidapi::HidApi::new() else {
         log::warn!("playstation pads: no HID access");
@@ -309,6 +339,11 @@ fn run(rumbles: Receiver<Rumble>, events: Sender<Event>) {
     let _ = std::thread::Builder::new().name("playstation pad scan".into()).spawn(move || {
         let Ok(mut api) = hidapi::HidApi::new() else { return };
         loop {
+            // (Off: the devices aren't even listed.)
+            if !enabled() {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             let _ = api.refresh_devices();
             if found_tx.send(sony_devices(&api)).is_err() {
                 return;
@@ -317,6 +352,9 @@ fn run(rumbles: Receiver<Rumble>, events: Sender<Event>) {
         }
     });
     let mut pads: Vec<Pad> = Vec::new();
+    // Pads that failed lately: when they may be tried again, and how many
+    // times in a row they've failed.
+    let mut retry: std::collections::HashMap<std::ffi::CString, (Instant, u32)> = std::collections::HashMap::new();
     let mut next_id = 0;
     let mut playing: Vec<(f32, f32, Instant)> = Vec::new();
     let mut buf = [0u8; 128];
@@ -329,10 +367,20 @@ fn run(rumbles: Receiver<Rumble>, events: Sender<Event>) {
             }
         }
         let now = Instant::now();
-        // Pads the scan found that aren't open yet.
+        // Turned off: every pad let go (to Windows and gilrs).
+        if !enabled() {
+            for p in pads.drain(..) {
+                let _ = events.send(Event::Disconnected { id: p.id });
+            }
+            for _ in found.try_iter() {}
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        // Pads the scan found that aren't open yet (not one that failed
+        // lately: reopening it again and again is what a player hears).
         for devices in found.try_iter() {
             for (model, product, bluetooth, path, name) in devices {
-                if pads.iter().any(|p| p.path == path) {
+                if pads.iter().any(|p| p.path == path) || retry.get(&path).is_some_and(|r| now < r.0) {
                     continue;
                 }
                 match api.open_path(&path) {
@@ -341,9 +389,15 @@ fn run(rumbles: Receiver<Rumble>, events: Sender<Event>) {
                         log::info!("playstation pads: {name} ({product:04x}) over {}", if bluetooth { "Bluetooth" } else { "USB" });
                         next_id += 1;
                         let _ = events.send(Event::Connected { id: next_id, model, product, bluetooth, name });
-                        pads.push(Pad { id: next_id, dev, path, model, bluetooth, seq: 0, last: None, sent: (0, 0) });
+                        pads.push(Pad { id: next_id, dev, path, model, bluetooth, seq: 0, last: None, sent: (0, 0), opened: now });
                     }
-                    Err(e) => log::warn!("playstation pads: can't open {name}: {e}"),
+                    Err(e) => {
+                        let failures = retry.get(&path).map_or(0, |r| r.1) + 1;
+                        if failures == 1 {
+                            log::warn!("playstation pads: can't open {name}: {e} (trying again every so often)");
+                        }
+                        retry.insert(path, (now + backoff(failures), failures));
+                    }
                 }
             }
         }
@@ -372,7 +426,15 @@ fn run(rumbles: Receiver<Rumble>, events: Sender<Event>) {
                         timeout = 0;
                     }
                     Err(e) => {
-                        log::info!("playstation pads: pad {} gone ({e})", p.id);
+                        // Gone soon after it opened: it waits before it's
+                        // opened again, longer each time.
+                        let failures = if p.opened.elapsed() < Duration::from_secs(30) { retry.get(&p.path).map_or(0, |r| r.1) + 1 } else { 1 };
+                        if failures == 1 {
+                            log::info!("playstation pads: pad {} gone ({e})", p.id);
+                        } else {
+                            log::debug!("playstation pads: pad {} gone again ({e})", p.id);
+                        }
+                        retry.insert(p.path.clone(), (Instant::now() + backoff(failures), failures));
                         let _ = events.send(Event::Disconnected { id: p.id });
                         return false;
                     }

@@ -1,0 +1,15 @@
+# Cross-compiling to Android with the NDK in D:\android-sdk (see README.md).
+[build]
+target = "aarch64-linux-android"
+target-dir = "../target/android"
+
+[target.aarch64-linux-android]
+linker = "D:/android-sdk/ndk/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
+
+[env]
+ANDROID_HOME = "D:/android-sdk"
+ANDROID_NDK_ROOT = "D:/android-sdk/ndk/android-ndk-r27d"
+ANDROID_NDK_HOME = "D:/android-sdk/ndk/android-ndk-r27d"
+CC_aarch64_linux_android = "D:/android-sdk/ndk/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
+CXX_aarch64_linux_android = "D:/android-sdk/ndk/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang++.cmd"
+AR_aarch64_linux_android = "D:/android-sdk/ndk/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"

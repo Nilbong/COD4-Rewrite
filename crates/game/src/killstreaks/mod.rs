@@ -19,6 +19,7 @@ pub mod hands;
 pub mod helicopter;
 pub mod mocap;
 pub(crate) mod models;
+pub(crate) mod prewarm;
 pub mod sentry;
 mod cratetest;
 mod test;
@@ -70,6 +71,7 @@ impl Plugin for KillstreaksPlugin {
         hands::build(app);
         mocap::build(app);
         models::build(app);
+        prewarm::build(app);
         carepackage::build(app);
         sentry::build(app);
         test::register(app);
@@ -186,9 +188,6 @@ impl Held {
     }
     pub fn remove(&mut self, h: Hardpoint) {
         self.0 &= !(1 << h as u8);
-    }
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
     }
     /// Those held, worst first.
     pub fn list(self) -> Vec<Hardpoint> {
@@ -576,7 +575,7 @@ fn player_input(
 fn use_hardpoints(
     mut commands: Commands,
     time: Res<Time>,
-    mut pawns: Query<(Entity, &Pawn, &mut Killstreak, &mut HardpointInput, Has<Dead>, Has<LocalPlayer>)>,
+    mut pawns: Query<(Entity, &Pawn, &mut Killstreak, &mut HardpointInput, Has<Dead>, Has<LocalPlayer>, Has<crate::splitscreen::LocalSlot>, Has<crate::netplay::RemotePlayer>)>,
     local: Query<&Pawn, With<LocalPlayer>>,
     mut radar: ResMut<uav::Radar>,
     mut strikes: ResMut<airstrike::Airstrikes>,
@@ -592,7 +591,7 @@ fn use_hardpoints(
     let now = time.elapsed_secs();
     let me = local.single().ok().cloned();
     let me = me.as_ref();
-    for (entity, pawn, mut streak, mut input, dead, is_local) in &mut pawns {
+    for (entity, pawn, mut streak, mut input, dead, is_local, has_hands, guest) in &mut pawns {
         let wanted = std::mem::take(&mut input.use_now);
         let target = input.target.take();
         let asked = input.item.take();
@@ -674,6 +673,12 @@ fn use_hardpoints(
             }
         };
         if used {
+            // A pawn with no hands here (a bot, an online guest) has its gun
+            // out of hand for the call-in all the same; a guest's airstrike
+            // was picked on its own map, the laptop already up.
+            if !has_hands && matches!(item, Hardpoint::Uav | Hardpoint::Airstrike | Hardpoint::Helicopter) {
+                commands.entity(entity).insert(hands::CallingIn::new(item, now, guest && item == Hardpoint::Airstrike));
+            }
             streak.held.remove(item);
             awards.write(crate::ui::progression::Award { pawn: entity, kind: crate::ui::progression::AwardKind::Hardpoint });
             notices.write(StreakNotice::CalledIn { item, by: pawn.name.clone(), team: pawn.team });
@@ -690,6 +695,7 @@ fn selecting_cursor(
     fe: Option<Res<crate::ui::Frontend>>,
     owners: Query<Has<Dead>>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    window: Single<&Window, With<PrimaryWindow>>,
     mut was: Local<bool>,
 ) {
     let active = selecting.as_ref().is_some_and(|s| owners.get(s.owner).is_ok_and(|dead| !dead)) && !crate::ui::menu_open(fe.as_deref());
@@ -698,8 +704,9 @@ fn selecting_cursor(
     }
     if active && hands::laptop_open() {
         // The laptop's own cursor takes the mouse's movement
-        // (`crate::ui::laptop_screen`).
-        if cursor.grab_mode == CursorGrabMode::None {
+        // (`crate::ui::laptop_screen`): the mouse held again on coming back
+        // to the window (not while away from it).
+        if cursor.grab_mode == CursorGrabMode::None && window.focused {
             cursor.grab_mode = CursorGrabMode::Locked;
             cursor.visible = false;
         }

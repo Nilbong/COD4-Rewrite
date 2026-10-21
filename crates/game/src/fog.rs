@@ -97,7 +97,7 @@ fn read_fog(mut commands: Commands, content: Res<Content>, map: Res<crate::world
 
 /// Every view's fog is the map's (cameras come and go: splitscreen, the
 /// killcam).
-fn apply_fog(fog: Option<Res<MapFog>>, map: Option<Res<crate::world::MapName>>, mut cameras: Query<&mut DistanceFog>, mut knobs: Local<(f32, f32)>) {
+fn apply_fog(fog: Option<Res<MapFog>>, map: Option<Res<crate::world::MapName>>, mut cameras: Query<&mut DistanceFog>, mut knobs: Local<(f32, f32, f32, f32)>) {
     let Some(fog) = fog else { return };
     // (Live knobs, `crate::tune`: the showcase profile's fog reach and tone.)
     let profile = crate::atmos::climate::profile();
@@ -107,6 +107,11 @@ fn apply_fog(fog: Option<Res<MapFog>>, map: Option<Res<crate::world::MapName>>, 
     let now = (
         crate::tune::get(&format!("fog.{map}.reach"), profile.map_or(crate::atmos::climate::look().map_or(1.0, |l| l.fog_reach), |p| p.fog_reach)),
         crate::tune::get(&format!("fog.{map}.tone"), profile.map_or(crate::atmos::climate::look().map_or(1.0, |l| l.fog_tone), |p| p.fog_tone)),
+        // (The Map Look Editor's: the colour warmer or cooler, and where
+        // it starts, scaled. The editor's "Sky & fog colour" warms both:
+        // the fog follows `sky.tint` unless a look sets its own.)
+        crate::tune::get(&format!("fog.{map}.warm"), crate::tune::get(&format!("sky.tint.{map}"), 0.0)).clamp(-1.0, 1.0),
+        crate::tune::get(&format!("fog.{map}.start"), 1.0).clamp(0.0, 10.0),
     );
     let all = fog.is_changed() || *knobs != now;
     *knobs = now;
@@ -116,16 +121,17 @@ fn apply_fog(fog: Option<Res<MapFog>>, map: Option<Res<crate::world::MapName>>, 
         }
         match fog.0 {
             Some(f) => {
-                let tone = now.1;
+                let tone = now.1.clamp(0.0, 4.0);
                 let c = Color::srgb(f.color[0], f.color[1], f.color[2]).to_linear();
-                d.color = Color::linear_rgba(c.red * tone, c.green * tone, c.blue * tone, f.max_opacity);
+                let warm = Vec3::new(1.0 + 0.4 * now.2, 1.0, 1.0 - 0.4 * now.2);
+                d.color = Color::linear_rgba(c.red * tone * warm.x, c.green * tone, c.blue * tone * warm.z, f.max_opacity);
                 // (`shaders/fog.wgsl`: start, halfway; `COD4RW_FOGNOSTART` the
                 // old start-less fog, for A/B.)
                 d.falloff = if std::env::var_os("COD4RW_FOGNOSTART").is_some() {
                     FogFalloff::Exponential { density: f.density() }
                 } else {
-                    let reach = now.0;
-                    FogFalloff::Linear { start: u(f.start), end: u(f.halfway) * reach }
+                    let reach = now.0.clamp(0.05, 100.0);
+                    FogFalloff::Linear { start: u(f.start) * now.3, end: u(f.halfway) * reach }
                 };
             }
             // No fog: fully transparent.

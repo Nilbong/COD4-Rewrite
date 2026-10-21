@@ -38,6 +38,11 @@ pub(super) fn register(app: &mut App) {
             play_at.after(crate::player::InputSet).before(crate::movement::MovementSet).run_if(crate::state::in_game),
         );
     }
+    if let Ok(dir) = std::env::var("COD4RW_FXBURST") {
+        app.insert_resource(FxBurst { dir: dir.into(), ..default() })
+            .add_systems(Update, burst_drive.after(crate::player::InputSet).before(crate::movement::MovementSet).run_if(crate::state::in_game))
+            .add_systems(PostUpdate, burst_capture.after(super::run_effects).run_if(crate::state::in_game));
+    }
     if let Ok(dir) = std::env::var("COD4RW_FXTEST") {
         app.insert_resource(FxTest { dir: dir.into(), ..default() })
             .add_systems(Update, drive.after(crate::player::InputSet).before(crate::movement::MovementSet))
@@ -431,4 +436,124 @@ fn play(
         }
     }
     shots.extend(pics.iter().map(|&(after, n)| (start + after, n.to_owned())));
+}
+
+/// Debug aid: with `COD4RW_FXBURST=<dir>`, from 6 s in, fire a 10-round
+/// burst at what's ahead (`burst_mid`: the frame of the fifth shot, its
+/// light), look at the muzzle's wisp half a second after (`wisp`), then
+/// down at the floor (`floor_2s`, 2 s after: the spent cases); then the
+/// same in third person (`third_floor`, the cases seen from behind), then
+/// exit.
+#[derive(Resource, Default)]
+struct FxBurst {
+    dir: std::path::PathBuf,
+    shots: u32,
+    ended: Option<f32>,
+    taken: u8,
+    /// The third-person burst: shots, ended.
+    third: (u32, Option<f32>),
+}
+
+const BURST_START: f32 = 6.0;
+const BURST_SHOTS: u32 = 10;
+
+fn burst_drive(
+    time: Res<Time>,
+    test: Res<FxBurst>,
+    mut third: ResMut<crate::wardrobe::ThirdPerson>,
+    mut player: Query<(&Transform, &mut ViewAngles, &mut WeaponInput, &mut crate::movement::Mover), With<LocalPlayer>>,
+    mut muzzle: Local<Option<(f32, Vec3)>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let t = time.elapsed_secs();
+    let Ok((_feet, mut view, mut input, mut mover)) = player.single_mut() else { return };
+    if t < BURST_START {
+        return;
+    }
+    input.ads = false;
+    match test.ended {
+        None => {
+            view.pitch = -4f32.to_radians();
+            input.fire = test.shots < BURST_SHOTS;
+        }
+        Some(end) => {
+            input.fire = false;
+            // Strafe right and turn left after the burst (the wisps must
+            // stay where they were left), then look down at the cases.
+            // A short strafe right and a turn left after the burst: smoke
+            // left in the world where the muzzle was should then sit off to
+            // the left, not ride along in the middle of the view.
+            let (yaw0, right) = *muzzle.get_or_insert_with(|| (view.yaw, (view.rotation() * Vec3::X).with_y(0.0).normalize_or_zero()));
+            if t > end + 0.3 && t < end + 1.0 {
+                let k = ((t - end - 0.3) / 0.4).min(1.0);
+                mover.velocity = if t < end + 0.6 { right * u(100.0) } else { Vec3::ZERO } + Vec3::Y * mover.velocity.y;
+                view.yaw = yaw0 + 20f32.to_radians() * k;
+            }
+            if t > end + 1.2 {
+                view.pitch = -55f32.to_radians();
+            }
+            // Then a burst in third person, and a look at the floor.
+            if t > end + 2.5 {
+                third.0[0] = true;
+                match test.third.1 {
+                    None => {
+                        view.pitch = -4f32.to_radians();
+                        input.fire = test.third.0 < BURST_SHOTS;
+                    }
+                    Some(end2) => {
+                        view.pitch = -40f32.to_radians();
+                        if t > end2 + 3.0 {
+                            exit.write(AppExit::Success);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn burst_capture(mut commands: Commands, time: Res<Time>, mut test: ResMut<FxBurst>, mut shots: MessageReader<ShotFired>, local: Query<(), With<LocalPlayer>>) {
+    let t = time.elapsed_secs();
+    let dir = test.dir.clone();
+    let shot = |commands: &mut Commands, name: &str| {
+        std::fs::create_dir_all(&dir).ok();
+        info!("fx burst: {name} at {t:.2} s");
+        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(dir.join(format!("{name}.png"))));
+    };
+    for s in shots.read() {
+        if local.contains(s.shooter) && test.ended.is_some_and(|e| t > e + 2.5) && test.third.1.is_none() {
+            test.third.0 += 1;
+            if test.third.0 >= BURST_SHOTS {
+                test.third.1 = Some(t);
+            }
+        }
+        if local.contains(s.shooter) && test.ended.is_none() {
+            test.shots += 1;
+            if test.shots == 5 {
+                shot(&mut commands, "burst_mid");
+            }
+            if test.shots >= BURST_SHOTS {
+                test.ended = Some(t);
+            }
+        }
+    }
+    let Some(end) = test.ended else { return };
+    if test.taken == 0 && t >= end + 0.3 {
+        test.taken = 4;
+        shot(&mut commands, "wisp_0.3s");
+    }
+    if test.taken == 4 && t >= end + 1.0 {
+        test.taken = 1;
+        shot(&mut commands, "wisp_1s_moved");
+    }
+    if test.taken == 1 && t >= end + 2.2 {
+        test.taken = 2;
+        shot(&mut commands, "floor_2s");
+    }
+    if let (2, Some(end2)) = (test.taken, test.third.1)
+        && t >= end2 + 2.0
+    {
+        test.taken = 3;
+        shot(&mut commands, "third_floor");
+    }
 }

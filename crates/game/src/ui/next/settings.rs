@@ -81,7 +81,7 @@ fn group_of(menu: &str) -> usize {
 
 /// A page's rows (test features' only in builds that have them).
 fn rows_of(p: &Page) -> Vec<Setting> {
-    p.rows.iter().filter(|s| cfg!(feature = "raytracing") || s.dvar != "r_lighting").copied().collect()
+    p.rows.iter().filter(|s| (cfg!(feature = "raytracing") || s.dvar != "r_lighting") && (s.dvar != "r_lightmaps" || crate::bake::cache::any_bakes())).copied().collect()
 }
 
 /// The list's section headers (y, title) and rows (page menu or "reset",

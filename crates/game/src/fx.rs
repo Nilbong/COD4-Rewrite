@@ -25,6 +25,7 @@
 //! where they die. Spot lights (which no multiplayer effect uses) and
 //! sounds are skipped (gun and impact sounds come from [`crate::audio`]).
 
+mod showcase;
 mod test;
 
 use crate::collision::{self, SURFACE_NAMES, Surfaces};
@@ -62,7 +63,7 @@ impl Plugin for FxPlugin {
         app.add_plugins(MaterialPlugin::<FxMaterial>::default())
             .add_systems(OnEnter(crate::state::GameState::InGame), reset.in_set(crate::state::Setup::Spawn))
             .add_message::<BulletImpact>()
-            .add_systems(Update, (weapon_effects, bullet_impacts).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game))
+            .add_systems(Update, (weapon_effects, bullet_impacts, rattles).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game))
             .add_systems(
                 PostUpdate,
                 // Bolted effects follow this frame's poses; the meshes built
@@ -242,6 +243,8 @@ pub struct Effects {
     defs: Vec<Loaded>,
     names: HashMap<String, Option<FxId>>,
     materials: Vec<Handle<FxMaterial>>,
+    /// Each material is alpha blended (smoke, dust), not added (flashes).
+    blended: Vec<bool>,
     material_names: HashMap<String, Option<u16>>,
     /// Models' surfaces, and models by name.
     models: Vec<Vec<(Handle<Mesh>, Handle<StandardMaterial>)>>,
@@ -257,6 +260,8 @@ pub struct Effects {
     particles: Vec<Particle>,
     new_decals: Vec<DecalSpawn>,
     batches: HashMap<(u16, FxLayer), Batch>,
+    /// Pulled batches' meshes, one per size in quads (see [`index_mesh`]).
+    index_meshes: HashMap<usize, Handle<Mesh>>,
     lights: Vec<Entity>,
     /// Impact marks, oldest first: each one's material (its batch).
     decals: VecDeque<AssetId<StandardMaterial>>,
@@ -279,9 +284,34 @@ pub struct Effects {
     busy_parts: [std::time::Duration; 3],
     /// The frame's quads per batch, kept between frames for their room.
     quad_lists: HashMap<(u16, FxLayer), Vec<Quad>>,
+    /// The showcase's ([`showcase`]): shots' lights (where, until when, on
+    /// which layer), shooters' bursts so far (for the wisp after), and spent
+    /// cases' rattles to play.
+    shot_lights: Vec<(Vec3, f64, FxLayer)>,
+    /// First-person shots' spent cases, landing in the world: when, where,
+    /// the resting case's effect.
+    world_cases: Vec<(f64, Vec3, String)>,
+    bursts: HashMap<Entity, Burst>,
+    sounds: Vec<(&'static str, Vec3)>,
+}
+
+/// A shooter's burst: shots, the last one's time, and where the muzzle was.
+#[derive(Clone, Copy, Debug)]
+struct Burst {
+    shots: u32,
+    last: f64,
+    tag: Option<Entity>,
+    at: Vec3,
+    layer: FxLayer,
 }
 
 impl Effects {
+    /// Load the effect named `name` ahead of its first use (its sprites'
+    /// batches made), as a weapon's are (`killstreaks::prewarm`).
+    pub fn preload_effect(&mut self, name: &str) {
+        self.preloads.push((name.trim_start_matches(',').to_owned(), FxLayer::World));
+    }
+
     /// Play the effect named `name` (as CoD names it,
     /// `impacts/large_concrete_1`) now.
     pub fn play(&mut self, name: &str, anchor: Anchor, layer: FxLayer) {
@@ -289,7 +319,17 @@ impl Effects {
         if name.is_empty() {
             return;
         }
-        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false, tint: [1.0; 3] });
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false, tint: [1.0; 3], size: 1.0 });
+    }
+
+    /// The same, tinted and its sprites `size` times their own (a muzzle's
+    /// wisp of smoke, from a bigger smoke).
+    pub fn play_styled(&mut self, name: &str, anchor: Anchor, layer: FxLayer, tint: [f32; 3], size: f32) {
+        let name = name.trim_start_matches(',');
+        if name.is_empty() {
+            return;
+        }
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false, tint, size });
     }
 
     /// The same, its colours multiplied by `tint` (linear RGB): a care
@@ -299,7 +339,7 @@ impl Effects {
         if name.is_empty() {
             return;
         }
-        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false, tint });
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor, layer, at: None, forever: false, tint, size: 1.0 });
     }
 
     /// Start a map's ambient effect (its createfx placements) at `frame`,
@@ -312,7 +352,19 @@ impl Effects {
             return;
         }
         let at = self.now + delay_ms.max(-AMBIENT_PREWARM_MSEC);
-        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor: Anchor::Fixed(frame), layer: FxLayer::World, at: Some(at), forever: true, tint: [1.0; 3] });
+        crate::fire::note(name, crate::fire::FireAt::Fixed(frame.origin));
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor: Anchor::Fixed(frame), layer: FxLayer::World, at: Some(at), forever: true, tint: [1.0; 3], size: 1.0 });
+    }
+
+    /// Plays a looping effect for as long as `entity` stands (the map
+    /// editor's placed effects): it stops spawning once the entity's gone.
+    pub fn play_ambient_bolted(&mut self, name: &str, entity: Entity) {
+        let name = name.trim_start_matches(',');
+        if name.is_empty() {
+            return;
+        }
+        crate::fire::note(name, crate::fire::FireAt::Entity(entity));
+        self.queue.push(Play { effect: EffectRef::Name(name.to_owned()), anchor: Anchor::Bolted(entity), layer: FxLayer::World, at: None, forever: true, tint: [1.0; 3], size: 1.0 });
     }
 
     fn next_seed(&mut self) -> u32 {
@@ -336,14 +388,15 @@ struct Play {
     forever: bool,
     /// When it starts (ms on the effects clock); `None` for this frame.
     at: Option<f64>,
-    /// Its colours multiplied by this.
+    /// Its colours multiplied by this, its sprites' sizes by this.
     tint: [f32; 3],
+    size: f32,
 }
 
 impl Play {
     /// A particle's child effect, from now.
     fn child(name: &str, frame: Frame, layer: FxLayer) -> Play {
-        Play { effect: EffectRef::Name(name.trim_start_matches(',').to_owned()), anchor: Anchor::Fixed(frame), layer, at: None, forever: false, tint: [1.0; 3] }
+        Play { effect: EffectRef::Name(name.trim_start_matches(',').to_owned()), anchor: Anchor::Fixed(frame), layer, at: None, forever: false, tint: [1.0; 3], size: 1.0 }
     }
 }
 
@@ -379,8 +432,10 @@ struct Instance {
     live: u32,
     /// Looping for good (a map's ambient effect).
     forever: bool,
-    /// Its colours multiplied by this ([`Effects::play_tinted`]).
+    /// Its colours multiplied by this ([`Effects::play_tinted`]), its
+    /// sprites' sizes by this ([`Effects::play_styled`]).
     tint: [f32; 3],
+    size: f32,
 }
 
 struct Particle {
@@ -432,6 +487,10 @@ struct ModelState {
     entities: Vec<Entity>,
     floor: Option<f32>,
     rest: Option<(Vec3, Quat)>,
+    /// Last frame's place and time (ms), and, bouncing (the showcase's spent
+    /// cases): its velocity (m/s), spin (rad/s), turn and bounces so far.
+    prev: Option<(Vec3, f64)>,
+    bounce: Option<(Vec3, Vec3, Quat, u8)>,
 }
 
 /// A model entity of an effect.
@@ -447,12 +506,19 @@ struct DecalSpawn {
     rotation: f32,
 }
 
-/// One material's sprites on one layer: a mesh rebuilt every frame.
+/// One material's sprites on one layer: a mesh rebuilt every frame, or
+/// (see [`pulled`]) its own material reading a vertex buffer written over.
 struct Batch {
     entity: Entity,
     mesh: Handle<Mesh>,
     /// Its mesh draws nothing (and needn't be rebuilt while that lasts).
     empty: bool,
+    /// Pulled: its material, vertex buffer and how many quads both hold.
+    pulled: Option<(Handle<FxMaterial>, Handle<bevy::render::storage::ShaderBuffer>, usize)>,
+    /// Frames left to rebind its material after its buffer grew: the
+    /// material may be prepared before the new buffer is, binding the old
+    /// (too small) one, whose clamped reads drew smoke as flat slabs.
+    rebind: u8,
 }
 
 #[derive(Component)]
@@ -488,6 +554,7 @@ struct WeaponFx {
 /// Effect sprites: a texture times the vertex colour, added or alpha
 /// blended (see `shaders/fx.wgsl`).
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone)]
+#[bind_group_data(FxKey)]
 pub struct FxMaterial {
     /// x: 1 additive, 0 alpha blended; y: brightness; z: soft particle fade
     /// distance in metres (0: none).
@@ -496,9 +563,54 @@ pub struct FxMaterial {
     #[texture(1)]
     #[sampler(2)]
     texture: Handle<Image>,
+    /// A batch's sprites' vertices (`FxVertex`), read by the vertex shader
+    /// in place of its mesh's (see [`pulled`]); a stand-in elsewhere.
+    #[storage(3, read_only)]
+    verts: Handle<bevy::render::storage::ShaderBuffer>,
+    /// The vertex shader reads `verts`, not the mesh.
+    #[reflect(ignore)]
+    pull: bool,
+}
+
+/// [`FxMaterial`]'s pipeline variant: whether its vertices come from its
+/// buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FxKey {
+    pull: bool,
+}
+
+impl From<&FxMaterial> for FxKey {
+    fn from(m: &FxMaterial) -> Self {
+        FxKey { pull: m.pull }
+    }
+}
+
+/// Batches' vertices in a buffer each, written over in place every frame,
+/// drawn through a fixed mesh per size: rebuilding a mesh per batch every
+/// frame cost the render thread ~0.5 ms in the mesh allocator alone (~1 ms
+/// with the extraction; Bloc, 2026-10-14). Unfinished, so off unless
+/// `COD4RW_FXPULL=1`: additive sprites (explosions) draw the same, but
+/// large alpha-blended batches (smoke) come out wrong, flat-edged and with
+/// their nearest sprites missing; cause not found yet.
+fn pulled() -> bool {
+    static PULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PULL.get_or_init(|| std::env::var("COD4RW_FXPULL").is_ok_and(|v| v == "1"))
+}
+
+/// One sprite vertex as the vertex shader reads it: position relative to
+/// the batch (w: the quad's ball radius, `quads_mesh`), uv and corner, colour.
+#[derive(Clone, Copy)]
+struct FxVertex {
+    pos: [f32; 4],
+    uv_corner: [f32; 4],
+    color: [f32; 4],
 }
 
 impl Material for FxMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "embedded://cod4rw/fx.wgsl".into()
+    }
+
     fn fragment_shader() -> ShaderRef {
         "embedded://cod4rw/fx.wgsl".into()
     }
@@ -521,9 +633,12 @@ impl Material for FxMaterial {
         _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialPipelineKey<Self>,
+        key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         descriptor.primitive.cull_mode = None;
+        if key.bind_group_data.pull {
+            descriptor.vertex.shader_defs.push("FX_PULL".into());
+        }
         Ok(())
     }
 }
@@ -532,6 +647,7 @@ impl Material for FxMaterial {
 #[derive(SystemParam)]
 struct FxAssets<'w> {
     meshes: ResMut<'w, Assets<Mesh>>,
+    buffers: ResMut<'w, Assets<bevy::render::storage::ShaderBuffer>>,
     fx_materials: ResMut<'w, Assets<FxMaterial>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
@@ -612,6 +728,7 @@ impl Effects {
             return *m;
         }
         let made = make_material(content, a, name).map(|m| {
+            self.blended.push(m.params.x < 0.5);
             self.materials.push(a.fx_materials.add(m));
             (self.materials.len() - 1) as u16
         });
@@ -731,7 +848,8 @@ fn make_material(content: &mut Content, a: &mut FxAssets, name: &str) -> Option<
         let info = content.material(zi, id, &mut a.materials, &mut a.images)?;
         a.materials.get(&info.handle)?.base_color_texture.clone()
     })?;
-    Some(FxMaterial { params: Vec4::new(if additive { 1.0 } else { 0.0 }, FX_BRIGHTNESS, feather, 0.0), texture })
+    let verts = stand_in_verts(&mut a.buffers);
+    Some(FxMaterial { params: Vec4::new(if additive { 1.0 } else { 0.0 }, FX_BRIGHTNESS, feather, 0.0), texture, verts, pull: false })
 }
 
 // ---------------------------------------------------------------------------
@@ -740,11 +858,12 @@ fn make_material(content: &mut Content, a: &mut FxAssets, name: &str) -> Option<
 impl Effects {
     /// Start an effect: spawn its one-shot elements and set up its looping
     /// ones.
-    fn start(&mut self, id: FxId, frame: Frame, bolt: Option<Entity>, layer: FxLayer, at: f64, forever: bool, tint: [f32; 3]) {
+    #[allow(clippy::too_many_arguments)]
+    fn start(&mut self, id: FxId, frame: Frame, bolt: Option<Entity>, layer: FxLayer, at: f64, forever: bool, tint: [f32; 3], size: f32) {
         let seed = self.next_seed();
         let def = &self.defs[id.0 as usize].def;
         let looping = def.looping().map(|i| (i as u16, 0)).collect();
-        let instance = Instance { def: id, bolt, frame, layer, start: at, looping, live: 0, forever, tint };
+        let instance = Instance { def: id, bolt, frame, layer, start: at, looping, live: 0, forever, tint, size };
         let slot = match self.free.pop() {
             Some(s) => {
                 self.instances[s as usize] = Some(instance);
@@ -854,7 +973,7 @@ impl Effects {
                     Some(b) => Anchor::Bolted(b),
                     None => Anchor::Fixed(child),
                 };
-                self.queue.push(Play { effect: EffectRef::Id(id), anchor, layer, at: Some(begin), forever: false, tint: [1.0; 3] });
+                self.queue.push(Play { effect: EffectRef::Id(id), anchor, layer, at: Some(begin), forever: false, tint: [1.0; 3], size: 1.0 });
             }
             ElemType::Decal => {
                 let Vis::Decal(material) = vis else { return };
@@ -876,6 +995,17 @@ impl Effects {
             | ElemType::Model => {
                 // Its whole life over before it began (`FX_SpawnElem`).
                 if begin + life as f64 <= self.now || self.particles.len() >= MAX_PARTICLES {
+                    return;
+                }
+                // The showcase: no smoke in a first-person muzzle flash (drawn
+                // with the gun, it was a card riding along with the view);
+                // the flash and sparks stay.
+                if matches!(layer, FxLayer::ViewModel(_))
+                    && loaded.def.name.starts_with("muzzleflashes/")
+                    && matches!(vis, Vis::Sprite(m) if self.blended.get(m as usize).copied().unwrap_or(false))
+                    && showcase::on()
+                    && crate::tune::get("fx.view_flash_smoke", 0.0) < 0.5
+                {
                     return;
                 }
                 let drawable = match e.elem_type {
@@ -913,6 +1043,8 @@ impl Effects {
                     entities: Vec::new(),
                     floor: None,
                     rest: None,
+                    prev: None,
+                    bounce: None,
                 });
                 let (frame, origin, follow) = run_frame(e, &frame, &r);
                 let emit_every = e.emit_dist.at(r(key::EMIT_DIST)) + e.emit_dist_variance.at(r(key::EMIT_VARIANCE));
@@ -1332,6 +1464,7 @@ fn run_effects(
         Option<Res<crate::model_lighting::LightGridLookup>>,
         Query<(&DirectionalLight, &GlobalTransform), (Without<crate::model_lighting::ViewModelSun>, Without<FxBatch>, Without<FxLight>, Without<FxModel>)>,
     ),
+    movers: Query<(), With<crate::world::ScriptBrushPart>>,
 ) {
     let (Some(mut fx), Some(mut content)) = (fx, content) else { return };
     let started = std::time::Instant::now();
@@ -1383,7 +1516,7 @@ fn run_effects(
                     Err(_) => continue,
                 },
             };
-            fx.start(id, frame, bolt, play.layer, at, play.forever, play.tint);
+            fx.start(id, frame, bolt, play.layer, at, play.forever, play.tint, play.size);
             started = true;
         }
         if !started {
@@ -1423,7 +1556,8 @@ fn run_effects(
     let mut wanted_lights = Vec::new();
     let mut ended = Vec::new();
     let mut cloud_time = std::time::Duration::ZERO;
-    let Effects { defs, instances, particles, models: model_parts, model_count, queue, .. } = &mut *fx;
+    let showcase_on = showcase::on();
+    let Effects { defs, instances, particles, models: model_parts, model_count, queue, sounds, .. } = &mut *fx;
     let mut despawn = |p: &Particle, commands: &mut Commands| {
         if let Some(m) = &p.model {
             *model_count = model_count.saturating_sub(1);
@@ -1494,6 +1628,7 @@ fn run_effects(
         for (c, k) in look.color.iter_mut().zip(inst.tint) {
             *c *= k;
         }
+        look.size = look.size.map(|v| v * inst.size);
         let dist = pos.distance(view.pos) / INCH;
         look.color[3] *= distance_fade(e, dist);
         if e.elem_type == ElemType::OmniLight {
@@ -1513,22 +1648,75 @@ fn run_effects(
                         .cast_ray(pos, Dir3::NEG_Y, u(256.0), true, &filter)
                         .map_or(f32::NEG_INFINITY, |h| pos.y - h.distance)
                 });
+                // The showcase's cases bounce and rattle before they settle.
+                let rattle = if loaded.def.name.contains("pistol") { "shell_eject_pistol" } else { "shell_eject_rifle" };
+                let mut landed = false;
                 if let Some((at, r)) = state.rest {
                     (pos, rotation) = (at, r);
+                } else if let Some((mut vel, spin, mut turn, mut n)) = state.bounce {
+                    let (last, then) = state.prev.unwrap_or((pos, now));
+                    let dt = (((now - then) / 1000.0) as f32).clamp(0.0, 0.05);
+                    vel.y -= u(GRAVITY) * dt;
+                    pos = last + vel * dt;
+                    turn = (Quat::from_scaled_axis(spin * dt) * turn).normalize();
+                    rotation = turn;
+                    if pos.y < floor + u(0.5) {
+                        pos.y = floor + u(0.5);
+                        let (up, along) = showcase::case_restitution();
+                        let speed = -vel.y;
+                        vel.y = speed * up;
+                        vel.x *= along;
+                        vel.z *= along;
+                        n += 1;
+                        if speed > u(40.0) {
+                            sounds.push((rattle, pos));
+                        }
+                        landed = n >= showcase::case_bounces() || vel.length() < u(25.0);
+                    }
+                    state.bounce = Some((vel, spin * 0.8, turn, n));
+                    p.life = p.life.max(age + 500.0);
                 } else if pos.y < floor + u(0.5) {
-                    pos.y = floor + u(0.5);
+                    let bounces = showcase_on && showcase::case_bounces() > 0;
+                    if let (true, Some((last, then))) = (bounces, state.prev) {
+                        // Off the floor again, at the speed it came down with.
+                        let dt = (((now - then) / 1000.0) as f32).max(1e-3);
+                        let mut vel = (pos - last) / dt;
+                        pos.y = floor + u(0.5);
+                        let (up, along) = showcase::case_restitution();
+                        let speed = -vel.y.min(0.0);
+                        vel.y = speed * up;
+                        vel.x *= along;
+                        vel.z *= along;
+                        let spin = Vec3::new(rand(p.seed, 91) - 0.5, rand(p.seed, 92) - 0.5, rand(p.seed, 93) - 0.5) * 30.0;
+                        state.bounce = Some((vel, spin, rotation, 1));
+                        sounds.push((rattle, pos));
+                        p.life = p.life.max(age + 500.0);
+                    } else {
+                        pos.y = floor + u(0.5);
+                        landed = true;
+                    }
+                }
+                if landed {
                     if e.has(flags::DIE_ON_TOUCH) {
                         p.life = age;
                     }
+                    state.bounce = None;
                     state.rest = Some((pos, rotation));
-                    // A case landing: the one that lies there (`*_resting`).
+                    // A case landing: the one that lies there (`*_resting`);
+                    // the showcase's in the world, whoever's gun threw it.
                     if let Some(name) = &e.effect_on_impact {
-                        queue.push(Play::child(name, Frame::facing(pos, Vec3::Y, 0.0), inst.layer));
+                        let layer = if showcase_on { FxLayer::World } else { inst.layer };
+                        queue.push(Play::child(name, Frame::facing(pos, Vec3::Y, 0.0), layer));
                     }
                 }
+                state.prev = Some((pos, now));
             }
             let tf = Transform { translation: pos, rotation, scale: Vec3::splat(look.scale.max(0.0)) };
             if state.entities.is_empty() {
+                // The showcase's spent cases lie about a while.
+                if showcase_on && loaded.def.name.ends_with("_resting") {
+                    p.life = p.life.max(age + showcase::case_linger_ms());
+                }
                 for (mesh, material) in &model_parts[*model as usize] {
                     let e = commands
                         .spawn((
@@ -1641,15 +1829,26 @@ fn run_effects(
 
     fx.busy_parts[2] += cloud_time;
     let part = std::time::Instant::now();
-    if lit_shares() != (0.0, 0.0) {
-        light_blended(fx, &assets, &mut quads, grid.as_deref(), &suns, &spatial);
+    // The showcase's shots' lights, with the effects' own.
+    if showcase_on {
+        fx.shot_lights.retain(|l| l.1 > now);
+        if let Some((_, radius, bright)) = showcase::muzzle_light() {
+            for &(pos, _, layer) in &fx.shot_lights {
+                let dist = pos.distance(view.pos) / INCH;
+                wanted_lights.push(LightWant { pos, radius, color: Vec3::new(1.0, 0.72, 0.42) * bright, layer, dist });
+            }
+        }
+    }
+    if lit_shares() != (0.0, 0.0) || showcase_on {
+        light_blended(fx, &assets, &mut quads, grid.as_deref(), &suns, &spatial, &wanted_lights, view.pos);
     }
     fx.busy_parts[0] += part.elapsed();
     let part = std::time::Instant::now();
     draw_batches(&mut commands, fx, &mut assets, quads, &mut batches);
     fx.busy_parts[1] += part.elapsed();
     place_lights(&mut commands, fx, wanted_lights, &mut lights);
-    place_decals(&mut commands, fx, &mut content, &mut assets, &spatial);
+    let mover = |e: Entity| movers.contains(e).then(|| globals.get(e).ok().copied()).flatten();
+    place_decals(&mut commands, fx, &mut content, &mut assets, &spatial, &mover);
     fx.busy.0 += started.elapsed();
     fx.busy.1 += 1;
     // `COD4RW_PERF`: where the time went, every 300 frames.
@@ -1681,7 +1880,8 @@ impl Effects {
             return;
         }
         self.warmed = true;
-        let material = assets.fx_materials.add(FxMaterial { params: Vec4::ZERO, texture: Handle::default() });
+        let verts = stand_in_verts(&mut assets.buffers);
+        let material = assets.fx_materials.add(FxMaterial { params: Vec4::ZERO, texture: Handle::default(), verts, pull: false });
         let layers = std::iter::once(FxLayer::World).chain((0..crate::splitscreen::MAX_PLAYERS as u8).flat_map(|s| [FxLayer::ViewModel(s), FxLayer::Body(s)]));
         for layer in layers {
             commands.spawn((
@@ -1720,7 +1920,7 @@ fn lit_shares() -> (f32, f32) {
 /// Past this many quads in a batch, the batch's centre lights them all.
 const LIT_QUADS_EACH: usize = 256;
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn light_blended(
     fx: &Effects,
     assets: &FxAssets,
@@ -1728,24 +1928,85 @@ fn light_blended(
     grid: Option<&crate::model_lighting::LightGridLookup>,
     suns: &Query<(&DirectionalLight, &GlobalTransform), (Without<crate::model_lighting::ViewModelSun>, Without<FxBatch>, Without<FxLight>, Without<FxModel>)>,
     spatial: &SpatialQuery,
+    lights: &[LightWant],
+    eye: Vec3,
 ) {
     let sun = suns.iter().find(|(l, _)| l.shadow_maps_enabled).map(|(l, g)| {
         let c = l.color.to_linear();
         (Vec3::new(c.red, c.green, c.blue) * l.illuminance, -g.forward().as_vec3())
     });
     let filter = collision::sight_filter();
-    let light_at = |p: Vec3| {
-        let mut light = grid.map_or(Vec3::ZERO, |g| g.at(p));
+    // The showcase: combat effects lit too, each puff shaded across itself,
+    // and the effects' and shots' lights on the smoke.
+    let showcase_on = showcase::on();
+    let shade = if showcase_on { showcase::shading() } else { 0.0 };
+    let from_lights = if showcase_on { showcase::smoke_from_lights() } else { 0.0 };
+    // The light at `p`: what lights it from everywhere (the grid), and the
+    // sun's and nearby lights' (their light there, towards them).
+    let fire_lights = crate::fire::smoke_lights();
+    let light_parts = |p: Vec3| {
+        let mut directed: Vec<(Vec3, Vec3)> = Vec::new();
+        let ambient = grid.map_or(Vec3::ZERO, |g| g.at(p));
         if let Some((sun_light, to_sun)) = sun
             && let Ok(dir) = Dir3::new(to_sun)
             && spatial.cast_ray(p, dir, u(4000.0), true, &filter).is_none()
         {
-            // A sprite faces every way: half the sun's light, as diffuse.
-            light += sun_light * 0.5 / std::f32::consts::PI;
+            directed.push((sun_light / std::f32::consts::PI, to_sun));
         }
-        light / FX_BRIGHTNESS
+        if from_lights > 0.0 {
+            for l in lights.iter().filter(|l| l.layer == FxLayer::World || matches!(l.layer, FxLayer::ViewModel(_))) {
+                let to = l.pos - p;
+                let range = u(l.radius);
+                let d = to.length();
+                if d >= range || d < 1e-3 {
+                    continue;
+                }
+                let intensity = LIGHT_LUMENS_PER_M2 * range * range;
+                let falloff = (1.0 - d / range).powi(2);
+                let lux = intensity / (4.0 * std::f32::consts::PI * (d * d).max(0.25)) * falloff;
+                directed.push((l.color * lux / std::f32::consts::PI * from_lights, to / d));
+            }
+        }
+        // The fires' light on the smoke, in every mode (`crate::fire`;
+        // `fire.smoke`, 1): undersides glowing over a burning car.
+        for &(pos, range, light) in &fire_lights {
+            let to = pos - p;
+            let d = to.length();
+            if d >= range || d < 1e-3 {
+                continue;
+            }
+            let falloff = (1.0 - d / range).powi(2);
+            let lux = 1.0 / (4.0 * std::f32::consts::PI * (d * d).max(0.25)) * falloff;
+            directed.push((light * lux / std::f32::consts::PI, to / d));
+        }
+        (ambient, directed)
     };
-    let (ambient_share, other_share) = lit_shares();
+    // A sprite faces every way: half the directed light, as diffuse; shaded,
+    // a corner gets its own side's share (its direction off the middle,
+    // turned towards the eye).
+    let shaded = |ambient: Vec3, directed: &[(Vec3, Vec3)], n: Option<Vec3>| {
+        let mut light = ambient;
+        for (l, dir) in directed {
+            let flat = 0.5;
+            let side = n.map_or(flat, |n| (n.dot(*dir) * 0.8 + 0.2).max(0.0));
+            light += *l * (flat * (1.0 - shade) + side * shade);
+        }
+        let light = light / FX_BRIGHTNESS;
+        // (The showcase's sky light isn't in the grid: lifted, and never
+        // darker than a share of the fixed brightness.)
+        // (Grey, its brightness only: the storm sky's tint turned the smoke
+        // violet against the map's own grey smoke.)
+        if showcase_on {
+            let grey = light.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+            Vec3::splat((grey * showcase::lit_gain()).max(showcase::lit_floor()))
+        } else {
+            light
+        }
+    };
+    let (ambient_share, mut other_share) = lit_shares();
+    if showcase_on {
+        other_share = other_share.max(showcase::lit_combat());
+    }
     for (&(material, _), list) in quads.iter_mut() {
         let additive = fx.materials.get(material as usize).and_then(|h| assets.fx_materials.get(h)).is_none_or(|m| m.params.x > 0.5);
         if additive || list.is_empty() {
@@ -1756,15 +2017,32 @@ fn light_blended(
         if lit.is_empty() {
             continue;
         }
-        let shared = (lit.len() > LIT_QUADS_EACH)
-            .then(|| light_at(lit.iter().map(|q| (q.verts[0] + q.verts[2]) * 0.5).sum::<Vec3>() / lit.len() as f32));
+        // The showcase lights a whole cloud alike (each puff lit on its own,
+        // some by the sun and some not, looked like two smokes in one).
+        let shared = (lit.len() > LIT_QUADS_EACH || showcase_on).then(|| {
+            let (a, d) = light_parts(lit.iter().map(|q| (q.verts[0] + q.verts[2]) * 0.5).sum::<Vec3>() / lit.len() as f32);
+            shaded(a, &d, None)
+        });
         for q in list.iter_mut() {
             let k = share(q);
             if k <= 0.0 {
                 continue;
             }
-            let light = Vec3::ONE.lerp(shared.unwrap_or_else(|| light_at((q.verts[0] + q.verts[2]) * 0.5)), k);
-            for c in &mut q.colors {
+            let centre = (q.verts[0] + q.verts[2]) * 0.5;
+            if let Some(light) = shared {
+                let light = Vec3::ONE.lerp(light, k);
+                for c in &mut q.colors {
+                    c[0] *= light.x;
+                    c[1] *= light.y;
+                    c[2] *= light.z;
+                }
+                continue;
+            }
+            let (ambient, directed) = light_parts(centre);
+            let to_eye = (eye - centre).normalize_or_zero();
+            for (c, v) in q.colors.iter_mut().zip(q.verts) {
+                let n = (shade > 0.0).then(|| ((v - centre).normalize_or_zero() + to_eye * 0.7).normalize_or_zero());
+                let light = Vec3::ONE.lerp(shaded(ambient, &directed, n), k);
                 c[0] *= light.x;
                 c[1] *= light.y;
                 c[2] *= light.z;
@@ -1792,6 +2070,48 @@ fn draw_batches(
             continue;
         }
         batch.empty = list.is_empty();
+        if let Some((material, verts, held)) = &mut batch.pulled {
+            let order: Vec<(f32, u32)> = {
+                let mut o: Vec<(f32, u32)> = list.iter().enumerate().map(|(i, q)| (q.depth, i as u32)).collect();
+                o.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+                o
+            };
+            let center = if list.is_empty() {
+                Vec3::ZERO
+            } else {
+                list.iter().map(|q| (q.verts[0] + q.verts[2]) * 0.5).sum::<Vec3>() / list.len() as f32
+            };
+            if let Ok((mut tf, mut g)) = batches.get_mut(batch.entity) {
+                *tf = Transform::from_translation(center);
+                *g = GlobalTransform::from_translation(center);
+            }
+            // (Never smaller: a buffer made anew each time sprites come and go
+            // is the churn this avoids.)
+            let quads_now = list.len().max(16).next_power_of_two().max(*held);
+            let data = quad_vertices(list, &order, center, quads_now);
+            if let Some(mut buffer) = assets.buffers.get_mut(verts.id()) {
+                let bytes = vertex_bytes(&data);
+                // (Bevy keeps a buffer, writing it over, only while this
+                // matches the data's size: left stale, it made a new buffer
+                // every frame that the material didn't bind.)
+                buffer.buffer_description.size = bytes.len() as u64;
+                buffer.data = Some(bytes);
+            }
+            if quads_now != *held {
+                // A bigger buffer (made anew): the material binds it again
+                // (over the next frames too, see `rebind`), and the mesh
+                // drawing it is that many quads.
+                *held = quads_now;
+                batch.rebind = 3;
+                let mesh = Effects::index_mesh_in(&mut fx.index_meshes, &mut assets.meshes, quads_now);
+                commands.entity(batch.entity).insert(Mesh3d(mesh));
+            }
+            if batch.rebind > 0 {
+                batch.rebind -= 1;
+                let _ = assets.fx_materials.get_mut(material.id());
+            }
+            continue;
+        }
         let mesh = if list.is_empty() {
             empty_mesh()
         } else {
@@ -1805,7 +2125,11 @@ fn draw_batches(
             }
             quads_mesh(list, &order, center)
         };
-        let _ = assets.meshes.insert(batch.mesh.id(), mesh);
+        // (Debug aid, for timing the uploads: `COD4RW_FXNOUPLOAD=1` leaves
+        // the batches as they were.)
+        if !no_upload() {
+            let _ = assets.meshes.insert(batch.mesh.id(), mesh);
+        }
     }
     fx.quad_lists = quads;
 }
@@ -1816,13 +2140,32 @@ impl Effects {
         if self.batches.contains_key(&(material, layer)) {
             return;
         }
-        let mesh = assets.meshes.add(empty_mesh());
+        let mut mesh = assets.meshes.add(empty_mesh());
+        let mut drawn_with = self.materials[material as usize].clone();
+        let mut pull = None;
+        if pulled() {
+            let base = assets.fx_materials.get(&drawn_with).cloned();
+            if let Some(mut own) = base {
+                // (Debug aid: `COD4RW_FXPULLSIZE=<quads>` starts every batch
+                // that big, so it never grows.)
+                let quads = std::env::var("COD4RW_FXPULLSIZE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16).max(16).next_power_of_two();
+                let verts = assets.buffers.add(bevy::render::storage::ShaderBuffer::new(
+                    &vertex_bytes(&vec![FxVertex::zeroed_quad(); quads * 4]),
+                    RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+                ));
+                own.verts = verts.clone();
+                own.pull = true;
+                drawn_with = assets.fx_materials.add(own);
+                mesh = self.index_mesh(&mut assets.meshes, quads);
+                pull = Some((drawn_with.clone(), verts, quads));
+            }
+        }
         let entity = commands
             .spawn((
                 FxBatch,
                 Name::new("fx batch"),
                 Mesh3d(mesh.clone()),
-                MeshMaterial3d(self.materials[material as usize].clone()),
+                MeshMaterial3d(drawn_with),
                 Transform::default(),
                 GlobalTransform::default(),
                 Visibility::default(),
@@ -1831,7 +2174,7 @@ impl Effects {
                 layer.render_layers(),
             ))
             .id();
-        self.batches.insert((material, layer), Batch { entity, mesh, empty: true });
+        self.batches.insert((material, layer), Batch { entity, mesh, empty: true, pulled: pull, rebind: 0 });
     }
 
     /// Load an effect ahead of its first use, with batches for its
@@ -1863,6 +2206,85 @@ impl Effects {
             }
         }
     }
+}
+
+impl FxVertex {
+    fn zeroed_quad() -> FxVertex {
+        FxVertex { pos: [0.0; 4], uv_corner: [0.0; 4], color: [0.0; 4] }
+    }
+}
+
+/// A batch's sprites as `FxVertex`es, far to near (`order`), as `quads_mesh`
+/// lays them out, padded with empty quads to `quads`.
+fn quad_vertices(quads: &[Quad], order: &[(f32, u32)], center: Vec3, padded: usize) -> Vec<FxVertex> {
+    let mut out = Vec::with_capacity(padded * 4);
+    for q in order.iter().map(|&(_, k)| &quads[k as usize]) {
+        let mid = (q.verts[0] + q.verts[1] + q.verts[2] + q.verts[3]) * 0.25;
+        let (across, down) = (q.verts[3] - q.verts[0], q.verts[0] - q.verts[1]);
+        let radius = across.length().min(down.length()) * 0.5;
+        for k in 0..4 {
+            let d = q.verts[k] - mid;
+            let at = |axis: Vec3| if axis.length_squared() > 1e-12 { 2.0 * d.dot(axis) / axis.length_squared() } else { 0.0 };
+            let p = q.verts[k] - center;
+            out.push(FxVertex { pos: [p.x, p.y, p.z, radius], uv_corner: [q.uv[k].x, q.uv[k].y, at(across), at(down)], color: q.colors[k] });
+        }
+    }
+    out.resize(padded * 4, FxVertex::zeroed_quad());
+    out
+}
+
+/// The vertices as the shader's buffer holds them (12 floats each).
+fn vertex_bytes(verts: &[FxVertex]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(verts.len() * 48);
+    for v in verts {
+        for f in v.pos.iter().chain(&v.uv_corner).chain(&v.color) {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// A one-quad-sized stand-in for materials whose vertices are their mesh's.
+fn stand_in_verts(buffers: &mut Assets<bevy::render::storage::ShaderBuffer>) -> Handle<bevy::render::storage::ShaderBuffer> {
+    buffers.add(bevy::render::storage::ShaderBuffer::new(&vertex_bytes(&[FxVertex::zeroed_quad(); 4]), RenderAssetUsages::RENDER_WORLD))
+}
+
+impl Effects {
+    fn index_mesh(&mut self, meshes: &mut Assets<Mesh>, quads: usize) -> Handle<Mesh> {
+        Self::index_mesh_in(&mut self.index_meshes, meshes, quads)
+    }
+
+    /// A mesh of `quads` quads whose positions hold only each vertex's
+    /// number (the pulled vertex shader looks the rest up in the batch's
+    /// buffer); made once per size. The other attributes are there, blank,
+    /// so the material's shader sees the same inputs as a mesh batch's.
+    fn index_mesh_in(cache: &mut HashMap<usize, Handle<Mesh>>, meshes: &mut Assets<Mesh>, quads: usize) -> Handle<Mesh> {
+        cache
+            .entry(quads)
+            .or_insert_with(|| {
+                let n = quads * 4;
+                let pos: Vec<[f32; 3]> = (0..n).map(|i| [i as f32, 0.0, 0.0]).collect();
+                let mut idx = Vec::with_capacity(quads * 6);
+                for q in 0..quads as u32 {
+                    let b = q * 4;
+                    idx.extend_from_slice(&[b, b + 1, b + 2, b + 2, b + 3, b]);
+                }
+                let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; n]);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, vec![[0.0f32; 2]; n]);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, vec![[1.0f32, 0.0, 0.0, 0.0]; n]);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.0f32; 4]; n]);
+                mesh.insert_indices(Indices::U32(idx));
+                meshes.add(mesh)
+            })
+            .clone()
+    }
+}
+
+fn no_upload() -> bool {
+    static NO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO.get_or_init(|| std::env::var("COD4RW_FXNOUPLOAD").is_ok_and(|v| v == "1"))
 }
 
 /// A mesh with nothing to draw (one degenerate triangle).
@@ -1943,7 +2365,7 @@ fn place_lights(
         w.color = w.color.max(Vec3::ZERO);
     }
     wanted.sort_by(|a, b| a.dist.total_cmp(&b.dist));
-    wanted.truncate(MAX_LIGHTS);
+    wanted.truncate(showcase::max_lights(MAX_LIGHTS));
     while fx.lights.len() < wanted.len() {
         let e = commands
             .spawn((
@@ -1989,7 +2411,7 @@ fn place_lights(
 /// surfaces within their radius either way along the effect's forward, so a
 /// mark is laid flat on the nearest surface there (behind an impact; behind
 /// someone shot, a wall within reach of the exit wound), or not at all.
-fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content, assets: &mut FxAssets, spatial: &SpatialQuery) {
+fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content, assets: &mut FxAssets, spatial: &SpatialQuery, mover: &dyn Fn(Entity) -> Option<GlobalTransform>) {
     for d in std::mem::take(&mut fx.new_decals) {
         let forward = d.frame.axis.col(0).normalize_or(Vec3::Y);
         let reach = u(d.size.max(4.0));
@@ -2035,13 +2457,23 @@ fn place_decals(commands: &mut Commands, fx: &mut Effects, content: &mut Content
         let x = t * cos + b * sin;
         let rotation = Quat::from_mat3(&Mat3::from_cols(x, n.cross(x), n));
         let tf = Transform { translation: at + n * u(0.1), rotation, scale: Vec3::splat(u(d.size * 2.0)) };
+        let color = Color::srgba_u8(d.color[0], d.color[1], d.color[2], d.color[3]).to_linear().to_f32_array();
+        // On something the scripts move (a range target, a door): its own
+        // quad, carried by it (it drops with the target, not left in the air).
+        if let Some(g) = mover(hit.entity) {
+            let local = g.affine().inverse() * tf.compute_affine();
+            let one = DecalBatch { mesh: Handle::default(), quads: VecDeque::from([(local, color)]), order: 0, dirty: false };
+            let mesh = assets.meshes.add(one.build());
+            commands.spawn((Name::new("impact mark (moving)"), Mesh3d(mesh), MeshMaterial3d(material.clone()), Transform::IDENTITY, NotShadowCaster, NoFrustumCulling, ChildOf(hit.entity)));
+            continue;
+        }
         let order = fx.decal_batches.len();
         let batch = fx.decal_batches.entry(material.id()).or_insert_with(|| {
             let mesh = assets.meshes.add(Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD));
             commands.spawn((Name::new("impact marks"), Mesh3d(mesh.clone()), MeshMaterial3d(material.clone()), Transform::IDENTITY, NotShadowCaster, NoFrustumCulling));
             DecalBatch { mesh, quads: VecDeque::new(), order, dirty: false }
         });
-        batch.quads.push_back((tf.compute_affine(), Color::srgba_u8(d.color[0], d.color[1], d.color[2], d.color[3]).to_linear().to_f32_array()));
+        batch.quads.push_back((tf.compute_affine(), color));
         batch.dirty = true;
         fx.decals.push_back(material.id());
         if fx.decals.len() > MAX_DECALS {
@@ -2294,6 +2726,8 @@ fn weapon_effects(
     surfaces: Query<&Surfaces>,
     hitboxes: Query<&Hitbox>,
     teams: Query<&crate::combat::Pawn>,
+    tags: Query<&GlobalTransform>,
+    eyes: Query<(&Transform, &crate::movement::Mover, &crate::movement::ViewAngles)>,
 ) {
     let (Some(mut fx), Some(content)) = (fx, content) else {
         shots.clear();
@@ -2328,6 +2762,62 @@ fn weapon_effects(
         for (tag, name) in [("tag_flash", flash), ("tag_brass", shell)] {
             if let (Some(tag), Some(name)) = (gun.and_then(|sk| sk.joint(tag)), name) {
                 fx.play(name, Anchor::Bolted(tag), layer);
+            }
+        }
+        // The showcase: a light for the shot, and the burst counted for the
+        // wisp of smoke after it.
+        if showcase::on() {
+            let tag = gun.and_then(|sk| sk.joint("tag_flash"));
+            let at = tag.and_then(|t| tags.get(t).ok()).map_or(s.from, |g| g.translation());
+            if let Some((ms, ..)) = showcase::muzzle_light() {
+                fx.shot_lights.push((at, now + ms, layer));
+            }
+            // The muzzle in the world (a first-person gun's tag is in the
+            // view's own space): the world gun's flash, else just ahead of
+            // the eye along the view.
+            let world_at = world_gun()
+                .and_then(|sk| sk.joint("tag_flash"))
+                .and_then(|t| tags.get(t).ok())
+                .map(|g| g.translation())
+                .filter(|_| !first_person)
+                .or_else(|| {
+                    eyes.get(s.shooter).ok().map(|(tf, mover, view)| {
+                        let rot = view.rotation();
+                        mover.eye(tf.translation) + rot * Vec3::NEG_Z * u(30.0) + rot * Vec3::X * u(4.0) - Vec3::Y * u(4.0)
+                    })
+                })
+                .unwrap_or(s.from);
+            let b = fx.bursts.entry(s.shooter).or_insert(Burst { shots: 0, last: now, tag, at: world_at, layer });
+            if now - b.last > 250.0 {
+                b.shots = 0;
+            }
+            *b = Burst { shots: b.shots + 1, last: now, tag, at: world_at, layer };
+            // A small puff left in the world every few shots of a burst.
+            if let Some((least, size, grey)) = showcase::wisp()
+                && b.shots >= least
+                && b.shots % least == 0
+            {
+                let drift = Vec3::new(roll().cos(), 0.0, roll().sin()) * u(2.0);
+                fx.play_styled(showcase::WISP, Anchor::Fixed(Frame::facing(world_at + drift, Vec3::Y, roll())), FxLayer::World, [grey; 3], size);
+            }
+            // First person, the case flies about the view (its own space,
+            // not the world's): the world gets its resting case where it
+            // would land, thrown out to the right of the eye and onto the
+            // floor below.
+            if let (true, Some(view_shell), Ok((tf, mover, view))) = (first_person, wfx.view_shell.as_deref(), eyes.get(s.shooter)) {
+                if let Some(base) = view_shell.split_once("_view").map(|(b, _)| b) {
+                    let base = if base.ends_with("saw") { format!("{base}_link") } else { base.to_owned() };
+                    let r = |k: u32| rand((s.shooter.to_bits() as u32).wrapping_mul(7919) ^ (now as u32), k);
+                    let rot = view.rotation();
+                    let (right, forward) = (rot * Vec3::X, (rot * Vec3::NEG_Z).with_y(0.0).normalize_or_zero());
+                    let eject = mover.eye(tf.translation) + right * u(8.0) - Vec3::Y * u(6.0) + forward * u(10.0);
+                    let out = eject + right * u(30.0 + 25.0 * r(1)) - forward * u(12.0 * r(2)) + Vec3::Y * u(4.0);
+                    let floor = Dir3::new(Vec3::NEG_Y).ok().and_then(|d| spatial.cast_ray(out, d, u(160.0), true, &collision::sight_filter()));
+                    if let Some(hit) = floor {
+                        let at = out - Vec3::Y * hit.distance + Vec3::Y * u(0.5);
+                        fx.world_cases.push((now + 450.0 + 200.0 * r(3) as f64, at, format!("{base}_resting")));
+                    }
+                }
             }
         }
         // Splitscreen: the other players see a player's third-person gun
@@ -2407,6 +2897,30 @@ fn weapon_effects(
         }
     }
 
+    // First-person shots' cases landing in the world.
+    let due: Vec<(f64, Vec3, String)> = {
+        let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut fx.world_cases).into_iter().partition(|c| c.0 <= now);
+        fx.world_cases = later;
+        ready
+    };
+    for (_, at, name) in due {
+        fx.play(&name, Anchor::Fixed(Frame::facing(at, Vec3::Y, roll())), FxLayer::World);
+        let rattle = if name.contains("pistol") { "shell_eject_pistol" } else { "shell_eject_rifle" };
+        fx.sounds.push((rattle, at));
+    }
+
+    // The showcase: a last puff where the muzzle was once a burst is over,
+    // left in the world (never on the gun or the view).
+    if let Some((least, size, grey)) = showcase::wisp().filter(|_| showcase::on()) {
+        let over: Vec<Burst> = fx.bursts.values().filter(|b| now - b.last > 150.0).copied().collect();
+        fx.bursts.retain(|_, b| now - b.last <= 150.0);
+        for b in over.into_iter().filter(|b| b.shots >= least) {
+            fx.play_styled(showcase::WISP, Anchor::Fixed(Frame::facing(b.at, Vec3::Y, roll())), FxLayer::World, [grey; 3], size);
+        }
+    } else {
+        fx.bursts.clear();
+    }
+
     // A killing shot also comes out the other side (the exit row's fatal
     // wound), as bullets go through players.
     for k in killed.read() {
@@ -2426,6 +2940,14 @@ fn weapon_effects(
         fx.play(BLOOD_SPLAT, Anchor::Fixed(Frame::facing(exit, p.dir, roll())), FxLayer::World);
     }
     fx.fatal.retain(|p| p.until > now);
+}
+
+/// The showcase's spent cases' rattles, as they bounce.
+fn rattles(fx: Option<ResMut<Effects>>, mut sfx: ResMut<crate::audio::Sfx>) {
+    let Some(mut fx) = fx else { return };
+    for (alias, at) in fx.sounds.drain(..).take(8) {
+        sfx.play(alias, Some(at));
+    }
 }
 
 /// A random roll about an impact's normal (`CG_RandomEffectAxis`).

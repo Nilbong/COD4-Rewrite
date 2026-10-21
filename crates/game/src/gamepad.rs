@@ -418,7 +418,7 @@ struct Bindings {
 /// The game's binding for a pad button pressed in `ctx`. `lean`: aiming in
 /// Bodycam gunplay (the stick clicks lean); `view`: View/Share held (R3
 /// then switches the view).
-fn binding(ctx: Context, b: GamepadButton, lean: bool, view: bool) -> Option<Bound> {
+fn binding(ctx: Context, b: GamepadButton, _aiming_bodycam: bool, view: bool) -> Option<Bound> {
     use Bound::*;
     use GamepadButton as P;
     Some(match (ctx, b) {
@@ -439,12 +439,10 @@ fn binding(ctx: Context, b: GamepadButton, lean: bool, view: bool) -> Option<Bou
         (Context::Game, P::DPadDown) if crate::killstreaks::picker_open() => Key(crate::killstreaks::PAD_DOWN),
         // Left: equipment or the grenade launcher (PC 3).
         (Context::Game, P::DPadLeft) => Key(KeyCode::Digit3),
-        // Lean (Bodycam gunplay) while aiming, as Rainbow Six does: L3 left,
-        // R3 right. Otherwise L3 sprints (`read_pad`) and R3 knifes
-        // (`crate::melee`, CoD4's console layout), or with View held
-        // switches first and third person.
-        (Context::Game, P::LeftThumb) if lean => Key(KeyCode::KeyQ),
-        (Context::Game, P::RightThumb) if lean => Key(KeyCode::KeyE),
+        // L3 sprints (`read_pad`) and R3 knifes (`crate::melee`, CoD4's
+        // console layout), or with View held switches first and third
+        // person. (No manual lean: leaning is automatic, at walls'
+        // edges while aiming, `crate::player`.)
         (Context::Game, P::RightThumb) if view => Key(KeyCode::F5),
         (Context::Game, P::RightThumb) if tactical() => return None,
         (Context::Game, P::RightThumb) => Key(KeyCode::KeyV),
@@ -823,12 +821,12 @@ mod tests {
         assert_eq!(b(Context::Game, GamepadButton::DPadDown), Some(Bound::Key(KeyCode::KeyI)));
         assert_eq!(binding(Context::Game, GamepadButton::DPadDown, false, true), Some(Bound::Key(KeyCode::KeyB)));
         assert_eq!(b(Context::None, GamepadButton::South), None);
-        // L3 sprints and R3 knifes, unless leaning (aiming in Bodycam);
-        // with View held R3 switches the view.
+        // L3 sprints and R3 knifes (aiming too: no manual lean); with
+        // View held R3 switches the view.
         assert_eq!(b(Context::Game, GamepadButton::LeftThumb), None);
         assert_eq!(b(Context::Game, GamepadButton::RightThumb), Some(Bound::Key(KeyCode::KeyV)));
-        assert_eq!(binding(Context::Game, GamepadButton::LeftThumb, true, false), Some(Bound::Key(KeyCode::KeyQ)));
-        assert_eq!(binding(Context::Game, GamepadButton::RightThumb, true, false), Some(Bound::Key(KeyCode::KeyE)));
+        assert_eq!(binding(Context::Game, GamepadButton::LeftThumb, true, false), None);
+        assert_eq!(binding(Context::Game, GamepadButton::RightThumb, true, false), Some(Bound::Key(KeyCode::KeyV)));
         assert_eq!(binding(Context::Game, GamepadButton::RightThumb, false, true), Some(Bound::Key(KeyCode::F5)));
     }
 }

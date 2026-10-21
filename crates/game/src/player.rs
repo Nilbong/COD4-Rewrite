@@ -28,7 +28,7 @@ impl Plugin for PlayerPlugin {
             .add_systems(
                 Update,
                 (
-                    grab_cursor.run_if(crate::ui::no_ingame_menu),
+                    grab_cursor.run_if(crate::ui::no_ingame_menu).run_if(crate::look_editor::closed),
                     (mouse_look, keyboard_input).in_set(InputSet).before(crate::movement::MovementSet),
                 )
                     .run_if(crate::state::in_game),
@@ -37,6 +37,9 @@ impl Plugin for PlayerPlugin {
                 PostUpdate,
                 (place_views, follow_camera).chain().before(TransformSystems::Propagate).run_if(crate::state::in_game),
             );
+        if std::env::var_os("COD4RW_LEANTEST").is_some() {
+            app.add_systems(PreUpdate, lean_test.after(bevy::input::InputSystems).run_if(crate::state::in_game));
+        }
     }
 }
 
@@ -86,8 +89,16 @@ const EXPOSURE_RANGE_EV: f32 = 3.0;
 /// under it (a thin shell lets the ground "see" past it): cars standing in
 /// shade, which CoD4 never baked into the lightmaps, sit on the ground.
 pub fn ssao() -> bevy::pbr::ScreenSpaceAmbientOcclusion {
-    // (`ssao.thickness` in tuning.txt, read as the camera spawns.)
-    bevy::pbr::ScreenSpaceAmbientOcclusion { constant_object_thickness: crate::tune::get("ssao.thickness", 3.0), ..default() }
+    // (`ssao.thickness` and `ssao.quality` in tuning.txt, read as the camera
+    // spawns: quality 0 low, 1 medium, 2 high (Bevy's default), 3 ultra.)
+    use bevy::pbr::ScreenSpaceAmbientOcclusionQualityLevel as Q;
+    let quality_level = match crate::tune::get("ssao.quality", 2.0).round() as i32 {
+        0 => Q::Low,
+        1 => Q::Medium,
+        3 => Q::Ultra,
+        _ => Q::High,
+    };
+    bevy::pbr::ScreenSpaceAmbientOcclusion { constant_object_thickness: crate::tune::get("ssao.thickness", 3.0), quality_level, ..default() }
 }
 
 /// Sky luminance in cd/m^2 for a fully white sky texel, tuned to sit
@@ -102,9 +113,24 @@ pub fn spawn_camera(
     sky: Option<Res<crate::world::MapSky>>,
 ) {
     commands.init_resource::<StanceToggle>();
-    let flat = LinearSpline::new([Vec2::new(-16.0, EXPOSURE_TARGET_EV), Vec2::new(16.0, EXPOSURE_TARGET_EV)]);
-    let compensation_curve =
-        curves.add(AutoExposureCompensationCurve::from_curve(flat).expect("flat exposure compensation curve"));
+    // Sloped (knob `exp.slope`, 1; 0 flat at the target): dark views are
+    // let stay darker than mid grey, so a dim room with a sunlit patch
+    // reads as dim (a flat curve pushed every room to the same grey).
+    let k = crate::tune::get("exp.slope", 1.0);
+    let curve = LinearSpline::new([
+        // (Not past dim rooms: by night, below -6, back to half a stop
+        // under, so a moonlit street reads (Wet Work's night went black).)
+        Vec2::new(-16.0, EXPOSURE_TARGET_EV - 0.5 * k),
+        Vec2::new(-9.0, EXPOSURE_TARGET_EV - 0.5 * k),
+        Vec2::new(-6.0, EXPOSURE_TARGET_EV - 1.5 * k),
+        Vec2::new(-4.5, EXPOSURE_TARGET_EV - 1.5 * k),
+        Vec2::new(-2.5, EXPOSURE_TARGET_EV),
+        // (Bright views held at the target: brightening them burnt out
+        // Crossfire's sunlit streets with the whole sun live.)
+        Vec2::new(4.0, EXPOSURE_TARGET_EV),
+        Vec2::new(16.0, EXPOSURE_TARGET_EV),
+    ]);
+    let compensation_curve = curves.add(AutoExposureCompensationCurve::from_curve(curve).expect("exposure compensation curve"));
     let count = crate::splitscreen::count();
     for slot in 0..count {
         spawn_view(&mut commands, slot, count, compensation_curve.clone(), sky.as_deref());
@@ -204,12 +230,14 @@ fn spawn_view(commands: &mut Commands, slot: usize, count: usize, compensation_c
             // thread over a millisecond a frame).
             bevy::light::cluster::ClusterConfig::Single,
             AutoExposure {
-                range: -EXPOSURE_RANGE_EV..=EXPOSURE_RANGE_EV,
+                // (Knobs `exp.min`, `exp.max`: a wider range lets dark rooms
+                // and sunlit streets each keep their own level.)
+                range: crate::tune::get("exp.min", -4.5)..=crate::tune::get("exp.max", EXPOSURE_RANGE_EV),
                 // The brightest 15% left out: snow and overcast skies set it
                 // otherwise, leaving shade black (Bloc); leaving out more
                 // lifted the whole frame and flattened Crash's depth
                 // against CoD4's.
-                filter: 0.05..=0.85,
+                filter: 0.05..=crate::tune::get("exp.filter_hi", 0.85),
                 compensation_curve,
                 ..default()
             },
@@ -266,10 +294,65 @@ fn grab_cursor(
     }
 }
 
+/// Auto lean: how far to lean (-1 left .. 1 right, 0 none) for an eye
+/// looking along `yaw`, given the last frame's. A wall's edge ahead to one
+/// side (short rays ahead from across the eye meet it on that side and not
+/// the other): lean out the open side only as far as puts the eye (and the
+/// gun's barrel with it, aimed) just past the edge, a small margin clear,
+/// no further; none if it's clear already. At most CoD4's lean; the
+/// lean's own collision keeps it out of walls. Kept a little longer once
+/// leaning, so it doesn't flicker.
+fn auto_lean(spatial: &avian3d::prelude::SpatialQuery, eye: Vec3, yaw: f32, last: f32) -> f32 {
+    let filter = crate::collision::movement_filter();
+    let forward = Quat::from_rotation_y(yaw) * Vec3::NEG_Z;
+    let right = Quat::from_rotation_y(yaw) * Vec3::X;
+    let knob = |n: &str, d: f32| crate::tune::get(&format!("autolean.{n}"), d);
+    // (High sensitivity: from a little further off.)
+    let high = crate::settings_apply::auto_lean_high();
+    let keep = if last != 0.0 { 1.3 } else { 1.0 };
+    let reach = u(if high { knob("reach_high", 32.0) } else { knob("reach", 22.0) }) * keep;
+    let blocked = |side: f32| Dir3::new(forward).ok().is_some_and(|d| spatial.cast_ray(eye + right * side, d, reach, true, &filter).is_some());
+    let shoulder = u(knob("shoulder", 10.0));
+    // Which side the wall is: blocked from that shoulder, open from the other.
+    let wall = match (blocked(-shoulder), blocked(shoulder)) {
+        (true, false) => -1.0,
+        (false, true) => 1.0,
+        _ => return 0.0,
+    };
+    // Where its edge is: across from the open side, the first blocked ray
+    // (signed, towards the wall).
+    let reach_out = crate::movement::LEAN_DISTANCE;
+    let step = u(1.0);
+    let mut edge = None;
+    // (From the open shoulder, which the test above found clear.)
+    let mut o = -shoulder;
+    while o <= shoulder {
+        if blocked(o * wall) {
+            edge = Some(o);
+            break;
+        }
+        o += step;
+    }
+    let Some(edge) = edge else { return 0.0 };
+    // The eye a margin clear of it, towards the open side.
+    let margin = u(knob("margin", 3.0));
+    let need = (margin - edge).max(0.0);
+    // (A small lean isn't worth it: the deadband.)
+    if need <= u(if high { knob("deadband_high", 2.0) } else { knob("deadband", 5.0) }) {
+        return 0.0;
+    }
+    (-wall * (need / reach_out)).clamp(-1.0, 1.0) * knob("amount", 1.0)
+}
+
+/// Test aid ([`crate::first_person::live_hands`]' A/B): the step smoothing
+/// off.
+pub static ZSMOOTH_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Vertical field of view in degrees for the weapon's current ADS fraction.
 pub fn view_fov(gunplay: Gunplay, weapon: &WeaponState) -> f32 {
     let (hip, ads) = gunplay.fovs(weapon.def);
-    hip + (ads - hip) * weapon.ads
+    // The laser aim zooms a little ([`crate::laser`]).
+    hip + (ads - hip) * weapon.ads.max(weapon.laser_aim * crate::laser::zoom_share())
 }
 
 /// Radians of view rotation per mouse count. Sensitivity scales with zoom
@@ -304,9 +387,18 @@ fn mouse_look(
 fn keyboard_input(
     gunplay: Res<Gunplay>,
     mut toggles: ResMut<StanceToggle>,
-    mut players: Query<(&LocalSlot, &PlayerInput, &mut MoveInput, &mut WeaponInput, &WeaponState, &Mover)>,
+    spatial: avian3d::prelude::SpatialQuery,
+    mut auto_leaning: Local<[f32; crate::splitscreen::MAX_PLAYERS]>,
+    // (Since when each player's lean has been wanted: it waits a moment.)
+    mut lean_wanted_since: Local<[Option<f32>; crate::splitscreen::MAX_PLAYERS]>,
+    time: Res<Time>,
+    mut players: Query<(&LocalSlot, &PlayerInput, &mut MoveInput, &mut WeaponInput, &WeaponState, &Mover, &Transform, &ViewAngles)>,
+    net: Option<Res<crate::netplay::NetStart>>,
 ) {
-    for (slot, input, mut mv, mut wi, weapon, mover) in &mut players {
+    // (Not online yet: a lean isn't in the inputs or the snapshots, so host
+    // and guest would put the eye, and the shots, in different places.)
+    let online = net.is_some();
+    for (slot, input, mut mv, mut wi, weapon, mover, tf, view) in &mut players {
         let toggle = &mut toggles.0[slot.0.min(crate::splitscreen::MAX_PLAYERS - 1)];
         if !input.live {
             *mv = MoveInput { stance: mv.stance, ..default() };
@@ -344,9 +436,27 @@ fn keyboard_input(
             sprint,
             stance: *toggle,
             speed_scale: weapon.speed_scale(),
-            // Q/E lean in Bodycam gunplay.
-            lean: if gunplay.is_bodycam() { axis(KeyCode::KeyE, KeyCode::KeyQ) } else { 0.0 },
+            // (No manual lean: it's automatic, below.)
+            lean: 0.0,
         };
+        // Aiming beside a wall's edge: leaning out past it on its own.
+        let auto = &mut auto_leaning[slot.0.min(crate::splitscreen::MAX_PLAYERS - 1)];
+        let aiming = mouse.pressed(MouseButton::Right) && !mover.sprinting && mover.stance != Stance::Prone;
+        let want = if aiming && mv.lean == 0.0 && !online && crate::settings_apply::auto_lean() {
+            auto_lean(&spatial, mover.eye(tf.translation), view.yaw, *auto)
+        } else {
+            0.0
+        };
+        // Leaning starts only once it's been wanted a moment (aiming past
+        // the edge, not sweeping by it); it stops at once.
+        let since = &mut lean_wanted_since[slot.0.min(crate::splitscreen::MAX_PLAYERS - 1)];
+        let now = time.elapsed_secs();
+        *since = if want == 0.0 { None } else { Some(since.unwrap_or(now)) };
+        let hold = crate::tune::get(if crate::settings_apply::auto_lean_high() { "autolean.hold_high" } else { "autolean.hold" }, if crate::settings_apply::auto_lean_high() { 0.15 } else { 0.35 });
+        *auto = if *auto != 0.0 || since.is_some_and(|s| now - s >= hold) { want } else { 0.0 };
+        if mv.lean == 0.0 {
+            mv.lean = *auto;
+        }
         *wi = WeaponInput {
             fire: mouse.pressed(MouseButton::Left),
             ads: mouse.pressed(MouseButton::Right),
@@ -390,7 +500,9 @@ pub fn follow_camera(
     mut vm_cameras: Query<(&crate::splitscreen::SlotViewModelCamera, &mut Projection), (Without<crate::splitscreen::SlotCamera>, Without<LocalSlot>)>,
     gunplay: Res<Gunplay>,
     time: Res<Time>,
+    mut step_smooth: Local<[(Option<f32>, f32); crate::splitscreen::MAX_PLAYERS]>,
 ) {
+    let time_delta = time.delta_secs();
     for ((slot, me, input), tf, mover, view, weapon, dead_state, picking_class, feel) in &players {
         let Some((_, mut cam_tf, mut proj)) = cameras.iter_mut().find(|c| c.0.0 == slot.0) else { continue };
         // Out until the next round: watch a teammate (fire for the next), as
@@ -428,6 +540,45 @@ pub fn follow_camera(
         // Waiting to spawn with a class: a level view from the spawn.
         let dead = dead_state.is_some() && !picking_class;
         let mut eye = if dead { tf.translation + Vec3::Y * u(8.0) } else { mover.eye(tf.translation) };
+        // A step up or down: the eye eases over it (`cam.zsmooth_time`, 0
+        // for none).
+        {
+            let i = slot.0.min(crate::splitscreen::MAX_PLAYERS - 1);
+            let (last, offset) = &mut step_smooth[i];
+            let change = last.map_or(0.0, |l| mover.steps_total - l);
+            *last = Some(mover.steps_total);
+            let time = if ZSMOOTH_OFF.load(std::sync::atomic::Ordering::Relaxed) { 0.0 } else { crate::tune::get("cam.zsmooth_time", 0.1) };
+            if dead || time <= 0.0 {
+                *offset = 0.0;
+            } else {
+                if change.abs() >= u(1.0) && change.abs() <= u(16.0) {
+                    *offset -= change;
+                }
+                *offset = offset.clamp(-u(16.0), u(16.0));
+                let ease = (offset.abs() / time.max(0.01)).max(u(40.0)) * time_delta;
+                *offset = if *offset > 0.0 { (*offset - ease).max(0.0) } else { (*offset + ease).min(0.0) };
+                eye.y += *offset;
+                if std::env::var_os("COD4RW_STEPLOG").is_some() && (change != 0.0 || offset.abs() > 0.0 || !mover.on_ground) {
+                    info!(
+                        "steplog: feet {:.1} eye {:.1} change {:.1} offset {:.1} ground {} vy {:.0}",
+                        tf.translation.y / u(1.0),
+                        eye.y / u(1.0),
+                        change / u(1.0),
+                        *offset / u(1.0),
+                        mover.on_ground,
+                        mover.velocity.y / u(1.0)
+                    );
+                }
+            }
+        }
+        // Leaning (CoD4's `AddLeanToPosition`): the eye out to the side and
+        // the view rolled with it (Bodycam gunplay leans its own way).
+        let lean_roll = if dead || gunplay.is_bodycam() {
+            0.0
+        } else {
+            eye += mover.lean_offset(view.yaw);
+            -mover.lean * crate::tune::get("lean.roll", 10.0).to_radians()
+        };
         // View angle bob while aiming down sights (`BG_CalculateViewAngles`),
         // in CoD degrees: pitch down, yaw left.
         let (mut bob_pitch, mut bob_yaw) = (0.0, 0.0);
@@ -449,18 +600,158 @@ pub fn follow_camera(
         // The richer bob's dips and roll ([`crate::first_person::feel`]).
         let (feel_up, feel_pitch, feel_roll) = feel.filter(|_| !dead).map_or((0.0, 0.0, 0.0), |f| (f.cam_up, f.cam_pitch, f.cam_roll));
         cam_tf.translation = eye + Vec3::Y * feel_up;
-        let roll = if dead { 0.6 } else { feel_roll };
+        let roll = if dead { 0.6 } else { feel_roll + lean_roll };
         cam_tf.rotation =
             Quat::from_euler(EulerRot::YXZ, view.yaw + bob_yaw.to_radians(), view.pitch - bob_pitch.to_radians() + feel_pitch, roll);
         if let Projection::Perspective(p) = proj.as_mut() {
-            let target = view_fov(*gunplay, weapon).to_radians();
+            // A heavy shot kicks the view in for a moment ([`crate::first_person::feel`]).
+            let punch = feel.filter(|_| !dead).map_or(0.0, |f| f.fov_punch).to_radians();
+            let target = view_fov(*gunplay, weapon).to_radians() + punch;
             p.fov += (target - p.fov) * (1.0 - (-20.0 * time.delta_secs()).exp());
-            let fov = p.fov;
+            // The gun drawn at the weapon's own ADS zoom when aimed (CoD4
+            // draws it at `fAdsZoomFov`: its aimed pose is made for it), not a
+            // wider aimed view's (ADS Field of View "Affected", a high field
+            // of view), which shrank it and set the sights back from the eye.
+            // A 3D scope's lens is fitted to the world's own view.
+            // (A 3D or lens scope: the world's, which the lens is fitted to.)
+            let three_d = (crate::ui::scope_3d() && crate::ui::scope_magnifies(weapon.def)) || (weapon.def.ads_overlay.is_some() && crate::ui::lens_scopes());
+            let fov = if gunplay.is_bodycam() || three_d || weapon.def.ads_fov <= 0.0 {
+                p.fov
+            } else {
+                let hip = gunplay.fovs(weapon.def).0;
+                let aimed = hip + (weapon.def.ads_fov - hip) * weapon.ads.clamp(0.0, 1.0);
+                // (Easing from the world's at the hip, as the world's eases.)
+                p.fov - punch + (aimed.to_radians() - view_fov(*gunplay, weapon).to_radians())
+            };
             if let Some((_, mut vp)) = vm_cameras.iter_mut().find(|c| c.0.0 == slot.0) {
                 if let Projection::Perspective(vp) = vp.as_mut() {
                     vp.fov = fov;
                 }
             }
+
         }
+    }
+}
+
+/// Test aid: `COD4RW_LEANTEST=<dir>`. At 5 s the player is put beside a
+/// wall's edge found near its spawn (where [`auto_lean`] would lean),
+/// looking past it; aims (`auto_lean.png` at 7 s), lets go (`upright.png`
+/// at 8.5 s); then at a field of view of 90 aims with ADS Field of View
+/// Affected (`ads_affected.png`) and Independent (`ads_independent.png`),
+/// and at the hip (`hip_90.png`); then exits.
+pub(crate) fn lean_test(
+    mut commands: Commands,
+    time: Res<Time>,
+    spatial: avian3d::prelude::SpatialQuery,
+    mut mouse: ResMut<ButtonInput<MouseButton>>,
+    mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    mut player: Query<(&mut Transform, &mut ViewAngles, &Mover), With<LocalPlayer>>,
+    names: Query<(Option<&Name>, Option<&crate::combat::Hitbox>, Option<&ChildOf>)>,
+    mut step: Local<usize>,
+    mut start: Local<Option<f32>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Ok(dir) = std::env::var("COD4RW_LEANTEST") else { return };
+    let Ok((mut tf, mut view, mover)) = player.single_mut() else { return };
+    let t = time.elapsed_secs() - *start.get_or_insert(time.elapsed_secs());
+    if cursor.grab_mode == CursorGrabMode::None {
+        cursor.grab_mode = CursorGrabMode::Locked;
+    }
+    let aim = (5.5..7.5).contains(&t) || (9.0..13.0).contains(&t);
+    if aim { mouse.press(MouseButton::Right) } else { mouse.release(MouseButton::Right) }
+    let shot = |commands: &mut Commands, name: &str| {
+        let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+        info!("lean test: {}", path.display());
+        commands.spawn(bevy::render::view::screenshot::Screenshot::primary_window()).observe(bevy::render::view::screenshot::save_to_disk(path));
+    };
+    const STEPS: [(f32, &str); 8] = [(5.0, "place"), (7.0, "auto_lean"), (8.5, "upright"), (9.0, "fov90"), (10.5, "ads_affected"), (11.0, "independent"), (12.5, "ads_independent"), (13.6, "hip_90")];
+    let Some(&(at, name)) = STEPS.get(*step) else {
+        if t > 14.5 {
+            crate::settings_apply::SCRIPT_FOV.store(0, std::sync::atomic::Ordering::Relaxed);
+            exit.write(AppExit::Success);
+        }
+        return;
+    };
+    if t < at {
+        return;
+    }
+    *step += 1;
+    match name {
+        "place" if std::env::var("COD4RW_SHOTTRACE").is_ok() || std::env::var("COD4RW_LEANTEST_SPOT").is_ok() => {
+            let nums = |k: &str| std::env::var(k).ok().map(|v| v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect::<Vec<f32>>());
+            // `COD4RW_SHOTTRACE=x,y,z,yaw,pitch` (CoD units and degrees, the
+            // eye): everything a bullet from there meets.
+            if let Some(v) = nums("COD4RW_SHOTTRACE").filter(|v| v.len() == 5) {
+                let eye = crate::units::pos([v[0], v[1], v[2]]);
+                let dir = ViewAngles { yaw: crate::units::yaw_from_cod_degrees(v[3]), pitch: -v[4].to_radians() }.rotation() * Vec3::NEG_Z;
+                if let Ok(d) = Dir3::new(dir) {
+                    let mut hits = spatial.ray_hits(eye, d, u(3000.0), 12, true, &crate::collision::bullet_filter());
+                    hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+                    for h in hits {
+                        let (name, hitbox, parent) = names.get(h.entity).unwrap_or((None, None, None));
+                        let parent_name = parent.and_then(|p| names.get(p.parent()).ok()).and_then(|n| n.0.map(|n| n.to_string()));
+                        info!(
+                            "shot trace: {:.0} units: {:?} {:?} (parent {:?}){} at CoD {:?}",
+                            h.distance / u(1.0),
+                            h.entity,
+                            name.map(|n| n.to_string()),
+                            parent_name,
+                            if hitbox.is_some() { " a hitbox" } else { "" },
+                            crate::units::to_cod(eye + dir * h.distance).map(f32::round)
+                        );
+                    }
+                }
+            }
+            // `COD4RW_LEANTEST_SPOT=x,y,z,yaw` (CoD): the lean tried there.
+            if let Some(v) = nums("COD4RW_LEANTEST_SPOT").filter(|v| v.len() == 4) {
+                tf.translation = crate::units::pos([v[0], v[1], v[2]]) + Vec3::Y * u(1.0);
+                view.yaw = crate::units::yaw_from_cod_degrees(v[3]);
+                view.pitch = 0.0;
+            }
+        }
+        "place" => {
+            // The nearest spot (on the floor, a grid round the spawn) and
+            // facing where it would lean.
+            let feet = tf.translation;
+            let down = Dir3::new(Vec3::NEG_Y).unwrap();
+            let height = mover.eye(feet) - feet;
+            let mut best: Option<(f32, Vec3, f32)> = None;
+            for i in -20i32..=20 {
+                for j in -20i32..=20 {
+                    let at = feet + Vec3::new(i as f32, 0.0, j as f32) * u(24.0);
+                    let Some(hit) = spatial.cast_ray(at + Vec3::Y * u(40.0), down, u(120.0), true, &crate::collision::movement_filter()) else { continue };
+                    let floor = at + Vec3::Y * (u(40.0) - hit.distance);
+                    for k in 0..24 {
+                        let yaw = k as f32 * std::f32::consts::TAU / 24.0;
+                        if auto_lean(&spatial, floor + height, yaw, 0.0) != 0.0 {
+                            let d = floor.distance(feet);
+                            if best.is_none_or(|b| d < b.0) {
+                                best = Some((d, floor, yaw));
+                            }
+                        }
+                    }
+                }
+            }
+            match best {
+                Some((_, floor, yaw)) => {
+                    tf.translation = floor + Vec3::Y * u(1.0);
+                    view.yaw = yaw;
+                    view.pitch = 0.0;
+                    info!("lean test: a wall's edge at CoD {:?}, yaw {:.0}", crate::units::to_cod(floor).map(f32::round), yaw.to_degrees());
+                }
+                None => warn!("lean test: no wall's edge near the spawn"),
+            }
+        }
+        "fov90" => {
+            crate::settings_apply::SCRIPT_FOV.store(90f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            crate::settings_apply::set_ads_affected(true);
+            view.yaw += std::f32::consts::PI;
+        }
+        "independent" => crate::settings_apply::set_ads_affected(false),
+        "auto_lean" => {
+            info!("lean test: leaning {:.2}", mover.lean);
+            shot(&mut commands, name);
+        }
+        other => shot(&mut commands, other),
     }
 }

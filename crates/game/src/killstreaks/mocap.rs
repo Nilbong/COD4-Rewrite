@@ -51,6 +51,7 @@ fn load(json: &str) -> Option<Arc<XAnim>> {
         bones,
         notifies: Vec::new(),
         delta_trans: TransTrack::None,
+        delta_yaw: Vec::new(),
     }))
 }
 

@@ -30,6 +30,22 @@ struct WorldParams {
     traced: vec4<f32>,
     // Detail map: tiling, 1 if on, its last mip.
     detail: vec4<f32>,
+    probe_center: vec4<f32>,
+    probe_box_min: vec4<f32>,
+    probe_box_max: vec4<f32>,
+    // The surfaces' primary light (`COD4RW_WORLDLIGHTS`): position and
+    // 1 / radius, colour (w 1 on), direction and spot exponent, spot scale,
+    // bias, 1 for a spot, 1 with baked visibility.
+    plight_pos: vec4<f32>,
+    plight_color: vec4<f32>,
+    plight_dir: vec4<f32>,
+    plight_spot: vec4<f32>,
+    // The material-class layer (`material_class.wgsl`): class, on, detail
+    // strength, anti-tiling amount.
+    surface: vec4<f32>,
+    // Probe normalisation (`crate::world::probe_norm`): x strength, y 1 on,
+    // z the calibration k, w the most it may brighten.
+    probe_norm: vec4<f32>,
 }
 
 #ifdef BINDLESS
@@ -53,6 +69,8 @@ struct WorldIndices {
     ssr_sampler: u32,
     height_map: u32,
     height_sampler: u32,
+    primary_map: u32,
+    primary_sampler: u32,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(120) var<storage> world_indices: array<WorldIndices>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(121) var<storage> world_params: array<WorldParams>;

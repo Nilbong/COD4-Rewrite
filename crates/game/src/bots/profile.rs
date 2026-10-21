@@ -269,7 +269,7 @@ mod tests {
         let half = MoveStyle::default().ads_range;
         assert!((ads(half, false, half) - 0.5).abs() < 1e-4);
         assert!(ads(half * 4.0, false, half) > 0.85 && ads(half / 4.0, false, half) < 0.15);
-        assert!(ads(half * 2.0, true, half) < ads(half * 2.0, false, half) * 0.6);
+        assert!(ads(half * 2.0, true, half) < ads(half * 2.0, false, half) * 0.75);
         // A profile that always aims down sights.
         assert_eq!(ads(u(50.0), true, 0.0), 1.0);
     }

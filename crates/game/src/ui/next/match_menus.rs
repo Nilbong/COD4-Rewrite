@@ -206,11 +206,14 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
     k.grad_v(R::new(b.x, b.bottom() - 220.0, b.w, 220.0), t::hex(0x050607, 1.0), 0.0, 0.8);
 
     let hq = key == super::super::hq::PAUSE_MENU;
-    let game_type = kept(fe, om, "m_gametype").unwrap_or_default();
+    // (A mission's pause: the mission in place of the game type.)
+    let mission = crate::campaign::active().then(|| crate::campaign::title().unwrap_or("Campaign").to_owned());
+    let game_type = mission.clone().unwrap_or_else(|| if hq { "Headquarters".to_owned() } else { kept(fe, om, "m_gametype").unwrap_or_default() });
     let map = kept(fe, om, "m_map").unwrap_or_default();
     let team = kept(fe, om, "m_faction");
     let (crumb, title) = match kind {
         Kind::Pause if hq => ("Headquarters".to_owned(), "Paused".to_owned()),
+        Kind::Pause if mission.is_some() => ("Campaign".to_owned(), "Paused".to_owned()),
         Kind::Pause => (if map.is_empty() { game_type.clone() } else { format!("{game_type}  \u{b7}  {map}") }, "Paused".to_owned()),
         Kind::Team => (game_type.clone(), "Choose Team".to_owned()),
         Kind::Class => (team.clone().unwrap_or_else(|| if game_type.is_empty() { "Match".to_owned() } else { game_type.clone() }), "Choose Class".to_owned()),
@@ -226,6 +229,7 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
             (Kind::Class, _) => "Custom classes",
             (Kind::Team, _) => "Teams",
             (Kind::Pause, _) if hq => "Headquarters",
+            (Kind::Pause, _) if mission.is_some() => "Mission",
             (Kind::Pause, _) => "Match",
         };
         section(&mut k, r.x, r.y, r.w, title);
@@ -278,7 +282,7 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
                 },
             }
         }
-        Kind::Pause => match_panel(&mut k, fe, om, &game_type, &map, team.as_deref()),
+        Kind::Pause => match_panel(&mut k, fe, om, &game_type, &map, team.as_deref().filter(|_| mission.is_none())),
     }
 
     cac::back_button(&mut k, focused.is_some_and(|(_, it)| it.window.name == "cac_back"));
@@ -301,9 +305,12 @@ fn match_panel(k: &mut Kit, fe: &Frontend, om: &OpenMenu, game_type: &str, map: 
     let p = PANEL;
     grid_panel(k, p, 84.0, 1.0);
     let (x, w) = (p.x + 44.0, p.w - 88.0);
-    k.text(x, p.y + 36.0, t::LABEL, "Game type", t::ACCENT, 0);
+    let campaign = crate::campaign::active();
+    k.text(x, p.y + 36.0, t::LABEL, if campaign { "Mission" } else { "Game type" }, t::ACCENT, 0);
     k.text(x, p.y + 60.0, Type { size: 52.0, ..t::DISPLAY }, game_type, t::INK, 0);
-    let desc = kept(fe, om, "m_gamedesc").unwrap_or_default();
+    // (A mission has no game type's line: the multiplayer one says Team
+    // Deathmatch, the stand-in it runs as.)
+    let desc = if campaign { String::new() } else { kept(fe, om, "m_gamedesc").unwrap_or_default() };
     let mm = 380.0;
     k.para(x, p.y + 136.0, w - mm - 40.0, Type { size: 22.0, ..t::BODY }, &desc, t::INK_DIM, 1.3);
     // The map, north up.
@@ -311,7 +318,9 @@ fn match_panel(k: &mut Kit, fe: &Frontend, om: &OpenMenu, game_type: &str, map: 
     let name = fe.dvar("mapname");
     let name = if name.is_empty() { fe.dvar("ui_mapname") } else { name };
     k.fill(map_r, t::hex(0x000000, 0.5));
-    if !name.is_empty() {
+    // (A mission's level has no multiplayer map picture: `mapname` may
+    // still name the last match's.)
+    if !name.is_empty() && !campaign {
         k.pic(map_r, &format!("compass_map_{name}"), [1.0; 4]);
     }
     k.frame(map_r, 1.0, t::LINE);

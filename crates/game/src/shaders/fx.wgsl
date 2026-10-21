@@ -15,7 +15,9 @@
 
 #import bevy_pbr::{
     forward_io::VertexOutput,
+    mesh_functions,
     mesh_view_bindings::view,
+    view_transformations::position_world_to_clip,
 }
 #ifdef DEPTH_PREPASS
 #import bevy_pbr::prepass_utils::prepass_depth
@@ -31,6 +33,66 @@ const ADDITIVE_MAX: f32 = 0.83;
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var color_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var color_sampler: sampler;
+
+// A batch's vertices (`crate::fx::FxVertex`): with `FX_PULL` the vertex
+// shader reads them here, by the number its mesh's position holds, in place
+// of the mesh's own (rebuilt every frame, that cost the render thread).
+struct FxVertex {
+    // xyz: relative to the batch; w: the quad's ball radius.
+    pos: vec4<f32>,
+    // xy: uv; zw: the corner's place across the quad.
+    uv_corner: vec4<f32>,
+    color: vec4<f32>,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<storage, read> verts: array<FxVertex>;
+
+struct Vertex {
+    @builtin(instance_index) instance_index: u32,
+    @location(0) position: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) uv_b: vec2<f32>,
+    @location(4) tangent: vec4<f32>,
+    @location(5) color: vec4<f32>,
+}
+
+@vertex
+fn vertex(vertex: Vertex) -> VertexOutput {
+    var out: VertexOutput;
+#ifdef FX_PULL
+    let v = verts[u32(vertex.position.x + 0.5)];
+    let local = v.pos.xyz;
+    let uv = v.uv_corner.xy;
+    let uv_b = v.uv_corner.zw;
+    let radius = v.pos.w;
+    let color = v.color;
+#else
+    let local = vertex.position;
+    let uv = vertex.uv;
+    let uv_b = vertex.uv_b;
+    let radius = vertex.tangent.w;
+    let color = vertex.color;
+#endif
+    let world_from_local = mesh_functions::get_world_from_local(vertex.instance_index);
+    out.world_position = mesh_functions::mesh_position_local_to_world(world_from_local, vec4(local, 1.0));
+    out.position = position_world_to_clip(out.world_position.xyz);
+    out.world_normal = vec3(0.0, 0.0, 1.0);
+#ifdef VERTEX_UVS_A
+    out.uv = uv;
+#endif
+#ifdef VERTEX_UVS_B
+    out.uv_b = uv_b;
+#endif
+#ifdef VERTEX_TANGENTS
+    out.world_tangent = vec4(1.0, 0.0, 0.0, radius);
+#endif
+#ifdef VERTEX_COLORS
+    out.color = color;
+#endif
+#ifdef VERTEX_OUTPUT_INSTANCE_INDEX
+    out.instance_index = vertex.instance_index;
+#endif
+    return out;
+}
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {

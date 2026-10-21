@@ -3,7 +3,7 @@
 //! game's builtins provided by a [`Host`].
 
 pub mod compile;
-mod std_lib;
+pub mod std_lib;
 pub use std_lib::{angle_vectors, vector_to_angles};
 pub mod value;
 
@@ -23,6 +23,9 @@ pub trait Host {
     fn get_field(&mut self, vm: &mut Vm, entity: u64, name: &str) -> Option<Value>;
     /// Set an engine field; false if it isn't one (a script field then).
     fn set_field(&mut self, vm: &mut Vm, entity: u64, name: &str, value: &Value) -> bool;
+    /// This frame's threads have run, and the `waittillframeend` ones are
+    /// next (the engine's own per-frame work that comes between).
+    fn before_frame_end(&mut self, _vm: &mut Vm) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +36,10 @@ pub enum ObjKind {
     Anim,
     /// A game entity, by the host's id.
     Entity(u64),
+    /// A game entity that's gone (CoD4's "removed entity"): undefined to
+    /// `isdefined`, no longer the engine's, but its script variables can
+    /// still be read (and not set).
+    Removed(u64),
 }
 
 pub struct Object {
@@ -52,6 +59,9 @@ struct Frame {
     pc: usize,
     locals: Vec<Value>,
     this: Value,
+    /// The thread's stack height when it was called (its caller's values
+    /// below).
+    base: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +82,10 @@ struct Thread {
     stack: Vec<Value>,
     wake: Wake,
     /// Ends when one of these is notified.
-    endons: Vec<(ObjId, Rc<str>)>,
+    /// Ends on these (object, event), each for the call it was made in
+    /// (its depth): CoD's `endon` ends that call, back to its caller (the
+    /// whole thread from its first).
+    endons: Vec<(ObjId, Rc<str>, usize)>,
     /// What to push when it resumes (a notify's arguments).
     resume_with: Option<(u8, Vec<Value>)>,
     vars_wanted: u8,
@@ -85,6 +98,8 @@ pub struct Vm {
     func_script: Vec<Rc<str>>,
     objects: Vec<Option<Object>>,
     free: Vec<u32>,
+    /// The thread running now (debug: [`Vm::current_stack`]).
+    current: Option<usize>,
     entities: HashMap<u64, ObjId>,
     threads: Vec<Thread>,
     ready: VecDeque<usize>,
@@ -117,6 +132,7 @@ impl Vm {
             func_script: Vec::new(),
             objects: Vec::new(),
             free: Vec::new(),
+            current: None,
             entities: HashMap::new(),
             threads: Vec::new(),
             ready: VecDeque::new(),
@@ -265,7 +281,7 @@ impl Vm {
     }
 
     pub fn set_field(&mut self, o: ObjId, name: &str, v: Value) {
-        if let Some(ob) = self.object_mut(o) {
+        if let Some(ob) = self.object_mut(o).filter(|ob| !matches!(ob.kind, ObjKind::Removed(_))) {
             if v.is_defined() {
                 ob.fields.insert(name.into(), v);
             } else {
@@ -279,16 +295,35 @@ impl Vm {
     pub fn free_entity(&mut self, id: u64) {
         let Some(o) = self.entities.remove(&id) else { return };
         self.notify(o, "entityshutdown", Vec::new());
+        // Calls that end on anything of it end (it's gone, as CoD's freed
+        // entities).
+        let mut events: Vec<Rc<str>> = self.threads.iter().flat_map(|t| t.endons.iter().filter(|e| e.0 == o).map(|e| e.1.clone())).collect();
+        events.sort();
+        events.dedup();
+        for ev in events {
+            self.notify(o, &ev, Vec::new());
+        }
+        // Waits on it can't end: those threads end. (Its own threads go on,
+        // `self` undefined to them, as CoD4's: a deleted vehicle's death
+        // thread sees `!isdefined( self )` and deletes its riders.)
         for t in &mut self.threads {
-            if t.frames.first().is_some_and(|f| f.this.as_obj() == Some(o)) {
+            if matches!(&t.wake, Wake::Notify(w, ..) if *w == o) {
                 t.wake = Wake::Done;
             }
         }
-        self.objects[o.0 as usize] = None;
-        self.free.push(o.0);
+        // (Its slot isn't reused: scripts holding it see a removed entity,
+        // never another object.)
+        if let Some(ob) = self.object_mut(o) {
+            ob.kind = ObjKind::Removed(id);
+        }
     }
 
     // ---- Threads ----
+
+    /// Is a thread started as `f` on `this` still going?
+    pub fn running(&self, f: FuncId, this: ObjId) -> bool {
+        self.threads.iter().any(|t| !matches!(t.wake, Wake::Done) && t.frames.first().is_some_and(|fr| fr.func == f && fr.this.as_obj() == Some(this)))
+    }
 
     /// Start `f` as a thread on `this` with `args` (it runs at the next
     /// [`Vm::run`]).
@@ -300,9 +335,16 @@ impl Vm {
 
     fn frame(&self, f: FuncId, this: Value, mut args: Vec<Value>) -> Frame {
         let c = &self.funcs[f.0 as usize];
+        // (Debug: `GSC_TRACE=<part>` names calls of matching functions.)
+        if let Ok(want) = std::env::var("GSC_TRACE")
+            && self.func_name(f).contains(&want)
+        {
+            let show = |v: &Value| v.as_obj().map_or_else(|| v.display(), |o| self.describe(o));
+            eprintln!("gsc call {} at {:.2} this {} args {:?}", self.func_name(f), self.time, show(&this), args.iter().map(show).collect::<Vec<_>>());
+        }
         args.truncate(c.params);
         args.resize(c.locals.max(c.params), Value::Undefined);
-        Frame { func: f, pc: 0, locals: args, this }
+        Frame { func: f, pc: 0, locals: args, this, base: 0 }
     }
 
     /// Run `f` on `this` now, until it returns or waits (the engine's
@@ -331,8 +373,23 @@ impl Vm {
             if matches!(t.wake, Wake::Done) {
                 continue;
             }
-            if t.endons.iter().any(|(eo, ev)| *eo == o && **ev == *event) {
-                t.wake = Wake::Done;
+            // An endon: the call that made it ends (the thread, if that's
+            // its first), back to its caller with nothing.
+            if let Some(depth) = t.endons.iter().filter(|(eo, ev, _)| *eo == o && **ev == *event).map(|e| e.2).min() {
+                if depth == 0 {
+                    t.wake = Wake::Done;
+                    continue;
+                }
+                let base = t.frames.get(depth).map_or(t.stack.len(), |f| f.base);
+                t.frames.truncate(depth);
+                t.stack.truncate(base);
+                t.stack.push(Value::Undefined);
+                t.endons.retain(|e| e.2 < depth);
+                t.resume_with = None;
+                if !matches!(t.wake, Wake::Ready) {
+                    t.wake = Wake::Ready;
+                    self.ready.push_back(i);
+                }
                 continue;
             }
             if let Wake::Notify(wo, ev, matching) = &t.wake
@@ -351,6 +408,57 @@ impl Vm {
         }
     }
 
+    /// Is a thread waiting for `event` on `o`?
+    pub fn waiting_on(&self, o: ObjId, event: &str) -> bool {
+        self.threads.iter().any(|t| matches!(&t.wake, Wake::Notify(w, ev, _) if *w == o && &**ev == event))
+    }
+
+    /// Debug: the running thread's call stack (innermost last).
+    pub fn current_stack(&self) -> String {
+        let Some(t) = self.current.and_then(|i| self.threads.get(i)) else { return String::new() };
+        t.frames
+            .iter()
+            .map(|f| {
+                let c = &self.funcs[f.func.0 as usize];
+                format!("{}:{}", c.name, c.lines.get(f.pc.saturating_sub(1)).copied().unwrap_or(0))
+            })
+            .collect::<Vec<_>>()
+            .join(" > ")
+    }
+
+    /// Debug: each live thread's call stack (innermost last) and what it
+    /// waits for.
+    pub fn thread_report(&self) -> Vec<String> {
+        self.threads
+            .iter()
+            .filter(|t| !matches!(t.wake, Wake::Done))
+            .map(|t| {
+                let stack: Vec<String> = t
+                    .frames
+                    .iter()
+                    .map(|f| {
+                        let c = &self.funcs[f.func.0 as usize];
+                        format!("{}:{}", c.name, c.lines.get(f.pc.saturating_sub(1)).copied().unwrap_or(0))
+                    })
+                    .collect();
+                let wake = match &t.wake {
+                    Wake::Notify(o, ev, m) => format!("waittill {ev:?} on {} {:?}", self.describe(*o), m.as_ref().map(Value::display)),
+                    w => format!("{w:?}"),
+                };
+                format!("{} <- {wake}", stack.join(" > "))
+            })
+            .collect()
+    }
+
+    fn describe(&self, o: ObjId) -> String {
+        match self.object(o).map(|ob| ob.kind) {
+            Some(ObjKind::Entity(id)) => format!("ent {id} ({})", self.field(o, "targetname").display()),
+            Some(ObjKind::Removed(id)) => format!("removed ent {id}"),
+            Some(k) => format!("{k:?}"),
+            None => "freed".into(),
+        }
+    }
+
     pub fn live_threads(&self) -> usize {
         self.threads.iter().filter(|t| !matches!(t.wake, Wake::Done)).count()
     }
@@ -366,6 +474,7 @@ impl Vm {
                 self.ready.push_back(i);
             }
         }
+        let mut hooked = false;
         loop {
             while let Some(i) = self.ready.pop_front() {
                 if matches!(self.threads[i].wake, Wake::Ready) {
@@ -373,6 +482,14 @@ impl Vm {
                 }
             }
             // `waittillframeend`: after everything else this frame.
+            // (What the engine's work wakes runs first.)
+            if !hooked && self.threads.iter().any(|t| matches!(t.wake, Wake::FrameEnd)) {
+                hooked = true;
+                host.before_frame_end(self);
+                if !self.ready.is_empty() {
+                    continue;
+                }
+            }
             let mut any = false;
             for (i, t) in self.threads.iter_mut().enumerate() {
                 if matches!(t.wake, Wake::FrameEnd) {
@@ -386,6 +503,7 @@ impl Vm {
             }
         }
         // Nothing is queued now: finished threads can go.
+        self.current = None;
         self.threads.retain(|t| !matches!(t.wake, Wake::Done));
     }
 
@@ -395,7 +513,13 @@ impl Vm {
             let c = &self.funcs[f.func.0 as usize];
             format!("{} line {}", c.name, c.lines.get(f.pc.saturating_sub(1)).copied().unwrap_or(0))
         });
-        let line = format!("{place}: {msg}");
+        let mut line = format!("{place}: {msg}");
+        // (Debug: `GSC_ERROR_DETAIL=1`: its self and call stack too.)
+        if std::env::var_os("GSC_ERROR_DETAIL").is_some() {
+            let me = t.frames.last().and_then(|f| f.this.as_obj()).map_or("level/none".to_owned(), |o| self.describe(o));
+            let stack: Vec<String> = t.frames.iter().map(|f| self.funcs[f.func.0 as usize].name.to_string()).collect();
+            line = format!("{line} [self {me}; {}]", stack.join(" > "));
+        }
         if self.errors.len() < 10_000 {
             self.errors.push(line);
         }
@@ -403,6 +527,7 @@ impl Vm {
     }
 
     fn exec(&mut self, host: &mut dyn Host, ti: usize) {
+        self.current = Some(ti);
         if let Some((n, args)) = self.threads[ti].resume_with.take() {
             for k in 0..n as usize {
                 let v = args.get(k).cloned().unwrap_or_default();
@@ -610,6 +735,9 @@ impl Vm {
                     t.wake = Wake::Done;
                     return Ok(false);
                 }
+                // (Its endons go with it.)
+                let depth = t.frames.len();
+                t.endons.retain(|e| e.2 < depth);
                 t.stack.push(v);
             }
             Op::Wait => {
@@ -690,7 +818,8 @@ impl Vm {
                 self.errors.push(format!("{}: call stack too deep", self.funcs[f.0 as usize].name));
                 return false;
             }
-            let frame = self.frame(f, this, args);
+            let mut frame = self.frame(f, this, args);
+            frame.base = self.threads[ti].stack.len();
             self.threads[ti].frames.push(frame);
             true
         }
@@ -728,6 +857,11 @@ impl Vm {
                 if !v.is_defined() || path.is_empty() {
                     // `self = x` isn't a thing; the self of a thread with
                     // none becomes nothing useful.
+                    return self.assign_in(host, &mut v, path, value);
+                }
+                // An array as self (`pipes pipebreakInit()`): its elements'
+                // fields (`self[j].whole = ...`).
+                if matches!(v, Value::Array(_)) {
                     return self.assign_in(host, &mut v, path, value);
                 }
                 v.as_obj().ok_or("self isn't an object")?
@@ -815,7 +949,8 @@ impl Vm {
             "endon" => {
                 let o = this.and_then(Value::as_obj).ok_or("endon on a non-object")?;
                 let ev = args.first().and_then(Value::as_str).ok_or("endon without an event")?;
-                self.threads[ti].endons.push((o, ev.into()));
+                let depth = self.threads[ti].frames.len().saturating_sub(1);
+                self.threads[ti].endons.push((o, ev.into(), depth));
                 return Ok(Value::Undefined);
             }
             _ => {}
@@ -836,6 +971,11 @@ impl Vm {
     /// 0..n.
     pub fn random_int(&mut self, n: u32) -> u32 {
         (self.random() % n.max(1) as u64) as u32
+    }
+
+    /// 0..1.
+    pub fn random_float(&mut self) -> f32 {
+        (self.random() % 1_000_000) as f32 / 1_000_000.0
     }
 
     pub(crate) fn random(&mut self) -> u64 {

@@ -62,17 +62,48 @@ pub struct Replay {
     /// History time shown last frame, the killer's shot count then, and the
     /// knife swing last played.
     last_t: f32,
+    /// Test log (`COD4RW_KILLCAMTEST`): when the last line went out.
+    last_t_log: f32,
     last_shots: Option<u32>,
     last_melee: Option<f32>,
     /// What was hidden for the replay, to show again after.
     hidden: Vec<Entity>,
     /// Where the camera was riding the projectile last (after it's gone).
     ride: Option<Transform>,
+    /// The final killcam's slow motion: the history time shown after each
+    /// [`WARP_STEP`] of real time (`None`: real time).
+    warp: Option<Vec<f32>>,
+}
+
+/// The slow motion's table step (s of real time).
+const WARP_STEP: f32 = 1.0 / 240.0;
+
+/// The final killcam's replay speed at history time `t`: easing down to
+/// `killcam.slowmo` (0.3) around the killing shot, `killcam.slowmo_width`
+/// (0.35 s) either side, then back up.
+fn slow_speed(t: f32, kill: f32) -> f32 {
+    let least = crate::tune::get("killcam.slowmo", 0.3).clamp(0.05, 1.0);
+    let width = crate::tune::get("killcam.slowmo_width", 0.35).max(0.05);
+    // (Centred just before the kill: the shot that made it.)
+    let d = (t - (kill - 0.05)) / width;
+    1.0 - (1.0 - least) * (-d * d).exp()
 }
 
 impl Replay {
-    pub fn new(title: &'static str, kill: Kill, names: (String, String), killer_team: Team, window: (f32, f32), now: f32, skippable: bool) -> Replay {
+    /// `slow`: the final killcam's slow motion round the kill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(title: &'static str, kill: Kill, names: (String, String), killer_team: Team, window: (f32, f32), now: f32, skippable: bool, slow: bool) -> Replay {
+        let warp = slow.then(|| {
+            let mut t = window.0;
+            let mut table = vec![t];
+            while t < window.1 && table.len() < 240 * 60 {
+                t += WARP_STEP * slow_speed(t, kill.time);
+                table.push(t);
+            }
+            table
+        });
         Replay {
+            warp,
             title,
             kill,
             killer_name: names.0,
@@ -86,6 +117,7 @@ impl Replay {
             viewmodel: None,
             ghosts: HashMap::new(),
             last_t: window.0,
+            last_t_log: 0.0,
             last_shots: None,
             last_melee: None,
             hidden: Vec::new(),
@@ -93,9 +125,22 @@ impl Replay {
         }
     }
 
-    /// The history time shown now.
+    /// The history time shown now (slowed round the kill in the final
+    /// killcam).
     pub fn time(&self, now: f32) -> f32 {
-        self.from + (now - self.started)
+        let real = (now - self.started).max(0.0);
+        let Some(table) = &self.warp else { return self.from + real };
+        let at = real / WARP_STEP;
+        let i = at.floor() as usize;
+        match (table.get(i), table.get(i + 1)) {
+            (Some(a), Some(b)) => a + (b - a) * at.fract(),
+            _ => table.last().copied().unwrap_or(self.from) + (real - (table.len() - 1) as f32 * WARP_STEP),
+        }
+    }
+
+    /// How fast the replay runs now (1 real time): its sounds play at it.
+    pub fn rate(&self, now: f32) -> f32 {
+        if self.warp.is_some() { slow_speed(self.time(now), self.kill.time) } else { 1.0 }
     }
 
     pub fn done(&self, now: f32) -> bool {
@@ -134,6 +179,7 @@ fn pawn_at<'a>(a: &'a Frame, b: &'a Frame, k: f32, e: Entity) -> Option<(PawnSam
     s.body_turn = pa.body_turn.slerp(pb.body_turn, k);
     s.overlay_weight = pa.overlay_weight + (pb.overlay_weight - pa.overlay_weight) * k;
     s.lean = pa.lean + (pb.lean - pa.lean) * k;
+    s.gun_offset = pa.gun_offset.lerp(pb.gun_offset, k);
     s.anim = match (&pa.anim, &pb.anim) {
         (Some((x, tx)), Some((y, ty))) if std::sync::Arc::ptr_eq(x, y) && ty >= tx => Some((x.clone(), tx + (ty - tx) * k)),
         _ if k > 0.5 => pb.anim.clone(),
@@ -234,7 +280,7 @@ pub fn place_camera(
     } else if let Some((s, _)) = pawn_at(a, b, k, r.kill.attacker) {
         cam_tf.translation = s.feet + Vec3::Y * s.eye_height;
         cam_tf.rotation = Quat::from_euler(EulerRot::YXZ, s.yaw, s.pitch, 0.0);
-        let fov = hip_fov() + (s.weapon.ads_fov.max(1.0) - hip_fov()) * s.ads * f32::from(s.weapon.ads_fov > 0.0);
+        let fov = hip_fov() + (crate::settings_apply::ads_fov(s.weapon.ads_fov.max(1.0)) - hip_fov()) * s.ads * f32::from(s.weapon.ads_fov > 0.0);
         set_fov(proj, &mut vm_camera, fov);
     }
     // Test aid (`COD4RW_KILLCAMTEST_ORBIT=1`): watch the victim's replayed
@@ -329,7 +375,7 @@ pub fn play_events(
     ),
     mut camos: Local<CamoCache>,
     mut players: Query<(&mut AnimPlayer, &WeaponAnims)>,
-    mut visibility: Query<&mut Visibility>,
+    (mut visibility, mut ghost_tf): (Query<&mut Visibility>, Query<&mut Transform, With<super::Ghost>>),
     bodies: Query<&Body>,
     live: (Query<Entity, With<crate::grenades::LiveGrenade>>, Query<Entity, With<crate::explosives::Explosive>>),
     mut effects: ResMut<Effects>,
@@ -338,6 +384,8 @@ pub fn play_events(
     let now = time.elapsed_secs();
     let Some(r) = killcam.replay.as_mut() else { return };
     let t = r.time(now);
+    // (Slow motion pitches the replay's sounds down with it.)
+    let rate = r.rate(now);
     let Some((a, b, k)) = history.at(t).or_else(|| history.last().map(|f| (f, f, 0.0))) else { return };
     let killer = pawn_at(a, b, k, r.kill.attacker).map(|(s, _)| s);
     let riding = r.ride.is_some() && r.projectile.is_some();
@@ -367,13 +415,13 @@ pub fn play_events(
         let mine = shot.shooter == r.kill.attacker && !riding;
         let alias = if mine { &w.sounds.fire_player } else { &w.sounds.fire };
         if !alias.is_empty() {
-            sfx.play(alias.clone(), (!mine).then_some(shot.from));
+            sfx.play_at_speed(alias.clone(), (!mine).then_some(shot.from), rate);
         }
         let _ = at;
     }
     for (_, blast) in history.blasts.iter().filter(|(at, _)| *at > r.last_t && *at <= t) {
         effects.play(&blast.effect, Anchor::Fixed(FxFrame::facing(blast.at, Vec3::Y, 0.0)), FxLayer::World);
-        sfx.play(blast.sound.clone(), Some(blast.at));
+        sfx.play_at_speed(blast.sound.clone(), Some(blast.at), rate);
     }
     r.last_t = t;
     // The killer's gun in hand, rebuilt when they switch.
@@ -425,7 +473,8 @@ pub fn play_events(
             let mut skeleton = Skeleton::default();
             let hands = crate::viewmodel::team_viewhands(content, r.killer_team == Team::Allies);
             if let Some(h) = content.model(hands, meshes, materials, images, bindposes) {
-                spawn_model(&mut commands, &mut skeleton, SpawnModel { model: &h, owner, attach_to: None, layers: Some(layer.clone()), shadows: false });
+                let surfaces = spawn_model(&mut commands, &mut skeleton, SpawnModel { model: &h, owner, attach_to: None, layers: Some(layer.clone()), shadows: false });
+                crate::character_look::mark(&mut commands, &surfaces);
             }
             let mut a = GunAssets { meshes, materials, images, bindposes, camo_materials };
             let target = GunTarget { owner, attach_to: skeleton.joint("tag_weapon"), layers: Some(layer) };
@@ -446,6 +495,17 @@ pub fn play_events(
     // Firing, aiming and reloading as they did.
     let Ok((mut anim, anims)) = players.get_mut(vm) else { return };
     let slot = |i: usize| anims.slots.get(i).cloned().flatten();
+    if std::env::var_os("COD4RW_KILLCAMTEST").is_some() && (t * 4.0).floor() != (r.last_t_log * 4.0).floor() {
+        r.last_t_log = t;
+        info!(
+            "killcam test: killer {} ads {:.2} ads_fov {} ads_up anim {} overlay {}",
+            s.weapon.name,
+            s.ads,
+            s.weapon.ads_fov,
+            slot(anim_slot::ADS_UP).is_some(),
+            anim.overlay.as_ref().map_or("none".to_string(), |(a, w)| format!("{} {w:.2}", a.name))
+        );
+    }
     // A knife swing (slots 7 and 8: melee, the lunge).
     let swing = s.melee.filter(|(started, _)| r.last_melee != Some(*started));
     if let Some((started, charge)) = swing {
@@ -464,4 +524,11 @@ pub fn play_events(
     }
     r.last_shots = Some(s.shots);
     anim.overlay = (s.ads > 0.0).then(|| slot(anim_slot::ADS_UP).map(|a| (a, s.ads))).flatten();
+    // The gun kicks in the hand as it did (it sat still through every
+    // burst: "the bots have no recoil"), as the live viewmodel turns it.
+    if let Ok(mut tf) = ghost_tf.get_mut(vm) {
+        let g = s.gun_offset;
+        let kick = Quat::from_euler(EulerRot::YXZ, g.y.to_radians(), -g.x.to_radians(), 0.0);
+        tf.rotation = kick * crate::viewmodel::rest_transform().rotation;
+    }
 }

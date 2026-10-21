@@ -12,9 +12,11 @@
 
 pub mod cache;
 mod denoise;
-mod dxt;
+pub mod gi;
+pub(crate) mod dxt;
 pub mod integrate;
 mod lamps;
+pub mod layout;
 mod scene;
 mod sky;
 // The sun's path, shared with the live sun (`crate::atmos`): one file, so
@@ -62,13 +64,43 @@ pub struct Profile {
     pub saturation: f32,
     /// Extra contact occlusion (see `Baker::gather_final`).
     pub contact: f32,
+    /// The live sun's bounce against CoD4's sun (the live sun itself is
+    /// drawn by the game: this is how far its sunlit patches light the
+    /// room around them).
+    pub sun_bounce: f32,
+    /// The floor in rooms where CoD4 had lamp light the fit missed
+    /// ([`floor_texels`]).
+    pub lamp_miss_floor: f32,
+    /// Whether the floor rises toward `safe`'s where the bake explains
+    /// little of CoD4's light ([`EXPLAINED_WELL`]).
+    pub explained_ramp: bool,
+    /// The sky's level, over `COD4RW_BAKE_SKY`.
+    pub sky: Option<SkyLevel>,
 }
 
 impl Profile {
     fn from_env() -> Profile {
         match cache::profile().as_deref() {
-            Some("safe") => Profile { sky_lift: 1.2, floor: 0.55, dark_floor: 0.85, lamp_scale: 0.85, saturation: 1.0, contact: 0.0 },
-            _ => Profile { sky_lift: 1.0, floor: 0.3, dark_floor: 0.5, lamp_scale: 1.0, saturation: 1.35, contact: 0.6 },
+            Some("safe") => Profile { sky_lift: 1.2, floor: 0.55, dark_floor: 0.85, lamp_scale: 0.85, saturation: 1.0, contact: 0.0, sun_bounce: 1.0, lamp_miss_floor: LAMP_MISS_FLOOR, explained_ramp: true, sky: None },
+            // Experimental (Rewrite Main, 2026-10-19: "Rebaked looks like
+            // Original"): the bake's own light with next to no floor back
+            // to CoD4's even interiors: real daylight's sky-to-sun balance,
+            // sunlit patches lighting the room around them, falloff away
+            // from windows, dark corners, more bounce colour. Some corners
+            // go dark: the light's direction reads.
+            Some("modern") => Profile {
+                sky_lift: 1.0,
+                floor: 0.06,
+                dark_floor: 0.12,
+                lamp_scale: 1.2,
+                saturation: 1.6,
+                contact: 0.9,
+                sun_bounce: 1.6,
+                lamp_miss_floor: 0.25,
+                explained_ramp: false,
+                sky: Some(SkyLevel::Physical),
+            },
+            _ => Profile { sky_lift: 1.0, floor: 0.3, dark_floor: 0.5, lamp_scale: 1.0, saturation: 1.35, contact: 0.6, sun_bounce: 1.0, lamp_miss_floor: LAMP_MISS_FLOOR, explained_ramp: true, sky: None },
         }
     }
 }
@@ -110,9 +142,24 @@ impl Options {
             _ => SkyLevel::Middle,
         };
         let profile = Profile::from_env();
+        let sky = if std::env::var_os("COD4RW_BAKE_SKY").is_some() { sky } else { profile.sky.unwrap_or(sky) };
         Options { profile, scale: std::env::var("COD4RW_BAKE_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f32).clamp(1.0, 8.0), samples: var("COD4RW_BAKE_SAMPLES", 512).max(16), bounces: var("COD4RW_BAKE_BOUNCES", 3).clamp(1, 8), sky, floor: std::env::var("COD4RW_BAKE_FLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(profile.floor).clamp(0.0, 1.0) }
     }
 }
+
+/// The live-sun bake (`COD4RW_BAKE_LIVESUN=1`, cache variant [`LIVESUN`]):
+/// the game draws the whole sun live with its shadow maps (`crate::world`'s
+/// sun at full strength when this bake is loaded, `crate::lightmaps`), so
+/// sunlight through a window makes a crisp, bright patch on any floor; the
+/// bake keeps only what the sun bounces (at the same full strength), the
+/// sky and the lamps. CoD4 drew half its sun (`diffuseFraction`) as baked
+/// light, which is why its sunlit patches indoors were faint.
+pub fn livesun() -> bool {
+    std::env::var("COD4RW_BAKE_LIVESUN").is_ok_and(|v| v == "1")
+}
+
+/// The live-sun bake's cache variant.
+pub const LIVESUN: &str = "livesun";
 
 fn secs(t: Instant) -> f32 {
     t.elapsed().as_secs_f32()
@@ -167,7 +214,9 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
     log::info!("bake {map}: loaded in {:.1}s", secs(t0));
 
     let t = Instant::now();
-    let mut scene = scene::Scene::build(&zones, &vfs);
+    // The map editor's models, left-out models and lights.
+    let layout = layout::Layout::load(map);
+    let mut scene = scene::Scene::build(&zones, &vfs, &layout);
     scene.saturation = opts.profile.saturation;
     log::info!("bake: profile {:?} {:?}", cache::profile(), opts.profile);
     log::info!("bake: scene and BVH in {:.1}s", secs(t));
@@ -195,7 +244,10 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         }
     };
     let sun = &world.sun;
-    let live = Vec3::from(sun.sun_color) * ((sun.sun_light - sun.ambient_scale) * (1.0 - sun.diffuse_fraction)).max(0.0);
+    // (`COD4RW_BAKE_LIVESUN=1`: the whole sun is live, its "diffuse" share,
+    // which CoD4 baked into its lightmaps, included: see [`livesun`].)
+    let diffuse_kept = if livesun() && ovr.is_none() { 1.0 } else { 1.0 - sun.diffuse_fraction };
+    let live = Vec3::from(sun.sun_color) * ((sun.sun_light - sun.ambient_scale) * diffuse_kept).max(0.0);
     let primary = zones[0].com_world().map_or(&[][..], |c| &c.primary_lights[..]);
     let mut lights = Lights::new(world, primary, LIVE_SUN_ILLUMINANCE * live.max_element());
     let map_sun = sun_path::MapSun::new(lights.to_sun.to_array(), sun.sun_color, LIVE_SUN_ILLUMINANCE * live.max_element());
@@ -210,6 +262,10 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
             s
         }));
     }
+    if ovr.is_none() {
+        lights.sun *= opts.profile.sun_bounce;
+    }
+    lights.live = layout.lights.clone();
     let lights = lights;
     log::info!("bake: sun {:?} (lightmap units), {} lamps, sky ground {:?}", lights.sun, lights.spots.len(), sky.ground);
     let baker = Baker { scene: &scene, sky, lights: &lights };
@@ -260,12 +316,48 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
     let mut grid = Grid::new(&world.light_grid);
     let grid_samples = (opts.samples / 2).max(128);
     bounces(&baker, &mut atlases, &mut grid, opts, true);
+    // Debug aid: `COD4RW_BAKE_SUNPATCH=1` logs indoor floors the sun
+    // reaches through a window or door (direct sun, little sky): where to
+    // look for window light.
+    if std::env::var_os("COD4RW_BAKE_SUNPATCH").is_some() {
+        let mut spots: Vec<(f32, glam33::Vec3A)> = Vec::new();
+        for a in &atlases {
+            for (i, t) in a.atlas.texels.iter().enumerate() {
+                let Some(t) = t else { continue };
+                let sun = sky::luma(a.sun[i]);
+                if t.nf.z > 0.9 && sun > 0.1 && sky::luma(a.gathered[i].sky) < 0.02 * sun.max(1.0) * 8.0 && sky::luma(a.gathered[i].sky) < 0.12 {
+                    if spots.iter().all(|(_, p)| p.distance(t.pos) > 150.0) {
+                        spots.push((sun, t.pos));
+                    }
+                }
+            }
+        }
+        for (sun, p) in spots.iter().take(40) {
+            log::info!("sun patch indoors: {:.0?} (sun {sun:.2})", p);
+        }
+        log::info!("sun patch indoors: {} spots", spots.len());
+    }
 
     // The sky's brightness, fitted to CoD4's own lightmaps (a keyframe's
     // sky is in lightmap units already).
     let k = if ovr.is_some() { 1.0 } else { fit_sky(&atlases, &originals) };
     let k_out = if ovr.is_some() { 1.0 } else { opts.sky.brightness(k, opts.profile.sky_lift) };
     log::info!("bake: sky brightness fitted to CoD4's x{k:.3}; baking with x{k_out:.3} ({:?})", opts.sky);
+
+    // Where the map editor's models shade what CoD4 lit: the lamp fit
+    // leaves those texels out and the floors take CoD4's light less the
+    // shade (else the fit and the floor filled the shadows back in).
+    let (shade, grid_shade): (Vec<Option<Vec<f32>>>, Option<Vec<f32>>) = if scene.placed > 0 && ovr.is_none() {
+        let t = Instant::now();
+        let shade: Vec<_> = atlases.iter().map(|a| Some(baker.placed_shade(&a.atlas, k_out))).collect();
+        let grid_shade = baker.placed_shade_grid(&grid, k_out);
+        let shaded = shade.iter().flatten().flatten().filter(|&&s| s < 0.9).count();
+        log::info!("bake: {shaded} texels shaded by placed models ({:.1}s)", secs(t));
+        (shade, Some(grid_shade))
+    } else {
+        (atlases.iter().map(|_| None).collect(), None)
+    };
+    let shade_at = |ai: usize, i: usize| shade[ai].as_ref().map_or(1.0, |s| s[i]);
 
     // CoD4's lamps, found again as lights; then the light again with them.
     // Twice: the second fit counts the first lamps' bounce as the bake's
@@ -277,6 +369,9 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         let samples = lamps::samples(&atlases, |ai, i| {
             let a = &atlases[ai];
             let orig = originals[ai].as_ref()?;
+            if shade_at(ai, i) < 0.9 {
+                return None;
+            }
             let w = a.atlas.w;
             let uv = Vec2::new((i % w) as f32 + 0.5, (i / w) as f32 + 0.5) / Vec2::new(w as f32, a.atlas.h as f32);
             let (e, l) = original_dir_at(orig, uv);
@@ -295,6 +390,24 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
             for l in found.iter().filter(|l| l.origin.distance(at) < 500.0) {
                 log::info!("lamp near: {:.0?} colour {:.3?} radius {} quadratic {}", l.origin, l.colour, l.radius, l.quadratic);
             }
+        }
+        // The last fit: lamps at switched-on fixtures brighter than CoD4's.
+        let mut found = found;
+        if round == 1 {
+            let lit = lamps::lit_fixtures(&zones);
+            let boost = lamps::lit_boost();
+            let mut boosted = 0;
+            for l in found.iter_mut() {
+                if lit.iter().any(|f| f.distance(l.origin) < 48.0) {
+                    // Brighter and half way to white: the fit's colour is
+                    // CoD4's light less the bake's, tinted by what it left
+                    // over (a fluorescent came out yellow on a pillar).
+                    let y = sky::luma(l.colour);
+                    l.colour = l.colour.lerp(Vec3::splat(y), 0.5) * boost;
+                    boosted += 1;
+                }
+            }
+            log::info!("bake: {boosted} lamps at {} switched-on fixtures x{boost}", lit.len());
         }
         lights.spots.truncate(primary_count);
         lights.spots.extend(found);
@@ -344,7 +457,7 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         }
         (ours / theirs.max(1e-9)) as f32
     };
-    let (floor, dark_floor) = if ovr.is_some() || explained >= EXPLAINED_WELL {
+    let (floor, dark_floor) = if ovr.is_some() || explained >= EXPLAINED_WELL || !opts.profile.explained_ramp {
         (floor, dark_floor)
     } else {
         let t = ((explained - EXPLAINED_POORLY) / (EXPLAINED_WELL - EXPLAINED_POORLY)).clamp(0.0, 1.0);
@@ -363,7 +476,7 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         denoise::atrous(&a.atlas, &mut light, &[1, 2, 4]);
         if let Some(orig) = originals[ai].as_ref().filter(|_| ovr.is_none()) {
             let sky_light: Vec<f32> = a.gathered.iter().map(|g| sky::luma(g.sky * k_out)).collect();
-            let raised = floor_texels(&a.atlas, &mut light, orig, floor, dark_floor, &sky_light);
+            let raised = floor_texels(&a.atlas, &mut light, orig, floor, dark_floor, &sky_light, shade[ai].as_deref(), opts.profile.lamp_miss_floor);
             log::info!("bake: {raised} texels raised to the visibility floor ({:.0}% of CoD4's)", opts.floor * 100.0);
             log_directionality(&a.atlas, &light, orig);
             log_materials(&a.atlas, &light, orig, world, &zones[0]);
@@ -382,6 +495,9 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
                 let want = sky::luma(original_at(orig, uv));
                 let other = baker.gather_texel(&atlases, &grid, t, i, opts.samples / 2, k_out, opts.profile.contact, (Vec3::ZERO, Vec3::Z));
                 if (sky::luma(other.e) - want).abs() < (sky::luma(light[i].e) - want).abs() {
+                    if probe_near(t.pos) {
+                        log::info!("probe flip {:.0?}: this side {:.3?} -> other side {:.3?} (cod4 {want:.3})", t.pos, light[i].e, other.e);
+                    }
                     light[i] = other;
                     flipped += 1;
                 }
@@ -393,6 +509,9 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
             for &(i, t) in &a.atlas.dropped {
                 let uv = Vec2::new((i % atlas.w) as f32 + 0.5, (i / atlas.w) as f32 + 0.5) / Vec2::new(atlas.w as f32, atlas.h as f32);
                 let (e, l) = original_dir_at(orig, uv);
+                if probe_near(t.pos) {
+                    log::info!("probe dropped {:.0?}: takes CoD4's {:.3?}", t.pos, e);
+                }
                 light[i] = Directional::default();
                 light[i].add(e, l);
                 atlas.texels[i] = Some(t);
@@ -433,12 +552,14 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
         .zip(&grid.cubes)
         .zip(&grid.local)
         .zip(original_cubes(&world.light_grid))
-        .map(|(((p, c), l), o)| {
+        .enumerate()
+        .map(|(gi, (((p, c), l), o))| {
+            let shade = grid_shade.as_ref().map_or(1.0, |s| s[gi]);
             (*p, std::array::from_fn(|f| {
                 let v = (c[f].sky * k_out + c[f].sun + l[f]) * grid.scale;
                 // The same floor as the texels', so no one stands unseen.
                 // (Grid light is ~1/5 of the lightmap's units: see `add_local`.)
-                o.filter(|_| ovr.is_none()).map_or(v, |o| v.max(o[f] * floor_at(sky::luma(o[f]) / grid.scale, floor, dark_floor))).to_array()
+                o.filter(|_| ovr.is_none()).map_or(v, |o| v.max(o[f] * shade * floor_at(sky::luma(o[f]) / grid.scale, floor, dark_floor))).to_array()
             }))
         })
         .collect();
@@ -460,6 +581,7 @@ pub fn run_with(map: &str, opts: &Options, variant: Option<Variant>) -> anyhow::
     );
     let name = match &variant {
         Some(Variant::Key(o)) => Some(o.variant.clone()),
+        None if livesun() && cache::profile().is_none() => Some(LIVESUN.to_owned()),
         None => cache::profile(),
     };
     let target = cache::dir_for(map, name.as_deref()).ok_or_else(|| anyhow::anyhow!("no cache folder"))?;
@@ -708,7 +830,7 @@ fn floor_at(lum: f32, floor: f32, dark: f32) -> f32 {
 /// there) and lit, the shortfall is a lamp the fit didn't find, not shade:
 /// there the floor is [`LAMP_MISS_FLOOR`] (Carentan's lamp-lit rooms went
 /// near black at the shade's floor).
-fn floor_texels(atlas: &texels::Atlas, light: &mut [Directional], orig: &(usize, usize, Vec<u8>), floor: f32, dark: f32, sky_light: &[f32]) -> usize {
+fn floor_texels(atlas: &texels::Atlas, light: &mut [Directional], orig: &(usize, usize, Vec<u8>), floor: f32, dark: f32, sky_light: &[f32], shade: Option<&[f32]>, lamp_miss: f32) -> usize {
     let (w, h) = (atlas.w, atlas.h);
     let mut raised = 0;
     for (i, t) in atlas.texels.iter().enumerate() {
@@ -719,8 +841,9 @@ fn floor_texels(atlas: &texels::Atlas, light: &mut [Directional], orig: &(usize,
         let (e, l) = original_dir_at(orig, uv);
         let lum = sky::luma(e);
         let indoors = sky_light.get(i).is_some_and(|&s| s < 0.2 * lum);
-        let share = if indoors && lum > 0.03 && floor > 0.0 { floor_at(lum, floor, dark).max(LAMP_MISS_FLOOR) } else { floor_at(lum, floor, dark) };
-        let target = e * share;
+        let share = if indoors && lum > 0.03 && floor > 0.0 { floor_at(lum, floor, dark).max(lamp_miss) } else { floor_at(lum, floor, dark) };
+        // (Less what the map editor's models shade.)
+        let target = e * share * shade.map_or(1.0, |s| s[i]);
         if sky::luma(light[i].e) < sky::luma(target) {
             light[i].add((target - light[i].e).max(Vec3::ZERO), l);
             raised += 1;
@@ -765,6 +888,16 @@ fn log_materials(atlas: &texels::Atlas, light: &[Directional], orig: &(usize, us
 
 /// Debug aid (`COD4RW_BAKE_PROBE=x,y,z`): texels within 80 units of a
 /// point, CoD4's light and the bake's.
+/// Whether `p` is within 40 units of `COD4RW_BAKE_PROBE`.
+fn probe_near(p: glam33::Vec3A) -> bool {
+    static AT: std::sync::OnceLock<Option<glam33::Vec3A>> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        let v: Vec<f32> = std::env::var("COD4RW_BAKE_PROBE").ok()?.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (v.len() == 3).then(|| glam33::Vec3A::new(v[0], v[1], v[2]))
+    })
+    .is_some_and(|at| at.distance(p) < 40.0)
+}
+
 fn probe(atlas: &texels::Atlas, light: &[Directional], orig: &(usize, usize, Vec<u8>), at: glam33::Vec3A, world: &iw3::zone::GfxWorld, zone: &Zone) {
     let (w, h) = (atlas.w, atlas.h);
     let mut shown = 0;
@@ -777,7 +910,7 @@ fn probe(atlas: &texels::Atlas, light: &[Directional], orig: &(usize, usize, Vec
         let (e, _l) = original_dir_at(orig, uv);
         let (a, b, bl) = light[i].fit();
         let mat = world.surfaces[t.surf as usize].material.and_then(|m| zone.material(m)).map_or("?".into(), |m| m.name.clone());
-        log::info!("probe {mat} {:.0?} n {:.2?} nf {:.2?} uv {:.4?} ({w}x{h}): cod4 {:.3} | bake e {:.3} A {:.3} B {:.3} L {:.2?}", t.pos, t.n, t.nf, uv, sky::luma(e), sky::luma(light[i].e), sky::luma(a), sky::luma(b), bl);
+        log::info!("probe {mat} {:.0?} n {:.2?} nf {:.2?} uv {:.4?} ({w}x{h}): cod4 {:.3} {:.3?} | bake e {:.3} {:.3?} A {:.3} B {:.3} L {:.2?}", t.pos, t.n, t.nf, uv, sky::luma(e), e, sky::luma(light[i].e), light[i].e, sky::luma(a), sky::luma(b), bl);
         shown += 1;
         if shown > 40 {
             break;
@@ -860,7 +993,7 @@ fn log_directionality(atlas: &texels::Atlas, light: &[Directional], orig: &(usiz
 /// The fitted light as the game's image: layer A (even light, direction x)
 /// above layer B (directional light, direction y), half floats, padding
 /// filled.
-fn pack(atlas: &texels::Atlas, light: &[Directional]) -> cache::BakedAtlas {
+pub(super) fn pack(atlas: &texels::Atlas, light: &[Directional]) -> cache::BakedAtlas {
     let (w, h) = (atlas.w, atlas.h);
     let mut fitted: Vec<[f32; 8]> = light
         .iter()

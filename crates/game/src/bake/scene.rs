@@ -53,6 +53,8 @@ pub struct TriInfo {
     pub colour: Vec3,
     /// Front face normal.
     pub nf: Vec3A,
+    /// Placed with the map editor (`super::layout`).
+    pub placed: bool,
 }
 
 pub struct Scene {
@@ -62,6 +64,8 @@ pub struct Scene {
     bvh: CwBvh,
     /// Colour saturation of bounced light (1: the textures' own).
     pub saturation: f32,
+    /// Triangles placed with the map editor.
+    pub placed: usize,
 }
 
 pub struct Hit {
@@ -172,8 +176,9 @@ impl Loader<'_> {
 
 impl Scene {
     /// World surfaces and static models of `zones[0]` (`zones[1]` is
-    /// common_mp, for models and materials kept there).
-    pub fn build(zones: &[Zone], vfs: &iw3::iwd::Vfs) -> Scene {
+    /// common_mp, for models and materials kept there), with the map
+    /// editor's changes (`layout`).
+    pub fn build(zones: &[Zone], vfs: &iw3::iwd::Vfs, layout: &super::layout::Layout) -> Scene {
         let world: &GfxWorld = zones[0].gfx_world().expect("zone has no GfxWorld");
         let mut loader = Loader { zones, vfs, mats: Vec::new(), by_id: HashMap::new() };
         let mut tris = Vec::new();
@@ -217,20 +222,38 @@ impl Scene {
                     lightmap: if (s.lightmap_index as usize) < world.lightmaps.len() { s.lightmap_index } else { NO_LIGHTMAP },
                     colour,
                     nf: Vec3A::ZERO,
+                    placed: false,
                 };
                 push(vs.map(|v| Vec3A::from(v.xyz)), vs.map(|v| unit(v.normal)), tri, &mut tris, &mut info);
             }
         }
         let world_tris = tris.len();
 
+        // The map's own static models (less those the map editor left
+        // out), then the editor's.
+        let mut models: Vec<(usize, AssetId, [Vec3A; 3], Vec3A, f32, bool)> = Vec::new();
         for sm in &world.static_models {
             let Some(model_id) = sm.model else { continue };
             let (zi, model_id) = resolve_xmodel(zones, 0, model_id);
             let Some(xm) = zones[zi].xmodel(model_id) else { continue };
+            if layout.hides(&xm.name, sm.origin) {
+                continue;
+            }
+            models.push((zi, model_id, sm.axis.map(Vec3A::from), Vec3A::from(sm.origin), sm.scale, false));
+        }
+        let mut missing = 0;
+        for p in &layout.models {
+            let found = zones.iter().enumerate().find_map(|(zi, z)| z.find(&p.model).filter(|&id| z.xmodel(id).is_some()).map(|id| (zi, id)));
+            let Some((zi, id)) = found.map(|(zi, id)| resolve_xmodel(zones, zi, id)) else {
+                missing += 1;
+                continue;
+            };
+            models.push((zi, id, p.axis, p.origin, p.scale, true));
+        }
+        for &(zi, model_id, axis, origin, scale, placed) in &models {
+            let Some(xm) = zones[zi].xmodel(model_id) else { continue };
             let Some(lod) = xm.lods.first() else { continue };
-            let axis = sm.axis.map(Vec3A::from);
-            let origin = Vec3A::from(sm.origin);
-            let place = |p: [f32; 3]| origin + (axis[0] * p[0] + axis[1] * p[1] + axis[2] * p[2]) * sm.scale;
+            let place = |p: [f32; 3]| origin + (axis[0] * p[0] + axis[1] * p[1] + axis[2] * p[2]) * scale;
             let turn = |n: Vec3A| (axis[0] * n.x + axis[1] * n.y + axis[2] * n.z).normalize_or_zero();
             for surf in lod.surf_index as usize..(lod.surf_index + lod.num_surfs) as usize {
                 let Some(mat) = xm.materials.get(surf).copied().flatten().and_then(|m| loader.material(zi, m)) else { continue };
@@ -244,6 +267,7 @@ impl Scene {
                         lightmap: NO_LIGHTMAP,
                         colour: Vec3::ONE,
                         nf: Vec3A::ZERO,
+                        placed,
                     };
                     push(
                         std::array::from_fn(|k| place(vs[k].xyz)),
@@ -254,6 +278,10 @@ impl Scene {
                     );
                 }
             }
+        }
+        let placed = info.iter().filter(|t: &&TriInfo| t.placed).count();
+        if !layout.models.is_empty() || !layout.hidden.is_empty() {
+            log::info!("bake scene: map editor layout: {} models placed ({placed} triangles, {missing} not found), {} of the map's left out, {} lights", layout.models.len() - missing, layout.hidden.len(), layout.lights.len());
         }
         log::info!(
             "bake scene: {world_tris} world and {} model triangles, {} materials ({} textured, {} alpha-tested)",
@@ -267,7 +295,7 @@ impl Scene {
         // Lay the triangles out in the BVH's order.
         let tris = bvh.primitive_indices.iter().map(|&i| tris[i as usize]).collect();
         let info = bvh.primitive_indices.iter().map(|&i| info[i as usize]).collect();
-        Scene { tris, info, mats: loader.mats, bvh, saturation: 1.0 }
+        Scene { tris, info, mats: loader.mats, bvh, saturation: 1.0, placed }
     }
 
     /// `t`, and barycentrics of v1 and v2, if `ray` hits triangle `i`.

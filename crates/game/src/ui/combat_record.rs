@@ -3,7 +3,7 @@
 //! and sharing are deliberately left to the multiplayer integration.
 
 mod menu;
-pub(super) use menu::{rank, rank_at};
+pub(super) use menu::{on_top, rank, rank_at};
 
 use super::{Frontend, progression::stat, stats::Stats};
 use crate::combat::{Dead, HitLocation, Killed, Pawn, hostile};
@@ -194,7 +194,8 @@ pub(super) fn setup(app: &mut App) {
         .add_systems(OnEnter(crate::state::GameState::InGame), |mut t: ResMut<Tracking>| *t = Tracking::default())
         .add_systems(Update, sync_identity.before(crate::movement::MovementSet).run_if(crate::state::in_game))
         // Read messages after all of the match's damage and weapon systems.
-        .add_systems(PostUpdate, track.in_set(TrackingSet).run_if(crate::state::in_game));
+        // (Multiplayer matches only: campaign AI and Headquarters don't count.)
+        .add_systems(PostUpdate, track.in_set(TrackingSet).run_if(crate::state::in_game).run_if(|| !crate::campaign::active() && !crate::hq::active()));
 }
 
 fn sync_identity(fe: Option<Res<Frontend>>, mut player: Query<&mut Pawn, With<LocalPlayer>>) {

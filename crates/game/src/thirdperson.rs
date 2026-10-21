@@ -139,6 +139,7 @@ fn attach_bodies(
         for m in &models {
             surfaces.extend(spawn_model(&mut commands, &mut skeleton, SpawnModel { model: m, owner, attach_to: None, layers: layers.clone(), shadows: true }));
         }
+        crate::character_look::mark(&mut commands, &surfaces);
         // The gun in hand comes next ([`hold_guns`]).
         let _ = layers;
         let black_ops = outfit.is_some_and(|o| o.character.game == crate::characters::Game::BlackOps);
@@ -1206,7 +1207,7 @@ fn drive_body_anims(
             // In cover: the campaign's cover poses ([`crate::cover`]).
             _ if cover_pose.is_some() => cover_pose.unwrap_or_default().to_owned(),
             // Headquarters: at ease, the gun lowered.
-            _ if crate::hq::active() => hq_anim(mover.stance, m).map_or_else(|| base_anim(mover.stance, m, grip, ads), str::to_owned),
+            _ if crate::hq::active() && !crate::hq::armed() => hq_anim(mover.stance, m).map_or_else(|| base_anim(mover.stance, m, grip, ads), str::to_owned),
             _ => match shuffle {
                 Some((dir, ..)) => base_anim(mover.stance, Motion::Walk(dir), grip, ads),
                 None => base_anim(mover.stance, m, grip, ads),
@@ -1214,7 +1215,7 @@ fn drive_body_anims(
         };
         // The angle blend's pair, instead of one direction's loop.
         let (name, side) = match angled {
-            Some((fwd, side, w)) if !(downed || now < state.hurt_until || crate::hq::active()) => {
+            Some((fwd, side, w)) if !(downed || now < state.hurt_until || (crate::hq::active() && !crate::hq::armed())) => {
                 let main = base_anim(mover.stance, m.with_dir(fwd), grip, ads);
                 let other = load(&base_anim(mover.stance, m.with_dir(side), grip, ads)).map(|a| (a, w));
                 (main, other)

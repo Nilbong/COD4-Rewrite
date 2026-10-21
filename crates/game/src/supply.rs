@@ -32,7 +32,7 @@ pub struct SupplyPlugin;
 impl Plugin for SupplyPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(OnEnter(crate::state::GameState::InGame), spawn_notice.in_set(crate::state::Setup::Spawn))
-            .add_systems(Update, (earn, show_notice).chain().run_if(crate::state::in_game));
+            .add_systems(Update, (earn, show_notice).chain().run_if(crate::state::in_game.and(|| !crate::campaign::active())));
     }
 }
 
@@ -378,6 +378,10 @@ pub fn apply(d: &mut WeaponDef, v: &Variant) {
                     &mut d.raise_time,
                     &mut d.drop_time,
                     &mut d.first_raise_time,
+                    &mut d.quick_drop_time,
+                    &mut d.quick_raise_time,
+                    &mut d.empty_drop_time,
+                    &mut d.empty_raise_time,
                     &mut d.reload_time,
                     &mut d.reload_empty_time,
                     &mut d.reload_start_time,

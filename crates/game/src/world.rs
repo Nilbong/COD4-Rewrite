@@ -35,6 +35,9 @@ impl Plugin for WorldPlugin {
             include_bytes!("shaders/world_deferred.wgsl").as_slice(),
         );
         app.add_plugins(MaterialPlugin::<WorldMaterial>::default()).add_systems(OnEnter(crate::state::GameState::InGame), load_map.in_set(crate::state::Setup::Content));
+        if std::env::var("COD4RW_WORLDLIGHTS").is_ok_and(|v| v == "1") && std::env::var_os("COD4RW_FIRE_AB").is_none() && std::env::var_os("COD4RW_SHOT").is_some() {
+            app.add_systems(Update, world_lights_ab);
+        }
     }
 }
 
@@ -47,7 +50,7 @@ pub type WorldMaterial = ExtendedMaterial<StandardMaterial, WorldLighting>;
 /// their draws batch: `shaders/world.wgsl`'s `BINDLESS` path).
 #[derive(Asset, AsBindGroup, Reflect, Debug, Clone, Default)]
 #[data(100, WorldParams, binding_array(121))]
-#[bindless(index_table(range(100..116), binding(120)))]
+#[bindless(index_table(range(100..118), binding(120)))]
 pub struct WorldLighting {
     pub params: WorldParams,
     /// IW3 normal map: tangent-space x in alpha, y in green.
@@ -85,6 +88,11 @@ pub struct WorldLighting {
     #[texture(114)]
     #[sampler(115)]
     pub height_map: Option<Handle<Image>>,
+    /// The raw `lightmapN_primary` image: the baked visibility of each
+    /// surface's primary light (`COD4RW_WORLDLIGHTS`).
+    #[texture(116)]
+    #[sampler(117)]
+    pub primary_map: Option<Handle<Image>>,
 }
 
 #[derive(ShaderType, Reflect, Debug, Clone, Default)]
@@ -122,6 +130,29 @@ pub struct WorldParams {
     /// Detail map: x, y its tiling (`detailScale`), z: has one, w: its
     /// last mip level (whose texel is its average).
     pub detail: Vec4,
+    /// Showcase reflections (`crate::probe_parallax`): the reflection
+    /// probe's position (w = 1 when set) and the box around it the probe's
+    /// view is projected onto (min w = 1 once fitted).
+    pub probe_center: Vec4,
+    pub probe_box_min: Vec4,
+    pub probe_box_max: Vec4,
+    /// The surfaces' primary light (`COD4RW_WORLDLIGHTS`; CoD4 adds it to
+    /// the lightmap at run time, which leaves it out): position (Bevy) and
+    /// 1 / radius (m).
+    pub plight_pos: Vec4,
+    /// Its colour times intensity (gamma space, as `sun_diffuse`); w 1 on.
+    pub plight_color: Vec4,
+    /// Its direction (where it shines) and the spot's exponent.
+    pub plight_dir: Vec4,
+    /// Spot: x `1 / (cos inner - cos outer)`, y `-x * cos outer`, z 1 for a
+    /// spot; w 1 with a primary lightmap (baked visibility) to multiply by.
+    pub plight_spot: Vec4,
+    /// The material-class layer (`crate::material_class`): x the CoD4
+    /// surface type, y 1 when on, z detail strength, w anti-tiling amount.
+    pub surface: Vec4,
+    /// Probe normalisation (`crate::world::probe_norm`): x strength, y on,
+    /// z calibration, w the most it may brighten.
+    pub probe_norm: Vec4,
 }
 
 impl From<&WorldLighting> for WorldParams {
@@ -281,9 +312,13 @@ pub fn load_map(
             info!("converted MW2 {zone}: {} assets ({:?})", z.assets.len(), t0.elapsed());
             z
         }
-        None => load_zone(&map.0),
+        // (A campaign mission's, read during its briefing: `crate::campaign`.)
+        None => crate::campaign::take_zone(&map.0).unwrap_or_else(|| load_zone(&map.0)),
     };
-    let mut content = Content::new(vec![map_zone, load_zone("common_mp")], vfs);
+    // (Parsed ahead on a background thread, `crate::common_zone`.)
+    let common = crate::common_zone::take().unwrap_or_else(|| load_zone("common_mp"));
+    let mut content = Content::new(vec![map_zone, common], vfs);
+    info!("load: zones ready ({:?})", t0.elapsed());
 
     // Re-baked lighting (`crate::bake`) when wanted and cached, else CoD4's.
     let zone_path = mw2.as_deref().and_then(crate::mw2::zone_path).unwrap_or_else(|| install.zone_path(&map.0));
@@ -292,6 +327,7 @@ pub fn load_map(
         Some(r) => r.lightmaps.clone(),
         None => crate::lightmaps::load(content.map(), content.map().gfx_world().expect("zone has no GfxWorld"), &mut images),
     };
+    info!("load: lightmaps ({:?})", t0.elapsed());
     let probes =
         crate::lightmaps::load_probes(content.map(), content.map().gfx_world().expect("zone has no GfxWorld"), &mut images);
     // Models (guns) reflect the nearest probe.
@@ -301,7 +337,9 @@ pub fn load_map(
         let mip = images.get(&h).map_or(0.0, |i| i.texture_descriptor.mip_level_count.saturating_sub(1) as f32);
         Some((units::pos(p.origin), h, mip))
     });
-    commands.insert_resource(ReflectionProbes(placed.collect()));
+    let placed: Vec<(Vec3, Handle<Image>, f32)> = placed.collect();
+    info!("load: probes ({:?})", t0.elapsed());
+    commands.insert_resource(ReflectionProbes(placed.clone()));
     spawn_world_geometry(
         &mut commands,
         &mut content,
@@ -313,7 +351,7 @@ pub fn load_map(
         &mut images,
         rebaked.is_some(),
     );
-    spawn_static_models(&mut commands, &mut content, &mut meshes, &mut std_materials, &mut world_materials, &mut images);
+    spawn_static_models(&mut commands, &mut content, &mut meshes, &mut std_materials, &mut world_materials, &mut images, &placed);
     let world = content.map().gfx_world().expect("zone has no GfxWorld");
     let light_grid = crate::model_lighting::spawn_irradiance_volume(&mut commands, world, &mut images, rebaked.as_ref().map(|r| &r.grid));
     spawn_sun(&mut commands, world, light_grid);
@@ -339,7 +377,8 @@ pub fn load_map(
             })
             .chain(dyn_brush_places(&content))
             .collect();
-        crate::collision::spawn_brush_entity_collision(&mut commands, clip, &places);
+        let movable = movable_brush_models(&content);
+        crate::collision::spawn_brush_entity_collision(&mut commands, clip, &places, &movable);
         crate::collision::spawn_static_model_collision(&mut commands, content.map(), clip);
     }
     let spawns =
@@ -358,6 +397,32 @@ pub fn load_map(
 fn brush_entity_shown(e: &iw3::ents::Entity) -> bool {
     let exploder = e.get("script_exploder").is_some() || e.get("script_prefab_exploder").is_some();
     e.get("script_gameobjectname").is_none() && !(exploder && matches!(e.get("targetname"), Some("exploder" | "exploderchunk")))
+}
+
+/// A script brush model a mission's scripts move: its surfaces drawn about
+/// its own origin under this entity, its colliders tagged so too; the stage
+/// sets their place from the level (`crate::campaign`).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct ScriptBrushPart(pub usize);
+
+/// The brush models of a mission's `script_brushmodel`s (none outside the
+/// campaign: multiplayer's stay merged into the world).
+pub fn movable_brush_models(content: &Content) -> std::collections::HashSet<usize> {
+    // (Debug: `COD4RW_STATIC_BRUSHES=1` keeps them in the world, as before.)
+    let hq = crate::hq::active();
+    if !(crate::campaign::active() || hq) || std::env::var_os("COD4RW_STATIC_BRUSHES").is_some() {
+        return Default::default();
+    }
+    let ents = content.map().map_ents().map(|e| iw3::ents::parse(&e.entity_string)).unwrap_or_default();
+    // Headquarters moves only F.N.G.'s doors and pop-up targets.
+    if hq {
+        return crate::hq::movable_brushes(&ents);
+    }
+    ents.iter()
+        .filter(|e| e.classname() == "script_brushmodel" && brush_entity_shown(e))
+        .filter_map(|e| e.get("model")?.strip_prefix('*')?.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .collect()
 }
 
 /// Where each brush model is drawn (index = model; 0 the world, in place):
@@ -441,13 +506,28 @@ fn spawn_world_geometry(
         }
         of
     };
-    let mut groups: HashMap<(AssetId, u8, u8), Vec<usize>> = HashMap::new();
+    // A mission's script brush models move (doors, the killhouse's
+    // targets): each drawn on its own, about its own origin, under an
+    // entity the stage moves ([`ScriptBrushPart`]).
+    let movable = movable_brush_models(content);
+    let mut moving: HashMap<(AssetId, u8, u8, u8, usize), Vec<usize>> = HashMap::new();
+    let mut groups: HashMap<(AssetId, u8, u8, u8), Vec<usize>> = HashMap::new();
+    // (With `COD4RW_WORLDLIGHTS`, split by primary light too: each group's
+    // material carries its light.)
+    let lights_on = world_lights();
+    let primaries = if lights_on { crate::lightmaps::load_primary(content.map(), content.map().gfx_world().expect("gfxworld"), images) } else { Vec::new() };
     for (i, s) in content.map().gfx_world().expect("gfxworld").surfaces.iter().enumerate() {
         if placed.get(surf_model[i] as usize).copied().flatten().is_none() {
             continue;
         }
+        if movable.contains(&(surf_model[i] as usize)) {
+            if let Some(m) = s.material {
+                moving.entry((m, s.lightmap_index, s.reflection_probe_index, if lights_on { s.primary_light_index } else { 0 }, surf_model[i] as usize)).or_default().push(i);
+            }
+            continue;
+        }
         if let Some(m) = s.material {
-            groups.entry((m, s.lightmap_index, s.reflection_probe_index)).or_default().push(i);
+            groups.entry((m, s.lightmap_index, s.reflection_probe_index, if lights_on { s.primary_light_index } else { 0 })).or_default().push(i);
         }
     }
     // One group per material and lightmap, with the probe most of its
@@ -457,18 +537,18 @@ fn spawn_world_geometry(
     // between neighbouring probes. `COD4RW_PROBESPLIT` keeps them split.
     if std::env::var_os("COD4RW_PROBESPLIT").is_none() {
         let surfaces = &content.map().gfx_world().expect("gfxworld").surfaces;
-        let mut merged: HashMap<(AssetId, u8), (HashMap<u8, usize>, Vec<usize>)> = HashMap::new();
-        for ((m, lm, probe), list) in groups.drain() {
-            let entry = merged.entry((m, lm)).or_default();
+        let mut merged: HashMap<(AssetId, u8, u8), (HashMap<u8, usize>, Vec<usize>)> = HashMap::new();
+        for ((m, lm, probe, pl), list) in groups.drain() {
+            let entry = merged.entry((m, lm, pl)).or_default();
             *entry.0.entry(probe).or_default() += list.iter().map(|&i| surfaces[i].tri_count as usize).sum::<usize>();
             entry.1.extend(list);
         }
-        for ((m, lm), (probes, list)) in merged {
+        for ((m, lm, pl), (probes, list)) in merged {
             let probe = probes.into_iter().max_by_key(|&(p, n)| (n, p)).map_or(0, |(p, _)| p);
-            groups.insert((m, lm, probe), list);
+            groups.insert((m, lm, probe, pl), list);
         }
     }
-    let mut world_mats: HashMap<(AssetId, u8, u8), Handle<WorldMaterial>> = HashMap::new();
+    let mut world_mats: HashMap<(AssetId, u8, u8, u8), Handle<WorldMaterial>> = HashMap::new();
     {
         let by_lightmap: std::collections::HashSet<(AssetId, u8)> = groups.keys().map(|k| (k.0, k.1)).collect();
         let by_material: std::collections::HashSet<AssetId> = groups.keys().map(|k| k.0).collect();
@@ -484,7 +564,14 @@ fn spawn_world_geometry(
     // Double-sided also lets single-sided roofs and walls block the sun.
     let mut proxy_positions: Vec<[f32; 3]> = Vec::new();
     let mut proxy_indices: Vec<u32> = Vec::new();
-    for ((mat_id, lightmap_index, probe_index), surfs) in groups {
+    let mut parts: HashMap<usize, Entity> = HashMap::new();
+    for &n in &movable {
+        let (at, turn) = placed.get(n).copied().flatten().unwrap_or((Vec3::ZERO, Quat::IDENTITY));
+        let e = commands.spawn((Name::new(format!("brush model *{n}")), Transform::from_translation(at).with_rotation(turn), Visibility::default(), ScriptBrushPart(n), ChildOf(root))).id();
+        parts.insert(n, e);
+    }
+    let all = groups.into_iter().map(|(k, v)| (k, 0usize, v)).chain(moving.into_iter().map(|((m, l, p, pl, n), v)| ((m, l, p, pl), n, v)));
+    for ((mat_id, lightmap_index, probe_index, plight), model, surfs) in all {
         let Some(mat) = content.material(MAP_ZONE, mat_id, std_materials, images) else {
             warn!("world material {:?} not drawn: ({}), {} surfaces", content.zone(MAP_ZONE).material(mat_id).map(|m| m.name.clone()), content.technique_set(MAP_ZONE, mat_id), surfs.len());
             continue;
@@ -519,7 +606,7 @@ fn spawn_world_geometry(
                 surfs.len()
             );
         }
-        let material = match world_mats.get(&(mat_id, lightmap_index, probe_index)) {
+        let material = match world_mats.get(&(mat_id, lightmap_index, probe_index, plight)) {
             Some(m) => m.clone(),
             None => {
                 let base = std_materials.get(&mat.handle).cloned().unwrap_or_default();
@@ -529,17 +616,38 @@ fn spawn_world_geometry(
                 // over: lit surfaces' directional light went black, Carentan's
                 // walls.)
                 let real = |h: Option<Handle<Image>>, name: Option<String>| h.filter(|_| !name.is_some_and(|n| n.trim_start_matches(',').starts_with('$')));
-                let normal_map = real(
+                let mut normal_map = real(
                     content.material_texture(MAP_ZONE, mat_id, TextureSemantic::Normal, false, images),
                     content.material_texture_name(MAP_ZONE, mat_id, TextureSemantic::Normal),
                 );
+                // Remastered textures (`crate::upscaled`): a normal map made
+                // from the colour where CoD4 has none, and heights for
+                // parallax on big flat opaque surfaces.
+                let upscaled = crate::upscaled::on();
+                let colour_name = content.material_texture_name(MAP_ZONE, mat_id, TextureSemantic::Color).map(|n| n.trim_start_matches(',').to_owned());
+                let normal_name = normal_map
+                    .as_ref()
+                    .and(content.material_texture_name(MAP_ZONE, mat_id, TextureSemantic::Normal))
+                    .map(|n| n.trim_start_matches(',').to_owned());
+                if upscaled && normal_map.is_none() {
+                    normal_map = colour_name.as_ref().and_then(|c| content.image(&format!("{c}.gen_n"), false, images));
+                }
+                let flat = upscaled
+                    && normal_map.is_some()
+                    && base.alpha_mode == AlphaMode::Opaque
+                    && crate::upscaled::parallax_depth() > 0.0
+                    && crate::upscaled::large_flat(content.map().gfx_world().expect("gfxworld"), &surfs);
+                let upscaled_height = if flat { normal_name.as_ref().or(colour_name.as_ref()).and_then(|n| content.image(&format!("{n}.height"), false, images)) } else { None };
+                let relief = if upscaled_height.is_some() { crate::upscaled::parallax_depth() } else { 0.0 };
                 // Opaque surfaces only: the prepass doesn't shift the UVs,
                 // so an alpha-tested edge would disagree between the passes
                 // (the sky colour showed along cables' edges).
-                let height_map = (normal_map.is_some() && base.alpha_mode == AlphaMode::Opaque && crate::atmos::climate::showcase())
-                    .then(|| content.material_texture_name(MAP_ZONE, mat_id, TextureSemantic::Normal))
-                    .flatten()
-                    .and_then(|name| crate::pom::height_map(&content.vfs.clone(), &name, images));
+                let height_map = upscaled_height.or_else(|| {
+                    (normal_map.is_some() && base.alpha_mode == AlphaMode::Opaque && crate::atmos::climate::showcase())
+                        .then(|| content.material_texture_name(MAP_ZONE, mat_id, TextureSemantic::Normal))
+                        .flatten()
+                        .and_then(|name| crate::pom::height_map(&content.vfs.clone(), &name, images))
+                });
                 let specular_map = real(
                     content.material_texture(MAP_ZONE, mat_id, TextureSemantic::Specular, true, images),
                     content.material_texture_name(MAP_ZONE, mat_id, TextureSemantic::Specular),
@@ -573,26 +681,80 @@ fn spawn_world_geometry(
                     .map(|t| t.name.as_str())
                     .unwrap_or("");
                 WorldLighting::falloff(zone_mat, technique_set, &mut params);
+                // The material-class layer (`crate::material_class`), not on
+                // fake beams, portals or water.
+                if params.falloff_parms.z == 0.0 && !technique_set.starts_with("wc_water") && base.alpha_mode != AlphaMode::Add {
+                    params.surface = crate::material_class::surface(zone_mat.map_or(0, |m| m.surface_type_bits));
+                }
+                params.probe_norm = probe_norm();
                 // Re-baked lightmaps are linear, their direction a unit vector.
                 params.traced.z = (rebaked && lightmap.is_some()) as u32 as f32;
+                // Remastered parallax depth (`relief_uv`; 0: the showcase's).
+                params.traced.w = relief;
+                if reflection_probe.is_some() && crate::atmos::climate::showcase() {
+                    if let Some(p) = content.map().gfx_world().and_then(|w| w.reflection_probes.get(probe_index as usize)) {
+                        params.probe_center = units::pos(p.origin).extend(1.0);
+                    }
+                }
                 if cod4_sun() {
                     let sun = &content.map().gfx_world().expect("gfxworld").sun;
                     params.sun_dir = to_sun(sun).extend(0.0);
                     params.sun_diffuse = live_sun(sun).extend(0.0);
                     params.traced.y = 1.0;
                 }
+                // With the whole sun live (`crate::lightmaps::full_sun`), no
+                // rolloff on lit surfaces (knob `gi.linear`): it scaled a
+                // sunlit floor by 0.66, so doubling the sun showed as +25%.
+                if crate::tune::get("gi.linear", if crate::lightmaps::full_sun() { 1.0 } else { 0.0 }) > 0.5 {
+                    // (Negative: ray-traced lighting's deferred path uses
+                    // `traced.x` for its floor, always positive.)
+                    params.traced.x = -1.0;
+                }
                 if technique_set.starts_with("wc_water") {
                     WorldLighting::water(zone_mat, content.map().gfx_world().expect("gfxworld"), &mut params);
+                    // Water's screen-space reflections, where `crate::ssr`
+                    // fills their history (the showcase). (Water leaves the
+                    // shader early, so `probe.z` is free for this there.)
+                    params.probe.z = crate::atmos::climate::on() as u32 as f32;
                 }
                 let detail_map = content.material_detail(MAP_ZONE, mat_id, images).map(|(h, scale)| {
                     let mips = images.get(&h).map_or(1, |i| i.texture_descriptor.mip_level_count);
                     params.detail = Vec4::new(scale.x, scale.y, 1.0, mips.saturating_sub(1) as f32);
                     h
                 });
-                let extension =
-                    WorldLighting { params, normal_map, specular_map, lightmap: lightmap.clone(), reflection_probe: reflection_probe.or_else(|| sky.clone()), detail_map, wet_map: crate::wet::wet_map(), ssr_history: crate::ssr::history(), height_map };
+                // The surfaces' primary light (spot or omni; the sun's
+                // handled above), CoD4's run-time light on its lightmap.
+                let mut primary_map = None;
+                if lights_on && lightmap.is_some() {
+                    let light = content.map().com_world().and_then(|w| w.primary_lights.get(plight as usize)).filter(|l| matches!(l.kind, 2 | 3) && l.radius > 0.0);
+                    if let Some(l) = light {
+                        primary_map = primaries.get(lightmap_index as usize).cloned().flatten();
+                        let k = crate::tune::get("worldlights.scale", 1.0);
+                        params.plight_pos = units::pos(l.origin).extend(1.0 / units::u(l.radius).max(0.01));
+                        params.plight_color = (Vec3::from(l.color) * k).extend(1.0);
+                        // (Its light def's falloff, by name: 1 none, 2 linear, 3
+                        // quadratic, 0 a smooth curve; with the exponent.)
+                        let def = l.def_name.as_deref().unwrap_or("");
+                        let falloff = if def.contains("no_falloff") { 1.0 } else if def.contains("linear") { 2.0 } else if def.contains("quadratic") { 3.0 } else { 0.0 };
+                        params.plight_dir = (-units::dir(l.dir)).normalize_or(Vec3::NEG_Y).extend(l.exponent as f32 + 100.0 * falloff);
+                        let span = (l.cos_half_fov_inner - l.cos_half_fov_outer).max(1e-3);
+                        params.plight_spot = Vec4::new(1.0 / span, -l.cos_half_fov_outer / span, (l.kind == 2) as u32 as f32, primary_map.is_some() as u32 as f32);
+                    }
+                }
+                let extension = WorldLighting {
+                    params,
+                    normal_map,
+                    specular_map,
+                    lightmap: lightmap.clone(),
+                    reflection_probe: reflection_probe.or_else(|| sky.clone()),
+                    detail_map,
+                    wet_map: crate::wet::wet_map(),
+                    ssr_history: crate::ssr::history(),
+                    height_map,
+                    primary_map,
+                };
                 let handle = world_materials.add(WorldMaterial { base, extension });
-                world_mats.insert((mat_id, lightmap_index, probe_index), handle.clone());
+                world_mats.insert((mat_id, lightmap_index, probe_index, plight), handle.clone());
                 handle
             }
         };
@@ -621,7 +783,8 @@ fn spawn_world_geometry(
                     continue;
                 }
                 // CoD winds front faces clockwise; Bevy expects counter-clockwise.
-                let (at, turn) = placed[surf_model[si] as usize].unwrap_or((Vec3::ZERO, Quat::IDENTITY));
+                // (A moving one's about its own origin: its entity places it.)
+                let (at, turn) = if model != 0 { (Vec3::ZERO, Quat::IDENTITY) } else { placed[surf_model[si] as usize].unwrap_or((Vec3::ZERO, Quat::IDENTITY)) };
                 for g in [global[0], global[2], global[1]] {
                     let local = *remap.entry(g).or_insert_with(|| {
                         let v = &world.vertices[g as usize];
@@ -664,7 +827,7 @@ fn spawn_world_geometry(
         // casting themselves for their cutouts.
         let alpha_mode = world_materials.get(&material).map_or(AlphaMode::Opaque, |m| m.base.alpha_mode);
         let casts_itself = matches!(alpha_mode, AlphaMode::Mask(_));
-        if alpha_mode == AlphaMode::Opaque {
+        if alpha_mode == AlphaMode::Opaque && model == 0 {
             let base = proxy_positions.len() as u32;
             if let (Some(bevy::mesh::VertexAttributeValues::Float32x3(p)), Some(Indices::U32(idx))) =
                 (mesh.attribute(Mesh::ATTRIBUTE_POSITION), mesh.indices())
@@ -673,11 +836,12 @@ fn spawn_world_geometry(
                 proxy_indices.extend(idx.iter().map(|i| base + i));
             }
         }
-        let mut e = commands.spawn((Name::new(name), Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), ChildOf(root)));
+        let parent = parts.get(&model).copied().unwrap_or(root);
+        let mut e = commands.spawn((Name::new(name), Mesh3d(meshes.add(mesh)), MeshMaterial3d(material), ChildOf(parent)));
         if let Some(w) = water {
             e.insert(w);
         }
-        if !casts_itself {
+        if !casts_itself && model == 0 {
             e.insert(NotShadowCaster);
         }
         if let Some(image) = lightmap {
@@ -709,6 +873,62 @@ fn spawn_world_geometry(
     info!("world geometry: {total_tris} triangles in {draws} draws");
 }
 
+/// Alpha-tested static models (foliage) on the world shader for its
+/// distance cutoff; `COD4RW_FOLIAGEWORLD=0` puts them back on their plain
+/// material (to time it).
+fn foliage_world() -> bool {
+    !std::env::var("COD4RW_FOLIAGEWORLD").is_ok_and(|v| v == "0")
+}
+
+/// Reflection probe normalisation (`world.wgsl`), read at map load:
+/// `COD4RW_PROBENORM=0` off; knobs `probe.normalize` (strength 0..1),
+/// `probe.norm_k` (calibration), `probe.norm_max` (the most it may
+/// brighten: 1, it only dims where less light arrives than the probe saw).
+pub fn probe_norm() -> Vec4 {
+    let on = !std::env::var("COD4RW_PROBENORM").is_ok_and(|v| v == "0");
+    Vec4::new(crate::tune::get("probe.normalize", 1.0), on as u32 as f32, crate::tune::get("probe.norm_k", 1.0), crate::tune::get("probe.norm_max", 1.0))
+}
+
+/// Static models drawn as the world's surfaces are (CoD4's normal and
+/// specular maps, gloss to roughness, the nearest probe's reflection)
+/// rather than plain colour. `COD4RW_PROPMATS=0` for the flat look.
+pub fn prop_materials() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("COD4RW_PROPMATS").is_ok_and(|v| v == "0"))
+}
+
+/// A static model material on the world shader: its CoD4 normal and
+/// specular maps, reflecting `probe` (with a specular map, as IW3's model
+/// techniques did), and the showcase's rain and sky as `crate::wet`'s.
+pub(crate) fn prop_material(
+    base: &StandardMaterial,
+    (normal_map, specular_map): (Option<Handle<Image>>, Option<Handle<Image>>),
+    surface_bits: u32,
+    probe: Option<&(Vec3, Handle<Image>, f32)>,
+    sky: Option<Handle<Image>>,
+    world_materials: &mut Assets<WorldMaterial>,
+) -> Handle<WorldMaterial> {
+    let params = WorldParams {
+        flags: Vec4::new(normal_map.is_some() as u32 as f32, specular_map.is_some() as u32 as f32, 0.0, crate::lightmaps::LIGHTMAP_EXPOSURE),
+        probe: Vec4::new(probe.is_some() as u32 as f32, probe.map_or(0.0, |p| p.2), (probe.is_none() && sky.is_some()) as u32 as f32, crate::mw2::active() as u32 as f32),
+        surface: crate::material_class::surface(surface_bits),
+        probe_norm: probe_norm(),
+        ..default()
+    };
+    world_materials.add(WorldMaterial {
+        base: base.clone(),
+        extension: WorldLighting {
+            params,
+            normal_map,
+            specular_map,
+            reflection_probe: probe.map(|p| p.1.clone()).or(sky),
+            wet_map: crate::wet::wet_map(),
+            ssr_history: crate::ssr::history(),
+            ..default()
+        },
+    })
+}
+
 fn spawn_static_models(
     commands: &mut Commands,
     content: &mut Content,
@@ -716,6 +936,7 @@ fn spawn_static_models(
     std_materials: &mut Assets<StandardMaterial>,
     world_materials: &mut Assets<WorldMaterial>,
     images: &mut Assets<Image>,
+    probes: &[(Vec3, Handle<Image>, f32)],
 ) {
     let root = commands.spawn((Name::new("static models"), Transform::default(), Visibility::default())).id();
     // Fake light beams and flares (`*_falloff_*`) fade as they turn edge-on,
@@ -723,6 +944,8 @@ fn spawn_static_models(
     let mut falloff_mats: HashMap<(usize, AssetId), Option<Handle<WorldMaterial>>> = HashMap::new();
     let instances: Vec<_> = content.map().gfx_world().expect("gfxworld").static_models.clone();
     let mut batches: HashMap<(BatchMaterial, IVec3, u32), Vec<(Handle<Mesh>, Transform)>> = HashMap::new();
+    // Each plain batch material's CoD4 one, for its maps (`prop_material`).
+    let mut zone_mats: HashMap<bevy::asset::AssetId<StandardMaterial>, (usize, AssetId)> = HashMap::new();
     let mut logged = std::collections::HashSet::new();
     // Models drawn with surfaces missing, or not at all (their collision
     // still stands): name -> (instances, surfaces missed, why).
@@ -739,6 +962,10 @@ fn spawn_static_models(
             continue;
         };
         let name = xm.name.clone();
+        // (Left out with the map editor, `crate::map_editor`.)
+        if crate::map_editor::layout::hidden(&name, sm.origin) {
+            continue;
+        }
         let mats: Vec<Option<AssetId>> = xm.materials.clone();
         let transform = Transform {
             translation: units::pos(sm.origin),
@@ -784,6 +1011,7 @@ fn spawn_static_models(
                 Some(m) => BatchMaterial::World(m),
                 None => BatchMaterial::Standard(mat.handle.clone()),
             };
+            zone_mats.entry(mat.handle.id()).or_insert((zi, mat_id));
             if std::env::var("COD4RW_BATCHLOG").is_ok_and(|v| !v.is_empty() && name.contains(&v)) {
                 info!("batchlog: {name} surf {surf} -> cell {cell} cull {cull} material {:?}", match &material { BatchMaterial::World(m) => m.id().to_string(), BatchMaterial::Standard(m) => m.id().to_string() });
                 logged.insert((material.clone(), cell, cull));
@@ -817,9 +1045,16 @@ fn spawn_static_models(
     // thread more than the models themselves); alpha-tested ones (foliage)
     // keep casting their own for their cutouts.
     let mut proxy: Vec<(Handle<Mesh>, Transform)> = Vec::new();
-    let mut wet_materials: std::collections::HashMap<bevy::asset::AssetId<StandardMaterial>, Handle<WorldMaterial>> = Default::default();
-    let sky = crate::atmos::climate::showcase().then(|| content.sky_cube(images)).flatten();
+    let mut wet_materials: std::collections::HashMap<(bevy::asset::AssetId<StandardMaterial>, Option<usize>), Handle<WorldMaterial>> = Default::default();
+    let mut prop_mats: std::collections::HashMap<(bevy::asset::AssetId<StandardMaterial>, Option<usize>), Handle<WorldMaterial>> = Default::default();
+    let sky = (crate::atmos::climate::showcase() || prop_materials()).then(|| content.sky_cube(images)).flatten();
     for ((material, _cell, cull), parts) in batches {
+        // The showcase reflects each batch's nearest probe (box-corrected,
+        // `crate::probe_parallax`), not just the sky.
+        let middle = parts.iter().map(|(_, tf)| tf.translation).sum::<Vec3>() / parts.len().max(1) as f32;
+        let probe = (crate::atmos::climate::wet_showcase() || prop_materials())
+            .then(|| probes.iter().enumerate().min_by(|a, b| a.1.0.distance_squared(middle).total_cmp(&b.1.0.distance_squared(middle))))
+            .flatten();
         let opaque = matches!(&material, BatchMaterial::Standard(m) if std_materials.get(m).is_some_and(|m| m.alpha_mode == AlphaMode::Opaque));
         if opaque && std::env::var_os("COD4RW_NOBATCH").is_none() {
             proxy.extend(parts.iter().cloned());
@@ -850,8 +1085,31 @@ fn spawn_static_models(
             // (Alpha-tested ones always take the world shader: its cutoff
             // drops with distance, so grass and leaves keep their cover far
             // off rather than thinning to see-through cards.)
-            BatchMaterial::Standard(m) if crate::atmos::climate::showcase() || std_materials.get(&m).is_some_and(|m| matches!(m.alpha_mode, AlphaMode::Mask(_))) => {
-                let wet = wet_materials.entry(m.id()).or_insert_with(|| crate::wet::wet_material(std_materials.get(&m), sky.clone(), world_materials)).clone();
+            // CoD4's maps on props (`prop_material`), the rain's wetness too.
+            BatchMaterial::Standard(m) if prop_materials() && zone_mats.contains_key(&m.id()) && std_materials.get(&m).is_some() => {
+                let probe_key = probe.map(|(i, _)| i);
+                let prop = match prop_mats.get(&(m.id(), probe_key)) {
+                    Some(h) => h.clone(),
+                    None => {
+                        let (zi, id) = zone_mats[&m.id()];
+                        let maps = content.model_maps(zi, id, images);
+                        let bits = content.material_surface_bits(zi, id);
+                        let h = prop_material(std_materials.get(&m).expect("checked"), maps, bits, probe.map(|(_, p)| p), sky.clone(), world_materials);
+                        prop_mats.insert((m.id(), probe_key), h.clone());
+                        h
+                    }
+                };
+                e.insert(MeshMaterial3d(prop))
+            }
+            BatchMaterial::Standard(m)
+                if crate::atmos::climate::wet_showcase()
+                    || (foliage_world() && std_materials.get(&m).is_some_and(|m| matches!(m.alpha_mode, AlphaMode::Mask(_)))) =>
+            {
+                let probe_key = probe.map(|(i, _)| i);
+                let wet = wet_materials
+                    .entry((m.id(), probe_key))
+                    .or_insert_with(|| crate::wet::wet_material(std_materials.get(&m), sky.clone(), probe.map(|(_, p)| p), world_materials))
+                    .clone();
                 e.insert(MeshMaterial3d(wet))
             }
             BatchMaterial::Standard(m) => e.insert(MeshMaterial3d(m)),
@@ -951,6 +1209,9 @@ pub(crate) fn merge_mesh_data(read: &[(&Mesh, &Transform)]) -> Option<Mesh> {
     use bevy::mesh::VertexAttributeValues as V;
     let read = read.to_vec();
     let colours = read.iter().all(|(m, _)| m.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
+    // (Tangents for the props' normal maps, `prop_material`.)
+    let tangents = read.iter().all(|(m, _)| m.attribute(Mesh::ATTRIBUTE_TANGENT).is_some());
+    let mut tan: Vec<[f32; 4]> = Vec::new();
     let (mut pos, mut nrm, mut uv, mut col, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::<u32>::new());
     for (m, t) in read {
         let (Some(V::Float32x3(p)), Some(V::Float32x3(n)), Some(V::Float32x2(u))) =
@@ -965,6 +1226,11 @@ pub(crate) fn merge_mesh_data(read: &[(&Mesh, &Transform)]) -> Option<Mesh> {
         pos.extend(p.iter().map(|v| matrix.transform_point3(Vec3::from(*v)).to_array()));
         nrm.extend(n.iter().map(|v| (t.rotation * Vec3::from(*v)).to_array()));
         uv.extend_from_slice(u);
+        if tangents {
+            if let Some(V::Float32x4(tv)) = m.attribute(Mesh::ATTRIBUTE_TANGENT) {
+                tan.extend(tv.iter().map(|v| (t.rotation * Vec3::new(v[0], v[1], v[2])).extend(v[3]).to_array()));
+            }
+        }
         if colours {
             if let Some(V::Float32x4(c)) = m.attribute(Mesh::ATTRIBUTE_COLOR) {
                 col.extend_from_slice(c);
@@ -984,6 +1250,9 @@ pub(crate) fn merge_mesh_data(read: &[(&Mesh, &Transform)]) -> Option<Mesh> {
     out.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
     if colours && !col.is_empty() {
         out.insert_attribute(Mesh::ATTRIBUTE_COLOR, col);
+    }
+    if tangents && tan.len() == out.count_vertices() {
+        out.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tan);
     }
     out.insert_indices(Indices::U32(idx));
     Some(out)
@@ -1047,6 +1316,9 @@ fn spawn_sun(commands: &mut Commands, world: &zone::GfxWorld, light_grid: bool) 
                 // typical baked 0.3, in the lightmaps' units (lux = pi * nits).
                 let live = live_sun(sun).max_element();
                 std::f32::consts::PI * crate::lightmaps::LIGHTMAP_EXPOSURE * ((0.3 + live).powf(2.2) - 0.3f32.powf(2.2)) / live.max(1e-3) * live
+            } else if live_sun_model() && crate::lightmaps::full_sun() {
+                // A live-sun bake (`crate::bake::livesun`): all of the sun.
+                LIVE_SUN_ILLUMINANCE * (Vec3::from(sun.sun_color) * (sun.sun_light - sun.ambient_scale).max(0.0)).max_element()
             } else if live_sun_model() {
                 LIVE_SUN_ILLUMINANCE * live_sun(sun).max_element()
             } else {
@@ -1105,4 +1377,57 @@ fn read_spawns(ents: &[iw3::ents::Entity]) -> Vec<SpawnPoint> {
             Some(SpawnPoint { pos: units::pos(e.origin()?), yaw: units::yaw_from_cod_degrees(e.angles()[1]), kind })
         })
         .collect()
+}
+
+/// Test switch `COD4RW_WORLDLIGHTS=1`: each world surface's primary light
+/// (the map's spot and omni lights) added to its lightmap as CoD4 does at
+/// run time, times its baked visibility (`lightmapN_primary`). Off by
+/// default: an A/B for the decision.
+pub fn world_lights() -> bool {
+    // (And under the night grade, `crate::fire`: the practical lights
+    // carry the scene while the baked light is turned down.)
+    std::env::var("COD4RW_WORLDLIGHTS").is_ok_and(|v| v == "1") || crate::fire::night_on()
+}
+
+/// With `COD4RW_WORLDLIGHTS=1` and `COD4RW_SHOT_VIEWS` (each view listed
+/// twice): the primary lights off for the even shots, on for the odd, so
+/// one launch makes before/after pairs; logs each half's frame time.
+fn world_lights_ab(
+    time: Res<Time>,
+    diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
+    mut materials: ResMut<Assets<WorldMaterial>>,
+    mut exposures: Query<&mut bevy::post_process::auto_exposure::AutoExposure>,
+    mut state: Local<Option<bool>>,
+) {
+    let late: f32 = std::env::var("COD4RW_SHOT_LATE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let t = time.elapsed_secs() - late;
+    // (As `crate::autoshot`: view k from 5 s, 1.5 s each, shot at 6 + 1.5 k;
+    // without views, its pairs at 6, 7, 8, 9 s.)
+    let k = if std::env::var_os("COD4RW_SHOT_VIEWS").is_some() { (((t - 5.0) / 1.5).floor().max(0.0)) as usize } else { ((t - 5.5).floor().max(0.0)) as usize };
+    let on = k % 2 == 1;
+    if *state == Some(on) {
+        return;
+    }
+    let ms = diagnostics.get(&bevy::diagnostic::FrameTimeDiagnosticsPlugin::FRAME_TIME).and_then(|d| d.average()).unwrap_or(0.0);
+    if let Some(was) = *state {
+        info!("worldlights: view {} {} frame {:.2} ms", k.saturating_sub(1), if was { "on" } else { "off" }, ms);
+    }
+    *state = Some(on);
+    // (The pair at one exposure: it settles fast on the view while the
+    // lights are off, and holds while they're on.)
+    for mut e in &mut exposures {
+        let speed = if on { 0.0 } else { 30.0 };
+        e.speed_brighten = speed;
+        e.speed_darken = speed;
+    }
+    let ids: Vec<_> = materials.ids().collect();
+    for id in ids {
+        let Some(m) = materials.get(id) else { continue };
+        if m.extension.params.plight_spot.w == 0.0 && m.extension.params.plight_pos.w == 0.0 {
+            continue;
+        }
+        if let Some(mut m) = materials.get_mut(id) {
+            m.extension.params.plight_color.w = on as u32 as f32;
+        }
+    }
 }

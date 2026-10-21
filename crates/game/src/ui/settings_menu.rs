@@ -44,7 +44,7 @@ pub(super) fn build(menus: &mut HashMap<String, Arc<Menu>>) {
         };
         let menu = Arc::make_mut(menu);
         // Test features' rows only in builds that have them.
-        let rows: Vec<Setting> = page.rows.iter().filter(|s| cfg!(feature = "raytracing") || s.dvar != "r_lighting").copied().collect();
+        let rows: Vec<Setting> = page.rows.iter().filter(|s| (cfg!(feature = "raytracing") || s.dvar != "r_lighting") && (s.dvar != "r_lightmaps" || crate::bake::cache::any_bakes())).copied().collect();
         if !rebuild(menu, &rows) {
             bevy::log::warn!("settings: {} has no rows to copy", page.menu);
             continue;

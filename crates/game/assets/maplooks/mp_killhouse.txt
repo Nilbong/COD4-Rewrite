@@ -1,0 +1,4 @@
+# mp_killhouse's normal look, from the Map Look Editor (F9).
+sky.cover.mp_killhouse = 0.02
+sky.physical.mp_killhouse = 1
+sky.screen_clouds.mp_killhouse = 1

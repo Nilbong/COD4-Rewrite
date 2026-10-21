@@ -23,7 +23,9 @@ pub(super) fn build(app: &mut App) {
                 c.entity(e).despawn();
             }
         })
-        .add_systems(Update, (spawn_cue, lead_changes, closing_time, match_end, chatter, ambience, emitters).run_if(crate::state::in_game));
+        // (A mission has no match: no spawn music, announcer or chatter.)
+        .add_systems(Update, (spawn_cue, lead_changes, closing_time, match_end, chatter).run_if(crate::state::in_game.and(|| !crate::campaign::active())))
+        .add_systems(Update, (ambience, emitters).run_if(crate::state::in_game));
 }
 
 /// The map's ambience still to start this match: its track, and its

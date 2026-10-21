@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
 
 /// Rays start this far off the surface (CoD units, inches).
-const OFFSET: f32 = 0.1;
+pub(super) const OFFSET: f32 = 0.1;
 /// Surfaces this near (units) count for contact occlusion.
 pub const CONTACT_RANGE: f32 = 32.0;
 /// Rays travel at most this far.
@@ -69,7 +69,7 @@ fn radical_inverse(i: u32) -> f32 {
     i.reverse_bits() as f32 * 2.328_306_4e-10
 }
 
-fn hash(mut x: u32) -> u32 {
+pub(super) fn hash(mut x: u32) -> u32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x7feb_352d);
     x ^= x >> 15;
@@ -77,19 +77,19 @@ fn hash(mut x: u32) -> u32 {
     x ^ (x >> 16)
 }
 
-fn rand2(seed: u32) -> Vec2 {
+pub(super) fn rand2(seed: u32) -> Vec2 {
     let a = hash(seed);
     let b = hash(a ^ 0x9e37_79b9);
     Vec2::new(a as f32 / 4_294_967_296.0, b as f32 / 4_294_967_296.0)
 }
 
 /// Sample `j` of `n` of a 2D low-discrepancy set, rotated by `rot`.
-fn sample2(j: u32, n: u32, rot: Vec2) -> Vec2 {
+pub(super) fn sample2(j: u32, n: u32, rot: Vec2) -> Vec2 {
     let s = Vec2::new((j as f32 + 0.5) / n as f32, radical_inverse(j)) + rot;
     s - s.floor()
 }
 
-fn basis(n: Vec3A) -> (Vec3A, Vec3A) {
+pub(super) fn basis(n: Vec3A) -> (Vec3A, Vec3A) {
     let t = n.any_orthonormal_vector();
     (t, n.cross(t))
 }
@@ -111,6 +111,9 @@ pub struct Lights {
     /// The live sun's irradiance (lightmap units) on a surface facing it.
     pub sun: Vec3,
     pub spots: Vec<Spot>,
+    /// Lights the game draws live (the map editor's, `super::layout`):
+    /// like the live sun, baked only for their bounce.
+    pub live: Vec<super::layout::Light>,
 }
 
 /// The sun disc's angular radius for soft shadows (radians), a little over
@@ -135,7 +138,7 @@ impl Lights {
                 quadratic: l.def_name.as_deref().is_some_and(|d| d.contains("quadratic")),
             })
             .collect();
-        Lights { to_sun, sun: Vec3::from(sun.sun_color) * live_sun_lux * lux_to_units, spots }
+        Lights { to_sun, sun: Vec3::from(sun.sun_color) * live_sun_lux * lux_to_units, spots, live: Vec::new() }
     }
 
     /// Direct light from the lamps at `p` (normal `n` for the cosine, `nf`
@@ -180,6 +183,27 @@ impl Lights {
                 each(s.colour * f * lit as f32 / N as f32, l);
             }
         }
+    }
+
+    /// The live lights' direct light at `p` (normal `n`), hard-shadowed
+    /// (it is only bounced).
+    fn live_lights(&self, scene: &Scene, p: Vec3A, n: Vec3A, nf: Vec3A) -> Vec3 {
+        let o = p + nf * OFFSET;
+        let mut sum = Vec3::ZERO;
+        for l in &self.live {
+            let to = l.origin - o;
+            let dist = to.length();
+            if dist >= l.range || dist < 1e-3 {
+                continue;
+            }
+            let d = to / dist;
+            let c = n.dot(d);
+            if c <= 0.0 || scene.occluded(o, d, dist - 1.0) {
+                continue;
+            }
+            sum += l.lux(dist) * c / (PI * crate_exposure());
+        }
+        sum
     }
 
     /// The sun's direct light at `p` (irradiance on a surface facing it,
@@ -404,6 +428,7 @@ impl Baker<'_> {
         if c > 0.0 && !scene.occluded(p + n * OFFSET, self.lights.to_sun, FAR) {
             e.sun += self.lights.sun * c;
         }
+        e.sun += self.lights.live_lights(scene, p, n, n);
         Split { sky: albedo * e.sky, sun: albedo * e.sun }
     }
 
@@ -417,7 +442,8 @@ impl Baker<'_> {
                 .map(|i| {
                     let Some(t) = texels[i] else { return (Vec3::ZERO, Vec3::ZERO) };
                     let seed = hash(i as u32 ^ 0x51ed);
-                    let sun = self.lights.sun * t.n.dot(self.lights.to_sun).max(0.0) * self.lights.sun_seen(self.scene, t.pos, t.nf, 8, seed);
+                    let sun = self.lights.sun * t.n.dot(self.lights.to_sun).max(0.0) * self.lights.sun_seen(self.scene, t.pos, t.nf, 8, seed)
+                        + self.lights.live_lights(self.scene, t.pos, t.n, t.nf);
                     let mut lamps = Vec3::ZERO;
                     self.lights.lamps(self.scene, t.pos, t.nf, seed, |e, l| lamps += e * t.n.dot(l).max(0.0));
                     (sun, lamps)
@@ -426,6 +452,64 @@ impl Baker<'_> {
             a.sun = out.iter().map(|o| o.0).collect();
             a.lamps = out.iter().map(|o| o.1).collect();
         }
+    }
+
+    /// How much of the light CoD4 baked reaches each texel with the map
+    /// editor's models in the way (1: all of it): the sky (by its
+    /// brightness each way) and the sun, the share of each whose first hit
+    /// is a placed model. Floors and fits against CoD4's lightmap scale
+    /// its light by this, so a placed model's shadow isn't filled back in.
+    pub fn placed_shade(&self, atlas: &super::texels::Atlas, sky_k: f32) -> Vec<f32> {
+        const N: u32 = 48;
+        (0..atlas.texels.len())
+            .into_par_iter()
+            .map(|i| {
+                let Some(t) = atlas.texels[i] else { return 1.0 };
+                self.shade_at(t.pos + t.nf * OFFSET, Some(t.n), hash(i as u32 ^ 0x9e37), N, sky_k)
+            })
+            .collect()
+    }
+
+    /// As [`Self::placed_shade`] at a grid point (light from every way).
+    pub fn placed_shade_grid(&self, grid: &Grid, sky_k: f32) -> Vec<f32> {
+        (0..grid.points.len()).into_par_iter().map(|i| self.shade_at(Grid::pos(grid.points[i]), None, hash(i as u32 ^ 0x7f4a), 48, sky_k)).collect()
+    }
+
+    fn shade_at(&self, o: Vec3A, n: Option<Vec3A>, seed: u32, samples: u32, sky_k: f32) -> f32 {
+        let scene = self.scene;
+        let placed = |d: Vec3A, far: f32| scene.closest(o, d, far).is_some_and(|h| scene.info[h.tri].placed);
+        let rot = rand2(seed);
+        let (mut all, mut blocked) = (0.0f32, 0.0f32);
+        for j in 0..samples {
+            let s = sample2(j, samples, rot);
+            let d = match n {
+                Some(n) => {
+                    let (t1, t2) = basis(n);
+                    let l = cosine_dir(s.x, s.y);
+                    (t1 * l.x + t2 * l.y + n * l.z).normalize()
+                }
+                None => {
+                    let z = 1.0 - 2.0 * s.x;
+                    let r = (1.0 - z * z).max(0.0).sqrt();
+                    Vec3A::new(r * (TAU * s.y).cos(), r * (TAU * s.y).sin(), z)
+                }
+            };
+            let w = luma(self.sky.radiance(d)) * sky_k;
+            all += w;
+            if placed(d, FAR) {
+                blocked += w;
+            }
+        }
+        // The sun, as much as the sky's light all round.
+        let c = n.map_or(1.0, |n| n.dot(self.lights.to_sun).max(0.0));
+        if c > 0.0 {
+            let w = luma(self.lights.sun) * c * samples as f32 / PI;
+            all += w;
+            if placed(self.lights.to_sun, FAR) {
+                blocked += w;
+            }
+        }
+        if all <= 0.0 { 1.0 } else { 1.0 - blocked / all }
     }
 
     /// One gathering pass over every texel: the light arriving at each.

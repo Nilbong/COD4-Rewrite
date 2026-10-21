@@ -44,11 +44,28 @@ static WET_MAP: OnceLock<Handle<Image>> = OnceLock::new();
 /// standard material under the world shader with nothing else of the
 /// world's (no lightmap, maps or probe), so it's lit as before; wet, it
 /// reflects the sky (`sky`, flagged in `probe.z`).
-pub fn wet_material(base: Option<&StandardMaterial>, sky: Option<Handle<Image>>, world_materials: &mut Assets<WorldMaterial>) -> Handle<WorldMaterial> {
-    let params = crate::world::WorldParams { probe: Vec4::new(0.0, 0.0, sky.is_some() as u32 as f32, 0.0), ..default() };
+/// With a `probe` (its position, cube map and last mip), the model reflects
+/// that, box-corrected (`crate::probe_parallax`), wet or dry; otherwise the
+/// sky when wet.
+pub fn wet_material(
+    base: Option<&StandardMaterial>,
+    sky: Option<Handle<Image>>,
+    probe: Option<&(Vec3, Handle<Image>, f32)>,
+    world_materials: &mut Assets<WorldMaterial>,
+) -> Handle<WorldMaterial> {
+    let mut params = crate::world::WorldParams { probe: Vec4::new(0.0, 0.0, sky.is_some() as u32 as f32, 0.0), ..default() };
+    let mut reflection = sky;
+    // (Off unless `COD4RW_MODELPROBES=1`: too subtle on CoD4's rough
+    // materials, see `crate::probe_parallax`.)
+    if let Some((at, cube, mip)) = probe.filter(|_| std::env::var("COD4RW_MODELPROBES").is_ok_and(|v| v == "1")) {
+        params.probe = Vec4::new(1.0, *mip, 0.0, 0.0);
+        // w = 2: reflects without a specular map (models have none).
+        params.probe_center = at.extend(2.0);
+        reflection = Some(cube.clone());
+    }
     world_materials.add(WorldMaterial {
         base: base.cloned().unwrap_or_default(),
-        extension: crate::world::WorldLighting { params, reflection_probe: sky, wet_map: wet_map(), ssr_history: crate::ssr::history(), ..default() },
+        extension: crate::world::WorldLighting { params, reflection_probe: reflection, wet_map: wet_map(), ssr_history: crate::ssr::history(), ..default() },
     })
 }
 
@@ -122,7 +139,7 @@ fn tag_world(
     let mut changed = 0;
     for (e, current) in &meshes {
         if current.map(|t| t.0) != Some(tag) {
-            commands.entity(e).insert(MeshTag(tag));
+            commands.entity(e).try_insert(MeshTag(tag));
             changed += 1;
         }
     }

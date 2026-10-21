@@ -430,6 +430,8 @@ fn with_private_match(menu: &Menu) -> Option<Menu> {
     // The campaign ([`crate::campaign`]) above it, in test builds only.
     if crate::modes::test_features() {
         out.items.extend(place_row(&template, y - 3.0 * HQ_PITCH, row + 1, str_exp("Campaign"), &script(&[&ui_script("startCampaign")])));
+        // The Coup straight away (testing the campaign's levels).
+        out.items.extend(place_row(&template, y - 4.0 * HQ_PITCH, row + 2, str_exp("The Coup"), &script(&[&ui_script("startCampaign coup")])));
     }
     Some(out)
 }
@@ -504,7 +506,24 @@ impl Frontend {
         let online = self.lobby.online.active();
         let l = &mut self.lobby;
         match cmd.as_str() {
-            "lobbymap" => l.map = n(1).min(maps().len() - 1),
+            "lobbymap" => {
+                let m = n(1).min(maps().len() - 1);
+                // Online, only a map everyone here can load (a custom map:
+                // only alone, nobody else is known to have it).
+                let others: Vec<u8> = l.online.members.iter().filter(|o| Some(o.peer) != l.online.me).map(|o| o.profile.games).collect();
+                let map = maps()[m].0;
+                let ok = others.is_empty() || others.iter().all(|&g| crate::netplay::mixed::can_load_map(map, g));
+                if ok {
+                    l.map = m;
+                } else {
+                    let need = match crate::netplay::mixed::map_need(map) {
+                        crate::netplay::mixed::MapNeed::Game(g) => g.title(),
+                        crate::netplay::mixed::MapNeed::Custom => "that custom map",
+                    };
+                    l.online.note = format!("Not everyone here has {need}: pick another map.");
+                    bevy::log::info!("lobby: {map} refused online: not everyone has {need}");
+                }
+            }
             // A game type picked (the new UI's mode screen).
             "lobbymode" => {
                 let m = n(1).min(GameMode::ALL.len() - 1);
@@ -792,6 +811,7 @@ impl Frontend {
             return;
         }
         let l = &self.lobby;
+        let o_active = l.online.active();
         // The map, under the settings.
         p.map_card(6.0, 264.0, 212.0, maps()[l.map]);
 
@@ -828,6 +848,10 @@ impl Frontend {
                 let (rank, prestige) = self.my_rank();
                 let w = p.member(x, y, rank, prestige, &self.profile_name(), GOLD);
                 p.text(x + 32.0 + w, y + 13.0, 0, 0.24, "(you)", GREY);
+                // Online: the games each player has (badges).
+                if o_active {
+                    p.text(x + PANEL_W - 8.0, y + 13.0, 2, 0.2, &crate::netplay::mixed::tags(crate::netplay::mixed::installed()).join(" "), GOLD);
+                }
             }
             // Friends, after this game's players.
             let mut row = l.locals_on(s).count();
@@ -838,6 +862,7 @@ impl Frontend {
                 if m.peer == crate::online::HOST {
                     p.text(x + 32.0 + w, y + 13.0, 0, 0.24, "(host)", GREY);
                 }
+                p.text(x + PANEL_W - 8.0, y + 13.0, 2, 0.2, &crate::netplay::mixed::tags(m.profile.games).join(" "), GOLD);
                 row += 1;
             }
         }
@@ -859,7 +884,10 @@ impl Frontend {
         if let Some(code) = &o.code {
             p.text(x + 8.0, ONLINE_TOP + 16.0, 0, 0.27, "Lobby code:", GREY);
             p.text(x + 100.0, ONLINE_TOP + 18.0, 0, 0.42, code, GOLD);
-            p.text(x + 8.0, ONLINE_TOP + 44.0, 0, 0.22, "Give it to friends. It only works for this lobby.", GREY);
+            // (A note takes its line.)
+            if o.note.is_empty() {
+                p.text(x + 8.0, ONLINE_TOP + 44.0, 0, 0.22, "Give it to friends. It only works for this lobby.", GREY);
+            }
         } else if o.guest() {
             let host = o.members.iter().find(|m| m.peer == crate::online::HOST).map_or("the host", |m| m.profile.name.as_str());
             p.text(x + 8.0, ONLINE_TOP + 16.0, 0, 0.27, &format!("In {host}'s lobby"), WHITE);
@@ -891,8 +919,10 @@ impl Frontend {
                 });
             }
             for m in l.online.others_on(s) {
+                // (Their games, as badges after the name.)
+                let tags = crate::netplay::mixed::tags(m.profile.games);
                 rows.push(LobbyRow::Friend {
-                    name: m.profile.name.clone(),
+                    name: if tags.is_empty() { m.profile.name.clone() } else { format!("{}  [{}]", m.profile.name, tags.join(" ")) },
                     rank: m.profile.rank as i32,
                     prestige: m.profile.prestige as i32,
                     host: m.peer == crate::online::HOST,

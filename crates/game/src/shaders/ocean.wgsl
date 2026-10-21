@@ -278,6 +278,8 @@ fn fragment(in: Out) -> @location(0) vec4<f32> {
     // weaker than a calm sea's mirror.)
     reflected = mix(vec3(lum), reflected, 0.75) * mix(1.0, 0.75, ocean.wind.w);
     reflected = min(reflected, up_sky * 1.5);
+    // (The editor's reflection strength, `debug.w` + 1.)
+    reflected *= 1.0 + ocean.debug.w;
     // Light from the whole sky, for the water's body and foam.
     // (Around the sky, not straight up, where a high sun's glow is.)
     var ambient = (sky_radiance(normalize(vec3(1.0, 0.6, 0.0)), 6.0) + sky_radiance(normalize(vec3(-1.0, 0.6, 0.0)), 6.0)
@@ -291,7 +293,9 @@ fn fragment(in: Out) -> @location(0) vec4<f32> {
     let deep = vec3(0.016, 0.026, 0.024);
     let shallow = vec3(0.024, 0.048, 0.042);
     let crest = saturate(in.rest.z / max(scale * 1.4, 0.2) * 0.5 + 0.5);
-    let body_col = mix(deep, shallow, crest * 0.6);
+    // (The Map Look Editor's tint, `debug.z`: warmer and murkier, or bluer.)
+    let tint = ocean.debug.z;
+    let body_col = mix(deep, shallow, crest * 0.6) * vec3(1.0 + 0.5 * tint, 1.0 + 0.15 * tint, 1.0 - 0.4 * tint);
     var body = body_col * (sun_col * n_l * shadow / PI + ambient);
     let through = pow(saturate(dot(v, -sun_dir) * 0.6 + 0.4), 4.0) * crest * crest;
     body += vec3(0.004, 0.025, 0.02) * sun_col / PI * through * shadow;

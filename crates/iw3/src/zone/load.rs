@@ -676,6 +676,8 @@ impl<'a> Loader<'a> {
                 let def_name = self.r.xstring(l.ptr(64))?;
                 primary_lights.push(PrimaryLight {
                     kind: l.u8(0),
+                    can_shadow: l.u8(1) != 0,
+                    exponent: l.u8(2),
                     color: l.vec3(4),
                     dir: l.vec3(16),
                     origin: l.vec3(28),

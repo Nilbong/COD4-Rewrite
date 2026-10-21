@@ -64,6 +64,14 @@ impl UiAssets {
             }
             zones.push(zone);
         }
+        // The campaign's own menus (CoD4's single player `ui.ff`), test
+        // builds only: kept under `sp:` (their names clash with MP's) and
+        // opened from the Campaign row ([`crate::campaign`]).
+        let sp_zone = crate::modes::test_features()
+            .then(|| iw3::fastfile::load(&install.zone_path("ui")).ok().and_then(|d| Zone::parse(&d, ParseOptions::default()).ok()))
+            .flatten();
+        let sp_index = sp_zone.is_some().then_some(zones.len());
+        zones.extend(sp_zone);
         let mut out = UiAssets {
             zones: Vec::new(),
             vfs,
@@ -81,15 +89,24 @@ impl UiAssets {
         };
         for (zi, zone) in zones.iter().enumerate() {
             let data = UiData::from_zone(zone);
+            let sp = Some(zi) == sp_index;
             for m in data.menus {
-                out.menus.insert(m.window.name.to_ascii_lowercase(), Arc::new(m));
+                let name = m.window.name.to_ascii_lowercase();
+                out.menus.insert(if sp { format!("sp:{name}") } else { name }, Arc::new(m));
             }
-            out.fonts.extend(data.fonts);
-            out.strings.extend(data.strings.into_iter().map(|(k, v)| (k.to_ascii_uppercase(), v)));
-            for t in data.tables {
-                out.tables.insert(t.name.to_ascii_lowercase(), t);
+            // (SP's strings and fonts only where MP has none.)
+            if sp {
+                for (k, v) in data.strings {
+                    out.strings.entry(k.to_ascii_uppercase()).or_insert(v);
+                }
+            } else {
+                out.fonts.extend(data.fonts);
+                out.strings.extend(data.strings.into_iter().map(|(k, v)| (k.to_ascii_uppercase(), v)));
+                for t in data.tables {
+                    out.tables.insert(t.name.to_ascii_lowercase(), t);
+                }
+                out.sounds.extend(crate::audio::bank::aliases(zone));
             }
-            out.sounds.extend(crate::audio::bank::aliases(zone));
             for (id, asset) in zone.assets.iter().enumerate() {
                 if let Asset::Material(m) = asset {
                     // Names with a leading comma are references to another zone's copy.

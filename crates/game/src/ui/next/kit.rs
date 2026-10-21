@@ -566,7 +566,7 @@ impl<'a> Kit<'a> {
             self.text_mid(r.cx(), r.cy(), t, key, ink, 1);
             return w;
         }
-        // The user's Xbox / PlayStation button art (`assets/ui/next/buttons`).
+        // The user's Xbox / PlayStation button art (`assets/ui/next/buttons2`).
         let (sprite, size) = button.pad_sprite(ps);
         let w = h * size.0 / size.1;
         self.pic(R::new(x, cy - h * 0.5, w, h), &format!("next:buttons2/{sprite}"), [1.0; 4]);

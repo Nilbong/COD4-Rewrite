@@ -135,6 +135,12 @@ fn min_jerk(t: f32) -> f32 {
 
 impl AimState {
     /// Angular error from the view to `goal` (yaw, pitch).
+    /// In the middle of a flick (under 85% of a submove done): a player
+    /// doesn't take the first shot then.
+    pub fn settling(&self, now: f32) -> bool {
+        self.submove.as_ref().is_some_and(|m| (now - m.start) / m.duration.max(1e-3) < 0.85)
+    }
+
     pub fn error(view: &ViewAngles, goal: Vec2) -> Vec2 {
         Vec2::new(wrap(goal.x - view.yaw), goal.y - view.pitch)
     }
@@ -210,7 +216,18 @@ impl AimState {
                 let perp = Vec2::new(-dir.y, dir.x);
                 // Lead a moving target by part of how far it travels meanwhile.
                 let lead = if goal.combat { self.goal_vel * duration * 0.5 } else { Vec2::ZERO };
-                let delta = dir * dist * gain + perp * dist * p.dir_sd * side + lead;
+                // The sideways miss grows with the flick only so far: scaled
+                // by the whole of a 150-degree turn it landed the view 14
+                // degrees off in pitch (the floor or the sky) after every big
+                // turn. A mostly sideways flick misses little in pitch. (Bot
+                // lab `oldflick`: as before.)
+                let off = if super::lab::on("oldflick") {
+                    perp * dist * p.dir_sd * side
+                } else {
+                    let o = perp * dist.min(0.35) * p.dir_sd * side;
+                    if dir.x.abs() > dir.y.abs() { Vec2::new(o.x, o.y * 0.35) } else { o }
+                };
+                let delta = dir * dist * gain + off + lead;
                 self.submove = Some(Submove { start: now, duration, delta, applied: 0.0 });
                 self.submoves += 1;
             }

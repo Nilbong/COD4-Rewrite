@@ -153,11 +153,16 @@ fn vertex(@location(0) v: vec3<f32>) -> Out {
         return out;
     }
     if k == 4 {
-        // A distant curtain of rain: a big soft sheet standing in a ring
-        // 30-150 m out, turned to face the eye, drifting with the wind.
-        let ang = rand(i * 9u + 6u) * 2.0 * PI + t * 0.004;
-        let r = mix(extent.x, extent.y, pow(rand(i * 9u + 7u), 0.7));
-        let at = centre.xyz + vec3<f32>(cos(ang), 0.0, sin(ang)) * r;
+        // A distant curtain of rain: a big soft sheet with a place in the
+        // world (wrapped into a square round the camera, as the streaks
+        // are, so it doesn't travel with the camera), drifting with the
+        // wind, turned to face the eye, shown 30-150 m out.
+        let csize = vec2<f32>(extent.y * 2.0);
+        let clo = centre.xz - vec2<f32>(extent.y);
+        let cbase = vec2<f32>(rand(i * 9u + 6u), rand(i * 9u + 7u)) * 4096.0 + velocity.xz * 0.15 * t;
+        let cxz = clo + fract((cbase - clo) / csize) * csize;
+        let at = vec3<f32>(cxz.x, centre.y, cxz.y);
+        let r = length(cxz - centre.xz);
         let to_eye = eye - at;
         let side = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), to_eye));
         let w = 18.0 + 22.0 * rand(i * 9u + 8u);
@@ -175,7 +180,12 @@ fn vertex(@location(0) v: vec3<f32>) -> Out {
         let phase = t * 0.9 + rand(i * 9u + 5u);
         let life = fract(phase);
         let s = i * 9u + u32(floor(phase)) * 7919u;
-        let spot = centre.xyz + vec3<f32>((rand(s) * 2.0 - 1.0) * extent.x, 0.0, (rand(s + 1u) * 2.0 - 1.0) * extent.z);
+        // (A place in the world, wrapped into the box round the camera, so
+        // a falling drip doesn't slide as the camera moves.)
+        let dsize = extent.xz * 2.0;
+        let dlo = centre.xz - extent.xz;
+        let dxz = dlo + fract((vec2<f32>(rand(s), rand(s + 1u)) * 997.0 - dlo) / dsize) * dsize;
+        let spot = vec3<f32>(dxz.x, centre.y, dxz.y);
         let a = f32(hash(s + 2u) % 4u) * PI * 0.5;
         let step = vec3<f32>(cos(a), 0.0, sin(a)) * kind.y;
         let top = height_at(spot);

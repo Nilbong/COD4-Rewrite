@@ -95,6 +95,41 @@ pub fn load(zone: &Zone, world: &GfxWorld, images: &mut Assets<Image>) -> Vec<Op
         .collect()
 }
 
+/// Every primary lightmap of `world` (`COD4RW_WORLDLIGHTS`), indexed like
+/// `GfxSurface::lightmap_index`: one channel, the baked visibility of each
+/// surface's primary light (its shadows from the world), which the world
+/// shader multiplies that light by.
+pub fn load_primary(zone: &Zone, world: &GfxWorld, images: &mut Assets<Image>) -> Vec<Option<Handle<Image>>> {
+    const FORMAT_L8: u32 = 50;
+    world
+        .lightmaps
+        .iter()
+        .enumerate()
+        .map(|(i, pair)| {
+            let img = pair.primary.and_then(|id| zone.image(id))?;
+            let def = img.load_def.as_ref()?;
+            if def.format != FORMAT_L8 {
+                warn!("primary lightmap {i}: format {}, not L8", def.format);
+                return None;
+            }
+            let (w, h) = (img.width as u32, img.height as u32);
+            let size = (w * h) as usize;
+            if def.data.len() < size {
+                return None;
+            }
+            let mut image = Image::new(
+                Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                TextureDimension::D2,
+                def.data[..size].to_vec(),
+                TextureFormat::R8Unorm,
+                RenderAssetUsages::RENDER_WORLD,
+            );
+            image.sampler = ImageSampler::linear();
+            Some(images.add(image))
+        })
+        .collect()
+}
+
 /// Map lighting: CoD4's own lightmaps and grid (the default), or the
 /// re-baked ones (`crate::bake`) where a bake of the map is cached. Set from
 /// the settings (`r_maplighting`); `COD4RW_MAPLIGHTING=rebaked|original`
@@ -105,14 +140,44 @@ pub fn set_rebaked(on: bool) {
     REBAKED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static FULL_SUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The map's lightmaps are a live-sun bake (`crate::bake::livesun`): the
+/// world's sun is drawn at its whole strength, none of it baked.
+pub fn full_sun() -> bool {
+    FULL_SUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn rebaked_wanted() -> bool {
     // Ray-traced lighting reads CoD4's (`shaders/world_deferred.wgsl`).
     if crate::ui::lighting() != crate::rtgi::Lighting::Baked {
         return false;
     }
     match std::env::var("COD4RW_MAPLIGHTING") {
-        Ok(v) => v.eq_ignore_ascii_case("rebaked"),
-        Err(_) => REBAKED.load(std::sync::atomic::Ordering::Relaxed),
+        Ok(v) => v.eq_ignore_ascii_case("rebaked") || v.eq_ignore_ascii_case("live"),
+        Err(_) => REBAKED.load(std::sync::atomic::Ordering::Relaxed) || LIVE.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+static LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_live(on: bool) {
+    LIVE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Map Lighting: Live (`crate::gi_live`): the map lit as it loads, the
+/// whole sun live, its bounce and the sky solved from the geometry. It
+/// starts from the map's re-bake (which it needs, for now) and replaces its
+/// light once traced.
+pub fn live_wanted() -> bool {
+    // (Over the showcase's time-of-day keyframes too: the clock moves the
+    // sun and Live follows it, `crate::gi_live`.)
+    if crate::ui::lighting() != crate::rtgi::Lighting::Baked {
+        return false;
+    }
+    match std::env::var("COD4RW_MAPLIGHTING") {
+        Ok(v) => v.eq_ignore_ascii_case("live"),
+        Err(_) => LIVE.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -130,23 +195,39 @@ pub struct Rebaked {
 /// With the showcase on (`crate::tod_light`), the map's time-of-day
 /// keyframes instead, blended for the clock, when it has them.
 pub fn load_rebaked(commands: &mut Commands, map: &str, zone_path: &std::path::Path, images: &mut Assets<Image>) -> Option<Rebaked> {
-    if crate::atmos::climate::showcase() && crate::ui::lighting() == crate::rtgi::Lighting::Baked {
+    if crate::atmos::climate::showcase() && crate::ui::lighting() == crate::rtgi::Lighting::Baked && !live_wanted() {
         // The clock's start (`COD4RW_TOD`); without it, noon until the
         // clock is set to the map's hour a frame or two in.
         let hour = std::env::var("COD4RW_TOD").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(12.0).rem_euclid(24.0);
         if let Some((rebaked, tod)) = crate::tod_light::load(map, zone_path, images, hour) {
             commands.insert_resource(tod);
+            // (The Map Look Editor's clock may then range widely.)
+            crate::atmos::climate::set_tod_keys(true);
             return Some(rebaked);
         }
     }
+    // (Reset before any way out: a match without a bake draws CoD4's sun.)
+    FULL_SUN.store(false, std::sync::atomic::Ordering::Relaxed);
     if !rebaked_wanted() {
         return None;
     }
     let t = std::time::Instant::now();
-    let Some(baked) = crate::bake::cache::load(map, crate::bake::cache::source_stamp(zone_path)) else {
+    let stamp = crate::bake::cache::source_stamp(zone_path);
+    // The live-sun bake first (`crate::bake::livesun`; knob `sun.full`, 1):
+    // with it the world's sun is drawn whole ([`full_sun`]).
+    let livesun = (crate::bake::cache::profile().is_none() && crate::tune::get("sun.full", 1.0) > 0.5)
+        .then(|| crate::bake::cache::dir_for(map, Some(crate::bake::LIVESUN)).and_then(|d| crate::bake::cache::load_in(&d, stamp)))
+        .flatten();
+    let live = live_wanted();
+    let whole_sun = livesun.is_some() || live;
+    let Some(baked) = livesun.or_else(|| crate::bake::cache::load(map, stamp)) else {
         info!("rebaked lighting: no bake of {map} (COD4RW_BAKE={map} makes one)");
         return None;
     };
+    if whole_sun {
+        FULL_SUN.store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("rebaked lighting: {map} with the whole sun drawn live{}", if live { " (Live)" } else { "" });
+    }
     let lightmaps = baked
         .atlases
         .into_iter()
@@ -161,9 +242,16 @@ pub fn load_rebaked(commands: &mut Commands, map: &str, zone_path: &std::path::P
                 RenderAssetUsages::RENDER_WORLD,
             );
             image.sampler = ImageSampler::linear();
+            // (Live: kept in the main world too, rewritten as it's lit.)
+            if live {
+                image.asset_usage = RenderAssetUsages::default();
+            }
             Some(images.add(image))
         })
-        .collect();
+        .collect::<Vec<_>>();
     info!("rebaked lighting: {map} loaded in {:?}", t.elapsed());
+    if live {
+        crate::gi_live::start(commands, map, &lightmaps, images);
+    }
     Some(Rebaked { lightmaps, grid: baked.grid.into_iter().collect() })
 }

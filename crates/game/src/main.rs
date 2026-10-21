@@ -15,6 +15,9 @@ mod bodycam;
 mod bots;
 mod bugreport;
 mod campaign;
+mod cinematic;
+mod character_look;
+mod material_class;
 mod characters;
 mod collision;
 mod combat;
@@ -25,6 +28,9 @@ mod explosives;
 mod fog;
 mod first_person;
 mod fx;
+mod fire;
+mod motes;
+mod atmos_water;
 mod ocean;
 mod scatter;
 mod gallery;
@@ -34,6 +40,7 @@ mod gunmodel;
 mod killcam;
 mod hud;
 mod killstreaks;
+mod laser;
 mod lightmaps;
 mod mapfx;
 mod mw2;
@@ -44,6 +51,7 @@ mod models;
 mod modes;
 mod melee;
 mod mesh_bounds;
+mod device_lost;
 mod net;
 mod online;
 mod matchmaking;
@@ -53,10 +61,18 @@ mod perf;
 mod perks;
 mod settings;
 mod settings_apply;
+mod showcase_shadows;
+mod fixture_lights;
+mod gi_live;
+mod look_editor;
+mod flycam;
+mod dev;
+mod map_editor;
 mod bindings;
 mod pickups;
 mod quake;
 mod render_scale;
+mod taa;
 mod reticles;
 mod hq;
 mod ragdoll;
@@ -75,6 +91,7 @@ mod textures;
 mod thirdperson;
 mod ui;
 mod units;
+mod upscaled;
 mod viewmodel;
 mod viewmodel_parts;
 mod wet_gun;
@@ -91,11 +108,16 @@ mod pom;
 mod vm_lights;
 mod settle;
 mod scope_shadows;
+mod probe_parallax;
+mod common_zone;
 mod window_icon;
 mod world;
 mod target_practice;
 mod tune;
 mod photo;
+// The Android build's entry point and pad (android/).
+#[cfg(target_os = "android")]
+mod android;
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
@@ -176,7 +198,7 @@ fn main() -> AppExit {
     // Splitscreen co-op for a run: `kbm,pad,pad` (`crate::splitscreen`).
     let mut splitscreen = std::env::var("COD4RW_SPLITSCREEN").ok();
     // Debug aids drive a match directly, skipping the menus.
-    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !k.starts_with("COD4RW_FP_") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER" | "COD4RW_RAGDOLL" | "COD4RW_NETLOOK" | "COD4RW_TIMELIMIT" | "COD4RW_COVER_TEST" | "COD4RW_COVER_TEST_WAIT" | "COD4RW_COVER_AUTOKEY" | "COD4RW_COVER_BUGS") && !net::setting(&k)) {
+    let mut first_state = if std::env::vars().any(|(k, _)| k.starts_with("COD4RW_") && !k.starts_with("COD4RW_PAD") && !k.starts_with("COD4RW_FP_") && !k.starts_with("COD4RW_CINEMATIC") && !matches!(k.as_str(), "COD4RW_UISHOT" | "COD4RW_UIMENUS" | "COD4RW_UIGAME" | "COD4RW_STATSFILE" | "COD4RW_SUPPLYDROPS" | "COD4RW_SUPPLYFILE" | "COD4RW_SUPPLYTIME" | "COD4RW_ADVERTISE" | "COD4RW_MASTER" | "COD4RW_RAGDOLL" | "COD4RW_NETLOOK" | "COD4RW_TIMELIMIT" | "COD4RW_COVER_TEST" | "COD4RW_COVER_TEST_WAIT" | "COD4RW_COVER_AUTOKEY" | "COD4RW_COVER_BUGS") && !net::setting(&k)) {
         state::GameState::InGame
     } else {
         state::GameState::Frontend
@@ -186,7 +208,11 @@ fn main() -> AppExit {
     if std::env::var_os("COD4RW_UISHOT").is_some() {
         first_state = state::GameState::Frontend;
     }
-    let mut args = std::env::args().skip(1).peekable();
+    let args = std::env::args().skip(1);
+    // Android has no command line: `GAME_ARGS` in its env.txt instead.
+    #[cfg(target_os = "android")]
+    let args = args.chain(android::args());
+    let mut args = args.peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--map" => {
@@ -218,7 +244,14 @@ fn main() -> AppExit {
         let (w, h) = r.split_once('x')?;
         Some(bevy::window::WindowResolution::new(w.parse().ok()?, h.parse().ok()?))
     });
-    let window = if std::env::var_os("COD4RW_SIM").is_some() {
+    // Debug aid: `COD4RW_WINPOS=x,y` puts a test window there (desktop
+    // pixels, e.g. on a second monitor) and doesn't take focus, so test runs
+    // stay off the user's main screen.
+    let winpos = std::env::var("COD4RW_WINPOS").ok().and_then(|p| {
+        let (x, y) = p.split_once(',')?;
+        Some(bevy::math::IVec2::new(x.trim().parse().ok()?, y.trim().parse().ok()?))
+    });
+    let mut window = if std::env::var_os("COD4RW_SIM").is_some() {
         Window {
             title: "CoD4 Rewrite (sim)".into(),
             resolution: resolution.clone().unwrap_or_else(|| (640, 360).into()),
@@ -245,6 +278,10 @@ fn main() -> AppExit {
     } else {
         Window { title: window_title(), resolution: resolution.unwrap_or_default(), ..default() }
     };
+    if let Some(at) = winpos {
+        window.position = bevy::window::WindowPosition::At(at);
+        window.focused = false;
+    }
     let mut plugins = DefaultPlugins
         .set(WindowPlugin { primary_window: Some(window), ..default() })
         .set(bevy::log::LogPlugin { custom_layer: log_file_layer, ..default() });
@@ -252,11 +289,16 @@ fn main() -> AppExit {
     if audio::silent_run() {
         plugins = plugins.disable::<bevy::audio::AudioPlugin>();
     }
+    #[cfg(target_os = "android")]
+    {
+        plugins = android::plugins(plugins);
+    }
     App::new()
         .add_plugins(plugins)
         .insert_resource(collision::physics_transform_config())
         .insert_resource(collision::collider_tree_optimization())
         .add_systems(avian3d::schedule::PhysicsSchedule, collision::sync_moved_colliders.in_set(avian3d::physics_transform::PhysicsTransformSystems::TransformToPosition))
+        .add_plugins(device_lost::DeviceLostPlugin)
         .add_plugins((physics_plugins(), state::StatePlugin(first_state), ui::UiPlugin, gunmodel::GunModelPlugin, audio::AudioPlugin, bo1::Bo1Plugin, waw::WawPlugin, mw2guns::Mw2GunsPlugin))
         .insert_resource(Gravity(Vec3::ZERO))
         // The broad phase's and solver's sets the collider trees' systems
@@ -326,8 +368,11 @@ fn main() -> AppExit {
             model_lighting::ModelLightingPlugin,
             supply::SupplyPlugin,
         ))
+        .add_plugins(character_look::CharacterLookPlugin)
+        .add_plugins(material_class::MaterialClassPlugin)
         // The showcase's time-of-day baked lighting.
         .add_plugins(tod_light::TodLightPlugin)
+        .add_plugins(cinematic::CinematicPlugin)
         .add_plugins((ragdoll::RagdollPlugin, pickups::PickupsPlugin, quake::QuakePlugin, hq::HqPlugin, campaign::CampaignPlugin, render_scale::RenderScalePlugin, tune::TunePlugin, target_practice::TargetPracticePlugin, photo::PhotoPlugin))
         .init_resource::<settings::Settings>()
         .add_plugins(settings_apply::SettingsApplyPlugin)
@@ -337,7 +382,10 @@ fn main() -> AppExit {
         .add_plugins(first_person::FirstPersonPlugin)
         .add_plugins(viewmodel_parts::ViewModelPartsPlugin)
         .add_plugins(wet_gun::WetGunPlugin)
-        .add_plugins((weather::WeatherPlugin, wet::WetPlugin, ssr::SsrPlugin, vm_lights::VmLightsPlugin, settle::SettlePlugin, scope_shadows::ScopeShadowsPlugin))
+        .add_plugins((weather::WeatherPlugin, wet::WetPlugin, ssr::SsrPlugin, vm_lights::VmLightsPlugin, settle::SettlePlugin, scope_shadows::ScopeShadowsPlugin, showcase_shadows::ShowcaseShadowsPlugin, look_editor::LookEditorPlugin, flycam::FlycamPlugin, map_editor::MapEditorPlugin))
+        .add_plugins(fixture_lights::FixtureLightsPlugin)
+        .add_plugins(gi_live::GiLivePlugin)
+        .add_plugins((probe_parallax::ProbeParallaxPlugin, common_zone::CommonZonePlugin))
         // G: grenades. 5: equipment and grenade launchers.
         .add_plugins((grenades::GrenadesPlugin, explosives::ExplosivesPlugin, perks::PerksPlugin, killcam::KillcamPlugin))
         .add_plugins((melee::MeleePlugin, props::PropsPlugin, glass::GlassPlugin, walktest::WalkTestPlugin, fog::FogPlugin, atmos::AtmosPlugin, window_icon::WindowIconPlugin))
@@ -345,7 +393,7 @@ fn main() -> AppExit {
         .add_systems(Update, collision::ray_test.run_if(state::in_game.and_then(|| std::env::var_os("COD4RW_RAYTEST").is_some())))
         // Muzzle flashes, bullet impacts and blood.
         .add_plugins(fx::FxPlugin)
-        .add_plugins((ocean::OceanPlugin, scatter::ScatterPlugin))
+        .add_plugins((ocean::OceanPlugin, scatter::ScatterPlugin, atmos_water::AtmosWaterPlugin, laser::LaserPlugin, fire::FirePlugin, motes::MotesPlugin))
         // Each map's film grading and its sun's flare, blind and glare.
         .add_plugins(vision::VisionPlugin)
         // Ray-traced lighting, when the Lighting setting asks for it.
@@ -380,6 +428,11 @@ fn main() -> AppExit {
 /// `cod4rw.log` next to the exe: this run's log (graphics card, errors), so a
 /// player whose game misbehaves has something to send.
 fn log_path() -> std::path::PathBuf {
+    // Android: in the app's files folder, beside `cod4/` (adb can pull it).
+    #[cfg(target_os = "android")]
+    if let Some(dir) = android::files_dir() {
+        return dir.join("cod4rw.log");
+    }
     std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("cod4rw.log"))).unwrap_or_else(|| "cod4rw.log".into())
 }
 
@@ -398,8 +451,21 @@ fn log_panics() {
     std::panic::set_hook(Box::new(move |info| {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(log_path()) {
-            let _ = writeln!(f, "CRASH: {info}
+            // Bevy's GPU readbacks failing once the device is lost: the
+            // loss, said once, and a clean exit ([`device_lost`]).
+            let message = info.payload_as_str().unwrap_or("");
+            if device_lost::follow_on(message) {
+                if device_lost::first_loss() {
+                    let location = info.location().map(|l| l.to_string()).unwrap_or_default();
+                    let _ = writeln!(f, "GPU device lost: a GPU readback failed ({location}: {})", message.lines().next().unwrap_or(""));
+                    drop(f);
+                    device_lost::lost_exit();
+                }
+                return;
+            } else {
+                let _ = writeln!(f, "CRASH: {info}
 {}", std::backtrace::Backtrace::force_capture());
+            }
         }
         previous(info);
     }));

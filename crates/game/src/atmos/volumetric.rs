@@ -51,7 +51,9 @@ impl Plugin for VolumetricPlugin {
                         // the transparent pass: `FogBeforeTransparents`.)
                         span_begin.in_set(Core3dSystems::MainPass).after(main_opaque_pass_3d),
                         span_end.in_set(Core3dSystems::EarlyPostProcess),
-                    ),
+                    )
+                        // (Not while quitting: `crate::perf::spans_on`.)
+                        .run_if(crate::perf::spans_on),
                 );
             }
         }
@@ -79,7 +81,9 @@ impl Level {
         match self {
             Level::Off => 0,
             Level::Low => 0,
-            Level::High => 32,
+            // (20, live `volumetric.steps`, `tune`: 32 cost ~0.9 ms at
+            // 1440p on every map for no visible difference.)
+            Level::High => 20,
         }
     }
 }
@@ -160,7 +164,8 @@ fn apply(
     // (Crash's 3500-unit halfway is ~0.008/m): the shafts are a few times
     // that, so one through a window shows (see the shader's levelling off).
     let (tint, fog_density) = super::map_fog(fog.as_deref()).map_or((Vec3::ONE, 0.006), |(c, d)| (c / c.max_element().max(1e-3), d));
-    let density = (fog_density * 6.0).clamp(0.025, 0.06);
+    // (A map look's own scale, `volumetric.<map>`: Shipment's faint haze.)
+    let density = (fog_density * 6.0).clamp(0.025, 0.06) * super::climate::look_knob("volumetric", |l| l.volumetric, 1.0);
     // Half way to white: the shafts keep the sun's colour, tinted.
     let tint = (tint + Vec3::ONE) * 0.5;
     // The floor the air thins up from: the spawns' average height.
@@ -228,8 +233,26 @@ fn tune(
     weather: Res<super::climate::Weather>,
     suns: Query<&DirectionalLight, Without<crate::model_lighting::ViewModelSun>>,
     mut air: Query<&mut FogVolume, With<Air>>,
+    mut cameras: Query<&mut VolumetricFog>,
 ) {
     let Some(now) = suns.iter().find(|l| l.shadow_maps_enabled).map(|l| l.illuminance) else { return };
+    // Steps per pixel (`volumetric.steps`), fewer in a storm, whose shafts
+    // are dim (below): the march cost the same for a third of the light.
+    let storm_now = if tod.enabled && weather.enabled { (weather.rain / 0.8).clamp(0.0, 1.0) } else { 0.0 };
+    let steps = (crate::tune::get("volumetric.steps", 20.0) * (1.0 - 0.4 * storm_now)).round().clamp(8.0, 64.0) as u32;
+    // The lamps', fires' and flares' glow in the air (`volumetric_fog.wgsl`'s
+    // `local_glow`, in the otherwise unused `ambient_intensity`):
+    // `volumetric.local` (1; 0 none).
+    // (Off by default until verified: see `volumetric_fog.wgsl`.)
+    let local = crate::tune::get("volumetric.local", 0.0).clamp(0.0, 100.0);
+    for mut fog in &mut cameras {
+        if fog.step_count != steps {
+            fog.step_count = steps;
+        }
+        if fog.ambient_intensity != local {
+            fog.ambient_intensity = local;
+        }
+    }
     let reference = tod.map.filter(|_| tod.enabled).map_or(now, |m| m.illuminance);
     let mut want = intensity() * (DAYLIGHT / reference.max(1.0)).clamp(1.0, 20.0);
     if tod.enabled {

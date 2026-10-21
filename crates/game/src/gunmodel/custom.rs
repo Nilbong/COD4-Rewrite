@@ -108,6 +108,7 @@ pub(super) fn material(
             // x, y: the paint's turn and scale; z: its gloss.
             look: Vec4::new(turn.x, turn.y, gloss, sheen),
             color,
+            micro: super::micro_detail(),
         },
     }
 }

@@ -20,5 +20,10 @@ fn main() -> std::process::ExitCode {
         let map = std::env::args().nth(2).unwrap_or_else(|| "mp_cargoship".into());
         return bake::cli_with(&map, |map, opts| bake::showcase(map, opts));
     }
+    if arg == "--gi-proto" {
+        // A LiveGI solve (`bake::gi`), saved as the `gi-proto` variant.
+        let map = std::env::args().nth(2).unwrap_or_else(|| "mp_crossfire".into());
+        return bake::cli_with(&map, |map, _| bake::gi::proto(map).map(|_| ()));
+    }
     bake::cli(&arg)
 }

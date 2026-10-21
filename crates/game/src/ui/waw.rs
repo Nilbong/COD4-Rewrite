@@ -228,7 +228,15 @@ impl Frontend {
                         let key = data.attachment(a).map_or(a.clone(), |x| x.key.clone());
                         (a.clone(), format!("@T4_{}", key.to_ascii_uppercase()))
                     }))
-                    .map(|(name, label)| Row { label: str_exp(&label), action: pick(&name), rename: from.clone().map(|f| (f, name)) })
+                    .map(|(name, label)| match super::progression::attachment_requirement(&self.stats, &gun.id(), gun.index, &name) {
+                        // Not earned yet: what it takes, and no pick.
+                        Some((kills, need)) => Row {
+                            label: str_exp(&format!("{}  \u{b7}  {}/{need} kills", self.assets.localize(&label), kills.min(need))),
+                            action: String::new(),
+                            rename: from.clone().map(|f| (f, name)),
+                        },
+                        None => Row { label: str_exp(&label), action: pick(&name), rename: from.clone().map(|f| (f, name)) },
+                    })
                     .collect();
                 with_rows(&t, key, &rows)?
             }

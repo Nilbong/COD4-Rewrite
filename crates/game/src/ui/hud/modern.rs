@@ -283,13 +283,6 @@ pub(super) fn ammo(p: &mut Painter, w: &WeaponState, name: &str, grenades: &[(&'
     }
 }
 
-// --- hit marker
-
-pub(super) fn hit_marker(p: &mut Painter, alpha: f32) {
-    let size = 26.0;
-    sprite(p, "hit_marker", vr(-size * 0.5, -size * 0.5, size, size, 2, 2), [1.0, 1.0, 1.0, alpha], 0.0, 1);
-}
-
 // --- kill feed
 
 /// The kill feed: its rows' height, and their text's.

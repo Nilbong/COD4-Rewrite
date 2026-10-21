@@ -23,7 +23,7 @@ const FAR: u32 = 8000;
 const SPLASHES: u32 = 4000;
 const DRIPS: u32 = 1500;
 /// Distant rain curtains: big soft sheets in a ring 30-150 m out.
-const CURTAINS: u32 = 48;
+const CURTAINS: u32 = 72;
 /// Snowflakes at full snow: near (a 24 x 16 x 24 m box round the camera)
 /// and far (out to 70 m, the near box left to the near ones).
 const FLAKES: u32 = 72000;
@@ -189,7 +189,7 @@ fn drive(
     grid: Option<Res<crate::model_lighting::LightGridLookup>>,
     tod: Option<Res<crate::atmos::climate::TimeOfDay>>,
     sun: Query<(&DirectionalLight, &GlobalTransform), Without<crate::model_lighting::ViewModelSun>>,
-    draws: Query<(&RainDraw, &MeshMaterial3d<RainMaterial>)>,
+    mut draws: Query<(&RainDraw, &MeshMaterial3d<RainMaterial>, &mut Visibility)>,
     mut materials: ResMut<Assets<RainMaterial>>,
     content: Option<Res<crate::content::Content>>,
     mut map_lamps: Local<Option<Vec<(Vec3, f32, Vec3)>>>,
@@ -267,12 +267,16 @@ fn drive(
     let velocity = Vec3::new(storm.wind.x, -FALL, storm.wind.y);
     // (Live knob, `crate::tune`: how much of the rain is drawn.)
     let storm_rain = storm.rain * crate::tune::get("rain.density", 1.0);
-    for (draw, handle) in &draws {
+    for (draw, handle, mut vis) in &mut draws {
         let Some(mut m) = materials.get_mut(&handle.0) else { continue };
         let (extent, share) = match draw.0 {
             // (Counts are for a downpour of 1.6: shares of them, `climate`.)
-            0 => (Vec3::new(14.0, 9.0, 14.0), (storm_rain / 1.6).min(1.0)),
-            1 => (Vec3::new(38.0, 16.0, 38.0), (storm_rain / 1.6).powi(2).min(1.0)),
+            // (`rain.near`: the near streaks' share, kept only as far as a
+            // downpour still reads as one.)
+            0 => (Vec3::new(14.0, 9.0, 14.0), (storm_rain / 1.6).min(1.0) * crate::tune::get("rain.near", 1.0).clamp(0.0, 1.0)),
+            // (The far layer at 70% (`rain.far`): most of the rain's
+            // overdraw, and the near streaks carry the downpour.)
+            1 => (Vec3::new(38.0, 16.0, 38.0), (storm_rain / 1.6).powi(2).min(1.0) * crate::tune::get("rain.far", 0.7).clamp(0.0, 1.0)),
             2 => (Vec3::new(11.0, 0.0, 11.0), (storm_rain / 1.6).min(1.0)),
             3 => (Vec3::new(9.0, 0.0, 9.0), (storm_rain / 1.6).sqrt().min(1.0)),
             // (Off over open sea: they read as a haze in the water. Over
@@ -310,5 +314,9 @@ fn drive(
         if draw.0 >= 5 {
             m.lamps = lamps;
         }
+        // Hidden while it draws none (snow in the rain, rain in the snow):
+        // every quad's corners ran through the vertex shader otherwise.
+        let on = m.extent.w > 0.0 && (draw.0 != 4 || m.kind.w > 0.0);
+        vis.set_if_neq(if on { Visibility::Inherited } else { Visibility::Hidden });
     }
 }

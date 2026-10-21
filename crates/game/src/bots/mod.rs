@@ -16,6 +16,7 @@
 //!   spot, hunt) and then moves with the same keys a player has.
 
 pub mod aim;
+pub mod chat;
 mod class;
 mod equipment;
 pub mod demos;
@@ -24,12 +25,16 @@ mod hardpoints;
 mod objective;
 pub mod lab;
 mod resupply;
+pub mod knowledge;
 pub mod learned;
+pub mod lobby;
 mod lookstat;
 pub mod motion;
+pub mod motive;
 pub mod nets;
 pub mod nav;
 pub mod perception;
+pub mod persona;
 pub mod profile;
 pub mod record;
 pub mod spectate;
@@ -61,10 +66,11 @@ impl Plugin for BotsPlugin {
             .init_resource::<TeamIntel>()
             .init_resource::<NavTrouble>()
             .add_systems(Update, accuracy_by_range.run_if(crate::state::in_game).run_if(|| std::env::var_os("COD4RW_SIM").is_some()))
+            .add_systems(Update, damage_by_weapon.run_if(crate::state::in_game).run_if(|| std::env::var_os("COD4RW_SIM").is_some()))
             .add_systems(Update, look_sources.run_if(crate::state::in_game).run_if(|| std::env::var_os("COD4RW_LOOKSRC").is_some()))
             .add_systems(
                 Update,
-                (class::class_bots, floor_line, build_nav, build_tactics, check_objectives, hardpoints::hardpoints, grenade::plan_grenades, equipment::plan_gear, think, resupply::resupply, knife, objective::use_objectives, crate::cover::bots::cover_bots)
+                (class::class_bots, floor_line, rebuild_nav, build_nav, build_tactics, check_objectives, motive::track, hardpoints::hardpoints, grenade::plan_grenades, equipment::plan_gear, think, resupply::resupply, knife, objective::use_objectives, crate::cover::bots::cover_bots)
                     .chain()
                     .before(crate::movement::MovementSet)
                     .run_if(crate::state::in_game),
@@ -87,6 +93,7 @@ impl Plugin for BotsPlugin {
             app.add_systems(Update, (debug_log, behaviour_log, grenade::tally).run_if(crate::state::in_game));
         }
         record::setup(app);
+        chat::setup(app);
         lookstat::setup(app);
         profile::setup(app);
         demos::setup(app);
@@ -157,7 +164,7 @@ fn rank_for(skill: f32, rng: &mut impl Rng) -> (i32, i32) {
 
 /// Kinds of gun, for what a bot carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GunKind {
+pub enum GunKind {
     Smg,
     Rifle,
     Lmg,
@@ -208,7 +215,7 @@ fn choose_gun(p: &Personality, rng: &mut impl Rng) -> (&'static str, GunKind) {
 
 /// How a bot likes to play.
 #[derive(Clone, Debug)]
-struct Personality {
+pub(crate) struct Personality {
     /// 0 = careful, 1 = rushes.
     aggression: f32,
     /// How long it will hold an angle.
@@ -262,6 +269,8 @@ struct Alarm {
     /// something), and when to work it out again.
     point: Option<Vec3>,
     next_point: f32,
+    /// A glance towards a sound, level and unhurried (not a combat flick).
+    glance: bool,
 }
 
 /// Reaction to a hit, gunfire or footsteps, as a multiple of the reaction
@@ -297,6 +306,38 @@ struct HoldPlan {
 /// climbed or a gap that's too tight stops catching bots.
 #[derive(Resource, Default)]
 pub struct NavTrouble(HashMap<u32, u32>);
+
+/// Someone who shot us from where we couldn't see them: kept in mind for a
+/// while, by who they are and where they were ([`Bot::grudge`]).
+#[derive(Clone, Copy, Debug)]
+struct Grudge {
+    who: Entity,
+    until: f32,
+    /// Times they've hit us in this grudge.
+    hits: u32,
+    plan: GrudgePlan,
+}
+
+/// What a player does about someone who shot them and hid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrudgePlan {
+    /// Go after them.
+    Push,
+    /// Hold the angle they'll come back through.
+    Watch,
+    /// Go round to them another way.
+    Move,
+}
+
+/// See [`Bot::shot_probe`].
+#[derive(Clone, Copy)]
+struct ShotProbe {
+    who: Entity,
+    start: f32,
+    last: f32,
+    looked: f32,
+    renotice: Option<f32>,
+}
 
 /// Map knowledge a bot reasons with this frame.
 struct TacCtx<'a> {
@@ -393,6 +434,17 @@ struct Engagement {
     /// wander (radians, yaw and pitch) and when it was last moved on.
     wander: Vec2,
     wander_at: f32,
+    /// A sniper's way of taking the shot, when it scoped in, and until when
+    /// it stays out of the scope after a quickscope.
+    scope: persona::Scope,
+    ads_since: Option<f32>,
+    unscope_until: f32,
+    /// Shoots even out of the gun's reach (a newer player's habit).
+    wild: Option<bool>,
+    /// Hip fire this fight (rather than sights), rolled once.
+    hip: Option<bool>,
+    /// The sights' raise last frame (are they still coming up?).
+    prev_ads: f32,
 }
 
 /// How far, as an angle, a bot's idea of where to aim wanders (its
@@ -418,6 +470,20 @@ const AIM_WANDER_STRAFE: f32 = 1.5;
 
 /// Reaction time grows with the target's distance past 30 m (1180 units),
 /// by up to 40% at 60 m and beyond: a far figure is harder to make out.
+/// How much slower a reaction is to someone `to` (from us) off the way we
+/// face: none within 40 degrees, 35% more out to the side, 70% behind.
+fn surprise(facing: Vec3, to: Vec3) -> f32 {
+    let flat = |v: Vec3| Vec3::new(v.x, 0.0, v.z).normalize_or_zero();
+    let off = flat(facing).dot(flat(to)).clamp(-1.0, 1.0).acos().to_degrees();
+    if off < 40.0 {
+        1.0
+    } else if off < 110.0 {
+        1.0 + 0.35 * (off - 40.0) / 70.0
+    } else {
+        1.35 + 0.35 * ((off - 110.0) / 70.0).min(1.0)
+    }
+}
+
 fn reaction_scale(dist: f32) -> f32 {
     1.0 + 0.4 * ((dist - u(1180.0)) / u(1180.0)).clamp(0.0, 1.0)
 }
@@ -438,6 +504,16 @@ pub struct Bot {
     /// grenades and equipment ([`class`]).
     pub class: crate::loadout::ClassLoadout,
     personality: Personality,
+    /// Its personality before its mood ([`motive::mood`]) moves it.
+    base: Personality,
+    /// Its match so far, its mood and motive ([`motive`]).
+    pub temper: motive::Temper,
+    /// Where it has learned enemies camp and kill from ([`knowledge`]).
+    pub learned: knowledge::Learned,
+    /// The real player this bot plays like ([`persona`]), if any.
+    pub persona: Option<persona::Persona>,
+    /// The kind of gun it carries.
+    kind: GunKind,
     role: Role,
     aim_profile: AimProfile,
     aim: AimState,
@@ -547,8 +623,33 @@ pub struct Bot {
     playing: Option<motion::Playing>,
     /// View turn rate last frame (radians/s).
     turn_rate: f32,
+    /// How stunned it is now (0 to 1): its aim wanders wider.
+    stunned: f32,
     /// Whether the matched player was sprinting.
     matched_sprint: bool,
+    /// Who shot it unseen lately ([`Grudge`]).
+    grudge: Option<Grudge>,
+    /// Sim probe of its memory of being shot (`COD4RW_SIM`).
+    shot_probe: Option<ShotProbe>,
+    /// Not holding a strong spot again until (after one ran out).
+    post_rest_until: f32,
+    /// The care package it's going for, and since when ([`objective`]).
+    crate_since: Option<(Vec3, f32)>,
+    /// Motion matching's turn rate, smoothed, and when last updated.
+    motion_turn: (f32, f32),
+    /// The most open way to look from where it last stood idle.
+    open_look: Option<(Vec3, Vec3)>,
+    /// When this life began (spawn sprint).
+    life_start: f32,
+    /// Where it was looking at its last decision (for surprise).
+    view_fwd: Vec3,
+    /// Next hop on the move (persona's jump habit).
+    next_hop: f32,
+    /// Prefiring: whether to, at the enemy being pre-aimed (rolled once
+    /// each), the burst under way, and the next allowed.
+    prefire: Option<(Entity, f32, bool)>,
+    prefire_until: f32,
+    next_prefire: f32,
     /// The side of the map this bot likes to play, -1 (left) to 1 (right)
     /// looking from our spawns towards theirs; teammates get different ones.
     lane: f32,
@@ -584,15 +685,43 @@ impl Bot {
         )
     }
 
+    /// Its real player, style and motive in a line (`COD4RW_MOTIVES`).
+    pub fn motive_line(&self) -> String {
+        let who = self.persona.as_ref().map_or_else(
+            || "no persona".to_string(),
+            |pp| format!("{} {} {}", pp.style(), self.class.guns.first().map_or("", |g| g.spec.as_str()), (pp.knowledge() * 100.0).round() as i32),
+        );
+        format!("{who} | {} ({:?})", self.temper.motive.name(), self.mode)
+    }
+
     /// This bot's favourite side of the map (see [`Bot::lane`]).
     pub fn with_lane(mut self, lane: f32) -> Self {
-        self.lane = lane.clamp(-1.0, 1.0);
+        // Personas spread wider, out to the side streets past the main
+        // lanes (the team's -0.8..0.8 kept even the outer bots in the middle
+        // streets on Crossfire). Bot lab `oldroutes`: as before.
+        self.lane = if self.persona.is_some() && !lab::on("oldroutes") { (lane * 1.5).clamp(-1.5, 1.5) } else { lane.clamp(-1.0, 1.0) };
         self
     }
 
     /// A bot of roughly `skill` (0..1). With a recorded player's `profile`
     /// it plays like them, `skill` 0.5 being their level.
     pub fn new(skill: f32, profile: Option<&PlayerProfile>) -> Self {
+        Self::build(skill, profile, |skill, rng| persona::Persona::sample(skill, rng))
+    }
+
+    /// A campaign soldier: no multiplayer persona (the campaign's own
+    /// difficulty stands).
+    pub fn campaign(skill: f32) -> Self {
+        Self::build(skill, None, |_, _| None)
+    }
+
+    /// The lobby's player called `name` ([`lobby`]): the same person, with
+    /// the same habits and class, every match this session.
+    pub fn named(name: &str, skill: f32, profile: Option<&PlayerProfile>) -> Self {
+        Self::build(skill, profile, |skill, _| lobby::persona_for(name, skill))
+    }
+
+    fn build(skill: f32, profile: Option<&PlayerProfile>, persona: impl FnOnce(f32, &mut rand::rngs::ThreadRng) -> Option<persona::Persona>) -> Self {
         let mut rng = rand::rng();
         // A touch either side of the skill it was dealt ([`lobby_skills`]).
         let skill = (skill + rng.random_range(-0.05..0.05)).clamp(0.0, 1.0);
@@ -634,10 +763,53 @@ impl Bot {
             }
             style = MoveStyle::from_profile(p);
         }
+        // A real player to play like (unless a recorded profile says how,
+        // or `COD4RW_PERSONAS=0`).
+        let persona = if profile.is_none() && persona::enabled() { persona(skill, &mut rng) } else { None };
+        // Its aim follows the real player's results, about the lobby's
+        // setting: a lobby isn't all one tier (every bot read "Regular"),
+        // and the floor sits a touch higher (a good player won by double).
+        // Bot lab `oldskill`: the setting alone.
+        let skill = match &persona {
+            Some(pp) if !lab::on("oldskill") => (skill + 0.55 * (pp.skill - 0.5) + 0.05).clamp(skill - 0.15, 1.0).clamp(0.0, 1.0),
+            _ => skill,
+        };
+        if persona.is_some() && !lab::on("oldskill") {
+            aim_profile = AimProfile::for_skill(skill, &mut rng);
+            // Real players pull against recoil and follow a strafing target
+            // better than the old curve's weak end (comp 0.2), and settle a
+            // flick in fewer, quicker corrections. Bot lab `oldaim`: the curve.
+            if !lab::on("oldaim") {
+                aim_profile.recoil_comp = aim_profile.recoil_comp.max(0.55 + 0.35 * skill);
+                aim_profile.pursuit_gain = aim_profile.pursuit_gain.max(0.75 + 0.2 * skill);
+                aim_profile.gain_sd *= 0.7;
+                // Better players also get there quicker (contact to first hit
+                // had drifted to 1.7 s; the user 1.2, demo players 0.5-0.6 to
+                // the first shot).
+                let quick = (skill - 0.5).max(0.0);
+                aim_profile.correction_delay *= 0.75 - 0.2 * quick;
+                aim_profile.fitts_a *= 1.0 - 0.35 * quick;
+                aim_profile.fitts_b *= 1.0 - 0.35 * quick;
+            }
+        }
+        if let Some(pp) = &persona {
+            reaction = pp.reaction() * rng.random_range(0.9..1.1);
+            personality.aggression = pp.aggression_knob();
+            personality.patience = pp.patience_knob();
+            personality.sprinter = pp.sprint_knob();
+            personality.head_bias = ((pp.headshots - profile::HEAD_RATE.0) / profile::HEAD_RATE.1 * (0.75 + 0.5 * skill)).clamp(0.0, 0.85);
+            style.ads_range = pp.ads_half();
+            style.crouch = pp.crouch_knob();
+            style.crouch_any_range = pp.crouch > 0.2;
+            style.jumps = (pp.jumps * 0.5).min(12.0);
+        }
         // Players have favourite guns: rushers SMGs and shotguns, patient
         // ones rifles, machine guns and the odd sniper rifle. The gun sets
         // the range they like to fight at, and snipers always scope in.
-        let (gun, kind) = choose_gun(&personality, &mut rng);
+        let (gun, kind) = match &persona {
+            Some(pp) => (GUNS.iter().find(|g| g.0 == pp.kind).map_or("m16", |g| g.1[0]), pp.kind),
+            None => choose_gun(&personality, &mut rng),
+        };
         personality.preferred_range = u(match kind {
             GunKind::Shotgun => rng.random_range(200.0..450.0),
             GunKind::Smg => rng.random_range(350.0..800.0),
@@ -645,14 +817,28 @@ impl Bot {
             GunKind::Lmg => rng.random_range(800.0..1500.0),
             GunKind::Sniper => rng.random_range(1500.0..2500.0),
         });
+        if let Some(pp) = &persona {
+            personality.preferred_range = u(pp.kill_range.clamp(200.0, 3000.0));
+            // (A shotgun's reach is its own, whatever the real player's kills
+            // say: some of those were with their pistol.)
+            if kind == GunKind::Shotgun {
+                personality.preferred_range = personality.preferred_range.min(u(350.0));
+            }
+        }
         match kind {
             GunKind::Sniper => style.ads_range = 0.0,
             GunKind::Shotgun => style.ads_range = style.ads_range.max(u(900.0)),
             _ => {}
         }
-        let rank = rank_for(skill, &mut rng);
-        let class = class::class_for(gun, kind, &personality, skill, rank, &mut rng);
-        let role = if personality.aggression > 0.72 {
+        let rank = persona.as_ref().map_or_else(|| rank_for(skill, &mut rng), |pp| pp.rank);
+        let mut class = class::class_for(gun, kind, &personality, skill, rank, &mut rng);
+        if let Some(pp) = &persona {
+            class = pp.class(class, &mut rng);
+        }
+        let camper = persona.as_ref().is_some_and(|pp| pp.camper());
+        let role = if camper {
+            Role::Anchor
+        } else if personality.aggression > 0.72 {
             Role::Rusher
         } else if personality.patience > 0.5 && personality.aggression < 0.6 {
             Role::Anchor
@@ -672,7 +858,12 @@ impl Bot {
             routing: false,
             net_aim: nets::NetAimState::default(),
             reaction,
+            base: personality.clone(),
             personality,
+            temper: motive::Temper::default(),
+            learned: knowledge::Learned::default(),
+            persona,
+            kind,
             know: Knowledge::default(),
             mode: Mode::Hunt,
             mode_since: 0.0,
@@ -733,7 +924,20 @@ impl Bot {
             stuck_at: None,
             playing: None,
             turn_rate: 0.0,
+            stunned: 0.0,
             matched_sprint: false,
+            next_hop: 0.0,
+            view_fwd: Vec3::NEG_Z,
+            life_start: 0.0,
+            open_look: None,
+            motion_turn: (0.0, 0.0),
+            crate_since: None,
+            post_rest_until: 0.0,
+            shot_probe: None,
+            grudge: None,
+            prefire: None,
+            prefire_until: 0.0,
+            next_prefire: 0.0,
             lane: 0.0,
             sprint_choice: false,
             next_sprint_choice: 0.0,
@@ -746,6 +950,17 @@ impl Bot {
             next_burst: 0.0,
             last_feet: Vec3::splat(f32::MAX),
         }
+    }
+
+    /// How well it knows maps and the game (0..1), from its persona's
+    /// experience; middling without one.
+    pub fn knowledge(&self) -> f32 {
+        self.persona.as_ref().map_or(0.5, |pp| pp.knowledge())
+    }
+
+    /// How long to hold a stop: like its real player, or `default`.
+    fn hold_time(&self, default: f32, rng: &mut impl Rng) -> f32 {
+        self.persona.as_ref().map_or(default, |pp| pp.hold_time(rng))
     }
 
     fn set_mode(&mut self, mode: Mode, now: f32) {
@@ -767,6 +982,32 @@ impl Bot {
             self.dest = Some(dest);
             self.path.clear();
         }
+    }
+}
+
+static REBUILD_NAV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The map changed under the bots (objects placed with
+/// [`crate::map_editor`]): build the graph and the tactics anew, and have
+/// every bot plan its routes again.
+pub fn request_nav_rebuild() {
+    REBUILD_NAV.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn rebuild_nav(mut commands: Commands, mut bots: Query<&mut Bot>, mut trouble: ResMut<NavTrouble>) {
+    if !REBUILD_NAV.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    commands.remove_resource::<NavGraph>();
+    commands.remove_resource::<TacticalMap>();
+    trouble.0.clear();
+    for mut bot in &mut bots {
+        bot.path.clear();
+        bot.path_i = 0;
+        bot.stuck_at = None;
+        bot.hold = None;
+        bot.last_spot = None;
+        bot.dest = None;
     }
 }
 
@@ -1129,12 +1370,20 @@ fn think(
         let blind = flashed.map_or(0.0, |f| f.strength(now)) > 0.35;
         let stun = stunned.map_or(0.0, |s| s.strength(now));
         let bot = &mut *bot;
+        bot.stunned = stun;
         let feet = tf.translation;
         let eye = mover.eye(feet);
 
         // Respawned (or teleported): start fresh.
         if feet.distance(bot.last_feet) > u(300.0) {
+            bot.life_start = now;
+            // A new life: no grudge carried over (it kept the killer fresh
+            // in mind and sent the bot straight back after them), no crate
+            // timer running from the last.
+            bot.grudge = None;
+            bot.crate_since = None;
             bot.aim.reset();
+            bot.shot_probe = None;
             bot.engagement = None;
             bot.set_mode(Mode::Hunt, now);
             bot.mode = Mode::Hunt;
@@ -1155,8 +1404,16 @@ fn think(
         let t_look = std::time::Instant::now();
         let enemies: Vec<PawnView> = snapshot.iter().filter(|p| p.hostile_to(pawn)).copied().collect();
         if blind {
+            // Nothing seen, and once it wears off they're found again from
+            // scratch (with the reaction that takes), not snapped back to.
+            let dropped = bot.know.contacts.values().filter(|c| c.noticed_at.is_some()).count();
+            if dropped > 0 && std::env::var_os("COD4RW_SIM").is_some() {
+                debug!("flash: {} blinded ({:.2}), lost {dropped} noticed, in {:?}", pawn.name, flashed.map_or(0.0, |f| f.strength(now)), bot.mode);
+            }
             for c in bot.know.contacts.values_mut() {
                 c.visible = false;
+                c.noticed_at = None;
+                c.awareness = 0.0;
             }
         } else if now - bot.last_look >= LOOK_INTERVAL {
             let look_dt = (now - bot.last_look).min(0.25);
@@ -1184,13 +1441,19 @@ fn think(
                     let to = (p.feet - feet).normalize_or_zero();
                     to.dot(view.forward()) < 0.26
                 });
-                if behind
-                    && bot.alarm.is_none()
-                    && bot.engagement.is_none()
-                    && rng.random::<f32>() < base + per_skill * bot.skill
-                {
+                // Gunfire: a real startle only when it's close; further off,
+                // now and then a level glance that way (bots spun round at any
+                // shot within 1200u, all the time on Killhouse). Bot lab
+                // `oldstartle`: as before.
+                let near = enemies.iter().find(|p| p.entity == e).is_some_and(|p| p.feet.distance(feet) < u(600.0));
+                let (chance, glance) = match sound {
+                    perception::Sound::Gunfire if !lab::on("oldstartle") && !near => (0.2, true),
+                    _ => (base + per_skill * bot.skill, false),
+                };
+                if behind && bot.alarm.is_none() && bot.engagement.is_none() && rng.random::<f32>() < chance {
                     let at = now + bot.reaction * SOUND_REACTION * (0.25 * gaussian(&mut rng)).exp();
-                    bot.alarm = Some(Alarm { target: e, at, until: at + ALARM_FOR, point: None, next_point: 0.0 });
+                    let until = at + if glance { 0.8 } else { ALARM_FOR };
+                    bot.alarm = Some(Alarm { target: e, at, until, point: None, next_point: 0.0, glance });
                 }
             }
             // Free-for-all: nobody tells anybody anything.
@@ -1198,24 +1461,104 @@ fn think(
                 perception::hear_callouts(&mut bot.know, pawn.team, &callouts, now);
             }
             perception::forget(&mut bot.know, &alive, now);
+            // Someone seen sitting still: a spot to remember.
+            let rate = knowledge::rate(bot.knowledge());
+            let still: Vec<Vec3> = bot.know.contacts.values().filter(|c| c.noticed() && c.vel.length() < u(30.0)).map(|c| c.pos).collect();
+            for at in still {
+                bot.learned.note(at, 0.35 * rate * look_dt, now);
+            }
         }
+        let k = bot.knowledge();
+        bot.learned.decay(now, k);
         for &(target, attacker) in &hits {
             if target == me {
                 if let Some(a) = snapshot.iter().find(|p| p.entity == attacker && p.hostile_to(pawn)) {
                     perception::shot_by(&mut bot.know, attacker, a.feet, now, &mut rng);
                     bot.next_decide = now;
+                    // Remembered: the longer by patient and experienced
+                    // players; what to do about it by how they play.
+                    let p = &bot.personality;
+                    let lasts = 8.0 + 10.0 * p.patience + 6.0 * bot.knowledge();
+                    match bot.grudge.as_mut() {
+                        // (Bot lab `nogrudge`: none, for A/B tests.)
+                        _ if lab::on("nogrudge") => {}
+                        Some(g) if g.who == attacker && now < g.until => {
+                            g.hits += 1;
+                            g.until = now + lasts;
+                        }
+                        _ => {
+                            let (push, watch, go_round) = (0.2 + p.aggression, 0.2 + p.patience, 0.1 + 0.8 * bot.knowledge());
+                            let r = rng.random::<f32>() * (push + watch + go_round);
+                            let plan = if r < push { GrudgePlan::Push } else if r < push + watch { GrudgePlan::Watch } else { GrudgePlan::Move };
+                            bot.grudge = Some(Grudge { who: attacker, until: now + lasts, hits: 1, plan });
+                        }
+                    }
                     let seen = bot.know.contacts.get(&attacker).is_some_and(|c| c.noticed());
+                    // (Sim probe: how it remembers who shot it from out of view.)
+                    if !seen && bot.shot_probe.is_none() && std::env::var_os("COD4RW_SIM").is_some() {
+                        bot.shot_probe = Some(ShotProbe { who: attacker, start: now, last: now, looked: 0.0, renotice: None });
+                    }
+                    // Shot from out of sight while sitting still: found.
+                    if !seen && matches!(bot.mode, Mode::Post | Mode::Hold) {
+                        bot.temper.spotted_at = now;
+                    }
                     if !seen && bot.alarm.is_none_or(|a| a.target != attacker) {
                         let at = now + bot.reaction * ALARM_REACTION * (0.25 * gaussian(&mut rng)).exp();
-                        bot.alarm = Some(Alarm { target: attacker, at, until: at + ALARM_FOR, point: None, next_point: 0.0 });
+                        bot.alarm = Some(Alarm { target: attacker, at, until: at + ALARM_FOR, point: None, next_point: 0.0, glance: false });
                     }
                 }
             }
         }
 
+        // A grudge: their last known place stays fresh in mind (watched,
+        // pre-aimed), and they're noticed quicker when they show again, the
+        // more so each time they've hit us.
+        if let Some(g) = bot.grudge {
+            match bot.know.contacts.get_mut(&g.who) {
+                Some(c) if now < g.until => {
+                    if !c.visible {
+                        c.time = c.time.max(now - 2.5);
+                        c.awareness = c.awareness.max(0.45 + 0.15 * g.hits.min(3) as f32);
+                    }
+                }
+                _ => bot.grudge = None,
+            }
+        }
+        // Sim probe: over the 10 s after a hit from someone unseen, how much
+        // of the time it looked their way, and how quickly it noticed them
+        // when they showed again.
+        if let Some(pr) = bot.shot_probe.as_mut() {
+            let dt = (now - pr.last).clamp(0.0, 0.1);
+            pr.last = now;
+            if let Some(a) = snapshot.iter().find(|p| p.entity == pr.who) {
+                let to = (a.feet + Vec3::Y * a.eye_height - eye).normalize_or_zero();
+                if to.dot(view.forward()) > 35f32.to_radians().cos() {
+                    pr.looked += dt;
+                }
+            }
+            if let Some(c) = bot.know.contacts.get(&pr.who) {
+                if pr.renotice.is_none() && c.visible_since > pr.start + 0.5 {
+                    if let Some(n) = c.noticed_at.filter(|_| c.visible) {
+                        pr.renotice = Some(n - c.visible_since);
+                    }
+                }
+            }
+            if now - pr.start >= 10.0 || health.current <= 0.0 {
+                info!(
+                    "shotmem: {} looked toward its unseen shooter {:.0}% of 10 s; noticed them again in {}",
+                    pawn.name,
+                    100.0 * pr.looked / (now - pr.start).max(0.1),
+                    pr.renotice.map_or("-".to_string(), |r| format!("{r:.2} s"))
+                );
+                bot.shot_probe = None;
+            }
+        }
+
         // Got a kill while holding: people move on rather than wait for the
         // revenge.
-        if deaths.iter().any(|k| k.attacker == Some(me) && k.victim != me) && matches!(bot.mode, Mode::Post | Mode::Hold) {
+        // (Campers often stay put.)
+        let stays = bot.persona.as_ref().is_some_and(|pp| rng.random::<f32>() < (pp.camp * 10.0).min(0.7));
+        if deaths.iter().any(|k| k.attacker == Some(me) && k.victim != me) && matches!(bot.mode, Mode::Post | Mode::Hold) && !stays {
             bot.hold_until = now;
             bot.next_decide = now;
         }
@@ -1243,6 +1586,7 @@ fn think(
         if now >= bot.next_decide && DECIDES_THIS_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < DECIDES_PER_FRAME {
             bot.next_decide = now + DECIDE_INTERVAL * rng.random_range(0.8..1.2);
             let t = std::time::Instant::now();
+            bot.view_fwd = view.forward();
             decide(bot, me, &spatial, nav.as_deref(), &tc, &map, pawn, feet, eye, health, weapon, now, &mut rng);
             phase(2, t);
         }
@@ -1272,7 +1616,7 @@ fn think(
         }
 
         // Aim: the hand model moves the view towards the chosen goal.
-        let yaw_before = view.yaw;
+        let (yaw_before, pitch_before) = (view.yaw, view.pitch);
         // A learned aim model (`COD4RW_NETAIM`) takes over while engaging.
         let moving = Vec2::new(mover.velocity.x, mover.velocity.z).length() > crate::units::u(20.0);
         let net = nets::aim_net().is_some_and(|n| bot.net_aim.update(n, &mut view, plan.look, moving, dt, &mut rng));
@@ -1310,10 +1654,18 @@ fn think(
             }
         }
         if stun > 0.0 {
-            // As the player's: turning damped to about a third.
-            let k = 1.0 - 0.65 * stun;
-            view.yaw = yaw_before + wrap_angle(view.yaw - yaw_before) * k;
+            // As the player's ([`crate::grenades`]): turning no faster than
+            // 35°/s at full strength. (Damping each frame's turn by a share,
+            // as this did, still closed on a target within a few frames at
+            // 100+ fps: stuns hardly slowed bots at all.)
+            let most = (crate::grenades::STUN_MAX_TURN / stun).to_radians() * dt;
+            let wanted = wrap_angle(view.yaw - yaw_before);
+            view.yaw = yaw_before + wanted.clamp(-most, most);
+            view.pitch = pitch_before + (view.pitch - pitch_before).clamp(-most, most);
             bot.aim.sync(&view);
+            if std::env::var_os("COD4RW_SIM").is_some() && wanted.abs() > most * 1.5 {
+                debug!("stun: {} at {stun:.2} wanted {:.0}°/s, held to {:.0}°/s", pawn.name, wanted.to_degrees() / dt, most.to_degrees() / dt);
+            }
         }
         bot.turn_rate = wrap_angle(view.yaw - yaw_before) / dt;
 
@@ -1350,7 +1702,7 @@ fn think(
             jump: plan.jump && !mv.jump,
             sprint: plan.sprint,
             stance: plan.stance,
-            speed_scale: weapon.speed_scale() * (1.0 - 0.45 * stun),
+            speed_scale: weapon.speed_scale() * (1.0 - (1.0 - crate::grenades::STUN_MOVE) * stun),
             lean: 0.0,
         };
     }
@@ -1409,6 +1761,8 @@ fn decide(
     now: f32,
     rng: &mut impl Rng,
 ) {
+    // Blocks on objectives (and crates) run out.
+    bot.blocked.retain(|b| b.1 > now);
     let p = bot.personality.clone();
     // Better players get out of fights they're losing; weaker ones stay in.
     let sense = 0.4 + bot.skill;
@@ -1429,7 +1783,9 @@ fn decide(
             Role::Flanker => 0.15 + 0.3 * p.patience,
             Role::Rusher => 0.05,
         };
-        options.push((Mode::Post, base + stick(Mode::Post)));
+        // Power positions are something players learn.
+        let knows = 0.25 + 0.9 * bot.knowledge();
+        options.push((Mode::Post, base * knows + stick(Mode::Post)));
     }
     // A long exchange at range going nowhere: real players duck out and come
     // back (fights in the demos last a median 2.4 s; bots trading shots
@@ -1449,6 +1805,12 @@ fn decide(
     }
     // In cover with a loaded gun and health to spare: fight from there.
     let settled_in_cover = bot.mode == Mode::Cover && bot.dest.is_none() && !empty && !hurt;
+    // A shotgun with the enemy out of its reach: the careful get into cover
+    // (and come at them another way); the rest close in.
+    let out_of_reach = threat.is_some_and(|(_, c)| c.pos.distance(feet) > effective_reach(weapon.def) * 1.3);
+    if let Some(o) = options.iter_mut().find(|o| o.0 == Mode::Engage).filter(|_| out_of_reach) {
+        o.1 -= 0.5 * (1.0 - p.aggression);
+    }
     if (threat.is_some() || recently_shot) && !settled_in_cover {
         let n = (visible_count as f32 - 1.0).max(0.0);
         options.push((
@@ -1491,6 +1853,8 @@ fn decide(
         let pincer = direct > 0 && around == 0;
         if c.age(now) < 12.0 && (still || bot.role == Role::Flanker || pincer) {
             let base = if bot.role == Role::Flanker { 0.75 } else { 0.4 + 0.3 * (1.0 - (p.aggression - 0.6).abs()) };
+            // Newer players go straight at people; going round is learned.
+            let base = base * (0.45 + 0.75 * bot.knowledge());
             let bonus = if pincer { 0.2 } else { 0.0 };
             options.push((Mode::Flank, (base + bonus) * pull * crowd + stick(Mode::Flank)));
         }
@@ -1501,13 +1865,42 @@ fn decide(
         let hold = (0.15 + 0.5 * p.patience * fresh) * near * if waiting { 0.5 } else { 1.0 };
         options.push((Mode::Hold, hold + stick(Mode::Hold)));
     }
+    // Someone shot us and hid: go after them, hold the angle they'd come
+    // back through, or go round (by persona, decided at the first hit).
+    if let (Some(g), Some((e, _))) = (bot.grudge, memory) {
+        if g.who == e && threat.is_none() {
+            let mode = match g.plan {
+                GrudgePlan::Push => Mode::Investigate,
+                GrudgePlan::Watch => Mode::Hold,
+                GrudgePlan::Move => Mode::Flank,
+            };
+            options.push((mode, 1.1 + 0.1 * g.hits.min(3) as f32 + stick(mode)));
+        }
+    }
     // The game mode's objective: flags, the bomb.
-    if let Some(goal) = objective::goal(bot, me, feet, tc) {
+    if let Some(goal) = objective::goal(bot, me, feet, tc, now) {
         options.push((Mode::Objective, goal.weight(p.aggression) + stick(Mode::Objective)));
     }
     // Hurt and nothing in sight: hang back while health comes back.
     if hurt && threat.is_none() {
         options.push((Mode::Hold, 0.5 + 0.4 * p.patience + stick(Mode::Hold)));
+    }
+    // Why: the motive of the moment leans the choice (persona and state).
+    let situation = motive::Situation {
+        hurt,
+        outnumbered: visible_count >= 2,
+        // (The mode's objectives, not a care package on the ground.)
+        objective: tc.objectives.is_some() && options.iter().any(|o| o.0 == Mode::Objective),
+        mate_fighting: tc.mates.iter().any(|m| m.mode == Mode::Engage && m.feet.distance(feet) < u(1500.0)),
+        now,
+    };
+    let why = motive::choose(bot, &situation, rng);
+    if why != bot.temper.motive {
+        bot.temper.motive = why;
+        bot.temper.motive_since = now;
+    }
+    for o in &mut options {
+        o.1 *= motive::bias(why, o.0);
     }
     // With an enemy in view a person fights or breaks for cover; nothing else.
     if threat.is_some() {
@@ -1517,10 +1910,18 @@ fn decide(
     for o in &mut options {
         o.1 += rng.random_range(0.0..0.08);
     }
-    // Holding has a time limit; moving on after it runs out.
+    // Holding has a time limit; moving on after it runs out, for a while
+    // before holding a spot again (campers chained spots near their own
+    // spawn for minutes: real campers sit 5-7% of a match in long stops).
     if matches!(bot.mode, Mode::Hold | Mode::Post) && now > bot.hold_until {
         let current = bot.mode;
         options.retain(|o| o.0 != current);
+        if current == Mode::Post {
+            bot.post_rest_until = now + rng.random_range(6.0..14.0);
+        }
+    }
+    if now < bot.post_rest_until {
+        options.retain(|o| o.0 != Mode::Post);
     }
     let Some(&(mode, _)) = options.iter().max_by(|a, b| a.1.total_cmp(&b.1)) else { return };
 
@@ -1531,7 +1932,15 @@ fn decide(
                 let noticed = c.noticed_at.unwrap_or(now);
                 let alarmed = bot.alarm.is_some_and(|a| a.target == target && now >= a.at);
                 let dist = c.pos.distance(feet);
-                let reaction = bot.reaction * (0.25 * gaussian(rng)).exp() * if alarmed { ALARMED_REACTION } else { 1.0 } * reaction_scale(dist);
+                // Someone appearing off to the side or behind takes longer to
+                // react to than someone where we were looking (not when
+                // already alerted to them).
+                let grudge = bot.grudge.filter(|g| g.who == target);
+                let surprise = if alarmed || grudge.is_some() { 1.0 } else { surprise(bot.view_fwd, c.pos - feet) };
+                // Quicker on someone who's already hit us, each time.
+                let surprise = surprise * grudge.map_or(1.0, |g| 0.85f32.powi(g.hits.min(3) as i32));
+                let reaction = bot.reaction * (0.25 * gaussian(rng)).exp() * if alarmed { ALARMED_REACTION } else { 1.0 } * reaction_scale(dist) * surprise;
+                let scope = bot.persona.as_ref().map_or(persona::Scope::Hard, |pp| pp.scope_style(rng));
                 bot.engagement = Some(Engagement {
                     target,
                     react_at: noticed + reaction,
@@ -1556,6 +1965,12 @@ fn decide(
                     moving_since: now,
                     wander: Vec2::ZERO,
                     wander_at: now,
+                    scope,
+                    ads_since: None,
+                    unscope_until: 0.0,
+                    wild: None,
+                    hip: None,
+                    prev_ads: 0.0,
                 });
             }
             bot.set_mode(Mode::Engage, now);
@@ -1566,6 +1981,7 @@ fn decide(
                 if bot.engagement.as_ref().is_none_or(|e| e.target != target) {
                     let noticed = c.noticed_at.unwrap_or(now);
                     let alarmed = bot.alarm.is_some_and(|a| a.target == target && now >= a.at);
+                    let scope = bot.persona.as_ref().map_or(persona::Scope::Hard, |pp| pp.scope_style(rng));
                     bot.engagement = Some(Engagement {
                         target,
                         react_at: noticed
@@ -1583,6 +1999,12 @@ fn decide(
                         moving_since: now,
                         wander: Vec2::ZERO,
                         wander_at: now,
+                        scope,
+                        ads_since: None,
+                        unscope_until: 0.0,
+                        wild: None,
+                        hip: None,
+                        prev_ads: 0.0,
                     });
                 }
             }
@@ -1643,10 +2065,18 @@ fn decide(
             if bot.mode != Mode::Hold {
                 bot.set_mode(Mode::Hold, now);
                 // Real players' stops in the demos: half under 0.6 s, 99% under 9 s.
-                bot.hold_until = now + rng.random_range(1.5..3.0) + 4.0 * p.patience;
+                let default = rng.random_range(1.5..3.0) + 4.0 * p.patience;
+                bot.hold_until = now + bot.hold_time(default, rng);
+                // Watching for someone who shot us: as long as we hold it
+                // against them.
+                if let Some(g) = bot.grudge.filter(|g| g.plan == GrudgePlan::Watch && memory.is_some_and(|(e, _)| e == g.who)) {
+                    bot.hold_until = bot.hold_until.max(g.until.min(now + 15.0));
+                }
                 bot.focus = memory.map(|(e, _)| e);
-                // Back off into cover from where the enemy was, if there is any near.
-                if let (Some(nav), Some((_, c))) = (nav, memory) {
+                // Back off into cover from where the enemy was, if there is any
+                // near (newer players often just stand in the open).
+                let into_cover = rng.random::<f32>() < 0.35 + 0.65 * bot.knowledge();
+                if let (Some(nav), Some((_, c)), true) = (nav, memory, into_cover) {
                     let threat = [c.pos + Vec3::Y * u(60.0)];
                     if let Some(spot) = find_cover(nav, spatial, feet, &threat, &tc.mate_points(), u(300.0)) {
                         bot.go_to(spot);
@@ -1680,12 +2110,14 @@ fn decide(
                         let ads = rng.random::<f32>() < if far { HOLD_ADS_FAR } else { HOLD_ADS };
                         bot.hold = Some(HoldPlan { spot: Some(spot), angles, angle_i: 0, next_switch: 0.0, stance, ads });
                         bot.last_spot = Some(spot);
-                        bot.hold_until = now
-                            + match bot.role {
-                                // Real players never held a spot much over 10 s.
-                                Role::Anchor => rng.random_range(2.5..6.0) + 4.0 * p.patience,
-                                _ => rng.random_range(1.5..4.0),
-                            };
+                        let default = match bot.role {
+                            // Real players never held a spot much over 10 s.
+                            Role::Anchor => rng.random_range(2.5..6.0) + 4.0 * p.patience,
+                            _ => rng.random_range(1.5..4.0),
+                        };
+                        // (Counted from when it gets there.)
+                        let travel = feet.distance(at) / u(200.0);
+                        bot.hold_until = now + travel + bot.hold_time(default, rng) * if bot.role == Role::Anchor { 1.3 } else { 1.0 };
                         bot.go_to(tactics.spots[spot].pos);
                     }
                     None => bot.set_mode(Mode::Hunt, now),
@@ -1693,13 +2125,32 @@ fn decide(
             }
         }
         Mode::Objective => {
-            let goal = objective::goal(bot, me, feet, tc).expect("objective needs a goal");
+            let goal = objective::goal(bot, me, feet, tc, now).expect("objective needs a goal");
             objective::pursue(bot, goal, tc, nav, feet, now, rng);
         }
         Mode::Hunt => {
-            if bot.mode != Mode::Hunt || bot.dest.is_none() {
+            // Going after our killer: where they were when they got us.
+            let revenge = bot.temper.revenge.filter(|r| bot.temper.motive == motive::Motive::Revenge && now < r.2).map(|r| r.1);
+            if let Some(at) = revenge {
+                if at.distance(feet) < u(300.0) {
+                    bot.temper.revenge = None;
+                } else {
+                    bot.set_mode(Mode::Hunt, now);
+                    bot.go_to(at);
+                }
+            } else if bot.mode != Mode::Hunt || bot.dest.is_none() {
                 bot.set_mode(Mode::Hunt, now);
-                if let Some(d) = hunt_destination(nav, tc, bot.role, bot.lane, map, pawn.team, feet, rng) {
+                // A spot it has learned someone camps: an experienced
+                // player goes round to it rather than through its sights.
+                let camper = bot.learned.strongest(feet, u(500.0), u(3500.0)).filter(|s| s.weight > knowledge::STRONG);
+                let flank = camper.filter(|_| rng.random::<f32>() < bot.knowledge()).and_then(|s| {
+                    let avoid = tc.mate_points();
+                    let fit = |p: Vec3| tc.lane_fit(bot.lane, p);
+                    nav.and_then(|nav| find_flank(nav, spatial, feet, s.pos, &avoid, fit, rng))
+                });
+                if let Some(d) = flank {
+                    bot.go_to(d);
+                } else if let Some(d) = hunt_destination(nav, tc, bot.role, bot.lane, bot.knowledge(), map, pawn.team, feet, rng) {
                     bot.go_to(d);
                 }
             }
@@ -1718,11 +2169,13 @@ fn finish_decide(bot: &mut Bot, mode: Mode, threat: bool) {
 /// Somewhere worth going when nothing is known: where enemies are about to
 /// spawn (or where they have kept showing up), else the enemy side of the
 /// map or anywhere reasonably far away.
+#[allow(clippy::too_many_arguments)]
 fn hunt_destination(
     nav: Option<&NavGraph>,
     tc: &TacCtx,
     role: Role,
     lane: f32,
+    knowledge: f32,
     map: &MapInfo,
     team: crate::combat::Team,
     feet: Vec3,
@@ -1751,7 +2204,10 @@ fn hunt_destination(
         .filter(|(p, _)| p.distance(feet) > u(600.0))
         .map(|&(p, w)| (p, w * 0.3f32.powi(crowded(p) as i32) * tc.lane_fit(lane, p)))
         .collect();
-    if !far.is_empty() && rng.random::<f32>() < if role == Role::Anchor { 0.5 } else { 0.85 } {
+    // Reading where they'll spawn next (spawn flips) takes experience:
+    // newer players wander off towards wherever.
+    let reads = 0.3 + 0.7 * knowledge;
+    if !far.is_empty() && rng.random::<f32>() < if role == Role::Anchor { 0.5 } else { 0.85 } * reads {
         let total: f32 = far.iter().map(|f| f.1).sum();
         let mut pick = rng.random::<f32>() * total;
         for (p, w) in &far {
@@ -2024,7 +2480,9 @@ fn act(
                 .next();
             bot.strafe = if bot.strafe == 0.0 {
                 away.unwrap_or(if rng.random::<bool>() { 1.0 } else { -1.0 })
-            } else if rng.random::<f32>() < bot.style.flip[b] && away != Some(bot.strafe) {
+            // (Personas flip half as often: 0.44 reversals a second in fights
+            // against real players' 0.21, the A-D-A-D look. Bot lab `oldstrafe`.)
+            } else if rng.random::<f32>() < bot.style.flip[b] * if bot.persona.is_some() && !lab::on("oldstrafe") { 0.5 } else { 1.0 } && away != Some(bot.strafe) {
                 -bot.strafe
             } else {
                 0.0
@@ -2060,6 +2518,9 @@ fn act(
         let crowded = tc.mates.iter().any(|m| m.feet.distance(feet) < MATE_SPACING);
         if bot.style.push.is_some() {
             plan.forward = if crowded { bot.advance.min(0.0) } else { bot.advance };
+        } else if dist > effective_reach(weapon.def) && !crowded {
+            // A shotgun out of reach: close the distance.
+            plan.forward = 1.0;
         } else if dist > p.preferred_range * 1.4 && p.aggression > 0.4 && !crowded {
             plan.forward = 1.0;
         } else if dist < p.preferred_range * 0.5 && p.aggression < 0.5 {
@@ -2116,7 +2577,8 @@ fn act(
                 if bot.mode != Mode::Objective {
                     bot.set_mode(Mode::Hold, now);
                 }
-                bot.hold_until = now + rng.random_range(1.5..4.0) + 4.0 * p.patience;
+                let default = rng.random_range(1.5..4.0) + 4.0 * p.patience;
+                bot.hold_until = now + bot.hold_time(default, rng);
                 if let Some(t) = tc.tactics {
                     let mut near: Vec<(Vec3, f32)> = t
                         .lanes_near(feet, u(1500.0))
@@ -2207,10 +2669,19 @@ fn act(
             if now >= alarm.next_point {
                 alarm.next_point = now + 0.3;
                 let head = c.predicted(now) + Vec3::Y * u(60.0);
-                alarm.point = if line_clear(spatial, eye, head) {
+                // With nowhere they'd come into view, a level look their way,
+                // not through the wall at them (bot lab `oldlook`: as before).
+                let level = {
+                    let flat = (head - eye).with_y(0.0).normalize_or_zero();
+                    eye + flat * u(600.0)
+                };
+                let fallback = if lab::on("oldlook") { head } else { level };
+                alarm.point = if alarm.glance && !lab::on("oldlook") {
+                    Some(level)
+                } else if line_clear(spatial, eye, head) {
                     Some(head)
                 } else {
-                    nav.and_then(|nav| emergence_point(nav, spatial, feet, eye, c.predicted(now))).or(Some(head))
+                    nav.and_then(|nav| emergence_point(nav, spatial, feet, eye, c.predicted(now))).or(Some(fallback))
                 };
             }
             alarm.point
@@ -2220,18 +2691,28 @@ fn act(
     if plan.look.is_some() {
         // Already aiming at someone we're fighting.
     } else if let Some(point) = alarm_point.filter(|_| !running_for_cover) {
-        plan.look = Some(AimGoal { angles: angles_to(eye, point), width: 0.08, combat: true });
+        let glance = bot.alarm.is_some_and(|a| a.glance);
+        plan.look = Some(AimGoal { angles: angles_to(eye, point), width: 0.08, combat: !glance });
         bot.look_src = "alarm";
     } else if let (true, None) = (holding, fresh_focus) {
         // Holding an angle: aim at head height where they'd appear, now and
         // then switching to another lane the spot covers.
         let h = bot.hold.as_mut().expect("holding");
         if now >= h.next_switch && !h.angles.is_empty() {
-            h.next_switch = now + rng.random_range(2.0..6.0);
+            h.next_switch = now + match bot.persona.as_ref() {
+                Some(pp) => pp.angle_time(rng),
+                None => rng.random_range(2.0..6.0),
+            };
             h.angle_i = if rng.random::<f32>() < 0.55 { 0 } else { rng.random_range(0..h.angles.len()) };
         }
         if let Some(&a) = h.angles.get(h.angle_i) {
-            plan.look = Some(AimGoal { angles: angles_to(eye, a + Vec3::Y * tactical::CHECK_HEIGHT), width: 0.02, combat: false });
+            let mut angles = angles_to(eye, a + Vec3::Y * tactical::CHECK_HEIGHT);
+            // Never a stare at the floor or the sky from a held spot (bot
+            // lab `oldlook`: as before).
+            if !lab::on("oldlook") {
+                angles.y = angles.y.clamp(-15f32.to_radians(), 15f32.to_radians());
+            }
+            plan.look = Some(AimGoal { angles, width: 0.02, combat: false });
             bot.look_src = "hold";
             plan.ads = h.ads;
         }
@@ -2239,6 +2720,46 @@ fn act(
     } else if let Some((c, point)) = preaim {
         plan.look = Some(AimGoal { angles: angles_to(eye, point), width: 0.03, combat: false });
         bot.look_src = "preaim";
+        // Prefiring: some players open up where someone they know about is
+        // about to come round (6% of real players' contacts, 14%+ for the
+        // keenest), once the crosshair is there and they're close.
+        if let Some(pp) = &bot.persona {
+            let old = lab::on("oldprefire");
+            let who = bot.preaim.map(|(e, _)| e);
+            // One roll a contact episode (re-rolled when they're seen again),
+            // one burst at most (bot lab `oldprefire`: one roll per enemy all
+            // match, a burst every few seconds).
+            let episode = if old { 0.0 } else { c.last_visible };
+            if bot.prefire.map(|x| (x.0, x.1)) != who.map(|w| (w, episode)) {
+                let scale = if old { PREFIRE_SCALE } else { 1.5 };
+                let roll = rng.random::<f32>() < (pp.prefire * scale).min(0.8);
+                bot.prefire = who.map(|w| (w, episode, roll));
+            }
+            let on = AimState::error(view, angles_to(eye, point)).length() < 0.06;
+            // Somewhere they'd really come from: not right in front, not at
+            // the floor, and someone known to be there just now.
+            let to = point - eye;
+            let level = to.y < 0.0 && -to.y > Vec2::new(to.x, to.z).length() * 0.45;
+            let near = (u(300.0)..PREFIRE_RANGE).contains(&to.length()) && c.age(now) < 2.5 && !level;
+            // Only on someone really there: seen (or who shot us) just now,
+            // never heard or called out; due at that point within a second;
+            // and nearly level.
+            let real = old
+                || (matches!(c.source, Source::Seen) && c.age(now) < 3.0 || matches!(c.source, Source::ShotBy) && c.age(now) < 2.0)
+                    && c.predicted(now).distance(point - Vec3::Y * u(60.0)) / u(190.0) < 1.0
+                    && to.y.abs() < Vec2::new(to.x, to.z).length() * 0.27;
+            if bot.prefire.is_some_and(|x| x.2) && on && near && real && now >= bot.next_prefire && weapon.clip > 0 && !weapon.reloading() {
+                bot.prefire_until = now + rng.random_range(0.2..0.5);
+                bot.next_prefire = now + rng.random_range(2.5..5.0);
+                if !old {
+                    bot.prefire = bot.prefire.map(|(w, ep, _)| (w, ep, false));
+                }
+            }
+            if now < bot.prefire_until {
+                plan.fire = true;
+                bot.look_src = "prefire";
+            }
+        }
         // Not while walking: real players hardly ever move with sights up
         // unless they're shooting.
         let _ = c;
@@ -2264,6 +2785,32 @@ fn act(
             bot.look_src = "motion";
             plan.turn = Some(step.turn * motion::RATE);
             plan.pitch = Some(step.pitch.clamp(-0.6, 0.6));
+            // The clip's turns, pulled back towards the route (open loop, its
+            // turns carried the view round into walls: most stares outside
+            // fights), and its pitch kept near level. Bot lab `oldmotion`.
+            if !lab::on("oldmotion") {
+                let mut turn = step.turn * motion::RATE;
+                if let Some(st) = bot.steer {
+                    let d = st - feet;
+                    if d.with_y(0.0).length() > u(8.0) {
+                        let off = wrap_angle(f32::atan2(-d.x, -d.z) - view.yaw);
+                        // (Only well off the route: a pull on every small
+                        // difference fought the clip back and forth.)
+                        if off.abs() > 20f32.to_radians() {
+                            turn += 1.5 * (off - off.signum() * 20f32.to_radians());
+                        }
+                    }
+                }
+                // Smoothed, and small turns let go: re-picking clips a few
+                // times a second made the view twitch (110 deg/s and two
+                // reversals a second, against real players' still view).
+                let dt = (now - bot.motion_turn.1).clamp(0.0, 0.1);
+                let k = (dt / 0.35).min(1.0);
+                let smooth = bot.motion_turn.0 + (turn - bot.motion_turn.0) * k;
+                bot.motion_turn = (smooth, now);
+                plan.turn = Some(if smooth.abs() < 12f32.to_radians() { 0.0 } else { smooth });
+                plan.pitch = Some(step.pitch.clamp(-0.25, 0.25));
+            }
             // Their movement relative to the view, as keys, unless that way
             // is blocked (then the route's keys stand).
             let speed = Vec2::new(step.forward, step.right).length();
@@ -2272,6 +2819,14 @@ fn act(
             if speed < 40.0 {
                 plan.forward = 0.0;
                 plan.right = 0.0;
+                // Standing: the clip doesn't get to turn the view (a bot at
+                // its spot stared at the wall the clip turned it to); the
+                // hold or the open-way look below does. Bot lab `oldmotion`.
+                if !lab::on("oldmotion") && Vec2::new(mover.velocity.x, mover.velocity.z).length() < u(20.0) {
+                    plan.turn = None;
+                    plan.pitch = None;
+                    bot.look_src = "motion-idle";
+                }
             } else if walkable(spatial, nav, feet, world) {
                 let key = |v: f32| if v > 0.38 { 1.0 } else if v < -0.38 { -1.0 } else { 0.0 };
                 plan.forward = key(step.forward / speed);
@@ -2299,10 +2854,21 @@ fn act(
             if now >= bot.next_check {
                 bot.next_check = now + 0.5;
                 let heading = Vec3::new(steer.x - feet.x, 0.0, steer.z - feet.z).normalize_or_zero();
-                if let Some(point) = t.check_point(spatial, eye, feet, heading, tc.front, tc.intel, tc.team, rng) {
+                // Where it has learned someone camps, if it's in view: a
+                // look there first (the more experienced, the surer).
+                let k = bot.knowledge();
+                let camper = bot
+                    .learned
+                    .strongest(feet, u(300.0), u(1800.0))
+                    .filter(|sp| sp.weight > 0.4 && rng.random::<f32>() < k)
+                    .map(|sp| sp.pos + Vec3::Y * tactical::CHECK_HEIGHT)
+                    .filter(|&pt| line_clear(spatial, eye, pt + Vec3::Y * u(14.0)));
+                if let Some(point) = camper.or_else(|| t.check_point(spatial, eye, feet, heading, tc.front, tc.intel, tc.team, rng)) {
                     // Now and then stop to look properly, as real players
                     // pause for a second or two (5% of their time).
-                    let pause = rng.random::<f32>() < 0.08 + 0.1 * p.patience;
+                    // (Personas: real players stop to hold half as often as this
+                    // used to.)
+                    let pause = rng.random::<f32>() < if bot.persona.is_some() { 0.04 + 0.06 * p.patience } else { 0.08 + 0.1 * p.patience };
                     let until = now + if pause { rng.random_range(0.8..2.2) } else { rng.random_range(0.35..0.8) };
                     bot.check = Some((point, until));
                     if pause {
@@ -2397,8 +2963,23 @@ fn act(
     }
 
     // Reload when it's quiet; sprint on long quiet trips.
-    if (!threat_near || !bot.careful_reload) && weapon.clip < weapon.def.clip_size * 3 / 5 {
-        plan.reload = true;
+    if lab::on("oldreload") {
+        if (!threat_near || !bot.careful_reload) && weapon.clip < weapon.def.clip_size * 3 / 5 {
+            plan.reload = true;
+        }
+    } else {
+        // As players do (3.4-4.6 reloads a minute, a third within 3 s of a
+        // kill): once nobody's been seen for a moment with the magazine
+        // under 70%, and often straight after a kill. (Contacts heard out to
+        // 3000u kept the old "quiet" from ever coming on Killhouse.)
+        let seen_lately = bot.know.contacts.values().any(|c| c.noticed_at.is_some() && now - c.last_visible < 1.5);
+        let after_kill = bot.temper.reload_after_kill && now - bot.temper.last_kill < 3.0;
+        if (!seen_lately || !bot.careful_reload) && weapon.clip * 10 < weapon.def.clip_size * 7 {
+            plan.reload = true;
+        } else if after_kill && !seen_lately && weapon.clip * 10 < weapon.def.clip_size * 9 {
+            plan.reload = true;
+            bot.temper.reload_after_kill = false;
+        }
     }
     // On a sprint leg, roughly facing the path: just run forward (the view
     // keeps turning along it) rather than holding a diagonal.
@@ -2416,7 +2997,29 @@ fn act(
     }
     plan.sprint = travelling && !contact_imminent && !plan.ads && bot.glance.is_none() && bot.sprint_choice;
     if bot.look_src == "motion" {
-        plan.sprint = bot.matched_sprint && !contact_imminent;
+        // The matched real player's sprinting, leaned by this one's habit:
+        // sprint-everywhere players sprint where the match walked, others
+        // walk some of what it sprinted.
+        let habit = if p.sprinter >= 0.6 { bot.matched_sprint || (travelling && bot.sprint_choice) } else { bot.matched_sprint && bot.sprint_choice };
+        plan.sprint = habit && !contact_imminent;
+    }
+    // Hops on the move, at the real player's rate (2 a minute for most,
+    // some never, bunny-hoppers 6+).
+    if let Some(pp) = &bot.persona {
+        let moving = plan.forward != 0.0 || plan.right != 0.0;
+        if now >= bot.next_hop {
+            let mean = 60.0 / (pp.jumps * 0.8).max(0.05);
+            bot.next_hop = now + mean * -(1.0 - rng.random::<f32>()).max(1e-4).ln();
+            if moving && mover.on_ground && !matches!(bot.mode, Mode::Post | Mode::Hold) && plan.stance == Stance::Stand {
+                plan.jump = true;
+                bot.jump_src = "habit";
+            }
+        }
+    }
+    // Out of spawn at a run, as players do (Killhouse respawn to first shot
+    // was 5.2 s, real 2-3 s). Bot lab `oldspawn`: as before.
+    if bot.persona.is_some() && !lab::on("oldspawn") && now - bot.life_start < 5.0 && travelling && !contact_imminent && !plan.ads {
+        plan.sprint = true;
     }
     if bot.mode == Mode::Post && bot.dest.is_none() {
         if let Some(h) = &bot.hold {
@@ -2448,6 +3051,38 @@ fn act(
             plan.stance = Stance::Crouch;
         }
     }
+    // Standing about with nothing to look at (no hold angles, nobody in
+    // mind): face the most open way from here, not whatever wall the view
+    // ended on (a bot in a corner stared at it). Bot lab `oldlook`.
+    let still = Vec2::new(mover.velocity.x, mover.velocity.z).length() < u(20.0);
+    if plan.look.is_none() && plan.turn.is_none() && still && !lab::on("oldlook") {
+        let open = match bot.open_look {
+            Some((at, point)) if at.distance(feet) < u(48.0) => Some(point),
+            _ => {
+                let mut best: Option<(f32, Vec3)> = None;
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let dir = Vec3::new(a.sin(), 0.0, a.cos());
+                    let reach = Dir3::new(dir)
+                        .ok()
+                        .and_then(|d| spatial.cast_ray(eye, d, u(2000.0), true, &crate::collision::sight_filter()))
+                        .map_or(u(2000.0), |h| h.distance);
+                    if best.is_none_or(|b| reach > b.0) {
+                        best = Some((reach, eye + dir * reach.min(u(1000.0))));
+                    }
+                }
+                let point = best.map(|b| b.1);
+                bot.open_look = point.map(|p| (feet, p));
+                point
+            }
+        };
+        // Only if the view now meets a wall close by.
+        let blocked = Dir3::new(view.forward()).ok().and_then(|d| spatial.cast_ray(eye, d, u(200.0), true, &crate::collision::sight_filter())).is_some();
+        if let (Some(point), true) = (open, blocked) {
+            plan.look = Some(AimGoal { angles: angles_to(eye, point), width: 0.05, combat: false });
+            bot.look_src = "open";
+        }
+    }
     // The view's pitch out of fights: the habit and a wander (real players
     // out of fights: mean 3.7 degrees down, spread 8), less for better
     // players. Motion matching has real players' own pitch.
@@ -2456,7 +3091,11 @@ fn act(
     const DRIFT_TIME: f32 = 1.5;
     let sigma = (4.0 * (1.3 - 0.6 * bot.skill)).to_radians();
     bot.pitch_drift += -bot.pitch_drift * dt / DRIFT_TIME + sigma * (2.0 * dt / DRIFT_TIME).sqrt() * gaussian(rng);
-    if let (Some(goal), None) = (plan.look.as_mut().filter(|g| !g.combat), plan.turn) {
+    // (Not while reacting or fighting: the react look holds the current view,
+    // and the habit added on top of it every frame nodded the view 3-14
+    // degrees down before every fight. Bot lab `oldlook`: as before.)
+    let fighting = matches!(bot.mode, Mode::Engage | Mode::Cover) || matches!(bot.look_src, "react" | "fight" | "prefire" | "alarm");
+    if let (Some(goal), None, false) = (plan.look.as_mut().filter(|g| !g.combat), plan.turn, fighting && !lab::on("oldlook")) {
         goal.angles.y += bot.pitch_habit + bot.pitch_drift;
     }
     // Climbing: face the mantle (it goes the way the view does).
@@ -2472,14 +3111,44 @@ fn act(
 }
 
 /// Chance of holding a spot with sights up; watching a long sightline.
+/// How far a gun does any damage worth shooting at: a shotgun's pellets
+/// stop at `fMinDamageRange` (500 units on the W1200, 600 on the M1014),
+/// so a little inside that; everything else, as far as anyone fights.
+fn effective_reach(def: &crate::weapons::WeaponDef) -> f32 {
+    // (Bot lab `noreach`: as before, for A/B tests.)
+    if def.class == 3 && !lab::on("noreach") && def.gunplay.shot_count > 1 {
+        u(def.min_damage_range.max(150.0)) * 0.85
+    } else {
+        f32::INFINITY
+    }
+}
+
+/// A quickscope's shot: this long after going into the scope (CoD4's
+/// sniper rifles zoom in in about a quarter of a second).
+const QUICKSCOPE_SETTLE: f32 = 0.27;
+
+/// A persona's prefire share of contacts, as a chance per enemy pre-aimed
+/// at (not every pre-aim ends in a contact).
+const PREFIRE_SCALE: f32 = 4.0;
+/// Only this close to where they'd appear (CoD units, eye to point).
+const PREFIRE_RANGE: f32 = u(1200.0);
+
 const HOLD_ADS: f32 = 0.1;
 const HOLD_ADS_FAR: f32 = 0.35;
 /// On the move, aiming down sights is as likely as standing still this
-/// many times closer. Set so bots in fights on Killhouse have sights up
-/// as much of their moving time as real players there (31%; at 3.2, from
-/// fitting players' shots by distance, bots fighting at their usual 800
-/// to 1800 units had them up 54%).
-const ADS_MOVING_SCALE: f32 = 8.5;
+/// many times closer. Fitted (2026-10-18) to real players shooting with an
+/// enemy in sight in 11 CoD4X demos (sniper-only lobbies left out): moving,
+/// sights up 33% under 500 units, 72% at 500-1000, 85% beyond (standing:
+/// 65, 89, 96%), which is a moving half-distance of about 400 units against
+/// the standing 170. At the old 8.5 bots moving at those ranges had them up
+/// 5, 36 and 53%: in a killcam they nearly always hip-fired. At 2.4 (the
+/// fit) a sim measured 15, 48, 75%: the roll sticks for a few seconds and
+/// sights wait for the reaction, so the setting runs below the fit; at
+/// 1.6, 61, 77, 88% (close up over, n small): 1.8 between the two.
+const ADS_MOVING_SCALE: f32 = 1.8;
+
+/// Past this (50 m) bots hip-fire only rarely, whatever the gun.
+const HIP_FAR: f32 = 1970.0;
 
 /// Chance of aiming down sights in a fight at `dist`, where `half` is the
 /// distance a standing player does it half the time. Fitted to real
@@ -2496,6 +3165,9 @@ fn ads_chance(dist: f32, moving: bool, half: f32) -> f32 {
 /// Aim at and shoot the current engagement's target. Returns the distance
 /// to it, or None without one.
 #[allow(clippy::too_many_arguments)]
+/// How much wider a stunned bot's aim wanders, at full strength.
+const STUN_WANDER: f32 = 3.0;
+
 fn fight_aim(
     bot: &mut Bot,
     view: &ViewAngles,
@@ -2509,6 +3181,14 @@ fn fight_aim(
 ) -> Option<f32> {
     let skill = bot.skill;
     let ads_half = bot.style.ads_range;
+    let aggression = bot.personality.aggression;
+    let reaction = bot.reaction;
+    let personas = bot.persona.is_some();
+    let knowledge = bot.knowledge();
+    let sharper = personas && !lab::on("oldskill");
+    // How far out it hip-fires: players who aim in more, a little less far.
+    let hip_habit = bot.persona.as_ref().map_or(1.0, |pp| (1.15 - 0.3 * pp.ads).clamp(0.85, 1.15));
+    let experience = bot.persona.as_ref().map_or(0.5, |pp| pp.experience());
     let eng = bot.engagement.as_mut()?;
     let c = bot.know.contacts.get(&eng.target).copied()?;
     if c.noticed() {
@@ -2520,7 +3200,9 @@ fn fight_aim(
     // or crouch (head 4 above the eyes, chest about 0.71 of the eye height:
     // 64/43 standing, 44/28 crouched), not fixed heights that went over a
     // crouched target.
-    let point = if lab::on("stanceaim") {
+    // (Personas aim this way: 9% -> 12% of shots hit on Killhouse, where
+    // people fight crouched; bot lab `nostanceaim` for the old heights.)
+    let point = if lab::on("stanceaim") || (bot.persona.is_some() && !lab::on("nostanceaim")) {
         pos + Vec3::Y * if eng.aim_head { c.eye_height + u(4.0) } else { c.eye_height * 0.71 }
     } else if eng.aim_head {
         pos + Vec3::Y * u(62.0)
@@ -2537,7 +3219,13 @@ fn fight_aim(
     let across = (c.vel - to * c.vel.dot(to)).with_y(0.0).length();
     // (Wider still the further away: past 15 m, up to 28% more at 45.)
     let far = 1.0 + AIM_WANDER_FAR * ((dist - u(590.0)) / u(1180.0)).clamp(0.0, 1.0);
-    let sd = aim_wander_sd(skill) * far * (1.0 + AIM_WANDER_STRAFE * (across / u(190.0)).min(1.0));
+    // Stunned: much wider (the aim swims).
+    // (Personas: steadier the more experienced, so the pool's floor isn't
+    // the old Recruit's swim; bot lab `oldskill` for the old.)
+    // (At their shots bots were on target 6% of the time, the user 17%,
+    // with the same median error: they hovered round the target.)
+    let steady = if sharper { 0.55 - 0.15 * experience } else { 1.0 };
+    let sd = aim_wander_sd(skill) * steady * far * (1.0 + AIM_WANDER_STRAFE * (across / u(190.0)).min(1.0)) * (1.0 + STUN_WANDER * bot.stunned);
     let k = dt / AIM_WANDER_TIME;
     eng.wander += -eng.wander * k + Vec2::new(gaussian(rng), gaussian(rng) * 0.6) * sd * (2.0 * k).sqrt();
     let goal = angles_to(eye, point) + eng.wander;
@@ -2570,6 +3258,118 @@ fn fight_aim(
     }
     // And down once they've lost sight of them for a second.
     plan.ads = eng.ads && reacted && now - eng.last_visible < 1.0;
+    // Snipers: scoped in throughout (hard scope), up only as the crosshair
+    // reaches them with the shot as soon as it settles and straight back
+    // out (quickscope), or from the hip close up (no scope).
+    let aim_err = AimState::error(view, goal).length();
+    // (Only with a sniper rifle in hand: a sniper persona's pistol or a
+    // picked-up SMG is fired as any other gun.)
+    let held_sniper = ["barrett", "m40a3", "m21", "dragunov", "remington700"].iter().any(|g| weapon.def.name.starts_with(g));
+    let scope = match eng.scope {
+        _ if !held_sniper => persona::Scope::Hard,
+        persona::Scope::No if dist > u(700.0) => persona::Scope::Quick,
+        s => s,
+    };
+    match scope {
+        persona::Scope::Hard => {}
+        persona::Scope::Quick => plan.ads = reacted && c.noticed() && aim_err < width * 4.0 + 0.06 && now >= eng.unscope_until,
+        persona::Scope::No => plan.ads = false,
+    }
+    // Hip or sights, decided once a fight by the gun and the range, as real
+    // players' first shots go (the C2 table: hip at under 10 m about 64% with
+    // an SMG, 26% for a rifle at 10-25 m, ...); then kept (sticky), with the
+    // sights coming up during the reaction rather than after it. Lowered
+    // only very close, or a second after losing sight. Snipers keep their
+    // scoping. Bot lab `oldadsgate`: the old rolls and gate.
+    let new_gate = personas && !lab::on("oldadsgate") && !held_sniper;
+    if new_gate {
+        if eng.hip.is_none() {
+            let col = if dist < u(394.0) { 0 } else if dist < u(985.0) { 1 } else { 2 };
+            let row = match weapon.def.class {
+                2 => [0.64, 0.38, 0.27],
+                4 => [0.70, 0.43, 0.34],
+                3 => [0.98, 0.95, 0.95],
+                1 => [0.74, 0.60, 0.49],
+                _ => [0.62, 0.26, 0.16],
+            };
+            // Past the table: long-range hip fire is rare (the C2 rows end
+            // at 50 m, and its LMG 49% read as a laser from across the
+            // map), and rifles and LMGs hardly hip-fire past 25 m. Bot lab
+            // `oldhiprange`: the table's last column at any range.
+            let far_ok = lab::on("oldhiprange");
+            let p = match col {
+                2 if !far_ok && dist >= u(HIP_FAR) => 0.02,
+                2 if !far_ok && matches!(weapon.def.class, 0 | 1) => 0.05,
+                _ => row[col],
+            };
+            // (Sights already partly up: carry on up rather than fire as
+            // they come down.)
+            eng.hip = Some(weapon.ads <= 0.0 && rng.random::<f32>() < (p * hip_habit).min(1.0));
+        }
+        // Hip chosen close up and the fight's drawn out: sights up, not on
+        // spraying from the hip across the map.
+        if eng.hip == Some(true) && !lab::on("oldhiprange") && weapon.def.class != 3 {
+            let limit = if matches!(weapon.def.class, 0 | 1) { u(985.0) } else { u(HIP_FAR) };
+            if dist > limit * 1.15 {
+                eng.hip = Some(false);
+            }
+        }
+        let early = c.noticed_at.is_some_and(|n| now >= n + 0.4 * reaction);
+        let close = dist < u(200.0);
+        plan.ads = eng.hip == Some(false) && !close && (reacted || early || weapon.ads > 0.5) && now - eng.last_visible < 1.0 && weapon.def.ads_fov > 0.0;
+        // Panic: just shot, up close, with a gun that hip-fires well.
+        if c.shot_us_at.is_some_and(|t| now - t < 0.6) && dist < u(400.0) && matches!(weapon.def.class, 2 | 3 | 4) {
+            plan.ads = false;
+        }
+        if plan.ads {
+            plan.sprint = false;
+        }
+    }
+    if plan.ads {
+        eng.ads_since.get_or_insert(now);
+    } else {
+        eng.ads_since = None;
+    }
+    let scope_ready = scope != persona::Scope::Quick || eng.ads_since.is_some_and(|t| now - t >= QUICKSCOPE_SETTLE);
+    // Aimed in before the first shot past hip range, as players do: sights
+    // up, and no shot until they're most of the way up. Hip fire only close
+    // in, with a shotgun, or in a panic (just shot at, near). Snipers keep
+    // their own scoping (above). Bot lab `hipfire`: as before.
+    let hip_range = match weapon.def.class {
+        2 => u(450.0),
+        4 => u(350.0),
+        _ => u(300.0),
+    } * hip_habit;
+    let aimed_in = if new_gate {
+        // Sights chosen: no shot until they're fully up (a partly raised gun
+        // fires with the hip spread), unless they can't come up (the laser
+        // aim, a gun against a wall) for a while. And not in mid-flick for
+        // the opening shot.
+        // (The fallback only while they're stuck: still coming up after a
+        // pause, they're waited for: 18 of 22 part-raised openings were that.)
+        let rising = weapon.ads > eng.prev_ads + 1e-4;
+        eng.prev_ads = weapon.ads;
+        let up = weapon.ads >= 1.0 || weapon.laser_aim >= 1.0 || (eng.ads_since.is_some_and(|t| now - t > weapon.def.ads_trans_in + 0.15) && !rising);
+        let flicking = eng.first_shot.is_none() && bot.aim.settling(now);
+        // Never with the sights part way, up or down.
+        let between = weapon.ads > 0.0 && weapon.ads < 1.0 && !up;
+        (!plan.ads || up) && !flicking && !between
+    } else {
+        let panic = c.shot_us_at.is_some_and(|t| now - t < 0.6) && dist < hip_range * 1.8;
+        let gate = personas && !lab::on("hipfire") && !held_sniper && weapon.def.class != 3 && weapon.def.ads_fov > 0.0 && dist > hip_range && !panic;
+        if gate {
+            plan.ads = reacted && now - eng.last_visible < 1.0;
+        }
+        !gate || weapon.ads >= 0.8
+    };
+    // A hard-scoped sniper rifle: fired from a full scope, as the rest.
+    let aimed_in = aimed_in && !(personas && !lab::on("oldadsgate") && held_sniper && scope == persona::Scope::Hard && weapon.ads < 1.0 && !eng.ads_since.is_some_and(|t| now - t > weapon.def.ads_trans_in + 0.15));
+    // Out of a shotgun's reach: hold fire and close in (newer players
+    // sometimes blaze away anyway; rolled once a fight).
+    if eng.wild.is_none() {
+        eng.wild = Some(rng.random::<f32>() < 0.3 * (1.0 - knowledge));
+    }
+    let in_reach = dist <= effective_reach(weapon.def) || eng.wild == Some(true);
     if eng.drop {
         plan.stance = Stance::Prone;
     } else if eng.crouch {
@@ -2580,17 +3380,34 @@ fn fight_aim(
     // (less so when skilled), in bursts by range, and keep a burst going
     // through small misses for about a reaction time.
     if reacted && c.noticed() && !weapon.reloading() {
-        let err = AimState::error(view, goal).length();
-        let start = width * (1.6 - 1.0 * skill) + 0.015 - 0.011 * skill;
+        let err_v = AimState::error(view, goal);
+        let mut err = err_v.length();
+        // (Personas open up as the crosshair arrives, as players do: the
+        // user's first hit in a fight comes 1.2 s from sight, bots' was 2 s.)
+        let mut start = (width * (1.6 - 1.0 * skill) + 0.015 - 0.011 * skill) * if sharper { 1.8 } else { 1.0 };
         // Weaker players spray on through bigger misses.
-        let keep = width * (4.0 - 2.0 * skill) + 0.045 - 0.02 * skill;
+        let mut keep = width * (4.0 - 2.0 * skill) + 0.045 - 0.02 * skill;
+        // Personas: the window to fire in is the body's shape (about 11u
+        // across and 27u up and down from the chest, a standing body being
+        // 70u tall), not one circle; and they stop spraying sooner when off
+        // (5.9 degrees of miss at 800u kept a burst going). The error is
+        // then measured in that ellipse (1 = its edge). Bot lab `oldspread`:
+        // as before.
+        if sharper && !lab::on("oldspread") {
+            let d = dist.max(u(16.0));
+            let k = 2.6 - 0.8 * skill;
+            let (hx, hy) = ((u(11.0) / d).atan() * k + 0.004, (u(27.0) / d).atan() * k + 0.004);
+            err = ((err_v.x / hx).powi(2) + (err_v.y / hy).powi(2)).sqrt();
+            start = 1.0;
+            keep = 1.0 + (0.6 + 0.6 * (1.0 - skill)) * (width / hx.min(hy)).min(2.0) + 0.6;
+        }
         if err > keep {
             bot.burst_until = bot.burst_until.min(now + 0.12);
         }
-        if err < start || now < bot.burst_until {
+        if (err < start || now < bot.burst_until) && scope_ready && in_reach && aimed_in {
             if now >= bot.next_burst && err < start {
                 let (burst, pause) = if dist < u(600.0) {
-                    (rng.random_range(0.6..1.5), rng.random_range(0.05..0.15))
+                    if sharper { (rng.random_range(0.35..0.9) * (1.2 - 0.4 * experience), rng.random_range(0.05..0.12)) } else { (rng.random_range(0.6..1.5), rng.random_range(0.05..0.15)) }
                 } else if dist < u(1500.0) {
                     (rng.random_range(0.25..0.5), rng.random_range(0.15..0.35))
                 } else {
@@ -2600,6 +3417,11 @@ fn fight_aim(
                 bot.next_burst = bot.burst_until + pause;
             }
             plan.fire = now < bot.burst_until;
+            if plan.fire && scope == persona::Scope::Quick {
+                // Out of the scope while the bolt cycles.
+                eng.unscope_until = now + rng.random_range(0.35..0.7);
+                bot.burst_until = now;
+            }
             if plan.fire && eng.first_shot.is_none() {
                 eng.first_shot = Some(now);
                 if std::env::var_os("COD4RW_SIM").is_some() {
@@ -2613,6 +3435,12 @@ fn fight_aim(
                 }
             }
         }
+    }
+    // They ducked out of sight: real players keep shooting where they went
+    // for a moment (half their shots are at someone out of sight), the
+    // pushier the longer.
+    if personas && in_reach && reacted && !c.noticed() && !weapon.reloading() && eng.first_shot.is_some() && now - eng.last_visible < 0.15 + 0.35 * aggression {
+        plan.fire = true;
     }
     // Lost sight for a moment: keep aiming where they were.
     if !c.noticed() {
@@ -2683,7 +3511,9 @@ fn emergence_point(nav: &NavGraph, spatial: &SpatialQuery, feet: Vec3, eye: Vec3
             break;
         }
     }
-    last_visible
+    // A point a step or two ahead isn't where anyone would come from: the
+    // bot stared at (and prefired into) the floor in front of it.
+    last_visible.filter(|p| p.distance(eye) > u(300.0))
 }
 
 /// Whether a few steps in `dir` stay on walkable ground.
@@ -2795,17 +3625,25 @@ fn follow_path(
                         .get(&cell(nav.nodes[i as usize].pos))
                         .map_or(0.0, |&(n, led)| n.min(2) as f32 + if led { 2.0 } else { 0.0 })
                 };
+                // Personas keep to their own lane across the map much more
+                // (on Crossfire real players spend 29% of the middle third in
+                // each outer lane and under 10% in each central one; bots were
+                // the other way round). Bot lab `oldroutes`: as before.
+                let spread = bot.persona.is_some() && !lab::on("oldroutes");
+                // (And keep off open ground more: real players skirt the open
+                // middle street, bots walked down it.)
+                let (side_cost, side_cap, rush_pull, open_cost) = if spread { (u(70.0), 2.0, 0.75, u(60.0)) } else { (u(24.0), 1.5, 1.5, u(24.0)) };
                 let cost = |i: u32| {
                     // Where real players walk (demos, `learned`) is the way
                     // to go for most: off it costs extra. Flankers still
                     // keep to the edges of the busiest lanes.
                     let lane = match role {
-                        Role::Rusher => (1.0 - traffic(i)) * u(real_route_pull() * 1.5),
+                        Role::Rusher => (1.0 - traffic(i)) * u(real_route_pull() * rush_pull),
                         Role::Flanker => traffic(i) * u(40.0),
                         Role::Anchor => (1.0 - traffic(i)) * u(real_route_pull()),
                     };
                     let pos = nav.nodes[i as usize].pos;
-                    let side = tc.lateral.map_or(0.0, |l| (l.of(pos) - bot.lane).abs().min(1.5));
+                    let side = tc.lateral.map_or(0.0, |l| (l.of(pos) - bot.lane).abs().min(side_cap));
                     let trouble = if tc.trouble.is_empty() { 0.0 } else { tc.trouble.get(&i).map_or(0.0, |&n| n.min(4) as f32 * u(300.0)) };
                     // In front of a known enemy claymore (its 192 units and
                     // 70 degrees, with room to spare).
@@ -2813,7 +3651,7 @@ fn follow_path(
                         .iter()
                         .any(|(_, c, f)| (pos - *c).length() < u(240.0) && (pos - *c).normalize_or_zero().dot(*f) > 0.6);
                     let claymore = if claymore { u(4000.0) } else { 0.0 };
-                    nav.nodes[i as usize].exposure * caution * u(24.0) + lane + shared(i) * u(16.0) + side * u(24.0) + trouble + claymore
+                    nav.nodes[i as usize].exposure * caution * open_cost + lane + shared(i) * u(16.0) + side * side_cost + trouble + claymore
                 };
                 let t0 = std::time::Instant::now();
                 let found = nav.path_sliced(bot.route_id, a, b, now, 60_000, ROUTE_SLICE, cost);
@@ -2834,7 +3672,14 @@ fn follow_path(
                     }
                     nav::Step::NoWay => {
                         // Unreachable: give up on this destination (and
-                        // for a while on an objective there).
+                        // for a while on an objective there; a killer's spot
+                        // with no way there is no revenge, not a stand-still
+                        // re-planning it every decision).
+                        if let (Some(d), Some(r)) = (bot.dest, bot.temper.revenge) {
+                            if bot.mode == Mode::Hunt && d.distance(r.1) < u(64.0) {
+                                bot.temper.revenge = None;
+                            }
+                        }
                         bot.dest = None;
                         bot.next_decide = now;
                         if let Some(g) = bot.goal.filter(|_| bot.mode == Mode::Objective) {
@@ -3056,7 +3901,11 @@ fn motion_step(
         let (fwd, right) = (rot * Vec3::NEG_Z, rot * Vec3::X);
         let g = (goal - feet) / u(1.0);
         let v = mover.velocity / u(1.0);
-        let f = motion::features(g.dot(fwd), g.dot(right), v.dot(fwd), v.dot(right), bot.turn_rate, view.pitch);
+        // (The bot's own turning damped in the query: matched on it in full,
+        // a turning bot picked turning clips and kept on turning, the view
+        // still 8% of the time against real players' 65%. Bot lab `oldmotion`.)
+        let turn_in = if lab::on("oldmotion") { bot.turn_rate } else { bot.turn_rate * 0.3 };
+        let f = motion::features(g.dot(fwd), g.dot(right), v.dot(fwd), v.dot(right), turn_in, view.pitch);
         // Prefer carrying on with the same player's motion where it fits.
         let from = bot.playing.as_ref().map(|p| (p.sample, ((now - p.started) * motion::RATE).round() as usize));
         let sample = lib.best(&f, from)?;
@@ -3525,10 +4374,23 @@ fn accuracy_by_range(
     bots: Query<(&Bot, &Transform)>,
     places: Query<&Transform>,
     mut counts: Local<[(u32, u32); 4]>,
+    mut fate: Local<[u32; 5]>,
+    mut by_src: Local<std::collections::BTreeMap<String, (u32, u32)>>,
     mut next: Local<f32>,
 ) {
     for s in shots.read() {
         let Ok((bot, tf)) = bots.get(s.shooter) else { continue };
+        // Where every bot shot went: a player, the world (cover), nothing;
+        // and whether its target was in view at the time.
+        fate[0] += 1;
+        fate[1] += s.hit_pawn as u32;
+        fate[2] += (s.hit_world && !s.hit_pawn) as u32;
+        let seen = bot.engagement.as_ref().and_then(|e| bot.know.contacts.get(&e.target)).is_some_and(|c| c.noticed());
+        fate[3] += !seen as u32;
+        let e = by_src.entry(format!("{}{}", bot.look_src, if seen { "" } else { "/unseen" })).or_default();
+        e.0 += 1;
+        e.1 += s.hit_pawn as u32;
+        fate[4] += bot.engagement.is_none() as u32;
         let Some(target) = bot.engagement.as_ref().and_then(|e| places.get(e.target).ok()) else { continue };
         let metres = tf.translation.distance(target.translation);
         let bucket = ((metres / 15.0) as usize).min(3);
@@ -3540,6 +4402,49 @@ fn accuracy_by_range(
         *next = now + 10.0;
         let rate = |(s, h): (u32, u32)| if s > 0 { format!("{:.0}% of {s}", 100.0 * h as f32 / s as f32) } else { "-".into() };
         info!("accuracy by range: 0-15 m {}, 15-30 m {}, 30-45 m {}, 45+ m {}", rate(counts[0]), rate(counts[1]), rate(counts[2]), rate(counts[3]));
+        let pc = |n: u32| 100.0 * n as f32 / fate[0].max(1) as f32;
+        info!(
+            "shot fates: {} shots, player {:.0}%, world {:.0}%, nothing {:.0}%; target out of view {:.0}%, no fight {:.0}%",
+            fate[0],
+            pc(fate[1]),
+            pc(fate[2]),
+            100.0 - pc(fate[1]) - pc(fate[2]),
+            pc(fate[3]),
+            pc(fate[4])
+        );
+        let list: Vec<String> = by_src.iter().map(|(k, (n, h))| format!("{k} {n} ({:.0}% hit)", 100.0 * *h as f32 / (*n).max(1) as f32)).collect();
+        info!("shots by look source: {}", list.join(", "));
+    }
+}
+
+/// Debug (`COD4RW_SIM`): damage a hit by weapon, bots' (and on the local
+/// player, apart), every 30 s: the same CoD4 numbers as the player's guns,
+/// or not.
+fn damage_by_weapon(
+    time: Res<Time>,
+    mut damage: MessageReader<Damage>,
+    bots: Query<(), With<Bot>>,
+    local: Query<(), With<crate::player::LocalPlayer>>,
+    mut acc: Local<std::collections::BTreeMap<(&'static str, bool), (u32, f32, f32, f32)>>,
+    mut next: Local<f32>,
+) {
+    for d in damage.read() {
+        let Some(a) = d.attacker.filter(|a| bots.contains(*a) && *a != d.target) else { continue };
+        let _ = a;
+        let e = acc.entry((d.weapon, local.contains(d.target))).or_insert((0, 0.0, f32::MAX, 0.0));
+        e.0 += 1;
+        e.1 += d.amount;
+        e.2 = e.2.min(d.amount);
+        e.3 = e.3.max(d.amount);
+    }
+    let now = time.elapsed_secs();
+    if now >= *next {
+        *next = now + 30.0;
+        let list: Vec<String> = acc
+            .iter()
+            .map(|((w, me), (n, sum, lo, hi))| format!("{w}{} {n} hits avg {:.1} ({lo:.0}-{hi:.0})", if *me { " on player" } else { "" }, sum / *n as f32))
+            .collect();
+        info!("bot damage by weapon: {}", list.join(", "));
     }
 }
 

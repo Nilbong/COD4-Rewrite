@@ -13,7 +13,12 @@
 //! package's marker is thrown as a grenade is (the grenades' own anims).
 //!
 //! [`HardpointHands`] on a local player's pawn is what `crate::viewmodel`
-//! shows and animates; meanwhile the gun can't fire, aim or reload.
+//! shows and animates. Meanwhile (and while a sentry is carried) the gun is
+//! out of hand: no firing, aiming, reloading, melee, grenades, equipment or
+//! weapon switch, nor another call-in, from the keys, the mouse or a pad
+//! ([`strip_input`]); and for every pawn the host runs (bots, online
+//! guests, which have no hands here) a [`CallingIn`] lock as long as the
+//! hands' call-in takes does the same ([`gate`]).
 
 use super::{Hardpoint, StreakNotice, airstrike};
 use crate::combat::{Dead, Pawn};
@@ -26,9 +31,20 @@ pub(super) fn build(app: &mut App) {
         .add_systems(OnEnter(crate::state::GameState::InGame), load.after(crate::world::load_map).in_set(crate::state::Setup::Content))
         .add_systems(Update, (start, carry_sentry, advance).chain().after(super::use_hardpoints).run_if(crate::state::in_game))
         .add_systems(Update, shots.run_if(|| std::env::var_os("COD4RW_HANDSHOT").is_some()))
-        .add_systems(PostUpdate, place_props.after(crate::models::animate_skeletons).before(bevy::transform::TransformSystems::Propagate).run_if(crate::state::in_game))
-        .add_systems(Update, hold_gun.after(crate::splitscreen::InputGathered).before(crate::weapons::WeaponSet).run_if(crate::state::in_game));
+        .add_systems(PostUpdate, (place_props, grip_laptop).chain().after(crate::models::animate_skeletons).before(bevy::transform::TransformSystems::Propagate).run_if(crate::state::in_game))
+        .configure_sets(Update, CallInGate.after(crate::player::InputSet).before(crate::movement::MovementSet).before(crate::weapons::WeaponSet))
+        .add_systems(Update, strip_input.in_set(crate::splitscreen::InputGathered).after(crate::splitscreen::gather_input).run_if(crate::state::in_game))
+        .add_systems(
+            Update,
+            gate.in_set(CallInGate).after(crate::netplay::drive_remotes).after(crate::cover::bots::cover_bots).run_if(crate::state::in_game),
+        );
 }
+
+/// Where the call-in's lock clears what pawns want of their guns, after
+/// every source of it (the keys, the bots, online guests) and before it's
+/// acted on.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallInGate;
 
 /// The hardpoints' weapon files (their viewmodel and animations).
 #[derive(Resource, Default)]
@@ -232,30 +248,166 @@ fn advance(
             }
         };
         if let Some((phase, seconds)) = next {
-            // The phone's raise, press and putting away: the captured take at
-            // its own pace (CoD4's at its set time), times
-            // `hands.phone.speed`.
-            let seconds = if !is_laptop(h.def) && matches!(phase, HandsPhase::Raise | HandsPhase::Press | HandsPhase::PutAway) {
-                let speed = crate::tune::get("hands.phone.speed", 1.8).clamp(0.1, 5.0);
-                super::mocap::phone_anim(phase).map_or(seconds, |a| a.duration()) / speed
-            } else {
-                seconds
-            };
             h.phase = phase;
             h.started = now;
-            h.until = now + seconds.max(0.05);
+            h.until = now + phase_time(h.def, phase, seconds);
         }
     }
 }
 
-/// No firing, aiming or reloading with the detonator in hand (or the gun
-/// on its way down or up).
-fn hold_gun(mut pawns: Query<&mut WeaponInput, With<HardpointHands>>) {
-    for mut input in &mut pawns {
-        input.fire = false;
-        input.ads = false;
-        input.reload = false;
-        input.inspect = false;
+/// A pawn without hands here (a bot, an online guest) calling one in: its
+/// gun is out of hand as long as the hands' call-in would take, from the
+/// gun going down to its coming back up. An online guest's airstrike
+/// goes by what it tells: its laptop up (held until it says more), the
+/// spot picked (from the press) or the laptop put away unpicked.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct CallingIn {
+    item: Hardpoint,
+    since: f32,
+    stage: CallStage,
+}
+
+/// Where a [`CallingIn`] lock's time starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallStage {
+    /// The whole call-in: the gun down, the item up, pressed, away, the
+    /// gun back up.
+    Whole,
+    /// The airstrike's laptop up while its spot is picked: no end of its
+    /// own ([`PICKING_LIMIT`] at most).
+    Picking,
+    /// Picked: pressed, away, the gun back up.
+    Pressed,
+    /// Put away unpicked: away, the gun back up.
+    PutAway,
+}
+
+/// How long a guest's laptop may hold its gun without a word (its message
+/// that it went away lost to a dropped connection, say).
+const PICKING_LIMIT: f32 = 60.0;
+
+impl CallingIn {
+    pub fn new(item: Hardpoint, since: f32, picked: bool) -> Self {
+        Self::staged(item, since, if picked { CallStage::Pressed } else { CallStage::Whole })
+    }
+
+    pub fn staged(item: Hardpoint, since: f32, stage: CallStage) -> Self {
+        Self { item, since, stage }
+    }
+
+    pub fn stage(&self) -> CallStage {
+        self.stage
+    }
+}
+
+/// How long a phase of the call-in takes: the phone's raise, press and
+/// putting away, the captured take at its own pace (CoD4's at its set
+/// time), times `hands.phone.speed`.
+fn phase_time(def: &WeaponDef, phase: HandsPhase, seconds: f32) -> f32 {
+    if !is_laptop(def) && matches!(phase, HandsPhase::Raise | HandsPhase::Press | HandsPhase::PutAway) {
+        let speed = crate::tune::get("hands.phone.speed", 1.8).clamp(0.1, 5.0);
+        super::mocap::phone_anim(phase).map_or(seconds, |a| a.duration()) / speed
+    } else {
+        seconds
+    }
+    .max(0.05)
+}
+
+/// A call-in's time from where its lock starts, as [`advance`] times it
+/// (but the airstrike's hold): the gun down, the item up, pressed, away,
+/// the gun back up.
+fn call_in_time(defs: &HardpointDefs, gun: &WeaponDef, item: Hardpoint, stage: CallStage) -> f32 {
+    let Some(def) = defs.of(item) else { return 0.0 };
+    let down_up = gun.drop_time.max(0.05) + phase_time(def, HandsPhase::Raise, raise_time(def));
+    let press = phase_time(def, HandsPhase::Press, PRESS);
+    let away = phase_time(def, HandsPhase::PutAway, drop_time(def)) + gun.raise_time.max(0.05);
+    match stage {
+        CallStage::Whole => down_up + press + away,
+        CallStage::Picking => PICKING_LIMIT,
+        CallStage::Pressed => press + away,
+        CallStage::PutAway => away,
+    }
+}
+
+/// How much sooner a guest's lock ends than its hands' call-in would (it
+/// began on the host half a round trip after the guest's own): so their
+/// first shot with the gun back up isn't lost.
+const GUEST_EARLY: f32 = 0.15;
+
+/// The fighting keys (as the bindings press them, [`crate::bindings`]):
+/// reload, melee, frag, the guns, equipment, special grenade, inspect.
+const FIGHT_KEYS: [KeyCode; 9] =
+    [KeyCode::KeyR, KeyCode::KeyV, KeyCode::KeyG, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::KeyI, KeyCode::KeyB];
+
+/// No fighting while the call-in has the hands: the gun's buttons, the
+/// grenade, melee, equipment and weapon keys and the scroll never reach
+/// the game (nor, for an online guest, the host: its controls are sent
+/// from these). Nor another call-in, but the airstrike's own keys while
+/// its spot is picked (they put the map away, or call it where a pad
+/// aims).
+#[allow(clippy::type_complexity)]
+fn strip_input(mut players: Query<(&mut crate::splitscreen::PlayerInput, Option<&HardpointHands>), Or<(With<HardpointHands>, With<super::sentry::Carrying>)>>) {
+    for (mut input, hands) in &mut players {
+        for key in FIGHT_KEYS {
+            input.keys.reset(key);
+        }
+        let picking = hands.is_some_and(|h| h.selecting || h.phase == HandsPhase::Hold);
+        if !picking {
+            for key in super::KEYS_READ.into_iter().chain([super::PAD_PICK]) {
+                input.keys.reset(key);
+            }
+        }
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            input.mouse.reset(button);
+        }
+        input.scroll = 0.0;
+        let pad = &mut input.pad;
+        (pad.fire, pad.ads, pad.ads_pressed) = (false, false, false);
+    }
+}
+
+/// With the gun out of hand (call-in hands, a sentry carried, a
+/// [`CallingIn`] lock) nothing a pawn wants of it is done: no shot, aim,
+/// reload, melee, grenade, equipment or switch, and nothing left over to
+/// happen once the gun is back (a press, a switch asked for).
+#[allow(clippy::type_complexity)]
+fn gate(
+    mut commands: Commands,
+    time: Res<Time>,
+    defs: Res<HardpointDefs>,
+    mut pawns: Query<
+        (
+            Entity,
+            &WeaponState,
+            Option<&CallingIn>,
+            Has<crate::netplay::RemotePlayer>,
+            &mut WeaponInput,
+            Option<&mut crate::grenades::GrenadeInput>,
+            Option<&mut crate::melee::MeleeInput>,
+            Option<&mut crate::loadout::SwitchInput>,
+        ),
+        Or<(With<HardpointHands>, With<CallingIn>, With<super::sentry::Carrying>)>,
+    >,
+) {
+    let now = time.elapsed_secs();
+    for (e, w, lock, guest, mut input, grenades, melee, switch) in &mut pawns {
+        if let Some(l) = lock {
+            let until = l.since + call_in_time(&defs, w.def, l.item, l.stage) - if guest { GUEST_EARLY } else { 0.0 };
+            if now >= until {
+                commands.entity(e).remove::<CallingIn>();
+                continue;
+            }
+        }
+        *input = WeaponInput::default();
+        if let Some(mut g) = grenades {
+            *g = crate::grenades::GrenadeInput::default();
+        }
+        if let Some(mut m) = melee {
+            m.pressed = false;
+        }
+        if let Some(mut s) = switch {
+            s.to = None;
+        }
     }
 }
 
@@ -406,6 +558,132 @@ fn place_props(mut anchors: Query<(&PropAnchor, &mut Transform)>, joints: Query<
             *tf = want;
         }
     }
+}
+
+/// A joint's place in its viewmodel's own space (this frame's animated
+/// pose, before it's propagated).
+fn in_root(poses: &Query<(&mut Transform, Option<&ChildOf>)>, joint: Entity, root: Entity) -> Option<bevy::math::Affine3A> {
+    let mut at = bevy::math::Affine3A::IDENTITY;
+    let mut e = joint;
+    for _ in 0..64 {
+        if e == root {
+            return Some(at);
+        }
+        let (tf, parent) = poses.get(e).ok()?;
+        at = tf.compute_affine() * at;
+        e = parent?.parent();
+    }
+    None
+}
+
+/// Both hands on the laptop. The bomb case's hold (whose hands the laptop
+/// borrows) has one hand on its lid and the other under it, a hand's width
+/// apart; the laptop is twice the case's width. Each arm is bent (shoulder,
+/// then elbow: two-bone IK in the plane it already bends in) to put its
+/// wrist on the laptop's side, where the base's edge is held, blended in as
+/// the laptop comes up before the eye (`crate::viewmodel`'s framing).
+/// Where (the laptop's own inches: x front, y across, z up; fitted by eye
+/// from sweeps of the knobs, a little behind the base's middle, just out
+/// from its sides and under its top), live tuned: `hands.grip.x`,
+/// `hands.grip.y` (out from the middle), `hands.grip.z`.
+#[allow(clippy::type_complexity)]
+fn grip_laptop(
+    time: Res<Time>,
+    hands: Query<&HardpointHands, With<crate::player::LocalPlayer>>,
+    anchors: Query<(Entity, &PropAnchor)>,
+    roots: Query<(Entity, &crate::models::Skeleton, &crate::viewmodel::ViewModelSlot), With<crate::viewmodel::ViewModelRoot>>,
+    mut poses: Query<(&mut Transform, Option<&ChildOf>)>,
+    mut weight: Local<f32>,
+) {
+    let held = hands.iter().any(|h| is_laptop(h.def) && matches!(h.phase, HandsPhase::Hold | HandsPhase::Press));
+    let step = time.delta_secs() / crate::tune::get("hands.laptop.view_ease", 0.3).max(0.01);
+    *weight = (*weight + if held { step } else { -step }).clamp(0.0, 1.0);
+    if *weight <= 0.0 {
+        return;
+    }
+    let k = *weight * *weight * (3.0 - 2.0 * *weight);
+    let g = |n: &str, d: f32| crate::tune::get(&format!("hands.grip.{n}"), d);
+    let (gx, gy, gz) = (g("x", -2.0), g("y", 12.0), g("z", -0.5));
+    for (anchor, a) in &anchors {
+        if !a.laptop {
+            continue;
+        }
+        // Its viewmodel (Player 1's: only theirs is brought up to the eye).
+        let mut e = anchor;
+        let mut root = None;
+        for _ in 0..64 {
+            if roots.contains(e) {
+                root = Some(e);
+                break;
+            }
+            let Some(p) = poses.get(e).ok().and_then(|(_, p)| p.map(|p| p.parent())) else { break };
+            e = p;
+        }
+        let Some((root, skeleton, slot)) = root.and_then(|r| roots.get(r).ok()) else { continue };
+        if slot.0 != 0 {
+            continue;
+        }
+        let Some(at) = in_root(&poses, anchor, root) else { continue };
+        for (side, y) in [("le", -gy), ("ri", gy)] {
+            let joint = |n: &str| skeleton.joint(&format!("j_{n}_{side}"));
+            let (Some(sj), Some(ej), Some(wj)) = (joint("shoulder"), joint("elbow"), joint("wrist")) else { continue };
+            let Some(parent) = poses.get(sj).ok().and_then(|(_, p)| p.map(|p| p.parent())) else { continue };
+            let (Some(sg), Some(eg), Some(wg), Some(pg)) = (in_root(&poses, sj, root), in_root(&poses, ej, root), in_root(&poses, wj, root), in_root(&poses, parent, root)) else { continue };
+            let (s, el, w) = (sg.translation.into(), eg.translation.into(), wg.translation.into());
+            let target: Vec3 = at.transform_point3(crate::units::pos([gx, y, gz]));
+            let target = w + (target - w) * k;
+            let Some((q1, q2)) = two_bone(s, el, w, target) else { continue };
+            // Each joint's turn, from the arm's space into its own.
+            let (_, prot, _) = pg.to_scale_rotation_translation();
+            let (_, srot, _) = sg.to_scale_rotation_translation();
+            if let Ok((mut tf, _)) = poses.get_mut(sj) {
+                tf.rotation = (prot.inverse() * q1 * prot * tf.rotation).normalize();
+            }
+            if let Ok((mut tf, _)) = poses.get_mut(ej) {
+                tf.rotation = (srot.inverse() * q1.inverse() * q2 * q1 * srot * tf.rotation).normalize();
+            }
+            // The hand turned to hold the base's edge: its fingers in and
+            // under it, its thumb up over it (the laptop's own directions:
+            // x front, y across, z up; live tuned `hands.grip.fingers_*`,
+            // `hands.grip.thumb_*`, mirrored for the left).
+            let across = if side == "le" { -1.0 } else { 1.0 };
+            let fingers = at.transform_vector3(crate::units::dir([g("fingers_x", 0.1), -across * g("fingers_in", 0.9), g("fingers_z", 0.0)]));
+            let thumb = at.transform_vector3(crate::units::dir([g("thumb_x", 0.5), -across * g("thumb_in", 0.3), g("thumb_z", 0.8)]));
+            let (Some(mid), Some(thumb_joint)) = (skeleton.joint(&format!("j_mid_{side}_1")), skeleton.joint(&format!("j_thumb_{side}_1"))) else { continue };
+            let (Some(eg), Some(wg), Some(mg), Some(tg)) = (in_root(&poses, ej, root), in_root(&poses, wj, root), in_root(&poses, mid, root), in_root(&poses, thumb_joint, root)) else { continue };
+            let w: Vec3 = wg.translation.into();
+            let basis = |f: Vec3, t: Vec3| -> Option<Mat3> {
+                let f = f.try_normalize()?;
+                let t = (t - f * t.dot(f)).try_normalize()?;
+                Some(Mat3::from_cols(f, t, f.cross(t)))
+            };
+            let (Some(now), Some(want)) = (basis(Vec3::from(mg.translation) - w, Vec3::from(tg.translation) - w), basis(fingers, thumb)) else { continue };
+            let turn = Quat::IDENTITY.slerp(Quat::from_mat3(&(want * now.transpose())).normalize(), k);
+            let (_, erot, _) = eg.to_scale_rotation_translation();
+            let (_, wrot, _) = wg.to_scale_rotation_translation();
+            if let Ok((mut tf, _)) = poses.get_mut(wj) {
+                tf.rotation = (erot.inverse() * turn * wrot).normalize();
+            }
+        }
+    }
+}
+
+/// Two-bone IK: the turns of the upper arm (about the shoulder `s`) and
+/// then the forearm (about the elbow, once moved) that take the wrist `w`
+/// to `target` (as near as the arm reaches), the elbow bending the way it
+/// already does.
+fn two_bone(s: Vec3, e: Vec3, w: Vec3, target: Vec3) -> Option<(Quat, Quat)> {
+    let (upper, fore) = ((e - s).length(), (w - e).length());
+    let to = target - s;
+    let dir = to.try_normalize()?;
+    let reach = to.length().clamp((upper - fore).abs() + 1e-4, upper + fore - 1e-4);
+    let bend = ((e - s) - dir * (e - s).dot(dir)).try_normalize().or_else(|| dir.any_orthonormal_vector().try_normalize())?;
+    let cos = ((upper * upper + reach * reach - fore * fore) / (2.0 * upper * reach)).clamp(-1.0, 1.0);
+    let elbow = s + (dir * cos + bend * (1.0 - cos * cos).max(0.0).sqrt()) * upper;
+    let q1 = Quat::from_rotation_arc((e - s).try_normalize()?, (elbow - s).try_normalize()?);
+    let wrist = s + q1 * (w - s);
+    let q2 = Quat::from_rotation_arc((wrist - elbow).try_normalize()?, (s + dir * reach - elbow).try_normalize()?);
+    Some((q1, q2))
 }
 
 /// Test aid: `COD4RW_HANDSHOT=<dir>` saves a screenshot every 0.1 s while

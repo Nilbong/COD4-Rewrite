@@ -42,7 +42,7 @@ pub(super) fn setup(app: &mut App) {
         })
         .add_systems(
             Update,
-            (kills, life, match_end, complete).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
+            (kills, life, match_end, complete).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game).run_if(|| !crate::campaign::active() && !crate::hq::active()),
         );
 }
 
@@ -531,6 +531,8 @@ fn complete(
         fe.stats.set(c.state, if state as usize >= c.levels.len() { CHALLENGE_DONE } else { state + 1 });
         let text = fe.assets.localize(&format!("@{}", level.name));
         info!("progression: challenge completed: {text} (+{} XP)", level.xp);
+        // (Its XP counted under Challenges in the post-match summary.)
+        super::next::summary::add_challenge(&text, level.xp);
         hud.notify(fe.assets.localize("@CHALLENGE_COMPLETED"), text, String::new(), now);
         if !level.unlock_text.is_empty() {
             hud.message(fe.assets.localize(&format!("@{}", level.unlock_text)), now);

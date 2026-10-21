@@ -3,7 +3,6 @@
 //! The choice is the player's (MW2's way, not per class), saved with the
 //! profile ([`crate::killstreaks::choice`], which the game reads).
 
-use super::super::expr::Env;
 use super::super::{Frontend, OpenMenu, Op, Placement};
 use super::cac;
 use super::home::virtual_rect;

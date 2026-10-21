@@ -15,14 +15,23 @@
 // IW3 lit in gamma space, so its results are linearised with pow 2.2.
 
 #import bevy_pbr::shadows::fetch_directional_shadow
+// The showcase's lamp and contact shadows (`crate::showcase_shadows`).
+#import cod4rw::shadows::{lamp_shade, sun_contact}
+#import cod4rw::material_class::material_class
+#ifdef IRRADIANCE_VOLUME
+#import bevy_pbr::irradiance_volume
+#import bevy_pbr::clustered_forward as clustering
+#endif
 #import bevy_pbr::mesh_view_types::DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT
 #import bevy_pbr::{
     lighting::{F_AB, EnvBRDFApprox},
     mesh_view_bindings::{view, globals, lights},
     pbr_fragment::pbr_input_from_standard_material,
-    pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
+    pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing, calculate_F0},
+    ambient,
     pbr_types::{
         STANDARD_MATERIAL_FLAGS_UNLIT_BIT,
+        STANDARD_MATERIAL_FLAGS_METALLIC_ROUGHNESS_TEXTURE_BIT,
         STANDARD_MATERIAL_FLAGS_ALPHA_MODE_RESERVED_BITS,
         STANDARD_MATERIAL_FLAGS_ALPHA_MODE_OPAQUE,
         STANDARD_MATERIAL_FLAGS_ALPHA_MODE_MASK,
@@ -50,6 +59,22 @@ struct WorldParams {
     traced: vec4<f32>,
     // Detail map: tiling, 1 if on, its last mip.
     detail: vec4<f32>,
+    probe_center: vec4<f32>,
+    probe_box_min: vec4<f32>,
+    probe_box_max: vec4<f32>,
+    // The surfaces' primary light (`COD4RW_WORLDLIGHTS`): position and
+    // 1 / radius, colour (w 1 on), direction and spot exponent, spot scale,
+    // bias, 1 for a spot, 1 with baked visibility.
+    plight_pos: vec4<f32>,
+    plight_color: vec4<f32>,
+    plight_dir: vec4<f32>,
+    plight_spot: vec4<f32>,
+    // The material-class layer (`material_class.wgsl`): class, on, detail
+    // strength, anti-tiling amount.
+    surface: vec4<f32>,
+    // Probe normalisation (`crate::world::probe_norm`): x strength, y 1 on,
+    // z the calibration k, w the most it may brighten.
+    probe_norm: vec4<f32>,
 }
 
 #import bevy_pbr::mesh_bindings::mesh
@@ -77,6 +102,8 @@ struct WorldIndices {
     ssr_sampler: u32,
     height_map: u32,
     height_sampler: u32,
+    primary_map: u32,
+    primary_sampler: u32,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(120) var<storage> world_indices: array<WorldIndices>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(121) var<storage> world_params: array<WorldParams>;
@@ -119,6 +146,9 @@ fn sample_height(uv: vec2<f32>, lod: f32) -> f32 {
 fn height_size() -> vec2<f32> {
     return vec2<f32>(textureDimensions(bindless_textures_2d[world.height_map]));
 }
+fn sample_primary(uv: vec2<f32>) -> f32 {
+    return textureSample(bindless_textures_2d[world.primary_map], bindless_samplers_filtering[world.primary_sampler], uv).r;
+}
 #else
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> params: WorldParams;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var normal_map: texture_2d<f32>;
@@ -136,6 +166,11 @@ fn height_size() -> vec2<f32> {
 @group(#{MATERIAL_BIND_GROUP}) @binding(113) var ssr_sampler: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(114) var height_map: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(115) var height_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(116) var primary_map: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(117) var primary_sampler: sampler;
+fn sample_primary(uv: vec2<f32>) -> f32 {
+    return textureSample(primary_map, primary_sampler, uv).r;
+}
 
 fn load_world_material(in: VertexOutput) {}
 fn sample_normal(uv: vec2<f32>) -> vec4<f32> {
@@ -271,14 +306,37 @@ fn water(in: VertexOutput) -> vec4<f32> {
         // (Rings only where it rains: calm mud otherwise.)
         let rain_now = select(0.0, saturate(f32((tag >> 8u) & 0xffu) / 255.0 * 2.0), (tag & 0x10000u) != 0u);
         let g = rain_ripples(in.world_position.xz, t) * rain_now;
+        // Still water: its faint surface from the world position (turned,
+        // off any grid), not the surface's UVs, which tiled the same waves
+        // across every pool and moved them all at once; slow and faint.
+        let rot = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
+        let q = rot * (in.world_position.xz * 0.23);
+        let ts = t * 0.25;
+        let wc = water_octaves(q, ts);
+        let wx = water_octaves(q + vec2(0.0039, 0.0), ts);
+        let wy = water_octaves(q + vec2(0.0, 0.0039), ts);
+        let still = vec2(wx - wc, wy - wc) * 0.15;
         // (World x, z is CoD x, -y.)
-        n = normalize(vec3(n.xy * (1.0 - 0.85 * muddy) + vec2(g.x, -g.y) * 0.35 * muddy, 1.0));
+        n = normalize(vec3(mix(n.xy, still, muddy) + vec2(g.x, -g.y) * 0.35 * muddy, 1.0));
     }
     let r = v - 2.0 * dot(v, n) * n;
     var reflected = params.water_color.rgb * 2.0;
     if (params.probe.x > 0.5) {
         let pr = sample_probe(vec3(r.x, r.y, abs(r.z)), 0.0);
         reflected = saturate(pr.rgb * pr.a * 4.0);
+    }
+    // The showcase's screen-space reflections over the probe (what's on
+    // screen: walls, the bank, soldiers), back into this gamma space.
+    // (World x, z is CoD x, -y: the reflected ray in Bevy axes.)
+    // (Only where the SSR history is filled, the showcase: `probe.z`,
+    // `crate::world`; elsewhere it held nothing.)
+    var found = vec4(0.0);
+    if (params.probe.z > 0.5) {
+        found = screen_reflection(in.world_position.xyz, vec3(r.x, abs(r.z), -r.y), 0.0, in.position.xy, true);
+    }
+    if (found.a > 0.0) {
+        let lin = found.rgb / max(params.flags.w * view.exposure, 1e-6);
+        reflected = mix(reflected, pow(max(lin, vec3(0.0)), vec3(1.0 / 2.2)), saturate(found.a));
     }
     let env = params.water_env;
     // (Muddy: the sky reflects dimmer off brown water under rain.)
@@ -293,6 +351,10 @@ fn water(in: VertexOutput) -> vec4<f32> {
 #ifdef VERTEX_COLORS
     alpha = in.color.a;
 #endif
+    // The Map Look Editor's clarity (`sun_dir.w` - 1, 1 when unset): how
+    // much of what's under shows through.
+    let clarity = select(1.0, params.sun_dir.w - 1.0, params.sun_dir.w > 0.5);
+    alpha = saturate(1.0 - (1.0 - alpha) * clarity);
     return vec4(colour, alpha);
 }
 
@@ -315,6 +377,34 @@ fn wet_noise(p: vec2<f32>) -> f32 {
     return mix(mix(wet_hash(i), wet_hash(i + vec2(1.0, 0.0)), u.x), mix(wet_hash(i + vec2(0.0, 1.0)), wet_hash(i + vec2(1.0, 1.0)), u.x), u.y);
 }
 
+// Organic puddle shapes: gradient noise (no grid-aligned edges, unlike
+// value noise), its domain warped by a larger one, four octaves.
+fn puddle_grad(c: vec2<f32>) -> vec2<f32> {
+    var p3 = fract(vec3(c.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    let a = fract((p3.x + p3.y) * p3.z) * 6.2831853;
+    return vec2(cos(a), sin(a));
+}
+
+fn puddle_gnoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = p - i;
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let a = dot(puddle_grad(i), f);
+    let b = dot(puddle_grad(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0));
+    let c = dot(puddle_grad(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0));
+    let d = dot(puddle_grad(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// 0..1, about 0.5 on average.
+fn puddle_field(p: vec2<f32>) -> f32 {
+    let warp = vec2(puddle_gnoise(p * 0.19 + vec2(3.1, 1.7)), puddle_gnoise(p * 0.19 + vec2(7.7, 4.2))) * 2.2;
+    let q = p + warp;
+    let n = puddle_gnoise(q * 0.33) * 0.62 + puddle_gnoise(q * 0.87) * 0.26 + puddle_gnoise(q * 2.3) * 0.11 + puddle_gnoise(q * 5.9) * 0.05;
+    return clamp(0.5 + n * 0.95, 0.0, 1.0);
+}
+
 // Rain reaches here (1) or not (0): the wet map's cells (0.5 m, 128 a
 // side, wrapping round the camera), blended between neighbours. Beyond
 // the map (30 m from the camera) it's taken as open.
@@ -325,7 +415,11 @@ fn wet_exposure(p: vec3<f32>) -> f32 {
     if (dot(to, to) > 30.0 * 30.0) {
         return 1.0;
     }
-    let g = p.xz / WET_CELL - 0.5;
+    // (Read a little off the point by a noise, and the cells' blend
+    // sharpened: shelter edges wander organically instead of tracing the
+    // 0.5 m cells as squares.)
+    let wobble = vec2(puddle_gnoise(p.xz * 1.7 + 5.3), puddle_gnoise(p.xz * 1.7 + 9.1)) * WET_CELL * 0.9;
+    let g = (p.xz + wobble) / WET_CELL - 0.5;
     let c = vec2<i32>(floor(g));
     let f = fract(g);
     let h00 = load_wet_height(((c % WET_CELLS) + WET_CELLS) % WET_CELLS);
@@ -334,7 +428,8 @@ fn wet_exposure(p: vec3<f32>) -> f32 {
     let h11 = load_wet_height(((c + vec2(1, 1)) % WET_CELLS + WET_CELLS) % WET_CELLS);
     let reach = p.y + 0.3;
     let e = vec4(select(0.0, 1.0, h00 < reach), select(0.0, 1.0, h10 < reach), select(0.0, 1.0, h01 < reach), select(0.0, 1.0, h11 < reach));
-    return mix(mix(e.x, e.y, f.x), mix(e.z, e.w, f.x), f.y);
+    let u = f * f * (3.0 - 2.0 * f);
+    return smoothstep(0.2, 0.8, mix(mix(e.x, e.y, u.x), mix(e.z, e.w, u.x), u.y));
 }
 
 // Raindrops' rings on standing water: the slope they add (world x, z).
@@ -417,8 +512,11 @@ fn wet_surface(in: VertexOutput, pbr: ptr<function, PbrInput>) -> f32 {
     // Rough (porous) surfaces soak and darken more.
     let porosity = smoothstep(0.3, 0.9, rough);
     // Puddles where the ground is flat, spreading as it gets wetter.
-    let n = wet_noise(p.xz * 0.35) * 0.65 + wet_noise(p.xz * 1.3) * 0.35;
-    let puddle = up * smoothstep(0.98 - w * 0.62, 1.06 - w * 0.62, n + 0.25);
+    let n = puddle_field(p.xz) + 0.25;
+    // (Softer with distance, so the edge stays a few pixels wide; no
+    // derivatives here, the early returns above aren't uniform.)
+    let soft = 0.035 + distance(p, view.world_position) * 0.0012;
+    let puddle = up * smoothstep(1.02 - w * 0.62 - soft, 1.02 - w * 0.62 + soft, n);
     // Water running down walls, in streaks.
     var streak = 0.0;
     if (vertical > 0.0 && rain > 0.0) {
@@ -464,11 +562,21 @@ fn wet_surface(in: VertexOutput, pbr: ptr<function, PbrInput>) -> f32 {
 const SSR_REACH: f32 = 30.0;
 // `crate::player::SKY_BRIGHTNESS`: the skybox's brightness (cd/m²).
 const SKY_BRIGHTNESS: f32 = 800.0;
-const SSR_MAX_STEPS: f32 = 40.0;
+const SSR_MAX_STEPS: f32 = 24.0;
 
-fn screen_reflection(origin: vec3<f32>, r: vec3<f32>, roughness: f32, frag: vec2<f32>) -> vec4<f32> {
+fn screen_reflection(origin: vec3<f32>, r: vec3<f32>, roughness: f32, frag: vec2<f32>, any_surface: bool) -> vec4<f32> {
 #ifdef DEPTH_PREPASS
-    let smooth_enough = 1.0 - smoothstep(0.2, 0.45, roughness);
+    // (Not far off: past 30-45 m the reflection is a few pixels, the
+    // probe's colour is as good, and the march cost as much as near.)
+    // (Only the lightmapped world (ground, walls): wet props and models,
+    // curved and small, showed little of it for most of its cost; their
+    // sky reflection and wet film stay.)
+    // (`any_surface`: water, which takes it whether lightmapped or not.)
+    if (params.flags.z < 0.5 && !any_surface) {
+        return vec4(0.0);
+    }
+    let far = 1.0 - smoothstep(30.0, 45.0, distance(origin, view.world_position));
+    let smooth_enough = (1.0 - smoothstep(0.2, 0.45, roughness)) * far;
     if (smooth_enough <= 0.0) {
         return vec4(0.0);
     }
@@ -484,7 +592,8 @@ fn screen_reflection(origin: vec3<f32>, r: vec3<f32>, roughness: f32, frag: vec2
     let size = view.viewport.zw;
     let s_uv = s.xy * vec2(0.5, -0.5) + 0.5;
     let e_uv = e.xy * vec2(0.5, -0.5) + 0.5;
-    let steps = clamp(length((e_uv - s_uv) * size) / 6.0, 8.0, SSR_MAX_STEPS);
+    // (A step per 10 pixels: the narrowing after a hit finds the edge.)
+    let steps = clamp(length((e_uv - s_uv) * size) / 10.0, 6.0, SSR_MAX_STEPS);
     let jitter = wet_hash(frag);
     var lo = 0.0;
     for (var i = 1.0; i <= steps; i += 1.0) {
@@ -544,7 +653,8 @@ fn relief_uv(v: VertexOutput) -> vec2<f32> {
 #ifdef VERTEX_TANGENTS
     // Height texels a pixel (before any branching: derivatives).
     let texels = max(length(dpdx(v.uv) * height_size()), length(dpdy(v.uv) * height_size()));
-    if ((mesh[v.instance_index].tag & 0x10000u) == 0u || params.flags.x < 0.5) {
+    // (Remastered textures, `crate::upscaled`: traced.w, their depth.)
+    if (((mesh[v.instance_index].tag & 0x10000u) == 0u && params.traced.w <= 0.0) || params.flags.x < 0.5) {
         return v.uv;
     }
     let to_eye = view.world_position - v.world_position.xyz;
@@ -566,7 +676,7 @@ fn relief_uv(v: VertexOutput) -> vec2<f32> {
     }
     let layers = mix(24.0, 6.0, ts.z);
     let layer = 1.0 / layers;
-    let delta = RELIEF_DEPTH * fade * smoothstep(0.3, 0.6, ts.z) * layer * vec2(-ts.x, ts.y) / max(ts.z, 0.45);
+    let delta = select(RELIEF_DEPTH, params.traced.w, params.traced.w > 0.0) * fade * smoothstep(0.3, 0.6, ts.z) * layer * vec2(-ts.x, ts.y) / max(ts.z, 0.45);
     var uv = v.uv;
     var depth = 0.0;
     var surface = 1.0 - sample_height(uv, lod);
@@ -586,6 +696,18 @@ fn relief_uv(v: VertexOutput) -> vec2<f32> {
 #else
     return vec2(0.0);
 #endif
+}
+
+// Screen-space occlusion as it falls on baked light: deepened (its raw
+// value was too faint to see on lightmapped walls), then lifted again for
+// light surfaces, whose bounce fills their own corners (multi-bounce AO,
+// Jimenez et al. 2016), which also keeps the shade's colour.
+fn baked_ao(ao: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {
+    let x = pow(saturate(dot(ao, vec3(1.0 / 3.0))), 1.8);
+    let a = 2.0404 * albedo - 0.3324;
+    let b = -4.7951 * albedo + 0.6417;
+    let c = 2.7552 * albedo + 0.6903;
+    return max(vec3(x), ((x * a + b) * x + c) * x);
 }
 
 @fragment
@@ -644,6 +766,11 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
         pbr_input.material.reflectance = sqrt(s.rgb / 0.16);
     }
 #endif
+    // The material-class layer: anti-tiling, detail normals, roughness by
+    // CoD4 surface type, specular anti-aliasing (`material_class.wgsl`).
+    let class_dn = max(dot(dpdx(pbr_input.N), dpdx(pbr_input.N)), dot(dpdy(pbr_input.N), dpdy(pbr_input.N)));
+    let rough_given = params.flags.y > 0.5 || (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_METALLIC_ROUGHNESS_TEXTURE_BIT) != 0u;
+    material_class(in.world_position.xyz, &pbr_input, params.surface, rough_given, class_dn);
 
     // Showcase rain.
     snow_surface(in, &pbr_input);
@@ -656,6 +783,8 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
     // bind groups the render thread rebuilt every frame) or, with it
     // (`LIGHTMAP`), through Bevy's lightmap path.
     var baked = vec3(0.0);
+    // The baked share of `baked` (without the live sun), for occlusion.
+    var baked_lm = vec3(0.0);
     // Occlusion fades into the fog (Bog: dark corners showed through the
     // haze of far buildings). CoD4's fog (`crate::fog`, "linear" mode).
     if (bevy_pbr::mesh_view_bindings::fog.mode == 1u) {
@@ -681,6 +810,44 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
             // soft limit) runs as for CoD4's lightmaps.
             lit = pow(max(lit, vec3(0.0)), vec3(1.0 / 2.2));
         }
+        // Shadows of moving things from the map's lamps (the showcase's
+        // shadow-casting lamps; 1 without them).
+        let lamp_view_z = dot(vec4(view.view_from_world[0].z, view.view_from_world[1].z, view.view_from_world[2].z, view.view_from_world[3].z), in.world_position);
+        lit *= lamp_shade(in.world_position, normalize(in.world_normal), in.position.xy, lamp_view_z);
+        // The surfaces' primary light (`COD4RW_WORLDLIGHTS`): CoD4 leaves it
+        // out of the lightmap and adds it at run time (`LIT_SPOT`/`LIT_OMNI`),
+        // in gamma space as the sun, times its baked visibility (the primary
+        // lightmap: the world's shadows from it).
+        // (Sampled outside the branch: textureSample needs uniform control flow.)
+        let plight_vis = sample_primary(in.uv_b);
+        if (params.plight_color.w > 0.5) {
+            let to_light = params.plight_pos.xyz - in.world_position.xyz;
+            let dist = length(to_light);
+            let pl = to_light / max(dist, 1e-4);
+            let pndl = saturate(dot(pbr_input.N, pl));
+            // Falloff to nothing at the radius (CoD4's light def's
+            // attenuation image is near this).
+            let x = saturate(dist * params.plight_pos.w);
+            // (By its light def: none, linear, quadratic, else smooth.)
+            let kind = floor(params.plight_dir.w / 100.0);
+            let exponent = params.plight_dir.w - kind * 100.0;
+            var fall = (1.0 - x * x) * (1.0 - x * x);
+            if (kind > 0.5 && kind < 1.5) {
+                fall = select(0.0, 1.0, x < 1.0);
+            } else if (kind > 1.5 && kind < 2.5) {
+                fall = 1.0 - x;
+            } else if (kind > 2.5) {
+                fall = (1.0 - x) * (1.0 - x);
+            }
+            var cone = 1.0;
+            if (params.plight_spot.z > 0.5) {
+                let c = saturate(dot(-pl, params.plight_dir.xyz) * params.plight_spot.x + params.plight_spot.y);
+                cone = select(c, pow(c, exponent), exponent > 0.5);
+            }
+            let vis = select(1.0, plight_vis, params.plight_spot.w > 0.5);
+            lit += params.plight_color.rgb * pndl * fall * cone * vis;
+        }
+        let lit_lm = lit;
         if (params.traced.y > 0.5 && params.water_color.w < 0.5) {
             // CoD4's `lm_sm_sun`: the live sun added to the baked light in
             // gamma space, shadowed, before linearising.
@@ -697,6 +864,9 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
                     if (((*light).flags & DIRECTIONAL_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u
                         && dot((*light).direction_to_light, params.sun_dir.xyz) > 0.999) {
                         shadow = fetch_directional_shadow(i, in.world_position, in.world_normal, view_z, in.position.xy);
+                        if (shadow > 0.0) {
+                            shadow *= sun_contact(in.world_position.xyz, in.position.xy, params.sun_dir.xyz);
+                        }
                         break;
                     }
                 }
@@ -710,10 +880,18 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
             lit = select(lit, vec3(1.0) + (lit - vec3(1.0)) * 0.35, lit > vec3(1.0));
         }
         baked = pow(lit, vec3(2.2)) * params.flags.w;
+        baked_lm = min(pow(max(lit_lm, vec3(0.0)), vec3(2.2)) * params.flags.w, baked);
     }
 #endif
+    // Occlusion on the baked light: screen-space AO darkens the lightmap's
+    // (sky and bounce) light more than Bevy's ambient would, and the live
+    // sun only a little (its contact shadows handle where things meet):
+    // corners, feet of walls and props' bases read, sunlit ground stays lit
+    // (Crossfire reports, 2026-10-18: "flat", "no shadow effects").
+    let lm_ao = baked_ao(ao, pbr_input.material.base_color.rgb);
+    let baked_occluded = baked_lm * lm_ao + (baked - baked_lm) * mix(vec3(1.0), ao, 0.3);
 #ifdef LIGHTMAP
-    pbr_input.lightmap_light = baked * ao;
+    pbr_input.lightmap_light = baked_occluded;
 #else
     if (params.flags.z > 0.5) {
         // Lightmapped surfaces take no ambient or light grid light: their
@@ -724,26 +902,62 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
 
     var out: FragmentOutput;
     // As in Bevy's own pbr.wgsl: `apply_pbr_lighting` ignores the unlit flag.
+    // `COD4RW_REFLDEBUG` (`crate::probe_parallax`): only the reflections.
+    var reflection_only = vec3(0.0);
     if (pbr_input.material.flags & STANDARD_MATERIAL_FLAGS_UNLIT_BIT) == 0u {
         out.color = apply_pbr_lighting(pbr_input);
+        if (params.flags.z < 0.5 && params.flags.y > 0.5) {
+            // Props with a specular map (`crate::world::prop_material`):
+            // without Bevy's flat ambient reflection, the same on every side
+            // and untinted (dark props washed grey, as the guns did); their
+            // shine is the probe's below.
+            let m = pbr_input.material;
+            let nv = max(dot(pbr_input.N, pbr_input.V), 1e-4);
+            let flat = ambient::ambient_light(pbr_input.world_position, pbr_input.N, pbr_input.V, nv, vec3(0.0), calculate_F0(m.base_color.rgb, m.metallic, m.reflectance), m.perceptual_roughness, pbr_input.diffuse_occlusion);
+            out.color = vec4(max(out.color.rgb - flat * view.exposure, vec3(0.0)), out.color.a);
+        }
 #ifndef LIGHTMAP
         let diffuse_color = pbr_input.material.base_color.rgb * (1.0 - pbr_input.material.metallic);
-        out.color = vec4(out.color.rgb + baked * ao * diffuse_color * view.exposure, out.color.a);
-        if (params.flags.z > 0.5 && params.water_color.w < 0.5) {
+        out.color = vec4(out.color.rgb + baked_occluded * diffuse_color * view.exposure, out.color.a);
+        // (`traced.x` -1: the whole sun is live, `crate::world`'s `gi.linear`:
+        // light stays linear, exposure and the tonemapper handle the top.)
+        if (params.flags.z > 0.5 && params.water_color.w < 0.5 && params.traced.x > -0.5) {
             out.color = vec4(lit_rolloff(out.color.rgb, diffuse_color, params.flags.w * view.exposure), out.color.a);
         }
 #endif
         // Only materials with a specular map reflect, as in IW3 (its
         // diffuse-only techniques have no probe term): matte plaster and
-        // ceilings took a sky-blue sheen from the probe otherwise.
-        if ((params.probe.x > 0.5 && params.flags.y > 0.5) || wet > 0.0) {
+        // ceilings took a sky-blue sheen from the probe otherwise. (The
+        // showcase's static models reflect their nearest probe:
+        // `probe_center.w` 2, `crate::wet::wet_material`.)
+        if ((params.probe.x > 0.5 && (params.flags.y > 0.5 || params.probe_center.w > 1.5)) || wet > 0.0) {
             let v = normalize(view.world_position - in.world_position.xyz);
             let n = pbr_input.N;
             let r = reflect(-v, n);
             var radiance = vec3(0.0);
+            // Showcase: the probe looked up where the reflected ray leaves
+            // the box around it (`crate::probe_parallax`), so a room's
+            // reflection stays put on the floor as the eye moves; rough
+            // surfaces' wide lobes keep more of the plain direction.
+            var pr = r;
+            if (params.probe_box_min.w > 0.5) {
+                let pos = in.world_position.xyz;
+                let lo = params.probe_box_min.xyz;
+                let hi = params.probe_box_max.xyz;
+                if (all(pos > lo - 0.25) && all(pos < hi + 0.25)) {
+                    // (An axis the ray barely moves along never ends it.)
+                    let safe = select(r, vec3(1e-5), abs(r) < vec3(1e-5));
+                    let inv = 1.0 / safe;
+                    let out_t = max((hi - pos) * inv, (lo - pos) * inv);
+                    let t = max(min(min(out_t.x, out_t.y), out_t.z), 0.0);
+                    let corrected = normalize(pos + r * t - params.probe_center.xyz);
+                    let rough = pbr_input.material.perceptual_roughness;
+                    pr = normalize(mix(corrected, r, saturate(rough * rough * 1.5)));
+                }
+            }
             if (params.probe.x > 0.5) {
                 // Probes are looked up with CoD axes: Bevy (x, y, z) is CoD (x, -z, y).
-                let p = sample_probe(vec3(r.x, -r.z, r.y), probe_lod);
+                let p = sample_probe(vec3(pr.x, -pr.z, pr.y), probe_lod);
                 // rgb * a peaks at ~0.5 (the sky), so alpha is a 2x overbright
                 // scale; doubling it matches the probes to the skybox.
                 radiance = pow(p.rgb * p.a * 2.0, vec3(2.2)) * params.flags.w;
@@ -751,14 +965,41 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
                 // The sky, as the skybox draws it (`crate::player`'s brightness).
                 radiance = sample_probe(vec3(r.x, -r.z, r.y), 0.0).rgb * SKY_BRIGHTNESS;
             }
+            // Probe normalisation: the probe was captured at one point, in the
+            // open; here the reflection is scaled by the light actually
+            // arriving (the lightmap's, or the light grid's on models)
+            // against the probe's own average along the normal (its last
+            // mip), so it stops glowing in dark corners. And horizon
+            // occlusion: a reflected ray bent below the surface's own
+            // plane (by the normal map) sees no sky.
+            if (params.probe_norm.y > 0.5 && params.probe.x > 0.5) {
+                let nn = pbr_input.N;
+                let avg_p = sample_probe(vec3(nn.x, -nn.z, nn.y), params.probe.y);
+                let avg = pow(avg_p.rgb * avg_p.a * 2.0, vec3(2.2)) * params.flags.w;
+                var here = baked_lm;
+#ifdef IRRADIANCE_VOLUME
+                if (params.flags.z < 0.5) {
+                    let vz = dot(vec4(view.view_from_world[0].z, view.view_from_world[1].z, view.view_from_world[2].z, view.view_from_world[3].z), in.world_position);
+                    var ranges = clustering::unpack_clusterable_object_index_ranges(clustering::view_fragment_cluster_index(in.position.xy, vz, false));
+                    here = irradiance_volume::irradiance_volume_light(in.world_position.xyz, nn, &ranges) / 3.14159265;
+                }
+#endif
+                let lw = vec3(0.2126, 0.7152, 0.0722);
+                let ratio = clamp(dot(here, lw) / max(dot(avg, lw), 1e-4) * params.probe_norm.z, 0.0, params.probe_norm.w);
+                radiance *= mix(1.0, ratio, params.probe_norm.x);
+                let h = saturate(1.0 + 1.3 * dot(r, normalize(in.world_normal)));
+                radiance *= h * h;
+            }
             // The probes (and the sky) were baked at CoD4's hour: in the
             // showcase they follow its sky's light (mesh tag bits 24-31).
             let tag = mesh[in.instance_index].tag;
             radiance *= select(1.0, f32(tag >> 24u) / 255.0, (tag & 0x10000u) != 0u);
             // The showcase's screen-space reflections over the probe, on
-            // wet and smooth surfaces.
-            if (wet > 0.0) {
-                let found = screen_reflection(in.world_position.xyz, r, pbr_input.material.perceptual_roughness, in.position.xy);
+            // wet surfaces and, with the probe boxes (`crate::probe_parallax`),
+            // smooth ones that reflect (the probe where they find nothing;
+            // they fade out with roughness).
+            if (wet > 0.0 || (params.probe_box_min.w > 0.5 && (params.flags.y > 0.5 || params.probe_center.w > 1.5))) {
+                let found = screen_reflection(in.world_position.xyz, r, pbr_input.material.perceptual_roughness, in.position.xy, false);
                 radiance = mix(radiance, found.rgb / max(view.exposure, 1e-6), found.a);
             }
             let f0 = 0.16 * pbr_input.material.reflectance * pbr_input.material.reflectance;
@@ -768,6 +1009,7 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
             let ao = min(pbr_input.specular_occlusion, dot(ao, vec3(1.0 / 3.0)));
             let specular = radiance * EnvBRDFApprox(f0, f_ab) * ao;
             out.color = vec4(out.color.rgb + specular * view.exposure, out.color.a);
+            reflection_only = specular * view.exposure;
         }
     } else {
         out.color = pbr_input.material.base_color;
@@ -789,5 +1031,8 @@ fn fragment(vertex: VertexOutput, @builtin(front_facing) is_front: bool) -> Frag
         out.color = vec4(pow(c, vec3(2.2)) * pbr_input.material.base_color.rgb, 1.0);
     }
     out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    if (params.probe_box_max.w > 0.5) {
+        out.color = vec4(reflection_only, out.color.a);
+    }
     return out;
 }

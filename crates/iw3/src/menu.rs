@@ -312,6 +312,23 @@ pub struct StringTable {
 }
 
 impl StringTable {
+    /// A zone's string tables (`maps/_intel_items.csv`...).
+    pub fn from_zone(zone: &Zone) -> Vec<StringTable> {
+        zone.assets
+            .iter()
+            .filter_map(|a| match a {
+                crate::zone::Asset::Generic(g) if g.ty == AssetType::StringTable => {
+                    let r = &g.root;
+                    let columns = r.int("columnCount").max(0) as usize;
+                    let rows = r.int("rowCount").max(0) as usize;
+                    let values = r.strings("values").into_iter().map(|v| v.unwrap_or("").to_owned()).collect();
+                    Some(StringTable { name: s(r, "name"), columns, rows, values })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn get(&self, row: usize, col: usize) -> Option<&str> {
         if col >= self.columns {
             return None;

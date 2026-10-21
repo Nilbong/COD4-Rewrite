@@ -79,8 +79,10 @@ impl Gunplay {
             // (`ui::scope`); the lens shows the gun's own zoom.
             Gunplay::Cod4 if def.ads_overlay.is_some() && crate::ui::lens_scopes() => (hip_fov(), crate::ui::LENS_OUTER_FOV),
             // A 3D scope (an ACOG too): likewise, the eyepiece magnifying.
-            Gunplay::Cod4 if crate::ui::scope_3d() && crate::ui::scope_magnifies(def) => (hip_fov(), crate::ui::LENS_OUTER_FOV.max(def.ads_fov)),
-            Gunplay::Cod4 => (hip_fov(), def.ads_fov),
+            // (ADS Field of View "Affected" widens that too with a wider
+            // view, [`crate::settings_apply::ads_fov`].)
+            Gunplay::Cod4 if crate::ui::scope_3d() && crate::ui::scope_magnifies(def) => (hip_fov(), crate::ui::scope3d::outer_fov(def)),
+            Gunplay::Cod4 => (hip_fov(), crate::settings_apply::ads_fov(def.ads_fov)),
             // A wide body-worn lens that barely zooms when aiming.
             Gunplay::Bodycam => (BODYCAM_FOV, BODYCAM_FOV - 5.0),
         }
@@ -421,13 +423,15 @@ fn euler(v: Vec3) -> Quat {
     Quat::from_euler(EulerRot::YXZ, v.x, v.y, v.z)
 }
 
-/// Turn the head toward where the weapon points (`aim`, yaw/pitch): smoothly,
-/// but never letting the weapon leave the deadzone.
+/// [`follow_head_moving`] standing still.
+#[cfg(test)]
 fn follow_head(head: Vec2, aim: Vec2, ads: f32, dt: f32) -> Vec2 {
     follow_head_moving(head, aim, ads, 0.0, dt)
 }
 
-/// [`follow_head`], moving at `speed` (0..1+ of full speed).
+/// Turn the head toward where the weapon points (`aim`, yaw/pitch): smoothly,
+/// but never letting the weapon leave the deadzone; moving at `speed` (0..1+
+/// of full speed).
 fn follow_head_moving(head: Vec2, aim: Vec2, ads: f32, speed: f32, dt: f32) -> Vec2 {
     use std::f32::consts::{PI, TAU};
     let rate = HEAD_FOLLOW_HIP + (HEAD_FOLLOW_ADS - HEAD_FOLLOW_HIP) * ads + HEAD_FOLLOW_MOVING * speed.min(1.5);

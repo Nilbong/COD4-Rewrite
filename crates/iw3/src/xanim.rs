@@ -52,6 +52,9 @@ pub struct XAnim {
     /// Root motion (`deltaPart` translation), in the animation's own axes:
     /// x forward, y left, z up.
     pub delta_trans: TransTrack,
+    /// Root turn (`deltaPart` quat, about z only): (frame, yaw radians),
+    /// empty for none.
+    pub delta_yaw: Vec<(u16, f32)>,
 }
 
 struct Cursor<'a> {
@@ -240,6 +243,7 @@ impl XAnim {
             .node("deltaPart")
             .and_then(|d| d.node("trans"))
             .map_or(TransTrack::None, |t| delta_trans(t, num_frames));
+        let delta_yaw = node.node("deltaPart").and_then(|d| d.node("quat")).map(|q| delta_yaw(q, num_frames)).unwrap_or_default();
         Ok(XAnim {
             name: name.to_owned(),
             num_frames,
@@ -249,7 +253,29 @@ impl XAnim {
             bones,
             notifies,
             delta_trans,
+            delta_yaw,
         })
+    }
+
+    /// Root turn (radians) from the start to `frac` (0..1) of the way.
+    pub fn delta_yaw_at(&self, frac: f32) -> f32 {
+        let k = &self.delta_yaw;
+        if k.is_empty() {
+            return 0.0;
+        }
+        let f = frac.clamp(0.0, 1.0) * self.num_frames as f32;
+        let frames: Vec<u16> = k.iter().map(|(f, _)| *f).collect();
+        let (a, b, t) = key_span(&frames, f);
+        let (ya, yb) = (k[a].1, k[b].1);
+        // The shorter way round.
+        let mut d = yb - ya;
+        while d > std::f32::consts::PI {
+            d -= std::f32::consts::TAU;
+        }
+        while d < -std::f32::consts::PI {
+            d += std::f32::consts::TAU;
+        }
+        ya + d * t
     }
 
     /// Root motion from the start to `frac` (0..1) of the way through, in
@@ -310,6 +336,40 @@ fn delta_trans(t: &GNode, num_frames: u16) -> TransTrack {
     };
     let frames = if frames.len() == keys { frames } else { (0..keys as u16).collect() };
     TransTrack::Keys { frames, values }
+}
+
+/// An `XAnimDeltaPartQuat`: `size` u16 then, with keys, their frame
+/// numbers (u8 under 256 frames) after a pointer, and `size + 1` `XQuat2`s
+/// (z and w as i16 / 32767: a turn about z); with none, one `XQuat2`.
+fn delta_yaw(q: &GNode, num_frames: u16) -> Vec<(u16, f32)> {
+    let d = &q.data;
+    if d.len() < 4 {
+        return Vec::new();
+    }
+    let size = u16::from_le_bytes([d[0], d[1]]) as usize;
+    let yaw = |b: &[u8]| {
+        let z = i16::from_le_bytes([b[0], b[1]]) as f32 / 32767.0;
+        let w = i16::from_le_bytes([b[2], b[3]]) as f32 / 32767.0;
+        2.0 * z.atan2(w)
+    };
+    let quats: Vec<f32> = match q.node("u").and_then(|u| u.node("frames")) {
+        Some(f) if size > 0 => f.nodes("frames").iter().filter(|n| n.data.len() >= 4).map(|n| yaw(&n.data)).collect(),
+        _ => q.node("u").map(|u| &u.data).filter(|b| b.len() >= 4).map(|b| vec![yaw(b)]).unwrap_or_default(),
+    };
+    if size == 0 {
+        return quats.first().map(|&y| vec![(0, y)]).unwrap_or_default();
+    }
+    let keys = size + 1;
+    if quats.len() != keys {
+        return Vec::new();
+    }
+    let frames: Vec<u16> = if num_frames < 256 {
+        d.get(8..8 + keys).map(|b| b.iter().map(|&f| f as u16).collect()).unwrap_or_default()
+    } else {
+        d.get(8..8 + 2 * keys).map(|b| b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()).unwrap_or_default()
+    };
+    let frames = if frames.len() == keys { frames } else { (0..keys as u16).collect() };
+    frames.into_iter().zip(quats).collect()
 }
 
 fn key_span(frames: &[u16], f: f32) -> (usize, usize, f32) {

@@ -46,6 +46,7 @@ pub(super) fn build(app: &mut App) {
         include_bytes!("scope3d.wgsl").as_slice(),
     );
     app.add_plugins(MaterialPlugin::<ScopeGlass>::default())
+        .init_resource::<ScopeAim>()
         .add_systems(
             Update,
             (spawn_camera, glaze, drive, blur, hide_crosshairs).chain().after(crate::weapons::WeaponSet).run_if(crate::state::in_game),
@@ -57,6 +58,20 @@ pub(super) fn build(app: &mut App) {
                 .before(bevy::transform::TransformSystems::Propagate)
                 .run_if(crate::state::in_game),
         );
+}
+
+/// While Player 1 is fully aimed through a 3D scope: where the scope looks
+/// (its axis, world space), which is where its reticle is; their shots go
+/// along it ([`crate::weapons`]), so what's under the reticle is what's hit
+/// however the gun is turned on the eye (sway, the live hands).
+#[derive(Resource, Default)]
+pub struct ScopeAim(pub Option<Vec3>);
+
+/// The view around a 3D scope while aimed (degrees): CoD4's ACOG view or
+/// [`super::LENS_OUTER_FOV`], the wider, and with ADS Field of View
+/// "Affected" as much wider as the player's own field of view is.
+pub fn outer_fov(def: &crate::weapons::WeaponDef) -> f32 {
+    crate::settings_apply::ads_fov(super::LENS_OUTER_FOV.max(def.ads_fov))
 }
 
 /// 3D scopes are the style.
@@ -82,12 +97,16 @@ fn relief(w: &WeaponState) -> (f32, f32) {
     let k = optic(w.def);
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
     // CoD4's Dragunov is aimed with its rubber eyecup against the eye.
-    let base = RELIEF[k] + if w.def.name.starts_with("dragunov") { 2.5 } else { 0.0 };
+    // The Barrett's ACOG sits further out on its long receiver: brought in
+    // towards the eye (a negative relief), as the other ACOGs sit.
+    let base = RELIEF[k]
+        + if w.def.name.starts_with("dragunov") { 2.5 } else { 0.0 }
+        + if w.def.name.starts_with("barrett") && w.def.name.contains("acog") { -2.0 } else { 0.0 };
     let relief = env("COD4RW_SCOPE_RELIEF").unwrap_or_else(|| knob(w.def, "relief", base));
     let eyepiece = env("COD4RW_SCOPE_EYEPIECE").unwrap_or_else(|| knob(w.def, "eyepiece", EYEPIECE[k]));
     let a = w.ads.clamp(0.0, 1.0);
     let out = relief * a * a * (3.0 - 2.0 * a);
-    (out, eyepiece / (eyepiece + out))
+    (out, eyepiece / (eyepiece + out).max(eyepiece * 0.4))
 }
 
 /// A live-tuned number for a scope (`crate::tune`): `scope.<weapon>.<what>`
@@ -265,7 +284,7 @@ fn glaze(
 fn eye_relief(player: Query<&WeaponState, With<LocalPlayer>>, mut gun: Query<&mut Transform, With<crate::viewmodel::ViewModelRoot>>) {
     let Some(w) = player.single().ok().filter(|w| scope_3d() && magnifies(w.def)) else { return };
     let (out, _) = relief(w);
-    if out > 0.0 {
+    if out != 0.0 {
         for mut tf in &mut gun {
             // The camera looks down -Z.
             tf.translation.z -= crate::units::u(out);
@@ -290,7 +309,8 @@ fn blur(
     let warming = glass.is_some_and(|g| time.elapsed_secs() < g.warm_until);
     // (`COD4RW_SCOPE_BLUR=<pixels>` for test runs.)
     let most = std::env::var("COD4RW_SCOPE_BLUR").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(BLUR_PIXELS);
-    let size = most * aimed * aimed;
+    // (Or the campaign's script blur and shellshocks, the larger.)
+    let size = (most * aimed * aimed).max(crate::campaign::blur::pixels());
     match (dof, size > 0.05 || warming) {
         (Some(mut d), true) => {
             if (d.max_circle_of_confusion_diameter - size).abs() > 0.05 {
@@ -324,6 +344,7 @@ fn drive(
     player: Query<&WeaponState, With<LocalPlayer>>,
     mut camera: Query<(&mut Camera, &mut Projection, &mut Transform), With<ScopeCamera3d>>,
     main: Query<&GlobalTransform, With<MainCamera>>,
+    mut scope_aim: ResMut<ScopeAim>,
     lenses: Query<(&LensGeom, &GlobalTransform, &InheritedVisibility, Option<&bevy::mesh::skinning::SkinnedMesh>), With<ScopeLens>>,
     joints: Query<&GlobalTransform>,
     bindposes: Res<Assets<bevy::mesh::skinning::SkinnedMeshInverseBindposes>>,
@@ -332,9 +353,12 @@ fn drive(
     let Some(glass) = glass else { return };
     let aimed = player.single().ok().filter(|w| scope_3d() && magnifies(w.def) && w.ads > FROM);
     let fade = aimed.map_or(0.0, |w| ((w.ads - FROM) / (1.0 - FROM)).clamp(0.0, 1.0));
+    let axis_now = gun.iter().next().map(|g| (g.rotation() * Vec3::X).normalize_or(Vec3::NEG_Z));
+    scope_aim.0 = axis_now.filter(|_| aimed.is_some_and(|w| w.ads >= 0.99));
     // The lens's reach (tangent), the gun's zoom over the aimed view round
     // it, and the scope camera's field to cover it with a margin.
-    let outer = (super::LENS_OUTER_FOV.to_radians() * 0.5).tan();
+    let outer = aimed.map_or(super::LENS_OUTER_FOV, |w| outer_fov(w.def)).to_radians() * 0.5;
+    let outer = outer.tan();
     // The scope's axis (the gun's forward: CoD models face +X) and its
     // frame as the shader takes it (up the view's).
     let axis_world = gun.iter().next().map(|g| (g.rotation() * Vec3::X).normalize_or(Vec3::NEG_Z));

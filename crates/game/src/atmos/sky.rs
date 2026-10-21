@@ -34,7 +34,9 @@ impl Plugin for SkyPlugin {
             std::path::Path::new("cod4rw/sky.wgsl"),
             include_bytes!("sky.wgsl").as_slice(),
         );
-        app.add_plugins(ExtractResourcePlugin::<DynamicSky>::default())
+        // (bevy_atmos's volumetric clouds, drawn per pixel over our sky,
+        // `HostSky` below.)
+        app.add_plugins((ExtractResourcePlugin::<DynamicSky>::default(), bevy_atmos::clouds::CloudsPlugin))
             .add_systems(Update, (create, update, swap, sun_fog).chain().run_if(crate::state::in_game));
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else { return };
         render_app
@@ -53,17 +55,37 @@ const STORM_SIZE: u32 = 384;
 
 /// The cube map's size for this map.
 fn size() -> u32 {
-    if super::climate::showcase() { STORM_SIZE } else { SIZE }
+    // (A dry showcase's sky, Bog's still night, keeps the full size.)
+    if super::climate::wet_showcase() { STORM_SIZE } else { SIZE }
 }
 /// A face is redrawn in this many strips, one a frame (96 frames for the
 /// whole sky: clouds drift a few metres in that time).
 const STRIPS: u32 = 16;
+/// The reflections' cube (with clouds) beside the screen-space clouds.
+const ENV_SIZE: u32 = 256;
+const ENV_STRIPS: u32 = 4;
+
+/// bevy_atmos's volumetric clouds draw this map's clouds (per map,
+/// `sky.screen_clouds.<map>`, the Map Look Editor's Sky tab; not in
+/// splitscreen, where each view would need its own). Off by default: the
+/// storm decks (Wet Work, Downpour) lose the cube's masses and rifts, and
+/// the clear maps' few clouds don't yet match (2026-10-16 A/B).
+fn screen_clouds(map: &str) -> bool {
+    crate::tune::get(&format!("sky.screen_clouds.{map}"), 0.0) >= 0.5 && !crate::splitscreen::active()
+}
 
 /// The dynamic sky's cube map, the classic one it's drawn from, and what
 /// to draw this frame.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct DynamicSky {
     image: Handle<Image>,
+    /// The reflections' cube with clouds (screen-space clouds on), and
+    /// what to draw of it this frame.
+    env: Handle<Image>,
+    env_params: SkyParams,
+    env_faces: u32,
+    env_rows: u32,
+    screen: bool,
     noise: Handle<Image>,
     classic: Handle<Image>,
     params: SkyParams,
@@ -106,6 +128,19 @@ struct SkyParams {
     /// The map's night sky (`climate::MapLook`): x stars, y zenith
     /// darkening, z warm city glow at the horizon (0: the classic sky's).
     night_look: Vec4,
+    /// The Map Look Editor's sky tint and brightness (rgb multiplier).
+    grade: Vec4,
+    /// 1: clouds in this cube; 0: the sky behind them (screen clouds on).
+    clouds: f32,
+}
+
+impl DynamicSky {
+    /// The sky with its clouds, for reflections: the small cube while the
+    /// screen-space clouds draw them (the skybox's cube has none), else
+    /// the skybox's.
+    pub fn reflection_cube(&self) -> Handle<Image> {
+        if self.screen { self.env.clone() } else { self.image.clone() }
+    }
 }
 
 /// How cloudy each map is (cover 0..1, how dark the undersides): CoD4's
@@ -157,8 +192,22 @@ fn create(mut commands: Commands, classic: Option<Res<crate::world::MapSky>>, sk
     );
     image.texture_view_descriptor = Some(TextureViewDescriptor { dimension: Some(TextureViewDimension::Cube), ..default() });
     image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING | TextureUsages::COPY_DST;
+    let mut env = Image::new_fill(
+        Extent3d { width: ENV_SIZE, height: ENV_SIZE, depth_or_array_layers: 6 },
+        TextureDimension::D2,
+        &[0; 8],
+        TextureFormat::Rgba16Float,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    env.texture_view_descriptor = Some(TextureViewDescriptor { dimension: Some(TextureViewDimension::Cube), ..default() });
+    env.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING | TextureUsages::COPY_DST;
     commands.insert_resource(DynamicSky {
         image: images.add(image),
+        env: images.add(env),
+        env_params: SkyParams::default(),
+        env_faces: 6,
+        env_rows: ENV_SIZE,
+        screen: false,
         noise: images.add(noise_image()),
         classic: classic.0.clone(),
         params: SkyParams::default(),
@@ -223,6 +272,7 @@ fn noise_image() -> Image {
 }
 
 fn update(
+    mut commands: Commands,
     mut sky: Option<ResMut<DynamicSky>>,
     settings: Res<crate::settings::Settings>,
     time: Res<Time>,
@@ -243,6 +293,7 @@ fn update(
     }
     sky.on = on;
     if !on {
+        commands.remove_resource::<bevy_atmos::clouds::HostSky>();
         return;
     }
     let Some((light, sun_tf)) = suns.iter().find(|(l, _)| l.shadow_maps_enabled).or_else(|| suns.iter().find(|(l, _)| l.illuminance > 0.0)) else { return };
@@ -273,12 +324,21 @@ fn update(
     // weather sets the cover; storms tower and darken; lightning flashes.
     let showcase = tod.enabled;
     let storm = if weather.enabled { (weather.rain / 0.8).clamp(0.0, 1.0) } else { 0.0 };
-    if weather.enabled {
+    // (A dry showcase map keeps its look's sky: Bog's clear night.)
+    // (The generic profile, a map's look setting only a time: its own sky.)
+    if weather.enabled && (weather.rain > 0.0 || weather.snow > 0.0 || (look_cover.is_none() && !super::climate::generic())) {
         coverage = weather.cloud_cover;
         // (Heavier, darker undersides the more severe the storm.)
         let severity = super::climate::profile().map_or(1.0, |p| p.severity);
         darkness = darkness.max((0.3 + 0.6 * storm * severity).min(crate::tune::get("sky.storm_darkness", 0.85)));
     }
+    // The Map Look Editor's sky (knobs per map, `crate::look_editor`).
+    let m = map.as_ref().map_or(String::new(), |m| m.0.clone());
+    let knob = |name: &str, default: f32| crate::tune::get(&format!("{name}.{m}"), default);
+    if coverage >= 0.0 || knob("sky.cover", -1.0) >= 0.0 {
+        coverage = knob("sky.cover", coverage).clamp(0.0, 1.0);
+    }
+    darkness = knob("sky.density", darkness).clamp(0.0, 1.0);
     let (key_dir, key_color) = if !showcase {
         (-sun_tf.forward().as_vec3(), sun_color / sun_color.max_element().max(1e-3))
     } else if tod.sun_illuminance >= tod.moon_illuminance {
@@ -309,11 +369,14 @@ fn update(
     let flashing = flash > 0.0 || sky.params.flash > 0.0;
     // (A flash redraws the face the bolt is on, whole, each frame.)
     let bolt = weather.lightning.map_or(Vec3::Y, |l| l.dir);
-    let smooth = super::climate::showcase();
+    let smooth = super::climate::wet_showcase();
     let drift = if smooth { time.elapsed_secs() * speed } else { drift };
-    let (faces, rows, face_base, row_base) = if sky.frames == 0 || smooth {
+    let (faces, rows, face_base, row_base) = if sky.frames == 0 {
         (6, size(), 0, 0)
-    } else if flashing {
+    } else if smooth || flashing {
+        // (The showcase's drifting storm: half the faces a frame, the
+        // other half the next. Its clouds move less than a texel a frame,
+        // so the halves never part; the whole cube each frame cost 0.3 ms.)
         // (All of it, at half the steps: a flash lights the clouds every
         // way, and one face alone left a hard-edged square in the sky.)
         // Half the faces a frame (a flash is ~0.6 s: 2 frames behind is unseen).
@@ -322,8 +385,25 @@ fn update(
     } else {
         (1, SIZE / strips, slice / strips, slice % strips * SIZE / strips)
     };
+    // (A screen-clouds toggle redraws the whole cube this frame: its reset
+    // below came after these were chosen, so the skybox caught up strip by
+    // strip.)
+    let (faces, rows) = if screen_clouds(&m) != sky.screen { (6, size()) } else { (faces, rows) };
+    let (face_base, row_base) = if faces == 6 { (0, 0) } else { (face_base, row_base) };
     sky.faces = faces;
     sky.rows = rows;
+    // bevy_atmos's clouds draw the clouds: none in the skybox's cube; a
+    // small cube with them for reflections, a strip a frame.
+    let screen = screen_clouds(&m);
+    if screen != sky.screen {
+        sky.frames = 0;
+    }
+    sky.screen = screen;
+    let env_slice = sky.frames % (6 * ENV_STRIPS);
+    let (env_faces, env_rows, env_face, env_row) =
+        if sky.frames == 0 || flashing { (6, ENV_SIZE, 0, 0) } else { (1, ENV_SIZE / ENV_STRIPS, env_slice / ENV_STRIPS, env_slice % ENV_STRIPS * ENV_SIZE / ENV_STRIPS) };
+    sky.env_faces = env_faces;
+    sky.env_rows = env_rows;
     sky.params = SkyParams {
         sun_dir: if showcase { tod.sun_dir } else { -sun_tf.forward().as_vec3() },
         // Twice the real sun's, as games draw it.
@@ -332,7 +412,12 @@ fn update(
         coverage,
         horizon,
         fog: has_fog,
-        wind: Vec2::new(drift, drift * 0.35),
+        wind: {
+            // (Direction and speed from the editor, and an offset to place them.)
+            let dir = knob("sky.wind_dir", 19.3).to_radians();
+            let along = drift * knob("sky.wind_speed", 1.0).clamp(0.0, 20.0) + knob("sky.offset", 0.0);
+            Vec2::new(dir.cos(), dir.sin()) * along * 1.0595
+        },
         darkness,
         face_base,
         row_base,
@@ -341,14 +426,46 @@ fn update(
         bolt_dir: weather.lightning.map_or(Vec3::Y, |l| l.dir),
         flash,
         key_dir,
-        physical: if showcase && super::climate::profile().is_some_and(|p| p.physical_sky) { 1.0 } else { 0.0 },
+        physical: {
+            let auto = if showcase && super::climate::profile().is_some_and(|p| p.physical_sky) { 1.0 } else { 0.0 };
+            if knob("sky.physical", auto) > 0.5 { 1.0 } else { 0.0 }
+        },
         key_color,
-        cloud_extra: 3400.0 * storm,
+        cloud_extra: (3400.0 * storm + knob("sky.altitude", 0.0)).clamp(-1500.0, 6000.0),
         time: time.elapsed_secs(),
         bolt_seed: *bolts as f32,
         night_look,
+        grade: {
+            let b = knob("sky.brightness", 1.0).clamp(0.0, 4.0);
+            let warm = knob("sky.tint", 0.0).clamp(-1.0, 1.0);
+            (Vec3::new(1.0 + 0.25 * warm, 1.0, 1.0 - 0.25 * warm) * b).extend(1.0)
+        },
         look: Vec4::new(crate::tune::get("sky.storm_contrast", 1.0), crate::tune::get("sky.flash_glow", 1.0), crate::tune::get("sky.rain_shafts", 1.0), if smooth { 1.0 } else { 0.0 }),
+        clouds: if screen { 0.0 } else { 1.0 },
     };
+    sky.env_params = SkyParams { face_base: env_face, row_base: env_row, clouds: 1.0, ..sky.params };
+    // What bevy_atmos's clouds take from our sky: its light (sun or moon),
+    // cover and darkness, drift, storm towers, lightning, horizon, grade.
+    let p = sky.params;
+    commands.insert_resource(bevy_atmos::clouds::HostSky {
+        enabled: screen,
+        background: sky.image.clone(),
+        reflections: screen.then(|| sky.env.clone()),
+        key_dir: p.key_dir,
+        key_color: p.key_color,
+        night: p.night,
+        // (Below 0: the cube guessed it from the skybox; a middling sky.)
+        cover: if p.coverage >= 0.0 { p.coverage } else { 0.5 },
+        darkness: p.darkness,
+        drift: p.wind,
+        tops: p.cloud_extra,
+        storm,
+        flash: p.flash * crate::tune::get("sky.flash_glow", 1.0),
+        bolt_dir: p.bolt_dir,
+        horizon: p.horizon,
+        fog: p.fog > 0.5,
+        grade: p.grade.truncate(),
+    });
     sky.frames += 1;
 }
 
@@ -368,12 +485,24 @@ fn swap(sky: Option<Res<DynamicSky>>, mut skyboxes: Query<&mut Skybox, With<Came
 /// does round it.
 fn sun_fog(sky: Option<Res<DynamicSky>>, suns: Query<&DirectionalLight, Without<crate::model_lighting::ViewModelSun>>, mut fogs: Query<&mut DistanceFog>) {
     let Some(sky) = sky else { return };
+    // Not while the match settles under the load screen: set then, in
+    // every second match of a session the GPU device was lost a moment
+    // after the map was ready (4 of 4, 2026-10-14; with SSAO on). Set once
+    // the match is shown, never (4 of 4 runs). Why isn't known: a driver or
+    // Bevy fault, not this tint's own. `COD4RW_SKYFOGEARLY=1`: as before.
+    if crate::settle::settling() && std::env::var_os("COD4RW_SKYFOGEARLY").is_none() {
+        return;
+    }
     let tint = suns.iter().find(|l| l.shadow_maps_enabled).map_or(Vec3::ZERO, |l| {
         let c = l.color.to_linear();
         Vec3::new(c.red, c.green, c.blue)
     });
     // A share of the sun's light (`directional_light_color` scales it).
-    let want = if sky.on { Color::linear_rgba(tint.x, tint.y, tint.z, 0.012) } else { Color::NONE };
+    // Off by default: Bevy's shadowed in-scatter path on every fogged
+    // fragment lost the GPU device with the dynamic sky (2026-10-14 and
+    // -20; classic sky clean). `COD4RW_SKYFOG=1` turns it back on.
+    let off = !std::env::var("COD4RW_SKYFOG").is_ok_and(|v| v == "1");
+    let want = if sky.on && !off { Color::linear_rgba(tint.x, tint.y, tint.z, 0.012) } else { Color::NONE };
     for mut f in &mut fogs {
         if f.directional_light_color != want {
             f.directional_light_color = want;
@@ -392,12 +521,7 @@ struct SkyPipeline {
 }
 
 #[derive(Resource)]
-struct SkyBindGroup {
-    group: BindGroup,
-    faces: u32,
-    rows: u32,
-    size: u32,
-}
+struct SkyBindGroup(Vec<(BindGroup, u32, u32, u32)>);
 
 fn init_pipeline(mut commands: Commands, asset_server: Res<AssetServer>, pipeline_cache: Res<PipelineCache>, device: Res<RenderDevice>) {
     let layout = BindGroupLayoutDescriptor::new(
@@ -439,29 +563,41 @@ fn prepare(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
-    mut views: Local<Option<(AssetId<Image>, TextureView)>>,
+    mut views: Local<Vec<(AssetId<Image>, TextureView)>>,
 ) {
     commands.remove_resource::<SkyBindGroup>();
     let Some(sky) = sky.filter(|s| s.on) else { return };
-    let (Some(out), Some(classic), Some(noise)) = (images.get(&sky.image), images.get(&sky.classic), images.get(&sky.noise)) else { return };
-    if views.as_ref().is_none_or(|(id, _)| *id != sky.image.id()) {
-        let view = out.texture.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..default() });
-        *views = Some((sky.image.id(), view));
+    let (Some(classic), Some(noise)) = (images.get(&sky.classic), images.get(&sky.noise)) else { return };
+    // The skybox's cube, and the reflections' while the screen clouds draw.
+    let mut targets = vec![(&sky.image, sky.params, sky.faces, sky.rows)];
+    if sky.screen {
+        targets.push((&sky.env, sky.env_params, sky.env_faces, sky.env_rows));
     }
-    let Some((_, out_view)) = views.as_ref() else { return };
-    let mut uniform = UniformBuffer::from(sky.params);
-    uniform.write_buffer(&device, &queue);
-    let group = device.create_bind_group(
-        "dynamic_sky",
-        &pipeline_cache.get_bind_group_layout(&pipeline.layout),
-        &BindGroupEntries::sequential((&uniform, &classic.texture_view, &pipeline.sampler, out_view, &noise.texture_view, &noise.sampler)),
-    );
-    commands.insert_resource(SkyBindGroup { group, faces: sky.faces, rows: sky.rows, size: out.texture.width() });
+    // (Views of cubes since dropped (a new match's) go.)
+    views.retain(|(id, _)| *id == sky.image.id() || *id == sky.env.id());
+    let mut groups = Vec::new();
+    for (image, params, faces, rows) in targets {
+        let Some(out) = images.get(image) else { continue };
+        if !views.iter().any(|(id, _)| *id == image.id()) {
+            let view = out.texture.create_view(&TextureViewDescriptor { dimension: Some(TextureViewDimension::D2Array), ..default() });
+            views.push((image.id(), view));
+        }
+        let Some((_, out_view)) = views.iter().find(|(id, _)| *id == image.id()) else { continue };
+        let mut uniform = UniformBuffer::from(params);
+        uniform.write_buffer(&device, &queue);
+        let group = device.create_bind_group(
+            "dynamic_sky",
+            &pipeline_cache.get_bind_group_layout(&pipeline.layout),
+            &BindGroupEntries::sequential((&uniform, &classic.texture_view, &pipeline.sampler, out_view, &noise.texture_view, &noise.sampler)),
+        );
+        groups.push((group, faces, rows, out.texture.width()));
+    }
+    commands.insert_resource(SkyBindGroup(groups));
 }
 
-fn draw(mut ctx: RenderContext, group: Option<Res<SkyBindGroup>>, pipeline: Res<SkyPipeline>, pipeline_cache: Res<PipelineCache>) {
+fn draw(mut ctx: RenderContext, groups: Option<Res<SkyBindGroup>>, pipeline: Res<SkyPipeline>, pipeline_cache: Res<PipelineCache>) {
     use bevy::render::diagnostic::RecordDiagnostics;
-    let Some(group) = group else { return };
+    let Some(groups) = groups else { return };
     let Some(compute) = pipeline_cache.get_compute_pipeline(pipeline.pipeline) else { return };
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
@@ -469,8 +605,10 @@ fn draw(mut ctx: RenderContext, group: Option<Res<SkyBindGroup>>, pipeline: Res<
     {
         let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor { label: Some("dynamic_sky"), timestamp_writes: None });
         pass.set_pipeline(compute);
-        pass.set_bind_group(0, &group.group, &[]);
-        pass.dispatch_workgroups(group.size.div_ceil(8), group.rows.div_ceil(8), group.faces);
+        for (group, faces, rows, size) in &groups.0 {
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(size.div_ceil(8), rows.div_ceil(8), *faces);
+        }
     }
     span.end(ctx.command_encoder());
 }

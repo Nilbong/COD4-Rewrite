@@ -339,7 +339,8 @@ struct Tracking {
 pub(super) fn setup(app: &mut App) {
     app.init_resource::<Tracking>()
         .add_systems(OnEnter(crate::state::GameState::InGame), |mut t: ResMut<Tracking>| *t = Tracking::default())
-        .add_systems(PostUpdate, update.after(combat_record::TrackingSet).run_if(crate::state::in_game));
+        // (Multiplayer matches only: no camos or XP from the campaign or Headquarters.)
+        .add_systems(PostUpdate, update.after(combat_record::TrackingSet).run_if(crate::state::in_game).run_if(|| !crate::campaign::active() && !crate::hq::active()));
 }
 
 fn update(
@@ -379,6 +380,7 @@ fn update(
             hud.notify(fe.assets.localize("@CHALLENGE_COMPLETED"), text.clone(), String::new(), now);
             hud.message(format!("Unlocked {}: {weapon}", camo_name(*camo)), now);
             progression::give_xp(fe, &mut hud, *xp, now);
+            super::next::summary::add(super::next::summary::Source::Other, *xp);
             info!("mastery: {text} completed (+{xp} XP)");
         }
         if !complete.is_empty() {

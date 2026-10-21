@@ -12,6 +12,12 @@ use crate::ui::next::theme::{self as t, Type, col_x, cols};
 pub(super) const RECORD_VIEW: &str = "next_record";
 pub(super) const EMBLEM_VIEW: &str = "next_emblem";
 
+/// The Combat Record (or its emblem editor) is on top: it draws its own
+/// button prompts (the pad footer stands down).
+pub(in crate::ui) fn on_top(fe: &Frontend) -> bool {
+    fe.stack.last().is_some_and(|m| m.menu.window.name == RECORD_VIEW || m.menu.window.name == EMBLEM_VIEW)
+}
+
 /// The right panel.
 const PANEL: R = R::new(826.0, 192.0, 998.0, 780.0);
 

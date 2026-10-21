@@ -123,15 +123,27 @@ fn cube_image(iwi: &Iwi) -> Option<Image> {
     if !iwi.is_cube() || !iwi.format.is_compressed() {
         return None;
     }
+    // Android: big textures lose their top levels (`crate::android::shrink`).
+    #[cfg(target_os = "android")]
+    let shrunk = crate::android::shrink(iwi);
+    #[cfg(target_os = "android")]
+    let iwi = shrunk.as_ref().unwrap_or(iwi);
     let format = match iwi.format {
         Format::Dxt1 => TextureFormat::Bc1RgbaUnormSrgb,
         Format::Dxt3 => TextureFormat::Bc2RgbaUnormSrgb,
         _ => TextureFormat::Bc3RgbaUnormSrgb,
     };
+    // Android GPUs have no BC formats: decoded (`crate::android::transcode`).
+    #[cfg(target_os = "android")]
+    let (format, android_data) = crate::android::transcode(iwi, true)?;
     let size = Extent3d { width: iwi.width, height: iwi.height, depth_or_array_layers: 6 };
     let mut image = Image::new_uninit(size, TextureDimension::D2, format, RenderAssetUsages::RENDER_WORLD);
     // iwi levels are mip-major: each level holds the six faces in D3D order.
     image.data = Some(iwi.levels.concat());
+    #[cfg(target_os = "android")]
+    {
+        image.data = Some(android_data);
+    }
     image.data_order = TextureDataOrder::MipMajor;
     image.texture_descriptor.mip_level_count = iwi.levels.len() as u32;
     image.texture_view_descriptor =
@@ -143,6 +155,12 @@ fn cube_image(iwi: &Iwi) -> Option<Image> {
 fn load(name: &str, srgb: bool, vfs: &Vfs) -> Option<Image> {
     if let Some(code) = name.strip_prefix('$') {
         return code_image(code);
+    }
+    // Remastered textures (`crate::upscaled`), when on and there's one.
+    if crate::upscaled::on()
+        && let Some(image) = crate::upscaled::load(name, srgb)
+    {
+        return Some(image);
     }
     let bytes = vfs.read(&format!("images/{name}.iwi")).ok()??;
     let iwi = match Iwi::parse(&bytes) {
@@ -167,6 +185,11 @@ pub fn set_anisotropy(v: u16) {
 }
 
 pub fn to_image(iwi: &Iwi, srgb: bool) -> Option<Image> {
+    // Android: big textures lose their top levels (`crate::android::shrink`).
+    #[cfg(target_os = "android")]
+    let shrunk = crate::android::shrink(iwi);
+    #[cfg(target_os = "android")]
+    let iwi = shrunk.as_ref().unwrap_or(iwi);
     let size = Extent3d { width: iwi.width, height: iwi.height, depth_or_array_layers: 1 };
     let (format, data, mips) = if iwi.format.is_compressed() {
         let format = match (iwi.format, srgb) {
@@ -182,6 +205,9 @@ pub fn to_image(iwi: &Iwi, srgb: bool) -> Option<Image> {
             return None;
         }
         let data: Vec<u8> = iwi.levels.concat();
+        // Android GPUs have no BC formats: decoded (`crate::android::transcode`).
+        #[cfg(target_os = "android")]
+        let (format, data) = crate::android::transcode(iwi, srgb)?;
         (format, data, iwi.levels.len() as u32)
     } else {
         let format = if srgb { TextureFormat::Rgba8UnormSrgb } else { TextureFormat::Rgba8Unorm };

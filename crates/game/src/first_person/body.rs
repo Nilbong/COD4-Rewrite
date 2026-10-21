@@ -116,7 +116,7 @@ fn follow(
     mut commands: Commands,
     pawns: Query<(Entity, &LocalSlot, &Body, &ViewAngles, &crate::movement::Mover, Option<&OwnBody>, Has<Dead>, Has<AwaitingClass>)>,
     bodies: Query<(&LocalBody, &Skeleton, Option<&crate::thirdperson::HeldGun>)>,
-    surfaces: Query<(&Mesh3d, Option<&MeshMaterial3d<StandardMaterial>>, &SkinnedMesh)>,
+    surfaces: Query<(&Mesh3d, Option<&MeshMaterial3d<StandardMaterial>>, Option<&MeshMaterial3d<crate::character_look::CharacterMaterial>>, &SkinnedMesh)>,
     parents: Query<&ChildOf>,
     locals: Query<&Transform>,
     mut globals: Query<&mut GlobalTransform>,
@@ -131,7 +131,7 @@ fn follow(
     mut eased: Local<HashMap<Entity, Vec<Option<Transform>>>>,
 ) {
     let ease = 1.0 - (-time.delta_secs() / EASE).exp();
-    let on = super::full_body() && !killcam.showing() && !gunplay.is_bodycam() && spectate.is_none() && !crate::hq::active();
+    let on = super::full_body() && !killcam.showing() && !gunplay.is_bodycam() && spectate.is_none() && !(crate::hq::active() && !crate::hq::armed()) && !crate::campaign::unarmed();
     let split = crate::splitscreen::active();
     for (pawn, slot, body, angles, mover, own, dead, waiting) in &pawns {
         let Ok((local, skeleton, held)) = bodies.get(body.0) else { continue };
@@ -257,7 +257,7 @@ fn spawn(
     owner: Entity,
     skeleton: &Skeleton,
     wanted: &[Entity],
-    surfaces: &Query<(&Mesh3d, Option<&MeshMaterial3d<StandardMaterial>>, &SkinnedMesh)>,
+    surfaces: &Query<(&Mesh3d, Option<&MeshMaterial3d<StandardMaterial>>, Option<&MeshMaterial3d<crate::character_look::CharacterMaterial>>, &SkinnedMesh)>,
     parents: &Query<&ChildOf>,
     layers: RenderLayers,
 ) -> Option<OwnBody> {
@@ -315,13 +315,14 @@ fn spawn(
     let root = commands.spawn((Name::new("own body"), Transform::default(), Visibility::Hidden)).id();
     let map: HashMap<Entity, Entity> = joints.iter().map(|j| (j.real, j.mine)).collect();
     for &s in wanted {
-        let Ok((mesh, material, skin)) = surfaces.get(s) else { continue };
-        let Some(material) = material else { continue };
+        let Ok((mesh, material, character, skin)) = surfaces.get(s) else { continue };
+        if material.is_none() && character.is_none() {
+            continue;
+        }
         let joints: Vec<Entity> = skin.joints.iter().map(|j| map.get(j).copied().unwrap_or(root)).collect();
-        commands.spawn((
+        let mut surface = commands.spawn((
             Name::new("own body surface"),
             mesh.clone(),
-            material.clone(),
             SkinnedMesh { inverse_bindposes: skin.inverse_bindposes.clone(), joints },
             bevy::camera::visibility::NoFrustumCulling,
             NotShadowCaster,
@@ -329,6 +330,14 @@ fn spawn(
             Transform::IDENTITY,
             ChildOf(root),
         ));
+        // The showcase's character look ([`crate::character_look`]), or
+        // CoD4's material, still to change.
+        match (character, material) {
+            (Some(c), _) => surface.insert(c.clone()),
+            (None, Some(m)) if crate::character_look::active() => surface.insert((m.clone(), crate::character_look::Worn)),
+            (None, Some(m)) => surface.insert(m.clone()),
+            _ => &mut surface,
+        };
     }
     let hips = (0..joints.len()).find(|&i| named(i, &[HIPS]));
     let chest = (0..joints.len()).find(|&i| named(i, &[CHEST]));

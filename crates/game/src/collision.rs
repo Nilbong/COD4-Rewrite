@@ -312,6 +312,9 @@ pub fn spawn_static_model_collision(commands: &mut Commands, zone: &iw3::zone::Z
     let (mut solid, mut foliage, mut boxes, mut tris) = (0, 0, 0, 0);
     for sm in &clip.static_models {
         let Some(model) = sm.model.and_then(|id| zone.xmodel(id)) else { continue };
+        if crate::map_editor::layout::hidden(&model.name, sm.origin) {
+            continue;
+        }
         let kind = |contents: i32| {
             if contents & contents::SOLID != 0 {
                 Some((Layer::ShotClip, "default"))
@@ -420,7 +423,7 @@ fn brush_planes(clip: &ClipMap, brush: &iw3::zone::Brush) -> Vec<(Vec3, f32)> {
 /// their own origin in the clipMap, made solid where the entity stands
 /// (`places`: brush model, origin and turn, Bevy space). Triggers and
 /// other brush entities stay out (see [`spawn_collision`]).
-pub fn spawn_brush_entity_collision(commands: &mut Commands, clip: &ClipMap, places: &[(usize, Vec3, Quat)]) {
+pub fn spawn_brush_entity_collision(commands: &mut Commands, clip: &ClipMap, places: &[(usize, Vec3, Quat)], movable: &std::collections::HashSet<usize>) {
     let mut count = 0;
     for &(n, at, turn) in places {
         let Some(m) = clip.cmodels.get(n) else { continue };
@@ -455,13 +458,16 @@ pub fn spawn_brush_entity_collision(commands: &mut Commands, clip: &ClipMap, pla
                 let m = brush.axial_materials[f / 3][f % 3];
                 if m < 0 { fallback } else { surface_type(clip, m as i64) }
             });
-            commands.spawn((
+            let mut e = commands.spawn((
                 collider,
                 Surfaces(surfaces),
                 CollisionLayers::new(layer, LayerMask::NONE),
                 Transform::from_translation(at).with_rotation(turn),
                 static_body(),
             ));
+            if movable.contains(&n) {
+                e.insert(crate::world::ScriptBrushPart(n));
+            }
             count += 1;
         }
         // Its curved surfaces (a tank's round body): triangles.
@@ -473,12 +479,15 @@ pub fn spawn_brush_entity_collision(commands: &mut Commands, clip: &ClipMap, pla
             .collect();
         if !tris.is_empty() {
             let verts: Vec<Vec3> = clip.verts.iter().map(|&v| units::pos(v)).collect();
-            commands.spawn((
+            let mut e = commands.spawn((
                 Collider::trimesh(verts, tris),
                 CollisionLayers::new(Layer::World, LayerMask::NONE),
                 Transform::from_translation(at).with_rotation(turn),
                 static_body(),
             ));
+            if movable.contains(&n) {
+                e.insert(crate::world::ScriptBrushPart(n));
+            }
             count += 1;
         }
     }

@@ -127,7 +127,9 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 27] = [
+    /// (Not the leans: leaning is automatic now, at walls' edges while
+    /// aiming; their old binds are still read, and do nothing.)
+    pub const ALL: [Action; 25] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -136,8 +138,6 @@ impl Action {
         Action::Crouch,
         Action::Prone,
         Action::Sprint,
-        Action::LeanLeft,
-        Action::LeanRight,
         Action::Fire,
         Action::Aim,
         Action::Reload,

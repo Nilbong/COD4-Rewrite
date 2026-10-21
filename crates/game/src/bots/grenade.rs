@@ -244,21 +244,31 @@ pub(super) fn plan_grenades(
                 .min_by(|a, b| a.distance(feet).total_cmp(&b.distance(feet)))
         };
         let aggression = bot.personality.aggression;
+        // How much their real player threw, against the bots' default.
+        let (frag_habit, special_habit) = bot.persona.as_ref().map_or((1.0, 1.0), |pp| (pp.frag_scale(), pp.special_scale()));
         // Pushing in on someone just round a corner: a flashbang or stun
         // first. Otherwise, now and then, a frag (livelier and better
         // players reach for one more often; never so near we'd catch it).
         let pushing = matches!(bot.mode, super::Mode::Investigate | super::Mode::Flank);
         let special = nades.special.filter(|k| matches!(k, Kind::Flash | Kind::Stun) && nades.specials > 0);
         if let (true, Some(kind), Some(t)) = (choice.is_none() && pushing, special, known(u(250.0), u(900.0))) {
-            if rng.random::<f32>() < (0.08 + 0.12 * aggression) * (0.5 + skill) {
+            if rng.random::<f32>() < (0.08 + 0.12 * aggression) * (0.5 + skill) * special_habit {
                 choice = Some((kind, t));
             }
         }
         if choice.is_none() && nades.frags > 0 {
             if let Some(t) = known(u(RANGE.0).max(radius + u(60.0)), u(RANGE.1)) {
-                if rng.random::<f32>() < (0.02 + 0.05 * aggression) * (0.5 + skill) {
+                if rng.random::<f32>() < (0.02 + 0.05 * aggression) * (0.5 + skill) * frag_habit {
                     choice = Some((Kind::Frag, t));
                 }
+            }
+        }
+        // A spot it has learned someone camps: experienced players nade it.
+        if choice.is_none() && nades.frags > 0 {
+            let k = bot.knowledge();
+            let spot = bot.learned.strongest(feet, u(RANGE.0).max(radius + u(60.0)), u(RANGE.1)).filter(|s| s.weight > super::knowledge::STRONG);
+            if let Some(s) = spot.filter(|_| rng.random::<f32>() < 0.04 * k * frag_habit) {
+                choice = Some((Kind::Frag, s.pos));
             }
         }
         let Some((kind, target)) = choice else { continue };

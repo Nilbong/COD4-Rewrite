@@ -133,10 +133,13 @@ fn chips(k: &mut Kit, x: f32, y: f32, right: f32, list: &[(String, bool)]) -> f3
     if list.is_empty() { 0.0 } else { row + 32.0 }
 }
 
-/// The weapon's attachments and camo as chips.
+/// The weapon's attachments, IR laser and camo as chips.
 fn gun_chips(fe: &Frontend, gun: &crate::loadout::Gun) -> Vec<(String, bool)> {
     let atts = gun.spec.split_once(':').map_or("", |(_, a)| a);
-    let mut out: Vec<(String, bool)> = atts.split('+').filter(|a| !a.is_empty()).map(|a| (attachment_name(fe, a), false)).collect();
+    let mut out: Vec<(String, bool)> = atts.split('+').filter(|a| !a.is_empty() && *a != crate::laser::ATTACHMENT).map(|a| (attachment_name(fe, a), false)).collect();
+    if crate::laser::fitted(&gun.spec) {
+        out.push(("IR Laser".into(), false));
+    }
     if let Some(c) = camo_name(gun.camo) {
         out.push((c.into(), true));
     }
@@ -166,7 +169,8 @@ fn spec_values(fe: &Frontend, spec: &str) -> [f32; 5] {
     std::array::from_fn(|i| {
         let col = 2 + i as i32;
         let base = attribute(fe, weapon, None, col).0;
-        let moved: f32 = atts.split('+').filter(|a| !a.is_empty()).map(|a| attribute(fe, weapon, Some(a), col).1 - base).sum();
+        // (The IR laser changes none of them.)
+        let moved: f32 = atts.split('+').filter(|a| !a.is_empty() && *a != crate::laser::ATTACHMENT).map(|a| attribute(fe, weapon, Some(a), col).1 - base).sum();
         (base + moved).clamp(0.0, 1.0)
     })
 }
@@ -392,18 +396,50 @@ pub(in crate::ui) fn paint_select(fe: &Frontend, om: &OpenMenu, pl: &Placement, 
 
 // --- Class editor -----------------------------------------------------------
 
+/// Each custom class gun's IR laser (1 on): this plus the gun's stat
+/// (`200 + 10 * class + 1` primary, `+ 3` secondary).
+pub(in crate::ui) const LASER_STATS: i32 = 5300;
+
+impl Frontend {
+    /// `uiScript cacLaser <1|3>`: the open class's primary's (or
+    /// secondary's) IR laser, on or off. `uiScript cacLaserReset`: both off
+    /// (Reset to Default).
+    pub(in crate::ui) fn laser_script(&mut self, args: &[String]) -> bool {
+        let Some(first) = args.first().map(|a| a.to_ascii_lowercase()) else { return false };
+        if first != "caclaser" && first != "caclaserreset" {
+            return false;
+        }
+        // (The class editor open, classic or new.)
+        let Some(slot) = self.stack.iter().rev().find_map(|m| CLASSES.iter().position(|c| m.name == format!("menu_cac_{c}"))) else { return true };
+        if first == "caclaserreset" {
+            for k in [1, 3] {
+                self.stats.set(LASER_STATS + base(slot) + k, 0);
+            }
+        } else {
+            let k: i32 = args.get(1).and_then(|s| s.parse().ok()).filter(|k| matches!(k, 1 | 3)).unwrap_or(1);
+            let stat = LASER_STATS + base(slot) + k;
+            let on = self.stats.get(stat) == 0;
+            self.stats.set(stat, on as i32);
+        }
+        self.stats.save_if_changed();
+        true
+    }
+}
+
 static EDITOR_OPENED: AtomicI64 = AtomicI64::new(i64::MIN);
 /// The editor row last focused (its details stay shown).
 static EDITOR_SHOWN: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// The editor's rows, in sections: (section, item name, the classic
 /// button's label, the row's label).
-const EDITOR_ROWS: [(&str, &str, &str, &str); 12] = [
+const EDITOR_ROWS: [(&str, &str, &str, &str); 14] = [
     ("Weapons", "cac_primary", "Primary Weapon", "Primary"),
     ("Weapons", "cac_primary_variant", "Primary Variant", "Variant"),
     ("Weapons", "cac_camo", "Camo", "Camo"),
+    ("Weapons", "cac_primary_laser", "", "IR Laser"),
     ("Weapons", "cac_secondary", "Secondary Weapon", "Secondary"),
     ("Weapons", "cac_secondary_variant", "Secondary Variant", "Variant"),
+    ("Weapons", "cac_secondary_laser", "", "IR Laser"),
     ("Perks", "cac_perk1", "Perk 1", "Perk 1"),
     ("Perks", "cac_perk2", "Perk 2", "Perk 2"),
     ("Perks", "cac_perk3", "Perk 3", "Perk 3"),
@@ -414,7 +450,7 @@ const EDITOR_ROWS: [(&str, &str, &str, &str); 12] = [
 ];
 
 const EDITOR_TOP: f32 = 176.0;
-const EDITOR_PITCH: f32 = 44.0;
+const EDITOR_PITCH: f32 = 42.0;
 /// The details, right of the rows.
 const DETAILS: R = R::new(826.0, 192.0, 998.0, 780.0);
 
@@ -473,8 +509,19 @@ pub(in crate::ui) fn editor_menu(fe: &Frontend, classic: &Menu) -> Option<Menu> 
     if !out.items.iter().any(|it| it.window.name == "cac_back") {
         out.items.push(back_item(&template, &out.on_esc));
     }
-    // Kill streaks: the player's three (`super::streaks`).
     let (_, rows) = editor_layout();
+    // The IR laser rows: on or off for this class's gun.
+    for (name, k) in [("cac_primary_laser", 1), ("cac_secondary_laser", 3)] {
+        if let Some(i) = EDITOR_ROWS.iter().position(|r| r.1 == name) {
+            let mut it = place(template.clone(), rows[i], name.into(), "IR Laser".into());
+            it.action = format!("\"play\" \"mouse_click\" ; \"uiScript\" \"cacLaser\" \"{k}\" ; ");
+            it.on_focus = "\"play\" \"mouse_over\" ; ".into();
+            it.mouse_enter = String::new();
+            it.visible_exp = Statement::default();
+            out.items.push(it);
+        }
+    }
+    // Kill streaks: the player's three (`super::streaks`).
     if let Some(i) = EDITOR_ROWS.iter().position(|r| r.1 == "cac_streaks") {
         let mut it = place(template, rows[i], "cac_streaks".into(), "Kill Streaks".into());
         it.action = format!("\"play\" \"mouse_click\" ; \"open\" \"{}\" ; ", super::streaks::MENU);
@@ -534,7 +581,7 @@ pub(in crate::ui) fn paint_editor(fe: &Frontend, om: &OpenMenu, pl: &Placement, 
         }
         let ink = if !available { t::INK_MUTE } else if on { t::INK } else { t::INK_DIM };
         // (Variant and camo rows sit under their gun.)
-        let indent = if matches!(name, "cac_primary_variant" | "cac_camo" | "cac_secondary_variant") { 44.0 } else { 24.0 };
+        let indent = if matches!(name, "cac_primary_variant" | "cac_camo" | "cac_primary_laser" | "cac_secondary_variant" | "cac_secondary_laser") { 44.0 } else { 24.0 };
         k.text_mid(r.x + indent, r.cy(), ty, label, ink, 0);
         // What's chosen, on the right.
         let right = r.right() - 16.0;
@@ -545,6 +592,8 @@ pub(in crate::ui) fn paint_editor(fe: &Frontend, om: &OpenMenu, pl: &Placement, 
             "cac_primary_variant" => primary.map(|g| (if g.variant.is_some() { "Equipped".into() } else { "None".into() }, None)),
             "cac_secondary_variant" => secondary.map(|g| (if g.variant.is_some() { "Equipped".into() } else { "None".into() }, None)),
             "cac_camo" => primary.map(|g| (camo_name(g.camo).unwrap_or("None").into(), None)),
+            "cac_primary_laser" => primary.map(|g| ((if crate::laser::fitted(&g.spec) { "On" } else { "Off" }).into(), None)),
+            "cac_secondary_laser" => secondary.map(|g| ((if crate::laser::fitted(&g.spec) { "On" } else { "Off" }).into(), None)),
             "cac_perk1" => perk(0).map(|(n, p)| (n, Some(p))),
             "cac_perk2" => perk(1).map(|(n, p)| (n, Some(p))),
             "cac_perk3" => perk(2).map(|(n, p)| (n, Some(p))),
@@ -579,7 +628,7 @@ pub(in crate::ui) fn paint_editor(fe: &Frontend, om: &OpenMenu, pl: &Placement, 
     let p = DETAILS;
     let (x, w) = (p.x + 44.0, p.w - 88.0);
     match showing.as_str() {
-        "cac_primary" | "cac_primary_variant" | "cac_camo" | "cac_secondary" | "cac_secondary_variant" => {
+        "cac_primary" | "cac_primary_variant" | "cac_camo" | "cac_primary_laser" | "cac_secondary" | "cac_secondary_variant" | "cac_secondary_laser" => {
             let second = showing.starts_with("cac_secondary");
             let (gun_key, over) = if second { (b + 3, "Secondary weapon") } else { (b + 1, "Primary weapon") };
             grid_panel(&mut k, p, 84.0, 1.0);
@@ -590,6 +639,10 @@ pub(in crate::ui) fn paint_editor(fe: &Frontend, om: &OpenMenu, pl: &Placement, 
                 gun(&mut k, R::new(p.x + 40.0, p.y + 130.0, p.w - 80.0, 380.0), gun_key, &g.spec, g.camo);
                 let h = chips(&mut k, x, p.y + 540.0, x + w, &gun_chips(fe, g));
                 stat_bars(&mut k, x, p.y + 560.0 + h, w * 0.6, &g.spec);
+                if showing.ends_with("_laser") {
+                    let note = "Seen only through night vision, where aiming cants the gun to the laser. No stat changes.";
+                    k.text(x, p.y + 708.0 + h, Type { size: 19.0, ..t::CAPTION }, note, t::INK_DIM, 0);
+                }
             }
         }
         "cac_perk1" | "cac_perk2" | "cac_perk3" | "cac_special" => {

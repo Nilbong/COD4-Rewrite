@@ -15,6 +15,7 @@ use crate::state::GameState;
 use bevy::prelude::{Commands, Res, ResMut, State};
 use cod4rw_multiplayer::protocol::{LobbyCode, MAX_PLAYERS as MAX_ONLINE, PeerId};
 use crate::matchmaking::{AcceptsJoinInProgress, JoinInProgress, Matchmaker};
+use crate::netplay::mixed;
 
 /// Public matches (Find Match, the lobby browser).
 #[path = "lobby_public.rs"]
@@ -85,6 +86,7 @@ impl OnlineLobby {
         self.members.iter().filter(move |m| m.team as usize == s && Some(m.peer) != self.me)
     }
     fn reset(&mut self, note: impl Into<String>) {
+        crate::netplay::layout_sync::clear();
         *self = OnlineLobby { note: note.into(), ..OnlineLobby::default() };
     }
 }
@@ -101,11 +103,12 @@ impl Lobby {
         }
     }
 
-    /// The host's settings, where this build has them.
-    fn apply(&mut self, s: &Settings) {
-        if let Some(map) = maps().iter().position(|m| m.0 == s.map) {
-            self.map = map;
-        }
+    /// The host's settings, where this build has them. False if this game
+    /// can't load the lobby's map (another game's, or a custom map it
+    /// hasn't got): it can't play there.
+    fn apply(&mut self, s: &Settings) -> bool {
+        let Some(map) = maps().iter().position(|m| m.0 == s.map) else { return false };
+        self.map = map;
         if (s.mode as usize) < GameMode::ALL.len() {
             self.mode = s.mode as usize;
         }
@@ -119,6 +122,7 @@ impl Lobby {
             self.difficulty = s.difficulty as usize;
         }
         self.hardcore = s.hardcore;
+        true
     }
 
     /// A side for someone joining: the one with fewer players, if either has room.
@@ -135,10 +139,15 @@ impl Frontend {
         let stat = |name: &str| {
             self.table_lookup("mp/playerStatsTable.csv", 1, name, 0).parse::<i32>().ok().map_or(0, |i| self.stat(i))
         };
+        // The games installed, and the ones the custom classes' guns are
+        // from ([`crate::netplay::mixed`]: who can host, who sees what).
+        let guns: Vec<String> = (1..=5).filter_map(|n| self.class_loadout(&format!("custom{n}"))).flat_map(|c| c.guns.into_iter().map(|g| g.spec)).collect();
         Profile {
             name: clean_name(&self.profile_name()),
             rank: stat("rank").clamp(0, MAX_RANK as i32) as u8,
             prestige: stat("plevel").clamp(0, MAX_PRESTIGE as i32) as u8,
+            games: mixed::installed(),
+            uses: mixed::guns_use(guns.iter().map(String::as_str)) & mixed::installed(),
         }
     }
 
@@ -173,7 +182,14 @@ impl Frontend {
         if l.online.electing.is_some() || l.starting {
             return;
         }
-        if l.online.host() && l.online.members.len() > 1 {
+        // Only among players who could all run every gun in play: else the
+        // host stays (and a class it can't run takes CoD4 stand-ins).
+        let used = l.online.members.iter().fold(0, |b, m| b | m.profile.uses);
+        let all_could_host = l.online.members.iter().all(|m| mixed::can_host(m.profile.games, used));
+        if l.online.host() && l.online.members.len() > 1 && !all_could_host {
+            bevy::log::info!("online: not everyone has the games in play ({}); this game stays the host", mixed::tags(used).join(", "));
+        }
+        if l.online.host() && l.online.members.len() > 1 && all_could_host {
             l.online.elect = true;
             l.online.electing = Some(std::time::Instant::now());
             return;
@@ -257,6 +273,17 @@ impl Frontend {
     }
 
     fn online_message(&mut self, from: PeerId, msg: LobbyMsg, online: &Online, in_frontend: bool) -> bool {
+        // A player who can't load the lobby's map can't come in.
+        if self.lobby.online.host()
+            && let LobbyMsg::Join { profile, .. } = &msg
+            && !self.lobby.online.members.iter().any(|m| m.peer == from)
+            && let mixed::MapNeed::Game(g) = mixed::map_need(self.lobby.map_id())
+            && profile.games & mixed::bit(g) == 0
+        {
+            bevy::log::info!("online: {} can't load {} (no {}): refused", profile.name, self.lobby.map_id(), g.title());
+            online.send(from, &LobbyMsg::Refused(Refusal::Map));
+            return false;
+        }
         // The host seats joiners on the side short of humans (in a match,
         // in place of a bot).
         if self.lobby.online.host()
@@ -311,7 +338,16 @@ impl Frontend {
         } else if from == HOST {
             match msg {
                 LobbyMsg::Lobby { settings, members, bots } => {
-                    l.apply(&settings);
+                    if !l.apply(&settings) {
+                        let why = match mixed::map_need(&settings.map) {
+                            mixed::MapNeed::Game(g) => format!("That lobby is on a map from {}, which isn't installed.", g.title()),
+                            mixed::MapNeed::Custom => format!("That lobby is on a custom map you haven't got ({}).", settings.map),
+                        };
+                        bevy::log::info!("online: leaving: {why}");
+                        l.online.reset(why);
+                        l.online.request = Some(Request::Leave);
+                        return true;
+                    }
                     l.bots = bots;
                     if let Some(me) = members.iter().find(|m| Some(m.peer) == l.online.me) {
                         l.teams[0] = if me.team == 0 { Team::Allies } else { Team::Axis };
@@ -319,6 +355,11 @@ impl Frontend {
                     l.online.members = members;
                     l.online.note.clear();
                     true
+                }
+                // The host's map editor layout, before its Start.
+                LobbyMsg::Layout { map, part, parts, data } => {
+                    crate::netplay::layout_sync::receive(map, part, parts, data);
+                    false
                 }
                 LobbyMsg::Start if in_frontend => {
                     l.starting = true;
@@ -329,8 +370,9 @@ impl Frontend {
                 LobbyMsg::Refused(r) => {
                     let why = match r {
                         Refusal::Full => "That lobby is full.",
-                        Refusal::Version => "That lobby is on a different version of the game.",
+                        Refusal::Version => "The host is on a different version of the game. Update to play together.",
                         Refusal::Started => "That lobby's match has already started.",
+                        Refusal::Map => "That lobby's map is from a game you haven't got installed.",
                     };
                     l.online.reset(why);
                     l.online.request = Some(Request::Leave);
@@ -367,6 +409,8 @@ pub(in crate::ui) fn online_lobby(
         Some(Request::Leave) => {
             let note = std::mem::take(&mut fe.lobby.online.note);
             online.leave();
+            // Our own map editor layouts again.
+            crate::netplay::layout_sync::clear();
             mm.left();
             fe.lobby.online.reset(note);
             fe.rebuild_lobby();
@@ -411,6 +455,10 @@ pub(in crate::ui) fn online_lobby(
             online.elect();
         }
         if std::mem::take(&mut l.online.start) {
+            // Everyone plays this game's map editor layout: sent first.
+            for part in crate::netplay::layout_sync::messages(l.map_id()) {
+                online.send(EVERYONE, &part);
+            }
             online.send(EVERYONE, &LobbyMsg::Start);
             l.online.begin = true;
         }

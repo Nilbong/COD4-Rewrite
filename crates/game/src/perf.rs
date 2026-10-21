@@ -89,6 +89,9 @@ impl Plugin for PerfPlugin {
     }
 
     fn build(&self, app: &mut App) {
+        if std::env::var_os("COD4RW_SETAT").is_some() {
+            app.add_systems(Update, set_at.run_if(crate::state::in_game));
+        }
         if let Ok(dir) = std::env::var("COD4RW_SHADOWTEST") {
             app.insert_resource(ShadowTest(dir.into())).add_systems(Update, shadow_test.run_if(crate::state::in_game));
         }
@@ -130,6 +133,8 @@ impl Plugin for PerfPlugin {
                 r.add_systems(Render, (|_: &mut World| busy_mark(&RENDER_BUSY, true)).in_set(RenderSystems::ExtractCommands));
                 r.add_systems(Render, (|_: &mut World| busy_mark(&RENDER_BUSY, false)).in_set(RenderSystems::PostCleanup));
                 r.add_systems(Render, draw_census.in_set(RenderSystems::Render));
+                r.add_systems(Render, upscaling_log.in_set(RenderSystems::Cleanup));
+                r.init_resource::<Quitting>().add_systems(bevy::render::ExtractSchedule, |mut q: ResMut<Quitting>| q.0 = QUITTING.load(Ordering::Relaxed));
                 // GPU spans per camera (its whole graph) and around the
                 // shadow maps (Bevy times neither). Spans nest per thread,
                 // so these all run on the render thread (NonSendMarker);
@@ -137,6 +142,8 @@ impl Plugin for PerfPlugin {
                 use bevy::core_pipeline::{schedule::{Core3d, Core3dSystems}, upscaling::upscaling};
                 use bevy::pbr::{clear_indirect_parameters_metadata, early_prepass_build_indirect_parameters, late_prepass_build_indirect_parameters, main_build_indirect_parameters, per_view_shadow_pass, shared_shadow_pass, EARLY_SHADOW_PASS, LATE_SHADOW_PASS};
                 use bevy::core_pipeline::mip_generation::experimental::depth::early_downsample_depth;
+                // (Not once the game is quitting: they'd wait for the main
+                // thread, which by then is waiting for this frame to end.)
                 r.add_systems(
                     Core3d,
                     (
@@ -158,7 +165,8 @@ impl Plugin for PerfPlugin {
                             .after(per_view_shadow_pass::<LATE_SHADOW_PASS>)
                             .after(shared_shadow_pass::<LATE_SHADOW_PASS>)
                             .before(main_build_indirect_parameters),
-                    ),
+                    )
+                        .run_if(spans_on),
                 );
             }
             // Bevy's GPU pass timings panic with its trace spans on
@@ -172,6 +180,7 @@ impl Plugin for PerfPlugin {
                     .after(avian3d::collider_tree::ColliderTreeSystems::UpdateAabbs)
                     .before(avian3d::collider_tree::ColliderTreeSystems::BeginOptimize),
             );
+            app.add_systems(Last, (light_census, note_quit));
             app.init_resource::<FrameTimes>()
                 .insert_resource(without)
                 .init_resource::<Redone>()
@@ -179,7 +188,8 @@ impl Plugin for PerfPlugin {
                 .add_systems(
                     Update,
                     hold_aim.run_if(|w: Res<Without>| w.ads).after(crate::player::InputSet).before(crate::weapons::WeaponSet),
-                );
+                )
+                .add_systems(PostUpdate, hold_view.before(bevy::transform::TransformSystems::Propagate));
         }
     }
 }
@@ -294,6 +304,18 @@ fn leave_out(
         window.present_mode = unsynced;
     }
     crate::settings_apply::present_overrides(&mut window);
+    // `COD4RW_SHADOWFILTER=hardware|gaussian|temporal`: the sun shadow's
+    // filtering on the world camera (Bevy's default is gaussian).
+    if let Some(method) = match std::env::var("COD4RW_SHADOWFILTER").as_deref() {
+        Ok("hardware") => Some(bevy::light::ShadowFilteringMethod::Hardware2x2),
+        Ok("gaussian") => Some(bevy::light::ShadowFilteringMethod::Gaussian),
+        Ok("temporal") => Some(bevy::light::ShadowFilteringMethod::Temporal),
+        _ => None,
+    } {
+        for e in &main_entity {
+            commands.entity(e).try_insert(method);
+        }
+    }
     if without.shadows {
         for mut sun in &mut suns {
             if sun.shadow_maps_enabled {
@@ -926,12 +948,12 @@ pub mod systrace {
     struct NameOf<'a>(&'a mut Option<String>);
     impl tracing::field::Visit for NameOf<'_> {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "name" {
+            if field.name() == "name" || field.name() == "camera" {
                 *self.0 = Some(value.to_owned());
             }
         }
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "name" {
+            if field.name() == "name" || field.name() == "camera" {
                 *self.0 = Some(format!("{value:?}").trim_matches('"').to_owned());
             }
         }
@@ -942,13 +964,17 @@ pub mod systrace {
     impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for SysLayer {
         fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
             let kind = attrs.metadata().name();
-            if kind != "system" && kind != "system_commands" {
+            if kind != "system" && kind != "system_commands" && kind != "camera_schedule" {
                 return;
             }
             let mut name = None;
             attrs.record(&mut NameOf(&mut name));
             let Some(name) = name else { return };
-            let name = if kind == "system" { name } else { format!("{name} [cmds]") };
+            let name = match kind {
+                "system" => name,
+                "camera_schedule" => format!("camera_schedule {name}"),
+                _ => format!("{name} [cmds]"),
+            };
             if let Some(span) = ctx.span(id) {
                 span.extensions_mut().insert(Name(name));
             }
@@ -1006,6 +1032,29 @@ fn gpu_span(mut ctx: bevy::render::renderer::RenderContext, name: Option<&'stati
     }
 }
 
+/// Set once the game is asked to quit (under `COD4RW_PERF`).
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// [`QUITTING`] as the render world's frame saw it at its extract.
+#[derive(Resource, Default)]
+pub struct Quitting(bool);
+
+fn note_quit(mut exit: MessageReader<AppExit>) {
+    if exit.read().next().is_some() {
+        QUITTING.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run condition for render systems pinned to the main thread
+/// (`NonSendMarker`: the GPU timing spans). When the game quits, Bevy's
+/// main thread waits for the render thread's last frame without running
+/// main-thread work any more, so one of these in that frame deadlocked
+/// the exit (every `COD4RW_PERF` run hung on quit until killed). Skipped
+/// from the frame extracted after the quit.
+pub fn spans_on(quitting: Option<Res<Quitting>>) -> bool {
+    !quitting.is_some_and(|q| q.0)
+}
+
 fn camera_span_begin(_main: bevy::ecs::system::NonSendMarker, view: bevy::render::renderer::ViewQuery<&bevy::render::camera::ExtractedCamera>, mut ctx: bevy::render::renderer::RenderContext) {
     use bevy::render::diagnostic::RecordDiagnostics;
     let name = format!("cam{}", view.into_inner().order);
@@ -1044,5 +1093,127 @@ fn collider_tree_log(trees: Res<avian3d::collider_tree::ColliderTrees>, mut acc:
             all[3].1.proxies.len()
         );
         *acc = Default::default();
+    }
+}
+
+/// For launch-time background loads the first match doesn't wait on
+/// (other games' gun tables and sounds): this thread below normal
+/// priority, so the menus, the map load and the frame win the cores when
+/// they compete. What's loaded, and when it's asked for, is unchanged.
+/// `COD4RW_BGPRIORITY=0` leaves it at normal.
+pub fn background_thread() {
+    if std::env::var("COD4RW_BGPRIORITY").is_ok_and(|v| v == "0") {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(thread: isize, priority: i32) -> i32;
+        }
+        // THREAD_PRIORITY_BELOW_NORMAL
+        unsafe { SetThreadPriority(GetCurrentThread(), -1) };
+    }
+}
+
+/// Under `COD4RW_PERF`: each view that gets a new upscaling (blit) pipeline,
+/// and when. Bevy blocks the frame until that pipeline is compiled, so a
+/// view appearing or changing its output mid-match is a hitch while other
+/// pipelines are still compiling (the first seconds of a match).
+fn upscaling_log(
+    views: Query<(Entity, Option<&bevy::render::camera::ExtractedCamera>), bevy::ecs::query::Changed<bevy::core_pipeline::upscaling::ViewUpscalingPipeline>>,
+    mut since: Local<Option<std::time::Instant>>,
+) {
+    let since = *since.get_or_insert_with(std::time::Instant::now);
+    for (e, camera) in &views {
+        match camera {
+            Some(c) => info!(
+                "perf: new upscaling pipeline for view {e} at {:.1} s: camera order {}, hdr {}, target {:?}, size {:?}, output {:?}",
+                since.elapsed().as_secs_f32(),
+                c.order,
+                c.hdr,
+                c.target,
+                c.physical_target_size,
+                c.output_mode
+            ),
+            None => info!("perf: new upscaling pipeline for view {e} (no camera) at {:.1} s", since.elapsed().as_secs_f32()),
+        }
+    }
+}
+
+/// `COD4RW_HOLDVIEW=x,y,z,yaw,pitch` (CoD units and degrees, the feet):
+/// the local player held there looking that way, so GPU timings compare
+/// the same view run to run (a sim's player otherwise roams as a bot).
+fn hold_view(time: Res<Time>, mut player: Query<(&mut crate::movement::ViewAngles, &mut Transform), With<crate::player::LocalPlayer>>) {
+    static VIEW: std::sync::OnceLock<Option<[f32; 6]>> = std::sync::OnceLock::new();
+    let Some(v) = *VIEW.get_or_init(|| {
+        let v: Vec<f32> = std::env::var("COD4RW_HOLDVIEW").ok()?.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        (v.len() >= 5).then(|| [v[0], v[1], v[2], v[3], v[4], v.get(5).copied().unwrap_or(0.0)])
+    }) else {
+        return;
+    };
+    // (A sixth value turns the view that many degrees a second: TAA trails.)
+    let yaw = v[3] + v[5] * time.elapsed_secs();
+    for (mut angles, mut tf) in &mut player {
+        tf.translation = crate::units::pos([v[0], v[1], v[2]]);
+        angles.yaw = crate::units::yaw_from_cod_degrees(yaw);
+        angles.pitch = v[4].to_radians();
+    }
+}
+
+/// Under `COD4RW_PERF`: the directional lights there are, every 2 s
+/// (each view's lights are a fixed few on the GPU).
+fn light_census(time: Res<Time<Real>>, lights: Query<(Entity, Option<&Name>, &DirectionalLight)>, mut next: Local<f32>) {
+    if time.elapsed_secs() < *next {
+        return;
+    }
+    *next = time.elapsed_secs() + 2.0;
+    let list: Vec<String> = lights.iter().map(|(e, n, l)| format!("{e} {} shadows {} lux {:.0}", n.map_or("-", |n| n.as_str()), l.shadow_maps_enabled, l.illuminance)).collect();
+    info!("perf: {} directional lights: {}", list.len(), list.join("; "));
+}
+
+/// Test aid: `COD4RW_SETAT=<s>:<dvar>=<value>;...` (or `window=<w>x<h>`) changes settings that
+/// many seconds (real) into each match, as the menu would (to reproduce
+/// crashes from changing an option mid-match).
+fn set_at(
+    time: Res<Time<Real>>,
+    mut settings: ResMut<crate::settings::Settings>,
+    mut since: Local<Option<f32>>,
+    mut done: Local<usize>,
+    state: Res<State<crate::state::GameState>>,
+    mut window: Single<&mut Window, With<bevy::window::PrimaryWindow>>,
+) {
+    if state.is_changed() {
+        *since = None;
+        *done = 0;
+    }
+    let start = *since.get_or_insert(time.elapsed_secs());
+    let Ok(spec) = std::env::var("COD4RW_SETAT") else { return };
+    let steps: Vec<(f32, String, String)> = spec
+        .split(';')
+        .filter_map(|s| {
+            let (at, kv) = s.split_once(':')?;
+            let (k, v) = kv.split_once('=')?;
+            Some((at.trim().parse().ok()?, k.trim().to_owned(), v.trim().to_owned()))
+        })
+        .collect();
+    while let Some((at, k, v)) = steps.get(*done) {
+        if time.elapsed_secs() - start < *at {
+            break;
+        }
+        info!("set at {at} s: {k} = {v}");
+        // (`window=<w>x<h>`: the window resized, as a resolution or display
+        // mode change does; test windows ignore those settings.)
+        if k == "window" {
+            if let Some((w, h)) = v.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))) {
+                window.resolution.set_physical_resolution(w, h);
+            }
+            *done += 1;
+            continue;
+        }
+        // (Every other dvar as it is: `update` defaults the ones not given.)
+        let now = settings.clone();
+        settings.update(|d| Some(if d == k { v.clone() } else { now.text(d).to_owned() }));
+        *done += 1;
     }
 }

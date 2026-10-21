@@ -217,7 +217,12 @@ fn drive_ocean(
             m.ocean.wind.x = d.x;
             m.ocean.wind.y = d.y;
         }
-        m.ocean.wind.w = (w.wind.length() / STORM_WIND).clamp(0.0, 1.0).max(SEA_STATE);
+        // (The Map Look Editor's water: wave strength, colour, reflection.)
+        let map = crate::atmos::climate::map_name();
+        let knob = |n: &str, d: f32| crate::tune::get(&format!("water.{n}.{map}"), d);
+        m.ocean.wind.w = (w.wind.length() / STORM_WIND).clamp(0.0, 1.0).max(SEA_STATE) * knob("waves", 1.0).clamp(0.0, 1.5);
+        m.ocean.debug.z = knob("tint", 0.0).clamp(-1.0, 1.0);
+        m.ocean.debug.w = knob("reflection", 1.0).clamp(0.0, 3.0) - 1.0;
         m.ocean.misc.x = w.rain.clamp(0.0, 1.0);
         m.ocean.debug.y = w.cloud_cover.clamp(0.0, 1.0);
     }

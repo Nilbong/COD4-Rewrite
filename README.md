@@ -592,6 +592,25 @@ and left out (one of them is a slab across all of `mp_crossfire`). Water (`wc_wa
 `water_l_sun`: animated waves reflecting the map's probe through a fresnel term, tinted by the material's water
 colour, with a sun glint (its colour map is a placeholder, the blue checker that showed before).
 
+### Map editor (F7)
+
+In a match, F7 opens the map editor (`crates/game/src/map_editor/`). The camera leaves the player (hold the right
+mouse button to fly: WASD, Space/Ctrl, wheel for speed) and a palette of the loaded zones' props opens on the left,
+with pictures, in categories, plus lights, scenery effects and spawn points. Player 1 can't be hurt while it's open.
+
+- Click a picture, then click the map to place it (X stops). Objects stand on whatever's under the pointer.
+- Click an object to select it, drag to move it. Q/E turn, PgUp/PgDn height, +/- size, G grid snap, T align to
+  slopes, Ctrl+D copy, Del remove, Ctrl+Z/Ctrl+Y undo/redo, Ctrl+S save.
+- Shift+drag paints the picked object (random turn and size), Alt+drag rubs placed objects out, [ ] size the brush.
+- H hides the map's own model under the pointer (or shows it again). It's gone from the next load, as the map's
+  models are merged as it loads.
+- A selected light: C colour, +/- brightness, [ ] range, V shadows.
+
+Placed models are solid to players and bullets, and the bots route round them once the editor closes. Each map's
+layout is saved to `crates/game/assets/maplayouts/<map>.txt` (built into the game), or outside the project folder
+to `%LOCALAPPDATA%\cod4rw\maplayouts\`, which wins. Test: `COD4RW_MAPEDIT=<shots dir>` places, saves and checks a
+few things and quits (`COD4RW_MAPLAYOUT_DIR=<dir>` keeps its files out of the project).
+
 ## Not yet
 
 These are the natural next milestones, roughly in order:

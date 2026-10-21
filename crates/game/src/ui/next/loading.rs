@@ -64,6 +64,10 @@ fn cod4_tips(fe: &Frontend) -> Vec<String> {
 }
 
 fn map_name(id: &str) -> String {
+    // (A mission is its title: F.N.G., not Killhouse.)
+    if let Some(t) = crate::campaign::title() {
+        return t.to_owned();
+    }
     super::super::lobby::maps().iter().find(|(m, _)| *m == id).map_or_else(
         || {
             let s = id.trim_start_matches("mp_").replace('_', " ");

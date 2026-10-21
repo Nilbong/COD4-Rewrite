@@ -72,7 +72,7 @@ impl Plugin for VisionPlugin {
         .init_resource::<MapLook>()
         .init_resource::<NightVisions>()
         .add_systems(OnEnter(GameState::InGame), load_look.in_set(crate::state::Setup::Spawn))
-        .add_systems(Update, (night_vision, apply_film, sun_effects).chain().run_if(in_game));
+        .add_systems(Update, (script_vision, night_vision, apply_film, sun_effects).chain().run_if(in_game));
         if let Ok(dir) = std::env::var("COD4RW_NVTEST") {
             app.insert_resource(NvTest(dir.into())).add_systems(Update, nv_test.before(night_vision).run_if(in_game));
         }
@@ -170,9 +170,31 @@ pub struct FilmUniform {
     /// The Rich look (`r_tonemap`) over the film: x: its S-curve, y: its
     /// saturation (0 and 1 for none).
     grade: Vec4,
+    /// The lens over it all (`apply_lens`): x film grain, y vignette, z lens
+    /// dirt, w the frame (the grain's seed).
+    lens: Vec4,
+    /// Split toning: the shadows' tint (rgb) and its amount (w), the
+    /// highlights' tint and amount.
+    split_dark: Vec4,
+    split_light: Vec4,
 }
 
 impl FilmUniform {
+    /// Part way from this film to another (a vision set's fade).
+    fn lerp(&self, to: &FilmUniform, k: f32) -> FilmUniform {
+        FilmUniform {
+            tint_base: self.tint_base.lerp(to.tint_base, k),
+            tint_delta: self.tint_delta.lerp(to.tint_delta, k),
+            bias: self.bias.lerp(to.bias, k),
+            glow: self.glow.lerp(to.glow, k),
+            glow_blur: self.glow_blur.lerp(to.glow_blur, k),
+            grade: self.grade.lerp(to.grade, k),
+            lens: self.lens.lerp(to.lens, k),
+            split_dark: self.split_dark.lerp(to.split_dark, k),
+            split_light: self.split_light.lerp(to.split_light, k),
+        }
+    }
+
     /// No film: the frame as it is.
     const NO_FILM: [Vec4; 3] = [Vec4::new(1.0, 1.0, 1.0, 0.0), Vec4::ZERO, Vec4::ZERO];
 
@@ -185,6 +207,9 @@ impl FilmUniform {
         glow: Vec4::new(0.99, 100.0, 0.0, 0.0),
         glow_blur: Vec4::ZERO,
         grade: Self::NO_GRADE,
+        lens: Vec4::ZERO,
+        split_dark: Vec4::ZERO,
+        split_light: Vec4::ZERO,
     };
     const NO_GRADE: Vec4 = Vec4::new(0.0, 1.0, 1.0, 0.0);
 
@@ -307,7 +332,7 @@ impl FilmUniform {
                 Vec3::splat(brightness).extend(one("r_filmDesaturation", 0.0)),
             ]
         };
-        FilmUniform { tint_base, tint_delta, bias, glow, glow_blur, grade: Self::NO_GRADE }
+        FilmUniform { tint_base, tint_delta, bias, glow, glow_blur, grade: Self::NO_GRADE, lens: Vec4::ZERO, split_dark: Vec4::ZERO, split_light: Vec4::ZERO }
     }
 }
 
@@ -322,6 +347,47 @@ const RICH_SATURATION: f32 = 1.2;
 
 /// Debug aid: `COD4RW_FILM=cod4` grades maps exactly as CoD4's film does
 /// (see [`FilmUniform::balanced`]), for comparing.
+/// A campaign level script's vision set (`VisionSetNaked( name, time )`):
+/// a request number (new for each), the name and the fade's seconds.
+pub static SCRIPT_VISION: std::sync::Mutex<Option<(u32, String, f32)>> = std::sync::Mutex::new(None);
+
+/// Fade the map's film to the vision set a level script asked for
+/// ([`SCRIPT_VISION`]): the AC-130's white- and black-hot, a level's
+/// changes of mood.
+fn script_vision(
+    time: Res<Time>,
+    mut look: ResMut<MapLook>,
+    content: Option<Res<Content>>,
+    mut fade: Local<Option<(u32, Option<FilmUniform>, Option<FilmUniform>, f32, f32)>>,
+) {
+    let now = time.elapsed_secs();
+    let request = SCRIPT_VISION.lock().ok().and_then(|r| r.clone());
+    if request.is_none() {
+        *fade = None;
+    }
+    if let Some((n, name, secs)) = request
+        && fade.as_ref().is_none_or(|f| f.0 != n)
+        && let Some(content) = content.as_deref()
+    {
+        let to = raw_file(content, &format!("vision/{name}.vision")).map(|t| {
+            let f = FilmUniform::parse(&t);
+            let contrast = f.film_on().then(|| FilmUniform::value(&t, "r_filmContrast")).flatten().unwrap_or(1.0);
+            if cod4_film() { f } else { f.balanced(contrast) }
+        });
+        if to.is_none() {
+            warn!("vision: {name} not found");
+        }
+        *fade = Some((n, look.film, to.or(look.film), now, secs.max(0.0)));
+    }
+    if let Some((_, from, to, start, secs)) = *fade {
+        let k = if secs <= 0.0 { 1.0 } else { ((now - start) / secs).clamp(0.0, 1.0) };
+        look.film = match (from, to) {
+            (Some(a), Some(b)) => Some(a.lerp(&b, k)),
+            (_, b) => b,
+        };
+    }
+}
+
 fn cod4_film() -> bool {
     std::env::var("COD4RW_FILM").is_ok_and(|v| v.eq_ignore_ascii_case("cod4"))
 }
@@ -365,7 +431,14 @@ fn apply_film(
     let base = look.film.map(|f| if crate::ui::film_tint() { f } else { f.untinted() });
     let base = base.map(|f| if crate::settings_apply::bloom() { f } else { f.unglowing() });
     let base = if crate::settings_apply::rich() { Some(base.unwrap_or(FilmUniform::NEUTRAL).rich()) } else { base };
+    // The lens and split toning over every frame (`lens_settings`); not on
+    // the scope's own image (the main frame's lens covers it).
+    let lensed = match lens_settings(&time) {
+        Some((lens, dark, light)) => Some(FilmUniform { lens, split_dark: dark, split_light: light, ..base.unwrap_or(FilmUniform::NEUTRAL) }),
+        None => base,
+    };
     for (e, film, bloom, slot) in &cameras {
+        let base = if slot.is_some() { lensed } else { base };
         let nv = night_vision.get(slot.map_or(0, |s| s.0));
         let wanted = if nv.showing(time.elapsed_secs()) { look.night.or(base) } else { base };
         match (wanted, film) {
@@ -619,7 +692,7 @@ impl NightVision {
         (1.0 - (t - NV_FADE) / back).max(0.0)
     }
 
-    fn switch(&mut self, on: bool, now: f32) {
+    pub fn switch(&mut self, on: bool, now: f32) {
         self.on = on;
         self.since = now;
     }
@@ -958,4 +1031,52 @@ r_filmDarkTint \"0.956 0.855 0.778\"
         assert!((approach(1.0, 0.0, 0.25, 0.5, 1.0) - 0.75).abs() < 1e-6);
         assert_eq!(approach(0.9, 1.0, 1.0, 0.5, 1.0), 1.0);
     }
+}
+
+/// The lens over the frame and its split toning, as knobs (the Map Look
+/// Editor's per map as `<knob>.<map>`): `film.grain` (0.025: film grain, more
+/// in the shadows, none in the highlights), `film.vignette` (0.25),
+/// `film.dirt` (0.35: lens dirt lit by bright light), `film.split` (0: split
+/// toning's amount), `film.split_dark` / `film.split_light` (hues in
+/// degrees: 215 blue shadows, 35 warm highlights). `COD4RW_FILMFX=0` none;
+/// `COD4RW_FILMFX_AB=1` with `COD4RW_SHOT_VIEWS` none on the even shots
+/// (same-view pairs).
+fn lens_settings(time: &Time) -> Option<(Vec4, Vec4, Vec4)> {
+    // (Off by the Film Effects setting, and in splitscreen: each slot's
+    // film pass covers the whole window, so the grain and vignette doubled.)
+    if std::env::var("COD4RW_FILMFX").is_ok_and(|v| v == "0") || !crate::settings_apply::film_fx() || crate::splitscreen::active() {
+        return None;
+    }
+    if std::env::var("COD4RW_FILMFX_AB").is_ok_and(|v| v == "1") {
+        let late: f32 = std::env::var("COD4RW_SHOT_LATE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let k = (((time.elapsed_secs() - late - 5.0) / 1.5).floor().max(0.0)) as usize;
+        if k % 2 == 0 {
+            return None;
+        }
+    }
+    let map = crate::atmos::climate::map_name();
+    let knob = |n: &str, d: f32| {
+        let per = crate::tune::get(&format!("{n}.{map}"), f32::NAN);
+        if per.is_nan() { crate::tune::get(n, d) } else { per }
+    };
+    let hue = |deg: f32| {
+        let h = deg.rem_euclid(360.0) / 60.0;
+        let x = 1.0 - (h % 2.0 - 1.0).abs();
+        let (r, g, b) = match h as u32 {
+            0 => (1.0, x, 0.0),
+            1 => (x, 1.0, 0.0),
+            2 => (0.0, 1.0, x),
+            3 => (0.0, x, 1.0),
+            4 => (x, 0.0, 1.0),
+            _ => (1.0, 0.0, x),
+        };
+        Vec3::new(r, g, b)
+    };
+    let split = knob("film.split", 0.0).clamp(0.0, 1.0);
+    let frame = (time.elapsed_secs() * 60.0).floor() % 4096.0;
+    Some((
+        Vec4::new(knob("film.grain", 0.025).clamp(0.0, 0.2), knob("film.vignette", 0.25).clamp(0.0, 1.0), knob("film.dirt", 0.35).clamp(0.0, 2.0), frame),
+        hue(knob("film.split_dark", 215.0)).extend(split),
+        hue(knob("film.split_light", 35.0)).extend(split),
+    ))
 }

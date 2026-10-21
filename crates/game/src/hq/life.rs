@@ -222,7 +222,10 @@ fn arrive(
                 .id();
             let mut skeleton = Skeleton::default();
             for m in &models {
-                spawn_model(&mut commands, &mut skeleton, SpawnModel { model: m, owner, attach_to: None, layers: None, shadows: true });
+                let surfaces = spawn_model(&mut commands, &mut skeleton, SpawnModel { model: m, owner, attach_to: None, layers: None, shadows: true });
+                if crate::character_look::is_character(&m.name) {
+                    crate::character_look::mark(&mut commands, &surfaces);
+                }
             }
             if scene.armed {
                 let hand = skeleton.joint("tag_weapon_right");

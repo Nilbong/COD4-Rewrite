@@ -4,7 +4,9 @@ use iw3::zone::{Asset, AssetType, ParseOptions, Zone};
 
 fn main() -> Result<()> {
     let name = std::env::args().nth(1).unwrap_or("ak47_mp".into());
-    let data = iw3::fastfile::load(&iw3::Install::locate()?.zone_path("common_mp"))?;
+    // (`ZONE=<zone>`: another zone's, a level's single-player guns.)
+    let zone_name = std::env::var("ZONE").unwrap_or("common_mp".into());
+    let data = iw3::fastfile::load(&iw3::Install::locate()?.zone_path(&zone_name))?;
     let zone = Zone::parse(&data, ParseOptions::default())?;
     let w = zone.assets.iter().find_map(|a| match a { Asset::Generic(g) if g.ty == AssetType::Weapon && g.name == name => Some(&g.root), _ => None }).expect("weapon");
     let model = |id: Option<usize>| id.map(|i| zone.get(i).name().to_owned());
@@ -12,7 +14,8 @@ fn main() -> Result<()> {
     println!("handXModel {:?}", model(w.asset("handXModel")));
     println!("worldModel {:?}", w.assets("worldModel").into_iter().map(model).take(2).collect::<Vec<_>>());
     println!("szXAnims {:?}", w.strings("szXAnims"));
-    for f in ["damage","playerDamage","iFireTime","iClipSize","iMaxAmmo","iStartAmmo","iReloadTime","iReloadEmptyTime","iReloadAddTime","iRaiseTime","iDropTime","iAdsTransInTime","iAdsTransOutTime","sprintInTime","sprintLoopTime","sprintOutTime","iFireDelay","weapClass","fireType","penetrateType"] {
+    println!("hideTags {:?}", w.strings("hideTags"));
+    for f in ["damage","playerDamage","iFireTime","iClipSize","iMaxAmmo","iStartAmmo","iReloadTime","iReloadEmptyTime","iReloadAddTime","iRaiseTime","iDropTime","iFirstRaiseTime","quickRaiseTime","quickDropTime","iEmptyRaiseTime","iEmptyDropTime","iAdsTransInTime","iAdsTransOutTime","sprintInTime","sprintLoopTime","sprintOutTime","iFireDelay","weapClass","fireType","penetrateType"] {
         print!("{f}={} ", w.int(f));
     }
     println!();

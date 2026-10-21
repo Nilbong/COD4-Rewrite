@@ -1,0 +1,12 @@
+[package]
+name = "bink"
+description = "A Bink 1 video and audio decoder (the format of Call of Duty 4's cinematics), written from the format's behaviour."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

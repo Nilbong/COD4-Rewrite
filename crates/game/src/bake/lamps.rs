@@ -60,6 +60,23 @@ pub fn samples(atlases: &[AtlasLight], residual: impl Fn(usize, usize) -> Option
 /// Light fixture models: where the lamp is (the bottom of the model's
 /// bounds, a little below).
 fn fixtures(zones: &[Zone]) -> Vec<Vec3A> {
+    fixtures_where(zones, |_| true)
+}
+
+/// Fixtures that are switched on (`com_cafe_light_part1_on`): their lamps
+/// get [`lit_boost`].
+pub fn lit_fixtures(zones: &[Zone]) -> Vec<Vec3A> {
+    fixtures_where(zones, |name| name.contains("_on"))
+}
+
+/// How much brighter a lamp at a switched-on fixture is baked than CoD4 had
+/// it (`COD4RW_BAKE_LAMP_BOOST`, default 1.6): CoD4's daytime lamps were
+/// faint enough that a lit shop read as unlit (Crossfire, 2026-10-18).
+pub fn lit_boost() -> f32 {
+    std::env::var("COD4RW_BAKE_LAMP_BOOST").ok().and_then(|v| v.parse().ok()).unwrap_or(1.6)
+}
+
+fn fixtures_where(zones: &[Zone], keep: impl Fn(&str) -> bool) -> Vec<Vec3A> {
     let world = zones[0].gfx_world().expect("gfxworld");
     let mut out = Vec::new();
     for sm in &world.static_models {
@@ -68,7 +85,7 @@ fn fixtures(zones: &[Zone]) -> Vec<Vec3A> {
         let Some(xm) = zones[zi].xmodel(id) else { continue };
         let name = xm.name.to_ascii_lowercase();
         let lamp = ["light", "lamp", "bulb", "fluo", "lantern", "sconce", "chandelier"].iter().any(|k| name.contains(k));
-        if !lamp || name.contains("lightning") || name.contains("lighthouse") {
+        if !lamp || name.contains("lightning") || name.contains("lighthouse") || !keep(&name) {
             continue;
         }
         let axis = sm.axis.map(Vec3A::from);
@@ -201,9 +218,26 @@ pub fn fit(zones: &[Zone], scene: &Scene, samples: &[Sample], scale: f32) -> Vec
             after += (s.residual[c] as f64 - fit[c]).powi(2);
         }
     }
+    // One colour per spot: fitted channel by channel, a spot's radii took
+    // colours of their own (a yellow lamp and a blue one at the same spot,
+    // reaching different distances), which painted yellow and blue patches
+    // where they parted (Crossfire's pillar, 2026-10-19). Each radius keeps
+    // its brightness; the spot's colour is their sum's, a quarter of the
+    // way to white.
+    let spot_tint: Vec<Vec3> = (0..k)
+        .map(|c| {
+            let sum = (0..RADII.len()).fold(Vec3::ZERO, |acc, ri| {
+                let v = x[c * RADII.len() + ri];
+                acc + Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32)
+            });
+            let y = luma(sum);
+            if y > 1e-6 { (sum / y).lerp(Vec3::ONE, 0.25) } else { Vec3::ONE }
+        })
+        .collect();
     let mut lamps = Vec::new();
     for (j, v) in x.iter().enumerate() {
-        let colour = Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32) * scale;
+        let fitted = Vec3::new(v[0] as f32, v[1] as f32, v[2] as f32) * scale;
+        let colour = spot_tint[j / RADII.len()] * luma(fitted);
         if luma(colour) < 0.02 {
             continue;
         }

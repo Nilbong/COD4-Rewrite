@@ -135,9 +135,26 @@ pub enum GameMsg {
     /// The kill streaks this guest picked (by [`crate::killstreaks::Hardpoint`]
     /// index).
     Chosen(Vec<u8>),
+    /// This guest's airstrike map (its laptop) came up, or went away
+    /// unpicked: the host keeps its gun out of hand meanwhile
+    /// ([`crate::killstreaks::hands::CallingIn`]). (A host from before
+    /// this drops it, as any message it doesn't know.)
+    Picking(bool),
+
+    // ---- Either way ----
+    /// A chat line ([`crate::bots::chat::ChatMessage`]): host -> guests,
+    /// whoever said it (bots' banter included; team lines only to that
+    /// team); guest -> host, the guest's own (the host names the sender).
+    /// `pawn`: the speaker's snapshot ID ([`BOT`] for the server); `team`
+    /// 0 allies, 1 axis, 2 none.
+    ///
+    /// [`BOT`]: crate::online::lobby::BOT
+    Chat { pawn: u16, name: String, team: u8, text: String, team_only: bool, dead: bool },
 }
 
 pub const MAX_NAME: usize = 24;
+/// The longest chat line carried.
+pub const MAX_CHAT: usize = 150;
 const MAX_ASSET: usize = 48;
 
 impl GameMsg {
@@ -192,6 +209,12 @@ impl GameMsg {
                     w.u8(*c);
                 }
             }
+            GameMsg::Picking(on) => {
+                w.u8(23).bool(*on);
+            }
+            GameMsg::Chat { pawn, name, team, text, team_only, dead } => {
+                w.u8(10).u16(*pawn).str(name, MAX_NAME).u8(*team).str(text, MAX_CHAT).bool(*team_only).bool(*dead);
+            }
         }
         w.0
     }
@@ -230,6 +253,12 @@ impl GameMsg {
                 ensure!(n <= 8, "too many streaks");
                 GameMsg::Chosen((0..n).map(|_| r.u8()).collect::<Result<Vec<_>>>()?)
             }
+            23 => GameMsg::Picking(r.bool()?),
+            10 => {
+                let m = GameMsg::Chat { pawn: r.u16()?, name: r.str(MAX_NAME)?, team: r.u8()?, text: r.str(MAX_CHAT)?, team_only: r.bool()?, dead: r.bool()? };
+                ensure!(matches!(m, GameMsg::Chat { team: 0..=2, .. }), "invalid team");
+                m
+            }
             _ => bail!("unknown game message"),
         };
         r.done()?;
@@ -257,6 +286,9 @@ mod tests {
             GameMsg::UseStreak { item: 0, target: None },
             GameMsg::Ping(87),
             GameMsg::Chosen(vec![1, 3]),
+            GameMsg::Chat { pawn: 3, name: "Soap".into(), team: 1, text: "nice shot lol".into(), team_only: true, dead: false },
+            GameMsg::Picking(true),
+            GameMsg::Picking(false),
         ];
         for m in msgs {
             let data = m.encode();

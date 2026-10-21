@@ -18,6 +18,71 @@
 #import bevy_pbr::shadows::{get_cascade_index, world_to_directional_light_local}
 #import bevy_pbr::utils::interleaved_gradient_noise
 #import bevy_pbr::view_transformations::{frag_coord_to_ndc, position_ndc_to_world, direction_world_to_view}
+#import bevy_pbr::mesh_view_bindings as view_bindings
+#import bevy_pbr::clustered_forward::{view_fragment_cluster_index, unpack_clusterable_object_index_ranges, get_clusterable_object_id}
+
+// The local lights' glow in the air along the ray from `eye` (`rd`, out to
+// `t_end`): each point and spot light near the eye (the clustered lights:
+// fires, lamps, flares, flashes) scatters toward the eye in closed form,
+// the 1/d² falloff integrated along the ray (no shadows), clipped to its
+// range; a spot's only inside its cone. `gain` is `volumetric.local`.
+fn local_glow(eye: vec3<f32>, rd: vec3<f32>, t_end: f32, frag: vec2<f32>, density: f32, gain: f32) -> vec3<f32> {
+    if (gain <= 0.0) {
+        return vec3(0.0);
+    }
+    let view_z = direction_world_to_view(rd).z * min(t_end, 30.0) * 0.5;
+    let cluster = view_fragment_cluster_index(frag, view_z, false);
+    let ranges = unpack_clusterable_object_index_ranges(cluster);
+    var sum = vec3(0.0);
+    // (Debug: `volumetric.local` 99 shows how many lights the pass sees,
+    // a tenth red each.)
+    if (gain > 98.0) {
+        return vec3(f32(ranges.first_reflection_probe_index_offset - ranges.first_point_light_index_offset) * 0.1, 0.0, 0.05);
+    }
+    // (Hard-capped: the cluster's counts in this pass aren't trusted; an
+    // unbounded walk timed the GPU out, 2026-10-20.)
+    let first = ranges.first_point_light_index_offset;
+    let last = min(ranges.first_reflection_probe_index_offset, first + 4u);
+    if (last <= first) {
+        return vec3(0.0);
+    }
+    for (var i = first; i < last; i = i + 1u) {
+        let id = get_clusterable_object_id(i);
+        let l = &view_bindings::clustered_lights.data[id];
+        let pos = (*l).position_radius.xyz;
+        let range = (*l).range;
+        let to = pos - eye;
+        let s0 = dot(to, rd);
+        let h2 = max(dot(to, to) - s0 * s0, 0.04);
+        let h = sqrt(h2);
+        if (h > range) {
+            continue;
+        }
+        // The ray's stretch inside the light's range.
+        let half = sqrt(max(range * range - h2, 0.0));
+        let a = clamp(s0 - half, 0.0, t_end);
+        let b = clamp(s0 + half, 0.0, t_end);
+        if (b <= a) {
+            continue;
+        }
+        var k = (atan((b - s0) / h) - atan((a - s0) / h)) / h;
+        if (i >= ranges.first_spot_light_index_offset) {
+            // Inside the cone at the closest point (Bevy packs the spot's
+            // direction x, z and its scale and offset).
+            let c = (*l).light_custom_data;
+            let y_sign = select(1.0, -1.0, ((*l).flags & 2u) != 0u);
+            let dir = vec3(c.x, y_sign * sqrt(max(1.0 - c.x * c.x - c.y * c.y, 0.0)), c.y);
+            let at = eye + rd * clamp(s0, a, b);
+            let cd = dot(normalize(at - pos), dir);
+            let cone = saturate(cd * c.z + c.w);
+            k *= cone * cone;
+        }
+        sum += (*l).color_inverse_square_range.rgb * k;
+    }
+    // Soft cap: a lamp's cone glows, never a white wall.
+    let v = sum * density * FRAC_4_PI * gain * view.exposure;
+    return 0.06 * (vec3(1.0) - exp(-v / 0.06));
+}
 
 // The GPU version of Bevy's `VolumetricFog` and `FogVolume` (must match
 // `bevy_pbr::volumetric_fog::render::VolumetricFogUniform`).
@@ -81,13 +146,29 @@ fn henyey_greenstein(cos_theta: f32, g: f32) -> f32 {
 
 @fragment
 fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    if (lights.n_directional_lights == 0u) {
-        return vec4(0.0);
+    // The volumetric sun: the directional light flagged so (the viewmodel's
+    // own sun may come first in the list). Without one (night, a held
+    // clock), only the local lights glow.
+    var sun_id = 0xffffffffu;
+    for (var k = 0u; k < lights.n_directional_lights; k += 1u) {
+        if ((lights.directional_lights[k].flags & DIRECTIONAL_LIGHT_FLAGS_VOLUMETRIC_BIT) != 0u) {
+            sun_id = k;
+            break;
+        }
     }
-    let light = &lights.directional_lights[0];
-    if (((*light).flags & DIRECTIONAL_LIGHT_FLAGS_VOLUMETRIC_BIT) == 0u) {
-        return vec4(0.0);
+    if (sun_id == 0xffffffffu) {
+        let eye0 = view.world_position;
+        let far0 = position_ndc_to_world(vec3(frag_coord_to_ndc(vec4(position.xy, 1.0, 1.0)).xy, 1.0));
+        let rd0 = normalize(far0 - eye0);
+        let depth0 = textureLoad(depth_texture, vec2<i32>(position.xy), 0);
+        var t0 = 40.0;
+        if (depth0 > 0.0) {
+            let surface0 = position_ndc_to_world(frag_coord_to_ndc(vec4(position.xy, depth0, 1.0)));
+            t0 = min(t0, distance(surface0, eye0));
+        }
+        return vec4(local_glow(eye0, rd0, t0, position.xy, volumetric_fog.density_factor, volumetric_fog.ambient_intensity), 0.0);
     }
+    let light = &lights.directional_lights[sun_id];
 
     let reach = volumetric_fog.density_texture_offset.x;
     let thinning = volumetric_fog.density_texture_offset.y;
@@ -136,8 +217,8 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         let p = eye + rd * t;
         let thin = exp(-max(p.y - floor_height, 0.0) * thinning);
 
-        let cascade = get_cascade_index(0u, rd_view_z * t);
-        let local = world_to_directional_light_local(0u, cascade, vec4(p + depth_offset, 1.0));
+        let cascade = get_cascade_index(sun_id, rd_view_z * t);
+        let local = world_to_directional_light_local(sun_id, cascade, vec4(p + depth_offset, 1.0));
         var lit = 1.0;
         if (local.w != 0.0) {
             lit = sample_shadow_map_hardware(local.xy, local.z, i32((*light).depth_texture_base_index + cascade));
@@ -175,8 +256,11 @@ fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     // writes no depth): a little light and no dimming, so palm crowns and
     // the sky behind them don't turn to haze (the god rays carry the
     // sun-facing light there, `super::godrays`).
+    // Lamps, fires and flares glowing in the air (`volumetric.local`, in
+    // the camera's otherwise unused `ambient_intensity`).
+    let glow = local_glow(eye, rd, t_end, position.xy, sigma, volumetric_fog.ambient_intensity);
     if (depth <= 0.0) {
-        return vec4(color * 0.3, 0.0);
+        return vec4(color * 0.3 + glow, 0.0);
     }
-    return vec4(color, 1.0 - transmittance);
+    return vec4(color + glow, 1.0 - transmittance);
 }

@@ -364,7 +364,11 @@ fn model_bounds(content: &Content) -> Vec<(Vec3, Vec3)> {
 /// Puddles as wet as the weather (`crate::atmos::climate::Weather`):
 /// gone when the deck is dry.
 fn wet_puddles(weather: Option<Res<crate::atmos::climate::Weather>>, mut puddles: Query<&mut Visibility, With<Puddle>>, mut was: Local<Option<(u32, bool)>>) {
-    let wet = weather.map_or(true, |w| !w.enabled || w.wetness > 0.15);
+    // (Standing water without rain where the profile says: Bog's swamp.)
+    // (The editor's `weather.puddles` too.)
+    let standing = crate::atmos::climate::profile().is_some_and(|p| p.standing_water);
+    let dry_map = crate::tune::get("weather.puddles", standing as u32 as f32) > 0.5;
+    let wet = weather.map_or(true, |w| !w.enabled || w.wetness > 0.15 || dry_map);
     // (Per match: a new map's puddles start shown.)
     let now = (crate::atmos::climate::match_id(), wet);
     if *was == Some(now) {

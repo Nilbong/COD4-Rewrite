@@ -2,13 +2,13 @@
 //! the HUD, drawn through the menus' own draw ops. [`theme`] holds the design
 //! tokens, [`font`] the type, [`kit`] the primitives and components.
 //!
-//! For now only mock-ups: `COD4RW_UINEXT=home|lobby|cac` paints that screen
-//! over the frontend and `COD4RW_UINEXT=hud` the HUD in a match (with
-//! `COD4RW_UISHOT` for screenshots).
+//! Screenshots: `COD4RW_UINEXT=<screen>:<row>` puts the new cursor on and
+//! focuses that row (`home:Headquarters`), with `COD4RW_UISHOT`.
 
 // The kit and theme are a library for the screens still to come.
 #[allow(dead_code)]
 pub mod cac;
+pub mod campaign;
 pub mod camo_edit;
 pub mod character;
 pub mod drops;
@@ -20,17 +20,19 @@ pub mod join;
 pub mod lobby;
 pub mod loading;
 pub mod maps;
+pub mod missions;
 pub mod match_menus;
 pub mod modes;
 #[allow(dead_code)]
 pub mod kit;
-mod mock;
 pub mod picker;
 pub mod popup;
 pub mod profiles;
 pub mod settings;
 pub mod sight;
 pub mod streaks;
+pub mod summary;
+pub mod variants;
 #[allow(dead_code)]
 pub(in crate::ui) mod shell;
 #[allow(dead_code)]
@@ -48,6 +50,7 @@ pub(super) fn build(app: &mut App) {
     app.add_systems(Update, (font::make_wanted, textures, track));
     app.add_systems(Update, join::sync.run_if(resource_exists::<Frontend>));
     settings::build(app);
+    summary::build(app);
     if std::env::var_os("COD4RW_UIDUMP").is_some() {
         app.add_systems(Update, dump_menus);
     }
@@ -231,7 +234,7 @@ pub(super) fn cursor(fe: &Frontend, p: Vec2, h: f32, ops: &mut Vec<Op>) -> bool 
     true
 }
 
-/// Which mock-up, and an optional focused row (`home:Headquarters`).
+/// A row to focus for screenshots (`COD4RW_UINEXT=home:Headquarters`).
 pub(super) fn mock_focus() -> Option<&'static str> {
     mock_full()?.split_once(':').map(|(_, f)| f)
 }
@@ -241,37 +244,3 @@ fn mock_full() -> Option<&'static str> {
     M.get_or_init(|| std::env::var("COD4RW_UINEXT").ok().filter(|s| !s.is_empty())).as_deref()
 }
 
-/// The mock-up asked for, if any.
-fn mock_screen() -> Option<&'static str> {
-    mock_full().map(|s| s.split(':').next().unwrap_or(s))
-}
-
-/// Whether the new HUD replaces CoD4's (mock-up only for now).
-pub(super) fn hud_replaced() -> bool {
-    mock_screen() == Some("hud")
-}
-
-impl Frontend {
-    /// Over the frontend's menus: the new UI's screen (mock-ups for now).
-    pub(super) fn paint_next(&self, w: f32, h: f32, ops: &mut Vec<Op>) {
-        if !IN_FRONTEND.load(Ordering::Relaxed) {
-            return;
-        }
-        let Some(screen) = mock_screen() else { return };
-        let mut k = kit::Kit::new(self, ops, kit::View::new(Vec2::ZERO, Vec2::new(w, h)));
-        match screen {
-            "lobby" => mock::lobby(&mut k),
-            "cac" => mock::cac(&mut k),
-            _ => {}
-        }
-    }
-
-    /// The new HUD over a match (mock-up for now).
-    pub(super) fn paint_next_hud(&self, w: f32, h: f32, minimap: Option<(Vec2, Vec2)>, ops: &mut Vec<Op>) {
-        if !hud_replaced() {
-            return;
-        }
-        let mut k = kit::Kit::new(self, ops, kit::View::new(Vec2::ZERO, Vec2::new(w, h)));
-        mock::hud(&mut k, h, minimap);
-    }
-}

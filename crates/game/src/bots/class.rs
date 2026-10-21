@@ -114,9 +114,13 @@ pub(super) fn class_for(gun: &str, kind: GunKind, p: &Personality, skill: f32, r
 pub(super) fn class_bots(
     mut commands: Commands,
     content: Option<Res<crate::content::Content>>,
+    map: Option<Res<crate::world::MapName>>,
     bots: Query<(Entity, &Bot), (Without<PawnClass>, Without<Dead>)>,
 ) {
     let Some(content) = content else { return };
+    // Night maps: bots wear night vision, and their guns carry IR lasers
+    // ([`crate::laser`]).
+    let night = map.is_some_and(|m| crate::laser::night_map(&m.0));
     for (e, bot) in &bots {
         let mut class = bot.class.clone();
         for g in &mut class.guns {
@@ -127,6 +131,12 @@ pub(super) fn class_bots(
         class.guns.retain(|g| crate::loadout::bot_weapon(&content, &g.spec).is_some());
         if class.guns.is_empty() {
             continue;
+        }
+        if night {
+            for g in &mut class.guns {
+                g.spec = crate::laser::with_laser(&g.spec, true);
+            }
+            commands.entity(e).insert(crate::laser::BotNightVision);
         }
         commands.entity(e).insert(PawnClass(class));
     }

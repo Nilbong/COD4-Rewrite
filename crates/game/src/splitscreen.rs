@@ -139,7 +139,12 @@ pub fn body_layer(slot: usize) -> usize {
 /// other players' bodies, and in third person its own.
 pub fn world_layers(slot: usize, count: usize, third_person: bool) -> bevy::camera::visibility::RenderLayers {
     let layers: Vec<usize> =
-        std::iter::once(0).chain((0..count).filter(|&s| s != slot || third_person).map(body_layer)).chain((!third_person).then(|| crate::first_person::body::layer(slot))).collect();
+        std::iter::once(0)
+            .chain((0..count).filter(|&s| s != slot || third_person).map(body_layer))
+            .chain((!third_person).then(|| crate::first_person::body::layer(slot)))
+            // The lasers this player sees ([`crate::laser`]).
+            .chain(std::iter::once(crate::laser::layer(slot)))
+            .collect();
     bevy::camera::visibility::RenderLayers::from_layers(&layers)
 }
 
@@ -286,7 +291,7 @@ fn assign_pads(mut players: ResMut<LocalPlayers>, devices: Res<crate::gamepad::D
 
 /// Fill each local player's [`PlayerInput`] from their device.
 #[allow(clippy::too_many_arguments)]
-fn gather_input(
+pub(crate) fn gather_input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
@@ -333,10 +338,12 @@ fn gather_input(
                 pad: pad.clone(),
                 pad_kind: active_device.pad,
                 pad_entity: active_device.entity.filter(|_| active_device.pad.is_some()),
-                live: grabbed,
+                // (Not while the fly camera has the view, `crate::flycam`.)
+                live: grabbed && !crate::flycam::active(),
             };
             // Headquarters has no fighting.
             crate::hq::strip(&mut input);
+            crate::campaign::strip(&mut input);
             continue;
         }
         *input = match players.devices.get(slot.0).copied().unwrap_or(Device::NextPad) {
@@ -347,7 +354,7 @@ fn gather_input(
                 mouse,
                 look: motion.delta,
                 scroll: scroll.delta.y,
-                live: grabbed && !menu,
+                live: grabbed && !menu && !crate::flycam::active(),
                 ..default()
             }
             }

@@ -204,8 +204,14 @@ pub fn data() -> Option<&'static Data> {
 /// Start loading BO1's data in the background.
 pub fn preload() {
     std::thread::spawn(|| {
-        data();
+        crate::perf::background_thread();
+        preload_blocking();
     });
+}
+
+/// [`preload`]'s work on this thread (`main` runs the games' in turn).
+pub fn preload_blocking() {
+    data();
 }
 
 /// A string table's rows from a parsed BO1 zone.
@@ -483,6 +489,8 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
         first_raise_time: fo("firstRaiseTime", fb.first_raise_time),
         quick_drop_time: fo("quickDropTime", fb.quick_drop_time),
         quick_raise_time: fo("quickRaiseTime", fb.quick_raise_time),
+        empty_drop_time: fo("emptyDropTime", fb.drop_time),
+        empty_raise_time: fo("emptyRaiseTime", fb.raise_time),
         hip_spread_min: [fo("hipSpreadStandMin", 3.0), fo("hipSpreadDuckedMin", 2.5), fo("hipSpreadProneMin", 2.0)],
         hip_spread_max: [fo("hipSpreadMax", 7.0), fo("hipSpreadDuckedMax", 6.0), fo("hipSpreadProneMax", 5.0)],
         hip_spread_fire_add: fo("hipSpreadFireAdd", fb.hip_spread_fire_add),

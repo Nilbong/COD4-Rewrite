@@ -36,7 +36,11 @@ WORK = os.path.join(ROOT, "target", "demo_work")
 REAL = os.path.join(ROOT, "data", "demo_tracks", "real")
 FLAGS = os.path.join(ROOT, "data", "demo_tracks", "flags.txt")
 LAB = os.path.join(ROOT, "target", "botlab")
-EXE = os.path.join(ROOT, "target", "supply", "release", "cod4rw.exe")
+# The newest of the fast (iteration) and release builds.
+EXE = max((os.path.join(ROOT, "target", d, "cod4rw.exe") for d in ("fast", "release")),
+          key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+# The skill the user plays at (the game's default otherwise is 0.6).
+SKILL = "0.5"
 
 # (map, game type, bots a side, the demos of real play on it)
 SUITE = [
@@ -272,9 +276,9 @@ def run(label, secs, only, exe_from=EXE, lab=""):
     stamp = time.strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(LAB, f"{stamp}-{label}" if label else stamp)
     os.makedirs(run_dir)
-    exe = os.path.join(run_dir, "sim.exe")
+    exe = os.path.join(run_dir, "cod4rw_botlab.exe")
     shutil.copy(exe_from, exe)
-    env = dict(os.environ, COD4RW_SIM=str(secs), COD4RW_RECORD_WHO="all", COD4RW_BOTLAB=lab)
+    env = dict(os.environ, COD4RW_SIM=str(secs), COD4RW_RECORD_WHO="all", COD4RW_BOTLAB=lab, COD4RW_WINPOS="-1000,200")
     with open(os.path.join(run_dir, "lab.txt"), "w") as f:
         f.write(f"experiments: {lab or '(none)'}\n")
         f.write(f"exe: {exe_from}\n")
@@ -285,12 +289,36 @@ def run(label, secs, only, exe_from=EXE, lab=""):
         os.makedirs(out_dir)
         env["COD4RW_RECORD"] = os.path.join(out_dir, "bots.csv")
         t0 = time.time()
-        with open(os.path.join(run_dir, map_name + ".log"), "w") as log:
+        # The shared rule: one game run at a time on this PC (target/gamerun.lock),
+        # and nobody else's copy running right before launching.
+        lock = os.path.join(ROOT, "target", "gamerun.lock")
+        while True:
             try:
-                subprocess.run([exe, "--map", map_name, "--mode", mode, "--bots", str(bots), "--spectate"], env=env, stdout=log,
-                               stderr=subprocess.STDOUT, timeout=secs * 3 + 300)
-            except subprocess.TimeoutExpired:
-                log.write("\nbotlab: timed out\n")
+                os.mkdir(lock)
+            except FileExistsError:
+                # A lock left by a run that was killed: stale after 20 min.
+                if time.time() - os.path.getmtime(lock) > 1200:
+                    print("botlab: removing a stale gamerun.lock", flush=True)
+                    shutil.rmtree(lock, ignore_errors=True)
+                    continue
+                print("botlab: waiting for gamerun.lock", flush=True)
+                time.sleep(20)
+                continue
+            with open(os.path.join(lock, "owner"), "w") as f:
+                f.write(f"botlab pid {os.getpid()} {time.strftime('%H:%M:%S')}\n")
+            if "cod4rw" not in subprocess.run(["tasklist"], capture_output=True, text=True).stdout.lower():
+                break
+            shutil.rmtree(lock, ignore_errors=True)
+            time.sleep(20)
+        try:
+            with open(os.path.join(run_dir, map_name + ".log"), "w") as log:
+                try:
+                    subprocess.run([exe, "--map", map_name, "--mode", mode, "--bots", str(bots), "--skill", SKILL, "--spectate"], env=env, stdout=log,
+                                   stderr=subprocess.STDOUT, timeout=secs * 3 + 300)
+                except subprocess.TimeoutExpired:
+                    log.write("\nbotlab: timed out\n")
+        finally:
+            shutil.rmtree(lock, ignore_errors=True)
         print(f"{map_name}: {time.time() - t0:.0f}s", flush=True)
     os.remove(exe)
     result = score_run(run_dir)

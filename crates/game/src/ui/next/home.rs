@@ -31,6 +31,7 @@ const SECTIONS: [(&str, &[Row]); 3] = [
         "Play",
         &[
             Row { label: "Campaign", keys: &["campaign"] },
+            Row { label: "The Coup", keys: &["the coup"] },
             Row { label: "Headquarters", keys: &["headquarters"] },
             Row { label: "Private Match", keys: &["private match", "start new server"] },
             Row { label: "Server Browser", keys: &["join game"] },
@@ -121,7 +122,7 @@ pub(in crate::ui) fn menu(fe: &Frontend, classic: &Menu) -> Option<Menu> {
             continue;
         };
         // The campaign is the test build's only ("Play Test Build.bat").
-        if matches!(all[k].label, "Campaign" | "Single Player") && !crate::modes::test_features() {
+        if matches!(all[k].label, "Campaign" | "The Coup" | "Single Player") && !crate::modes::test_features() {
             continue;
         }
         found.push((k, it.clone()));
@@ -164,6 +165,7 @@ pub(in crate::ui) fn opened(fe: &Frontend) {
 fn preview(row: &str) -> (&'static str, &'static str, &'static str) {
     match row {
         "Campaign" => ("next:preview_campaign", "Story", "Call of Duty 4's campaign, from Crew Expendable to Game Over."),
+        "The Coup" => ("next:preview_campaign", "Story", "Act 1: Al-Fulani's last drive through the city, with its briefing film."),
         "Headquarters" => ("next:preview_headquarters", "Social hub", "Make classes, open supply drops and gather your squad between matches."),
         "Private Match" => ("next:preview_private_match", "Host a match", "Bots, splitscreen for up to four, and lobby codes to invite friends."),
         "Server Browser" => ("next:preview_join_game", "Online", "Find a server on the relay and join the match in progress."),
@@ -243,7 +245,7 @@ pub(in crate::ui) fn paint(fe: &Frontend, om: &OpenMenu, pl: &Placement, ops: &m
         // Its icon, on the right.
         use super::kit::icons::*;
         let icon = match label {
-            "Campaign" | "Single Player" => Some(CROSSHAIR),
+            "Campaign" | "The Coup" | "Single Player" => Some(CROSSHAIR),
             "Headquarters" => Some(HOME),
             "Private Match" => Some(PEOPLE),
             "Server Browser" => Some(LINK),

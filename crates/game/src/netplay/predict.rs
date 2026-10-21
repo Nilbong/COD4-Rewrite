@@ -230,6 +230,9 @@ pub(crate) fn predict_own(
                 }
                 let error = pos - tf.translation;
                 p.error = error.length();
+                // (Its own count of steps: the replay's may differ by one.)
+                let mut m = m;
+                m.steps_total = mover.steps_total;
                 if p.error > SNAP {
                     tf.translation = pos;
                     *mover = m;

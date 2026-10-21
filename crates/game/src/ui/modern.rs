@@ -45,6 +45,10 @@ impl Frontend {
         super::next::match_menus::paint(self, om, pl, ops);
         super::next::profiles::paint(self, om, pl, ops);
         super::next::streaks::paint(self, om, pl, ops);
+        super::next::variants::paint(self, om, pl, ops);
+        super::next::summary::paint(self, om, pl, ops);
+        super::next::campaign::paint(self, om, pl, ops);
+        super::next::missions::paint(self, om, pl, ops);
     }
 }
 

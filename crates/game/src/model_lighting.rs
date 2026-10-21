@@ -9,6 +9,17 @@
 //! it. The viewmodel can't see the world's shadow maps, so its own sun is
 //! dimmed by how much of the sun is visible from the player's eye.
 //!
+//! The viewmodel can't take the light grid's volume either: Bevy gives every
+//! light probe the default render layer when it hands them to the views
+//! (`bevy_light`'s cluster assignment), and the viewmodel cameras draw only
+//! their own layers, so the gun and arms got none of the grid and went
+//! black wherever the sun didn't reach them (indoors, under cover, all of a
+//! night). Instead the grid's ambient cube at the eye lights them as six
+//! lights on their layer, one from each side ([`viewmodel_fill`]): as
+//! CoD4 lit its models, from the grid's six sides. (A camera's own
+//! `AmbientLight` would do it flat, but on the viewmodel camera, which
+//! finishes the whole frame, it also changed the world's haze.)
+//!
 //! Like Black Ops' maps (`r_lightGridIntensity`, `r_lightGridContrast` in
 //! their art scripts), the grid's light is brightened and its sides pushed
 //! apart, so models read with more shape; `COD4RW_NOVISION` leaves that out.
@@ -29,7 +40,7 @@ pub struct ModelLightingPlugin;
 
 impl Plugin for ModelLightingPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (soak, viewmodel_sun, viewmodel_reflections).chain().run_if(crate::state::in_game));
+        app.add_systems(Update, (soak, viewmodel_sun, viewmodel_reflections, viewmodel_fill).chain().run_if(crate::state::in_game));
     }
 }
 
@@ -173,7 +184,13 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
             points.iter().filter_map(|(p, _)| (0..3).all(|i| p[i] >= lo[i] && p[i] <= hi[i]).then(|| luma(mean[index([0, 1, 2].map(|i| (p[i] - lo[i]) as usize))]))).collect();
         lit.sort_by(f32::total_cmp);
         let open = lit.get(lit.len() * 9 / 10).copied().unwrap_or(1.0).max(1e-4) * scale;
-        commands.insert_resource(LightGridLookup { lo, n, mean, scale, open });
+        let mut cubes = vec![[[0.0; 3]; 6]; points.len()];
+        for (cell, s) in src.iter().enumerate() {
+            if let (Some(s), Some(c)) = (s, cells[cell]) {
+                cubes[*s as usize] = c;
+            }
+        }
+        commands.insert_resource(LightGridLookup { lo, n, mean, scale, open, src: src.clone(), cubes });
     }
 
     let r = [n[0], n[2], n[1]];
@@ -187,7 +204,9 @@ pub fn spawn_irradiance_volume(commands: &mut Commands, world: &GfxWorld, images
         // clock runs (`crate::tod_light`): kept in the main world for that
         // (a render-world-only image leaves it once uploaded, and the
         // rewrites were lost: the gun and arms kept the first hour's light).
-        if crate::atmos::climate::showcase() { RenderAssetUsages::default() } else { RenderAssetUsages::RENDER_WORLD },
+        // (Kept in the main world where it's rewritten: the showcase's time
+        // of day, Live lighting, `crate::gi_live`.)
+        if crate::atmos::climate::showcase() || crate::lightmaps::live_wanted() { RenderAssetUsages::default() } else { RenderAssetUsages::RENDER_WORLD },
     );
     image.sampler = ImageSampler::linear();
     let voxels = images.add(image);
@@ -241,6 +260,11 @@ pub struct LightGridLookup {
     scale: f32,
     /// How bright the open air is (luminance, Bevy light units).
     pub open: f32,
+    /// Per cell, the grid point it takes its light from, and per point its
+    /// ambient cube (CoD's +x, -x, +y, -y, +z, -z; for the viewmodel's
+    /// fill, [`viewmodel_fill`]).
+    src: Vec<Option<u32>>,
+    cubes: Vec<[[f32; 3]; 6]>,
 }
 
 fn luma(c: [f32; 3]) -> f32 {
@@ -248,6 +272,40 @@ fn luma(c: [f32; 3]) -> f32 {
 }
 
 impl LightGridLookup {
+    /// The grid's light anew (the showcase's time of day), per cell as
+    /// [`GridVolume::means`] gives it.
+    pub fn set_means(&mut self, mean: Vec<[f32; 3]>) {
+        if mean.len() == self.mean.len() {
+            self.mean = mean;
+        }
+    }
+
+    /// The grid points' cubes anew (the showcase's time of day), in
+    /// `LightGrid::points` order.
+    pub fn set_cubes(&mut self, cubes: Vec<[[f32; 3]; 6]>) {
+        if cubes.len() == self.cubes.len() {
+            self.cubes = cubes;
+        }
+    }
+
+    /// The ambient cube around Bevy-space point `at` (Bevy light units;
+    /// `None` outside the grid).
+    pub fn cube_at(&self, at: Vec3) -> Option<[Vec3; 6]> {
+        let cell = self.cell(at)?;
+        let c = self.cubes.get(self.src.get(cell).copied().flatten()? as usize)?;
+        Some(c.map(|f| Vec3::from(f) * self.scale))
+    }
+
+    fn cell(&self, at: Vec3) -> Option<usize> {
+        let cod = units::to_cod(at);
+        let spacing = LightGrid::SPACING;
+        let q: [i64; 3] = std::array::from_fn(|i| ((cod[i] + 131_072.0) / spacing[i]).round() as i64 - self.lo[i] as i64);
+        if (0..3).any(|i| q[i] < 0 || q[i] >= self.n[i] as i64) {
+            return None;
+        }
+        Some(q[0] as usize + self.n[0] * (q[1] as usize + self.n[1] * q[2] as usize))
+    }
+
     /// The light around Bevy-space point `at` (zero outside the grid).
     pub fn at(&self, at: Vec3) -> Vec3 {
         let cod = units::to_cod(at);
@@ -309,6 +367,15 @@ impl GridVolume {
             Some(if crate::vision::disabled() { cube } else { grid_contrast(cube, light_grid_contrast()) })
         })
     }
+
+    /// Each cell's mean light (for [`LightGridLookup::set_means`]) with
+    /// each grid point's from `point_cube`; black where it has none.
+    pub fn means(&self, point_cube: impl Fn(usize) -> Option<[[f32; 3]; 6]>) -> Vec<[f32; 3]> {
+        self.src
+            .iter()
+            .map(|s| s.and_then(|p| point_cube(p as usize)).map_or([0.0; 3], |c| std::array::from_fn(|k| c.iter().map(|f| f[k]).sum::<f32>() / 6.0)))
+            .collect()
+    }
 }
 
 /// The light grid volume's own intensity, before the rain darkens it.
@@ -338,7 +405,9 @@ fn soak(weather: Option<Res<crate::atmos::climate::Weather>>, mut volumes: Query
     let grid_on = if std::env::var_os("COD4RW_VM_NOGRID").is_some() { 0.0 } else { 1.0 };
     SOAK.store(keep.to_bits(), std::sync::atomic::Ordering::Relaxed);
     for (mut v, base) in &mut volumes {
-        let want = base.0 * keep * grid_on;
+        // (And the night grade's dim fill, `crate::fire`: props sink with
+        // the baked light.)
+        let want = base.0 * keep * grid_on * crate::fire::night_dim();
         if (v.intensity - want).abs() > base.0 * 0.005 {
             v.intensity = want;
         }
@@ -452,6 +521,91 @@ fn viewmodel_reflections(
         }
     }
 }
+
+/// One of the six lights a local player's viewmodel takes the light
+/// grid's ambient cube at the eye from: CoD's `face` (+x, -x, +y, -y, +z,
+/// -z), lighting what faces that way.
+#[derive(Component)]
+pub struct VmFill {
+    slot: usize,
+    face: usize,
+}
+
+/// The light grid's ambient cube round each local player's eye as six
+/// unshadowed lights on their viewmodel's layer (in place of the grid's
+/// volume, which the viewmodel can't take: see the module's note), one
+/// shining onto each side: the gun and arms as lit as a soldier standing
+/// there, dimly in the dark, never black (each side at least
+/// [`VM_FILL_FLOOR`] of the open air's light), darker in the rain as the
+/// grid is ([`soak_share`]). `vm.fill` (`crate::tune`, Bevy's light units
+/// against its irradiance volume's: fitted by eye to the scene) scales it;
+/// `COD4RW_VM_NOFILL` leaves it out (as before: the gun black out of the
+/// sun); `COD4RW_VM_FILL_LOG` logs it once a second.
+fn viewmodel_fill(
+    mut commands: Commands,
+    time: Res<Time>,
+    grid: Option<Res<LightGridLookup>>,
+    eyes: Query<(&GlobalTransform, &crate::splitscreen::SlotCamera)>,
+    mut fills: Query<(&VmFill, &mut DirectionalLight, &mut Transform)>,
+    mut seen: Local<Vec<Option<[Vec3; 6]>>>,
+) {
+    let Some(grid) = grid else { return };
+    let off = std::env::var_os("COD4RW_VM_NOFILL").is_some();
+    let scale = crate::tune::get("vm.fill", 3.0) * soak_share();
+    let k = 1.0 - (-time.delta_secs() / 0.25).exp();
+    let floor = Vec3::splat(grid.open * VM_FILL_FLOOR);
+    for (eye, slot) in &eyes {
+        let s = slot.0;
+        // A slot's fills, made when it has none (each match clears them;
+        // the spawn lands before the next frame looks).
+        if !fills.iter().any(|(f, _, _)| f.slot == s) {
+            if let Some(was) = seen.get_mut(s) {
+                *was = None;
+            }
+            let layer = RenderLayers::layer(crate::splitscreen::viewmodel_layer(s));
+            for face in 0..6 {
+                commands.spawn((Name::new("viewmodel fill"), VmFill { slot: s, face }, DirectionalLight { illuminance: 0.0, shadow_maps_enabled: false, ..default() }, Transform::default(), layer.clone()));
+            }
+        }
+        let here = grid.cube_at(eye.translation()).unwrap_or([Vec3::ZERO; 6]).map(|f| f.max(floor));
+        // Eyes adjust over a moment rather than snapping.
+        if seen.len() <= s {
+            seen.resize(s + 1, None);
+        }
+        let cube = match seen[s] {
+            Some(was) => std::array::from_fn(|f| was[f] + (here[f] - was[f]) * k),
+            None => here,
+        };
+        seen[s] = Some(cube);
+        if std::env::var_os("COD4RW_VM_FILL_LOG").is_some() && time.elapsed_secs().fract() < time.delta_secs() {
+            info!("vm fill: eye CoD {:?}: cube {:.0?} (open air {:.0})", units::to_cod(eye.translation()).map(f32::round), cube.map(|f| f.max_element()), grid.open);
+        }
+    }
+    for (fill, mut light, mut tf) in &mut fills {
+        let Some(cube) = seen.get(fill.slot).copied().flatten().filter(|_| !off) else {
+            light.illuminance = 0.0;
+            continue;
+        };
+        let c = cube[fill.face];
+        let level = c.max_element().max(1e-6);
+        light.color = Color::linear_rgb(c.x / level, c.y / level, c.z / level);
+        light.illuminance = level * scale;
+        // Shining onto what faces CoD's side `face`: travelling the other way.
+        let mut toward = [0.0; 3];
+        toward[fill.face / 2] = if fill.face % 2 == 0 { -1.0 } else { 1.0 };
+        let dir = units::dir(toward);
+        let up = if dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+        let want = Transform::default().looking_to(dir, up);
+        if *tf != want {
+            *tf = want;
+        }
+    }
+}
+
+/// The least light the viewmodel takes from each side, against the open
+/// air's: a gun in a black corner (or past the grid's edge) still reads,
+/// barely.
+const VM_FILL_FLOOR: f32 = 0.03;
 
 fn viewmodel_sun(
     mut commands: Commands,

@@ -19,6 +19,25 @@ const XFILE_HEADER_SIZE: usize = 4 + 4 + 4 * reader::BLOCK_COUNT;
 
 pub type AssetId = usize;
 
+/// The decompressed zone's first words, for error reports: the `XFile`
+/// header (size, external size, block sizes) and the `XAssetList` after it.
+pub fn header_summary(data: &[u8]) -> String {
+    let word = |i: usize| data.get(i * 4..i * 4 + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let words: Vec<String> = (0..XFILE_HEADER_SIZE / 4 + 4).map(|i| word(i).map_or("--".into(), |w| format!("{w:08x}"))).collect();
+    let list = XFILE_HEADER_SIZE / 4;
+    format!(
+        "zone {} bytes, header: size {}, external {}, blocks [{}], list: strings {} at {}, assets {} at {}",
+        data.len(),
+        words[0],
+        words[1],
+        words[2..list].join(" "),
+        words[list],
+        words[list + 1],
+        words[list + 2],
+        words[list + 3]
+    )
+}
+
 /// `XAssetType` in Modern Warfare 2's order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AssetType {
@@ -186,7 +205,17 @@ impl Zone {
         }
 
         let asset_count = list.u32(8) as usize;
-        let (entries_loc, entries) = l.r.array(4, 8, asset_count)?;
+        // A list no zone of this size could hold: another layout (a modded,
+        // repacked or other game's zone) or a damaged file.
+        let room = data.len() - XFILE_HEADER_SIZE - 16;
+        if string_count > room / 4 || asset_count > room / 8 {
+            bail!(
+                "this zone's asset list is not a Modern Warfare 2 PC one ({string_count} script strings, {asset_count} assets in {} bytes; {}); the file looks modded, from another game or damaged: verify the game files in Steam",
+                data.len(),
+                header_summary(data)
+            );
+        }
+        let (entries_loc, entries) = l.r.array(4, 8, asset_count).map_err(|e| e.context(header_summary(data)))?;
         let mut top_level = Vec::with_capacity(asset_count);
         let mut stats = ZoneStats { top_level_total: asset_count, ..Default::default() };
         let trace = std::env::var_os("IW4_TRACE").is_some();

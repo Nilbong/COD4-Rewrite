@@ -86,7 +86,9 @@ fn drive(
     // moonlight by night ([`NIGHT_FLOOR`]): readable, but clearly night (CoD4's
     // whole read as dusk, the user's verdict).
     let night_map = map.color.z > map.color.x * 1.15;
-    let floor = map.illuminance * NIGHT_FLOOR * tod.night * (1.0 - 0.4 * storm);
+    // (`night.moon`, the share: 0.35, up from 0.2 when Wet Work's night read
+    // as too dark to play, 2026-10-21.)
+    let floor = map.illuminance * crate::tune::get("night.moon", NIGHT_FLOOR).clamp(0.0, 1.0) * tod.night * (1.0 - 0.4 * storm);
     let (color, lux) = if night_map && tod.night > 0.0 && floor > lux {
         (color.lerp(map.color, tod.night), floor)
     } else {
@@ -158,7 +160,7 @@ fn drive(
 
 /// By night a moonlit map keeps this share of CoD4's own moonlight and sky
 /// light (moody but readable: soldiers stay visible against the deck).
-const NIGHT_FLOOR: f32 = 0.2;
+const NIGHT_FLOOR: f32 = 0.35;
 
 /// How many stops the auto-exposure may brighten a dark frame by night (by
 /// day its usual 3): it lifted a moonlit storm back to dusk.

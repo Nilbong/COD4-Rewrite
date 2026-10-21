@@ -22,6 +22,8 @@ pub mod install;
 pub mod iwd;
 pub mod iwi;
 pub mod menu;
+pub mod paths;
+pub mod brushes;
 pub mod unpack;
 pub mod wavelet;
 pub mod xanim;

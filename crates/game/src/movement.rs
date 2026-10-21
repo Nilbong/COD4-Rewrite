@@ -275,6 +275,9 @@ pub struct Mover {
     pub bob_cycle: f32,
     /// -1..1 lean, already limited by nearby walls.
     pub lean: f32,
+    /// Every step up (and down) taken so far, added up (metres): the camera
+    /// eases over each ([`crate::player::follow_camera`]).
+    pub steps_total: f32,
     /// Climbing onto or over something.
     pub mantle: Option<Mantle>,
     /// A mantle is there to be had (the player's own; IW3 shows a hint).
@@ -312,6 +315,7 @@ impl Default for Mover {
             clock_ms: 1.0,
             bob_cycle: 0.0,
             lean: 0.0,
+            steps_total: 0.0,
             mantle: None,
             mantle_hint: false,
             charge: None,
@@ -716,6 +720,13 @@ fn pmove(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, input: &MoveInput, view: &Vie
     m.jump_held = input.jump;
 
     ground_trace(ctx, *pos, m);
+    // Off the top of a short steep face (a curb's slanted edge) at a run:
+    // the walk had turned the speed up the slope, and kept it, so the player
+    // was thrown into the air. Leaving the ground without a jump, nothing
+    // carries them up.
+    if was_on_ground && !m.on_ground && !m.jumping && m.ladder.is_none() && m.velocity.y > 0.0 && crate::tune::get("move.crest_stop", 1.0) > 0.0 {
+        m.velocity.y = 0.0;
+    }
     update_bob_cycle(m, input, &ctx.tuning, fmove, input.right.clamp(-1.0, 1.0) * 127.0, msec);
 
     // Track the fall for damage and landing.
@@ -1259,6 +1270,12 @@ fn step_slide_move(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, gravity: bool, dt: 
     let steep_ground = had_ground && m.ground_normal.y < STEP_ON_SLOPE_NORMAL;
 
     let bumped = slide_move(ctx, pos, m, gravity, dt);
+    // In the air (not jumping), hitting something mustn't throw the player
+    // up: running off a ledge onto a curb's slanted face turned the sprint's
+    // speed into a bounce of 200+ units a second.
+    if !had_ground && !m.jumping && m.velocity.y > start_vel.y.max(0.0) {
+        m.velocity.y = start_vel.y.max(0.0);
+    }
 
     let mut step = if m.stance == Stance::Prone { PRONE_STEP_HEIGHT } else { STEP_HEIGHT };
     let mut jumping = false;
@@ -1326,6 +1343,9 @@ fn step_slide_move(ctx: &Ctx, pos: &mut Vec3, m: &mut Mover, gravity: bool, dt: 
         clamp_jump_velocity(m, pos.y);
     }
     // Stepping up or down costs speed (not when the step was undone).
+    if had_ground && (pos.y - down_pos.y).abs() > u(0.5) {
+        m.steps_total += pos.y - down_pos.y;
+    }
     if had_ground && m.stance != Stance::Prone && (pos.y - down_pos.y).abs() > u(0.5) {
         let scale = 1.0 - STEP_SLOWDOWN + (1.0 - (pos.y - start_pos.y).abs() / step).max(0.0) * STEP_SLOWDOWN;
         m.velocity *= scale;

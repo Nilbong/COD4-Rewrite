@@ -6,6 +6,14 @@ from the game (`COD4RW_RECORD=<file.csv> COD4RW_RECORD_WHO=all`).
 
     python tools/compare_play.py --real <dir|glob>... --bots <dir|glob>...
 
+With `--traits <sim dir>` it compares persona traits instead (sprint,
+holds, aggression, prefire, ADS, utility, ...: see tools/demo_traits.py)
+of the bots recorded in a sim against real players on the same map and
+mode (and all real players), and checks each bot plays like its own real
+player:
+
+    python tools/compare_play.py --traits <dir with bots-*.csv and the log> --map mp_crossfire --mode war
+
 Everything is resampled at 20 Hz (the demos' rate). A moment counts as a
 fight when the player fired or aimed down sights within half a second of it.
 Prints each measure for real players and bots, with how much real players
@@ -224,9 +232,17 @@ def group(paths):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--real", nargs="+", required=True)
-    ap.add_argument("--bots", nargs="+", required=True)
+    ap.add_argument("--real", nargs="+")
+    ap.add_argument("--bots", nargs="+")
+    ap.add_argument("--traits", help="a sim's recordings dir: compare persona traits")
+    ap.add_argument("--map", default="")
+    ap.add_argument("--mode", default="war")
+    ap.add_argument("--work", default=os.path.join(os.path.dirname(__file__), "..", "data", "demo_traits"))
     a = ap.parse_args()
+    if a.traits:
+        return traits(a)
+    if not a.real or not a.bots:
+        sys.exit("--real and --bots, or --traits")
     real, bots = group(files(a.real)), group(files(a.bots))
     if not real or not bots:
         sys.exit("no tracks found")
@@ -248,6 +264,42 @@ def main():
         b = pooled_b[k]
         flag = "" if math.isnan(b) or math.isnan(lo) or lo - 1e-9 <= b <= hi + 1e-9 else "  <-- outside"
         print(f"{k:28} {v:8.2f} {lo:8.2f}-{hi:<8.2f} {b:8.2f}{flag}")
+
+
+def traits(a):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import demo_traits as dt
+
+    real = []
+    with open(os.path.join(a.work, "players.csv"), encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            for k, v in r.items():
+                try:
+                    r[k] = float(v) if v not in ("",) else math.nan
+                except ValueError:
+                    pass
+            real.append(r)
+    bots = dt.bot_rows(a.traits, a.map, a.mode)
+    if not bots:
+        sys.exit(f"no bot recordings with the vis column in {a.traits}")
+    out = f"# Bots vs real players: {a.map} {a.mode}\n\n"
+    same_map = [r for r in real if r["map"] == a.map and r["mode"] == a.mode]
+    if len(same_map) >= 8:
+        out += dt.compare(same_map, bots, title=f"{a.map} {a.mode}") + "\n"
+    out += dt.compare([r for r in real if r["mode"] == a.mode], bots, title=f"all {a.mode}") + "\n"
+    # Persona fidelity: the bot against its own real player.
+    by_source = {}
+    with open(os.path.join(os.path.dirname(__file__), "..", "crates", "game", "src", "bots", "personas.csv"), encoding="utf-8") as f:
+        for r in csv.DictReader(line for line in f if not line.startswith("#")):
+            by_source[r["source"]] = r
+    keys = ["sprint_share", "still_share", "crouch_share", "hold_p50", "aggression", "ads_fight_share", "prefire_rate", "kill_dist_p50", "headshot_share"]
+    out += "### Each bot against its own real player\n\n" + dt.fidelity(bots, by_source, keys) + "\n"
+    out += "### Bots\n\n" + dt.table(["bot", "source", "style", "rank", "kd", "sprint", "still", "aggr", "prefire", "ads", "motives"],
+                                        [[b["player"], b["source"], b["style"], b["rank"], b["kd"], b["sprint_share"], b["still_share"],
+                                          b["aggression"], b["prefire_rate"], b["ads_fight_share"], b["motives"]] for b in bots])
+    print(out)
+    with open(os.path.join(a.traits, "traits.md"), "w", encoding="utf-8") as f:
+        f.write(out)
 
 
 if __name__ == "__main__":

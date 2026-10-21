@@ -87,7 +87,7 @@ impl Dressing {
             .iter()
             .map(|b| PreparedBone { name: b.name.clone(), parent: b.parent, bind_local: b.bind_local, anim_base: b.anim_base })
             .collect();
-        Some(PreparedModel { name: m.name.clone(), bones, surfaces, inverse_bindposes: m.inverse_bindposes.clone(), extent: m.extent, bounds: m.bounds })
+        Some(PreparedModel { name: m.name.clone(), bones, surfaces, inverse_bindposes: m.inverse_bindposes.clone(), extent: m.extent, bounds: m.bounds, shape: m.shape.clone() })
     }
 
     /// One surface: `None` leaves it out (the cornea); otherwise its mesh
@@ -148,7 +148,9 @@ impl Dressing {
         new_mesh.insert_attribute(Mesh::ATTRIBUTE_TANGENT, tangents);
         let mut new_material = old_material.clone();
         new_material.normal_map_texture = Some(image);
-        Some((crate::mesh_bounds::add(meshes, new_mesh), materials.add(new_material)))
+        let new_material = materials.add(new_material);
+        crate::character_look::register_copy(material.id(), new_material.id());
+        Some((crate::mesh_bounds::add(meshes, new_mesh), new_material))
     }
 }
 

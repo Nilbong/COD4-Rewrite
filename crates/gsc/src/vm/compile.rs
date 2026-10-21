@@ -306,7 +306,8 @@ impl Compiler {
             && let (Callee::Named(None, name), Some(object), false) = (&call.callee, &call.object, call.thread)
         {
             match name.as_str() {
-                "waittill" if !call.args.is_empty() => {
+                // (`waittillmatch` with the event alone is a `waittill`.)
+                "waittill" | "waittillmatch" if call.args.len() == 1 || (name == "waittill" && !call.args.is_empty()) => {
                     self.expr(object);
                     self.expr(&call.args[0]);
                     let vars = &call.args[1..];

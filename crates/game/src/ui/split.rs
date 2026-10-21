@@ -93,11 +93,6 @@ impl Frontend {
         self.slot_menus.get(slot).is_some_and(|m| !m.stack.is_empty())
     }
 
-    /// Does any local player have a menu up?
-    pub fn any_slot_menu(&self) -> bool {
-        self.slot_menus.iter().any(|m| !m.stack.is_empty())
-    }
-
     /// Open `menu` for a local player, on their team.
     pub(super) fn open_for(&mut self, slot: usize, menu: &str, team: Team) {
         self.with_slot(slot, |fe| {
@@ -250,8 +245,11 @@ pub(super) fn paint(fe: &mut Frontend, list: &mut DrawList, images: &mut Assets<
         // Their mouse cursor, if theirs is the mouse.
         if devices.devices.get(s) == Some(&Device::KeyboardMouse) {
             if let Some(p) = window.cursor_position().map(|c| c - origin).filter(|p| p.cmpge(Vec2::ZERO).all() && p.cmplt(size).all()) {
-                let at = Vec2::splat(32.0 * pl.scale);
-                ops.push(Op::Pic { pos: p - at * 0.5, size: at, material: "ui_cursor".into(), color: [1.0; 4] });
+                // The new UI's arrow (or hand), with the new style on.
+                if !fe.with_slot(s, |fe| super::next::cursor(fe, p, size.y, &mut ops)) {
+                    let at = Vec2::splat(32.0 * pl.scale);
+                    ops.push(Op::Pic { pos: p - at * 0.5, size: at, material: "ui_cursor".into(), color: [1.0; 4] });
+                }
             }
         }
         ops.extend(super::hud::menu_banner_ops(fe, &pl, &format!("PLAYER {}", s + 1)));

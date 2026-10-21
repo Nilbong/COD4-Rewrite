@@ -58,6 +58,30 @@ pub mod anim_slot {
     /// Raising and putting the gun away around a grenade throw.
     pub const QUICK_RAISE: usize = 18;
     pub const QUICK_DROP: usize = 19;
+    /// Raising and putting away an empty weapon (a pistol's slide back).
+    pub const EMPTY_RAISE: usize = 20;
+    pub const EMPTY_DROP: usize = 21;
+
+    /// A switch's raise anim (the normal one where it has no such anim).
+    pub fn raise(how: crate::loadout::SwitchAnim) -> [usize; 2] {
+        use crate::loadout::SwitchAnim::*;
+        match how {
+            Normal => [RAISE, RAISE],
+            Quick => [QUICK_RAISE, RAISE],
+            First => [FIRST_RAISE, RAISE],
+            Empty => [EMPTY_RAISE, RAISE],
+        }
+    }
+
+    /// A switch's put-away anim.
+    pub fn drop(how: crate::loadout::SwitchAnim) -> [usize; 2] {
+        use crate::loadout::SwitchAnim::*;
+        match how {
+            Quick => [QUICK_DROP, DROP],
+            Empty => [EMPTY_DROP, DROP],
+            Normal | First => [DROP, DROP],
+        }
+    }
     pub const SPRINT_IN: usize = 22;
     pub const SPRINT_LOOP: usize = 23;
     pub const SPRINT_OUT: usize = 24;
@@ -124,6 +148,11 @@ pub(crate) struct WeaponMotion {
 }
 
 impl WeaponMotion {
+    /// An inspect under way (or easing out).
+    pub(crate) fn inspecting(&self) -> bool {
+        self.inspect.is_some() || self.inspect_fade > 0.0
+    }
+
     fn new(sprint_pose: Option<crate::waw::SprintPose>) -> Self {
         WeaponMotion {
             idle_time: 0.0,
@@ -277,7 +306,8 @@ fn sync_viewmodel(
     let hands_name = hands.as_ref().map_or("no hands", |h| h.name.as_str());
     let mut skeleton = Skeleton::default();
     if let Some(h) = &hands {
-        spawn_model(&mut commands, &mut skeleton, SpawnModel { model: h, owner, attach_to: None, layers: Some(layer.clone()), shadows: false });
+        let surfaces = spawn_model(&mut commands, &mut skeleton, SpawnModel { model: h, owner, attach_to: None, layers: Some(layer.clone()), shadows: false });
+        crate::character_look::mark(&mut commands, &surfaces);
     }
     let mut assets = GunAssets {
         meshes: &mut meshes,
@@ -305,7 +335,10 @@ fn sync_viewmodel(
     let first = match (grenade, after_grenade, raising) {
         (Some(o), ..) => anims.get(anim_slot::HOLD_FIRE).map(|a| (a, o.until - o.started)),
         (_, Some(o), _) => anims.get(anim_slot::QUICK_RAISE).map(|a| (a, o.until - o.started)),
-        (_, _, Some(s)) => anims.get(if s.alt { anim_slot::ALT_RAISE } else { anim_slot::RAISE }).map(|a| (a, s.until - s.started)),
+        (_, _, Some(s)) => {
+            let [slot, fallback] = if s.alt { [anim_slot::ALT_RAISE; 2] } else { anim_slot::raise(s.anim) };
+            anims.get(slot).or_else(|| anims.get(fallback)).map(|a| (a, s.until - s.started))
+        }
         _ => anims.get(anim_slot::FIRST_RAISE).map(|a| (a, w.def.first_raise_time)),
     };
     if let Some((a, seconds)) = first.or(anims.get(anim_slot::IDLE).map(|a| (a, 0.0))) {
@@ -539,7 +572,8 @@ fn drive_one(
 
     if let Some(s) = loadout.and_then(|l| l.switching) {
         if !s.raising && *state != VmState::Dropping {
-            play(&mut anim, if s.alt { ALT_DROP } else { DROP }, 0.1, Some(s.until - s.started));
+            let [slot, fallback] = if s.alt { [ALT_DROP; 2] } else { anim_slot::drop(s.anim) };
+            play(&mut anim, if anims.get(slot).is_some() { slot } else { fallback }, 0.1, Some(s.until - s.started));
             *state = VmState::Dropping;
         }
         return;
@@ -618,7 +652,7 @@ fn drive_one(
 /// movement bob, applied as a rotation about the eye on top of the view.
 pub(crate) fn weapon_angles(
     time: Res<Time>,
-    players: Query<(&crate::splitscreen::LocalSlot, &Mover, &WeaponState, Option<&crate::first_person::feel::Feel>)>,
+    players: Query<(&crate::splitscreen::LocalSlot, &Mover, &WeaponState, Option<&crate::first_person::feel::Feel>, Option<&crate::first_person::live_hands::LiveHands>)>,
     mut vm: Query<(&ViewModelSlot, &mut Transform, &mut WeaponMotion, &Skeleton, &GlobalTransform, &ChildOf), With<ViewModelRoot>>,
     joints: Query<&GlobalTransform, Without<ViewModelRoot>>,
     mut poses: Query<(&mut Transform, &ChildOf), Without<ViewModelRoot>>,
@@ -628,7 +662,7 @@ pub(crate) fn weapon_angles(
     mut laptop: Local<f32>,
 ) {
   for (vslot, mut tf, mut motion, skeleton, root, camera) in &mut vm {
-    let Some((_, mover, w, feel)) = players.iter().find(|p| p.0.0 == vslot.0) else { continue };
+    let Some((_, mover, w, feel, live)) = players.iter().find(|p| p.0.0 == vslot.0) else { continue };
     let (d, f, dt) = (&w.def, w.ads, time.delta_secs());
 
     // Idle sway: three slow sines, stronger in ADS, eased per stance.
@@ -642,7 +676,14 @@ pub(crate) fn weapon_angles(
     let step = 0.5 * dt;
     motion.idle_factor += (target - motion.idle_factor).clamp(-step, step);
     motion.idle_time += speed * dt * 1000.0;
-    let (t, sc) = (motion.idle_time, amount * motion.idle_factor * 0.01);
+    // With live hands, CoD4's slow sines a third as strong at the hip: the
+    // hands' own idle (drift and corrections) takes their place.
+    let cod_idle = if live.is_some() && crate::first_person::live_hands() && d.ads_overlay.is_none() {
+        1.0 + (crate::first_person::live_hands::cod_idle() - 1.0) * (1.0 - f)
+    } else {
+        1.0
+    };
+    let (t, sc) = (motion.idle_time, amount * motion.idle_factor * 0.01 * cod_idle);
     let mut pitch = sc * (t * 0.001).sin();
     let mut yaw = sc * (t * 0.0007).sin();
     let mut roll = sc * (t * 0.0005).sin();
@@ -680,14 +721,32 @@ pub(crate) fn weapon_angles(
     let side = mover.horizontal_bob(std::f32::consts::FRAC_PI_2, bob_speed * 1.5, 10.0) * (cycle - 0.471_238_9).sin();
     roll += side.min(0.0) * scale;
 
-    // The gun's own kick ([`WeaponState::gun_offset`]).
-    pitch += w.gun_offset.x;
-    yaw += w.gun_offset.y;
+    // The gun's own kick ([`WeaponState::gun_offset`]): about the eye, as
+    // CoD4 has it; with live hands, about the hands (below).
+    let hands_on = live.is_some() && crate::first_person::live_hands();
+    if !hands_on {
+        pitch += w.gun_offset.x;
+        yaw += w.gun_offset.y;
+    }
     // Sway as the view turns and the richer bob ([`crate::first_person::feel`]).
     let (feel_angles, feel_shift) = feel.map_or((Vec3::ZERO, Vec3::ZERO), |f| (f.gun_angles, f.gun_shift));
-    pitch += feel_angles.x;
-    yaw += feel_angles.y;
-    roll += feel_angles.z;
+    // The live hands' weight in the transitions ([`crate::first_person::live_hands`]).
+    let (mut feel_angles, feel_shift) = live.map_or((feel_angles, feel_shift), |l| (feel_angles + l.gun_angles, feel_shift + l.gun_shift));
+    if hands_on {
+        feel_angles += Vec3::new(w.gun_offset.x, w.gun_offset.y, 0.0);
+    } else {
+        // (Without live hands, about the eye as before.)
+        pitch += feel_angles.x;
+        yaw += feel_angles.y;
+        roll += feel_angles.z;
+        feel_angles = Vec3::ZERO;
+    }
+    // The laser aim ([`crate::laser`]): the gun up to the cheek and canted
+    // inward, eased in and out.
+    let la = w.laser_aim * w.laser_aim * (3.0 - 2.0 * w.laser_aim);
+    let (laser_turn, laser_shift) = if la > 0.0 { crate::laser::pose() } else { (Vec3::ZERO, Vec3::ZERO) };
+    pitch += laser_turn.x * la;
+    yaw += laser_turn.y * la;
     // CoD angles: pitch down, yaw left, roll right side down.
     let euler = |a: Vec3| Quat::from_euler(EulerRot::YXZ, a.y.to_radians(), -a.x.to_radians(), -a.z.to_radians());
     // CoD's (forward, left, up) in inches, along the view's axes.
@@ -780,12 +839,31 @@ pub(crate) fn weapon_angles(
         }
     }
 
+    // The laser aim's cant: about the view's forward line through the gun
+    // (not the eye, which swung the gun across the view).
+    if la > 0.0 {
+        let cant = Quat::from_axis_angle(Vec3::NEG_Z, (laser_turn.z * la).to_radians());
+        let pivot = along(crate::laser::pivot());
+        moved = cant * moved + (pivot - cant * pivot);
+        turn = cant * turn;
+    }
+    // With live hands, the gun's weight turns it about the hands (near the
+    // right hand and the stock), not the eye: about the eye a turn only
+    // slides the picture; about the hands the gun's side shows. Eased onto
+    // the eye as the sights come up, so they stay on it.
+    let weigh = euler(feel_angles);
+    let hands_pivot = along(crate::first_person::live_hands::pivot()) * (1.0 - f).powi(2);
+    let moved = weigh * moved + (hands_pivot - weigh * hands_pivot);
+    let turn = weigh * turn;
     tf.rotation = offset * turn * rest;
     // The sprint pose's offset, along the view's axes (forward, `axis[1]`,
     // up): IW's second axis points left, so a negative `sprintOfsR` is to
     // the right.
     let ofs = motion.sprint_pose.map_or(Vec3::ZERO, |p| p.ofs * k);
-    tf.translation = along(ofs + feel_shift) + offset * moved;
+    // The Weapon Position setting, at the hip only (aimed, the sights are
+    // where they always were).
+    let position = crate::settings_apply::gun_position(time.elapsed_secs()) * (1.0 - f).powi(2) * (1.0 - la);
+    tf.translation = along(ofs + feel_shift + laser_shift * la + position) + offset * moved;
 
     // The airstrike's laptop, once up, is brought before the eye, arms and
     // all: the whole viewmodel moved so the screen sits in the middle of
@@ -815,6 +893,26 @@ pub(crate) fn weapon_angles(
             let target = bevy::math::Affine3A::from_rotation_translation(facing * Quat::from_rotation_x(g("tilt", 20.0).to_radians()), middle);
             let (_, rotation, translation) = (target * local.inverse()).to_scale_rotation_translation();
             let e = *laptop * *laptop * (3.0 - 2.0 * *laptop);
+            // Debug aid: `COD4RW_LAPTOP_DEBUG` logs, twice a second while it's
+            // held, where the arms are about the screen (its inches: x
+            // across, y up the lid, z out of it) and in view (-1..1).
+            if std::env::var_os("COD4RW_LAPTOP_DEBUG").is_some() && *laptop >= 1.0 && (time.elapsed_secs() * 2.0).fract() < dt * 2.0 {
+                let to_screen = local.inverse();
+                let placed = target * local.inverse();
+                let names = ["j_wrist_le", "j_wrist_ri", "j_elbow_le", "j_elbow_ri", "j_shoulder_le", "j_shoulder_ri", "j_gun", "tag_weapon"];
+                let found: Vec<String> = names
+                    .iter()
+                    .filter_map(|n| {
+                        let g = skeleton.joint(n).and_then(|j| joints.get(j).ok())?;
+                        let p = root.affine().inverse().transform_point3(g.translation());
+                        let on = to_screen.transform_point3(p) / (crate::units::INCH * scale);
+                        let c = placed.transform_point3(p);
+                        let ndc = Vec2::new(c.x / (-c.z * half * aspect), c.y / (-c.z * half));
+                        Some(format!("{n} screen {:.1?} view {:.2?}", on.to_array(), ndc.to_array()))
+                    })
+                    .collect();
+                info!("laptop hold: {}", found.join(" | "));
+            }
             tf.translation = tf.translation.lerp(offset * translation, e);
             tf.rotation = tf.rotation.slerp(offset * rotation, e);
         }

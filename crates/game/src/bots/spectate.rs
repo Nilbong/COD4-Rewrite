@@ -66,7 +66,7 @@ pub fn setup(app: &mut App) {
         hidden_body: None,
     })
     .add_systems(OnEnter(crate::state::GameState::InGame), spawn_overlay)
-    .add_systems(Update, (controls, overlay).chain().run_if(crate::state::in_game))
+    .add_systems(Update, (controls, overlay, hide_empty_panels).chain().run_if(crate::state::in_game))
     .add_systems(
         PostUpdate,
         (place_camera, fight_shots)
@@ -284,20 +284,40 @@ struct Overlay;
 #[derive(Component)]
 struct MatchOverlay;
 
-fn spawn_overlay(mut commands: Commands) {
-    let text = |size: f32| {
-        (Text::new(""), TextFont { font_size: FontSize::Px(size), ..default() }, TextColor(Color::WHITE), TextShadow::default())
+/// The overlay in the new menus' look: their typeface (Bahnschrift, else
+/// Bevy's own), theme ink on a dark panel with the accent along its left.
+fn spawn_overlay(mut commands: Commands, mut fonts: ResMut<Assets<Font>>) {
+    use crate::ui::next::theme as t;
+    let colour = |c: t::Rgba| Color::srgba(c[0], c[1], c[2], c[3]);
+    let font = match crate::ui::next::font::face_bytes() {
+        Some(bytes) => bevy::text::FontSource::Handle(fonts.add(Font::from_bytes(bytes.to_vec()))),
+        None => bevy::text::FontSource::default(),
     };
-    commands.spawn((
-        Overlay,
-        text(18.0),
-        Node { position_type: PositionType::Absolute, left: px(16), bottom: px(14), ..default() },
-    ));
-    commands.spawn((
-        MatchOverlay,
-        text(20.0),
-        Node { position_type: PositionType::Absolute, left: px(16), top: px(12), ..default() },
-    ));
+    let text = |size: f32| (Text::new(""), TextFont { font: font.clone(), font_size: FontSize::Px(size), ..default() }, TextColor(colour(t::INK)), TextShadow::default());
+    let panel = |left: Val, top: Option<Val>, bottom: Option<Val>| {
+        (
+            Node {
+                position_type: PositionType::Absolute,
+                left,
+                top: top.unwrap_or(Val::Auto),
+                bottom: bottom.unwrap_or(Val::Auto),
+                padding: UiRect::axes(px(12), px(8)),
+                border: UiRect { left: px(3), ..default() },
+                ..default()
+            },
+            BackgroundColor(colour(t::hex(0x0b0e0f, 0.72))),
+            BorderColor::all(colour(t::ACCENT)),
+        )
+    };
+    commands.spawn((Overlay, text(17.0), panel(px(16), None, Some(px(14)))));
+    commands.spawn((MatchOverlay, text(19.0), panel(px(16), Some(px(12)), None)));
+}
+
+/// A panel with nothing to say (photo mode) isn't shown.
+fn hide_empty_panels(mut panels: Query<(&Text, &mut Visibility), Or<(With<Overlay>, With<MatchOverlay>)>>) {
+    for (text, mut v) in &mut panels {
+        v.set_if_neq(if text.0.is_empty() { Visibility::Hidden } else { Visibility::Inherited });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

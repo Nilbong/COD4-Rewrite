@@ -45,6 +45,9 @@ pub struct PawnSample {
     pub body_turn: Quat,
     /// A knife swing: when it started, and whether a lunge.
     pub melee: Option<(f32, bool)>,
+    /// The gun's own kick in the hand (`WeaponState::gun_offset`, degrees:
+    /// pitch, yaw), so the replayed gun recoils as it did.
+    pub gun_offset: Vec2,
 }
 
 /// A grenade or projectile at one moment.
@@ -178,6 +181,7 @@ pub fn record(
                 lean: mover.lean,
                 body_turn,
                 melee: melee.map(|m| (m.started, m.charge)),
+                gun_offset: w.gun_offset,
             }
         })
         .collect();

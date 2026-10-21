@@ -8,7 +8,7 @@ use crate::protocol::{MAX_MESSAGE, MAX_PLAYERS, PeerId};
 use anyhow::{Result, bail, ensure};
 
 /// Lobby message format version, separate from the transport's.
-pub const LOBBY_VERSION: u8 = 1;
+pub const LOBBY_VERSION: u8 = 2;
 /// "[CLAN] Name" from the combat record fits easily.
 pub const MAX_NAME: usize = 24;
 /// The game build's version string ("0.1.0").
@@ -23,7 +23,22 @@ pub struct Profile {
     pub name: String,
     pub rank: u8,
     pub prestige: u8,
+    /// The Call of Duty games this player has installed, and the ones their
+    /// custom classes use: bits in the game's own order (CoD4, Black Ops,
+    /// MW2, World at War; [`MAX_GAMES`] of them).
+    pub games: u8,
+    pub uses: u8,
 }
+
+/// "Refused: a different version" in lobby format `version`'s bytes, for a
+/// player on another version of the game (every format so far, 1 and 2,
+/// writes it the same: message 5, reason 1).
+pub fn version_refusal(version: u8) -> Vec<u8> {
+    vec![b'L', version, 5, 1]
+}
+
+/// Game bits a profile may set.
+pub const MAX_GAMES: u32 = 4;
 
 /// Someone in the lobby: the host is peer 0.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -54,6 +69,9 @@ pub enum Refusal {
     Version,
     /// The match already started.
     Started,
+    /// The lobby's map needs a game (or a custom map) this player hasn't
+    /// got.
+    Map,
 }
 
 /// A pawn in the match, as guests need it beyond its snapshot state.
@@ -123,7 +141,15 @@ pub enum LobbyMsg {
     /// The match's other state, either way (objectives, killstreaks, the
     /// clock, rounds...): the game encodes and checks it ([`MAX_GAME`]).
     Game(Vec<u8>),
+    /// Host -> everyone (or a joiner), before [`LobbyMsg::Start`]: part
+    /// `part` of `parts` of the map editor layout for `map`, compressed by
+    /// the game. `parts` 0: the host has none (play the map as it comes).
+    Layout { map: String, part: u8, parts: u8, data: Vec<u8> },
 }
+
+/// The largest [`LobbyMsg::Layout`] part, and the most parts.
+pub const MAX_LAYOUT_PART: usize = 1000;
+pub const MAX_LAYOUT_PARTS: u8 = 64;
 
 /// The largest [`LobbyMsg::Game`] payload.
 pub const MAX_GAME: usize = MAX_MESSAGE - 8;
@@ -165,7 +191,8 @@ impl W {
     fn profile(&mut self, p: &Profile) -> Result<()> {
         ensure!(p.rank <= MAX_RANK && p.prestige <= MAX_PRESTIGE, "invalid rank");
         self.str(&p.name, MAX_NAME)?;
-        self.0.extend([p.rank, p.prestige]);
+        ensure!(p.games >> MAX_GAMES == 0 && p.uses >> MAX_GAMES == 0, "invalid games");
+        self.0.extend([p.rank, p.prestige, p.games, p.uses]);
         Ok(())
     }
 }
@@ -197,7 +224,8 @@ impl<'a> R<'a> {
         Ok(s)
     }
     fn profile(&mut self) -> Result<Profile> {
-        let p = Profile { name: self.str(MAX_NAME)?, rank: self.u8()?, prestige: self.u8()? };
+        let p = Profile { name: self.str(MAX_NAME)?, rank: self.u8()?, prestige: self.u8()?, games: self.u8()?, uses: self.u8()? };
+        ensure!(p.games >> MAX_GAMES == 0 && p.uses >> MAX_GAMES == 0, "invalid games");
         ensure!(p.rank <= MAX_RANK && p.prestige <= MAX_PRESTIGE, "invalid rank");
         Ok(p)
     }
@@ -239,6 +267,7 @@ impl LobbyMsg {
                     Refusal::Full => 0,
                     Refusal::Version => 1,
                     Refusal::Started => 2,
+                    Refusal::Map => 3,
                 },
             ]),
             Self::Pawn(p) => {
@@ -282,6 +311,14 @@ impl LobbyMsg {
                 w.0.push(11);
                 w.0.extend(allies.to_le_bytes());
                 w.0.extend(axis.to_le_bytes());
+            }
+            Self::Layout { map, part, parts, data } => {
+                ensure!(*parts <= MAX_LAYOUT_PARTS && (*parts == 0 || part < parts) && data.len() <= MAX_LAYOUT_PART, "invalid layout part");
+                w.0.push(15);
+                w.str(map, 48)?;
+                w.0.extend([*part, *parts]);
+                w.0.extend((data.len() as u16).to_le_bytes());
+                w.0.extend(data);
             }
             Self::Game(data) => {
                 ensure!(!data.is_empty() && data.len() <= MAX_GAME, "invalid game message");
@@ -363,6 +400,7 @@ impl LobbyMsg {
                 0 => Refusal::Full,
                 1 => Refusal::Version,
                 2 => Refusal::Started,
+                3 => Refusal::Map,
                 _ => bail!("invalid refusal"),
             }),
             6 => {
@@ -411,6 +449,13 @@ impl LobbyMsg {
                 }
                 k
             }
+            15 => {
+                let map = r.str(48)?;
+                let (part, parts) = (r.u8()?, r.u8()?);
+                let n = r.u16()? as usize;
+                ensure!(parts <= MAX_LAYOUT_PARTS && (parts == 0 || part < parts) && n <= MAX_LAYOUT_PART, "invalid layout part");
+                Self::Layout { map, part, parts, data: r.take(n)?.to_vec() }
+            }
             14 => {
                 let n = r.u16()? as usize;
                 ensure!(n > 0 && n <= MAX_GAME, "invalid game message");
@@ -454,7 +499,7 @@ mod tests {
         LobbyMsg::Lobby {
             settings: Settings { map: "mp_crossfire".into(), mode: 2, time: 3, score: 1, difficulty: 2, hardcore: true },
             members: (0..10)
-                .map(|i| Member { peer: i, profile: Profile { name: name.clone(), rank: 54, prestige: 10 }, team: (i % 2) as u8 })
+                .map(|i| Member { peer: i, profile: Profile { name: name.clone(), rank: 54, prestige: 10, games: 15, uses: 5 }, team: (i % 2) as u8 })
                 .collect(),
             bots: [vec!["y".repeat(MAX_NAME); 4], vec!["z".repeat(MAX_NAME); 4]],
         }
@@ -463,11 +508,12 @@ mod tests {
     #[test]
     fn roundtrip_and_fit() {
         let msgs = [
-            LobbyMsg::Join { build: "0.1.0".into(), profile: Profile { name: "[SAS] Soap".into(), rank: 9, prestige: 1 } },
+            LobbyMsg::Join { build: "0.1.0".into(), profile: Profile { name: "[SAS] Soap".into(), rank: 9, prestige: 1, games: 5, uses: 1 } },
             LobbyMsg::SwitchTeam,
             full_lobby(),
             LobbyMsg::Start,
             LobbyMsg::Refused(Refusal::Version),
+            LobbyMsg::Refused(Refusal::Map),
             LobbyMsg::Pawn(PawnInfo { id: 7, peer: BOT, name: "Gaz".into(), team: 1, weapon: "m4_acog_mp".into(), kills: 3, deaths: 9 }),
             LobbyMsg::PawnGone(7),
             LobbyMsg::MatchOver(1),
@@ -476,6 +522,8 @@ mod tests {
             LobbyMsg::Launch { shooter: 2, weapon: "rpg_mp".into(), from: [1.0, 2.0, 3.0], dir: [0.0, 0.0, -1.0], yaw: 0.5 },
             LobbyMsg::Kill { victim: 3, attacker: BOT, weapon: "m16_gl_mp".into(), location: 4 },
             LobbyMsg::Game(vec![1, 2, 3]),
+            LobbyMsg::Layout { map: "mp_crash".into(), part: 1, parts: 3, data: vec![7; MAX_LAYOUT_PART] },
+            LobbyMsg::Layout { map: "mp_crash".into(), part: 0, parts: 0, data: Vec::new() },
             LobbyMsg::Game(vec![9; MAX_GAME]),
             LobbyMsg::Class(Class {
                 guns: vec![("m4_mp:acog".into(), 2), ("deserteagle_mp".into(), 0)],
@@ -492,6 +540,13 @@ mod tests {
     }
 
     #[test]
+    fn version_refusal_reads_as_one() {
+        assert_eq!(LobbyMsg::decode(&version_refusal(LOBBY_VERSION)).unwrap(), LobbyMsg::Refused(Refusal::Version));
+        assert_eq!(LobbyMsg::Refused(Refusal::Version).encode().unwrap(), version_refusal(LOBBY_VERSION));
+        assert!(LobbyMsg::decode(&version_refusal(1)).is_err());
+    }
+
+    #[test]
     fn hostile_input_rejected() {
         let data = full_lobby().encode().unwrap();
         for n in 0..data.len() {
@@ -500,11 +555,11 @@ mod tests {
         let mut extra = data.clone();
         extra.push(0);
         assert!(LobbyMsg::decode(&extra).is_err());
-        let bad = |name: &str| LobbyMsg::Join { build: "1".into(), profile: Profile { name: name.into(), rank: 0, prestige: 0 } };
+        let bad = |name: &str| LobbyMsg::Join { build: "1".into(), profile: Profile { name: name.into(), rank: 0, prestige: 0, ..Default::default() } };
         assert!(bad("^1red").encode().is_err());
         assert!(bad("line\nbreak").encode().is_err());
         assert!(bad("").encode().is_err());
-        assert!(LobbyMsg::Join { build: "1".into(), profile: Profile { name: "a".into(), rank: 55, prestige: 0 } }.encode().is_err());
+        assert!(LobbyMsg::Join { build: "1".into(), profile: Profile { name: "a".into(), rank: 55, ..Default::default() } }.encode().is_err());
         assert_eq!(clean_name("^1Pr\u{e9}ce\n"), "1Prce");
         assert_eq!(clean_name("   "), "Player");
     }

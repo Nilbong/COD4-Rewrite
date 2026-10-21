@@ -12,6 +12,10 @@
 //! value` the first time it's asked for; a line whose value still equals its
 //! listed default follows the code's default (so changing a default in code
 //! takes effect, and the line is refreshed), any other value overrides it.
+//!
+//! Over the file sits the map's look ([`look_set`]): the Map Look Editor's
+//! values and a map's saved look (`crate::look_editor`), cleared each map.
+//! They win over the file; saving them never writes `tuning.txt`.
 
 use bevy::prelude::*;
 use std::collections::BTreeMap;
@@ -30,6 +34,8 @@ impl Plugin for TunePlugin {
 
 struct Tuning {
     values: BTreeMap<String, f32>,
+    /// The map's look (`crate::look_editor`), over `values`.
+    look: BTreeMap<String, f32>,
     /// Knobs asked for, with their defaults (for listing in the file).
     known: BTreeMap<String, f32>,
     modified: Option<SystemTime>,
@@ -37,7 +43,7 @@ struct Tuning {
 }
 
 static TUNING: LazyLock<RwLock<Tuning>> =
-    LazyLock::new(|| RwLock::new(Tuning { values: BTreeMap::new(), known: BTreeMap::new(), modified: None, dirty: false }));
+    LazyLock::new(|| RwLock::new(Tuning { values: BTreeMap::new(), look: BTreeMap::new(), known: BTreeMap::new(), modified: None, dirty: false }));
 
 fn path() -> PathBuf {
     std::env::var_os("COD4RW_TUNING").map_or_else(|| PathBuf::from("tuning.txt"), PathBuf::from)
@@ -46,6 +52,12 @@ fn path() -> PathBuf {
 /// The value of knob `name`, or `default` when the file doesn't set it.
 pub fn get(name: &str, default: f32) -> f32 {
     if let Ok(t) = TUNING.read() {
+        // (The editor's A/B shows the map without its look.)
+        if !crate::atmos::climate::original() {
+            if let Some(v) = t.look.get(name) {
+                return *v;
+            }
+        }
         if let Some(v) = t.values.get(name) {
             return *v;
         }
@@ -148,4 +160,41 @@ fn watch(time: Res<Time<Real>>, mut next: Local<f32>) {
             t.modified = std::fs::metadata(path()).and_then(|m| m.modified()).ok();
         }
     }
+}
+
+/// Sets knob `name` in the map's look (over `tuning.txt`), `None` unsets it.
+pub fn look_set(name: &str, value: Option<f32>) {
+    if let Ok(mut t) = TUNING.write() {
+        match value.filter(|v| v.is_finite()) {
+            Some(v) => {
+                t.look.insert(name.to_owned(), v);
+            }
+            None => {
+                t.look.remove(name);
+            }
+        }
+    }
+}
+
+/// The map's look as set ([`look_set`]).
+pub fn look_all() -> BTreeMap<String, f32> {
+    TUNING.read().map(|t| t.look.clone()).unwrap_or_default()
+}
+
+/// Replaces the whole map's look (a map's saved look, or nothing).
+pub fn look_replace(values: BTreeMap<String, f32>) {
+    if let Ok(mut t) = TUNING.write() {
+        t.look = values.into_iter().filter(|(_, v)| v.is_finite()).collect();
+    }
+}
+
+/// The value knob `name` has without the map's look: `tuning.txt`'s, else
+/// the code's default as last asked for, else `fallback`.
+pub fn base(name: &str, fallback: f32) -> f32 {
+    TUNING.read().ok().and_then(|t| t.values.get(name).or(t.known.get(name)).copied()).unwrap_or(fallback)
+}
+
+/// Whether the map's look sets knob `name` (cheap: no copy).
+pub fn look_has(name: &str) -> bool {
+    !crate::atmos::climate::original() && TUNING.read().is_ok_and(|t| t.look.contains_key(name))
 }

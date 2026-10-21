@@ -30,14 +30,25 @@ struct EndHeading;
 #[derive(Component)]
 struct EndBody;
 
-const GOLD: Color = Color::srgb(1.0, 0.85, 0.45);
+/// The menus' reward gold and ink (`crate::ui::next::theme`).
+const GOLD: Color = Color::srgb(0.949, 0.788, 0.298);
+
+/// The menus' typeface (Bahnschrift), made at setup; Bevy's own font where
+/// the PC lacks it.
+static FONT: std::sync::OnceLock<Handle<Font>> = std::sync::OnceLock::new();
 
 fn text(s: &str, size: f32, color: Color) -> (Text, TextFont, TextColor, TextShadow) {
-    (Text::new(s), TextFont { font_size: FontSize::Px(size), ..default() }, TextColor(color), TextShadow::default())
+    let font = FONT.get().map_or_else(bevy::text::FontSource::default, |h| bevy::text::FontSource::Handle(h.clone()));
+    (Text::new(s), TextFont { font, font_size: FontSize::Px(size), ..default() }, TextColor(color), TextShadow::default())
 }
 
-fn setup(mut commands: Commands, campaign: Option<Res<Campaign>>) {
+fn setup(mut commands: Commands, campaign: Option<Res<Campaign>>, mut fonts: ResMut<Assets<Font>>) {
     let Some(campaign) = campaign else { return };
+    if FONT.get().is_none()
+        && let Some(bytes) = crate::ui::next::font::face_bytes()
+    {
+        FONT.set(fonts.add(Font::from_bytes(bytes.to_vec()))).ok();
+    }
     let root = commands
         .spawn(Node { width: percent(100), height: percent(100), position_type: PositionType::Absolute, ..default() })
         .id();
@@ -126,7 +137,12 @@ fn marker(
     mut q: Single<(&mut Text, &mut Node, &mut Visibility, &ComputedNode), With<Marker>>,
 ) {
     let (text, node, vis, computed) = &mut *q;
+    *super::OBJECTIVE_AT.lock().unwrap_or_else(|e| e.into_inner()) = campaign.marker();
+    // (CoD4's own levels mark objectives on the compass only.)
     let shown = (|| {
+        if campaign.scripted {
+            return None;
+        }
         let at = crate::units::pos(campaign.marker()?);
         let (camera, view, _) = cameras.iter().find(|c| c.2.0 == 0)?;
         let px = camera.world_to_viewport(view, at).ok()?;
@@ -151,7 +167,8 @@ fn marker(
 fn title(time: Res<Time>, campaign: Res<Campaign>, mut q: Single<(&mut TextColor, &mut Visibility), With<Title>>) {
     let Some(t0) = campaign.started else { return };
     let t = time.elapsed_secs() - t0;
-    let over = if campaign.ended.is_some() { 0.0 } else { 1.0 };
+    // (A scripted level shows its own: the Coup's credits.)
+    let over = if campaign.ended.is_some() || campaign.scripted { 0.0 } else { 1.0 };
     let alpha = (t / 1.0).min(1.0).min((TITLE_TIME - t) / 1.5).clamp(0.0, 1.0) * over;
     let (color, vis) = &mut *q;
     color.0 = Color::srgba(1.0, 1.0, 1.0, alpha);
@@ -168,7 +185,8 @@ fn end_screen(
     mut body: Single<&mut Text, (With<EndBody>, Without<EndHeading>)>,
 ) {
     let (vis, bg) = &mut *screen;
-    let Some((outcome, at)) = campaign.ended else {
+    // (Going on to the next level: no screen, as CoD4.)
+    let Some((outcome, at)) = campaign.ended.filter(|_| campaign.next.is_none()) else {
         vis.set_if_neq(Visibility::Hidden);
         return;
     };
@@ -178,7 +196,18 @@ fn end_screen(
     let m = campaign.mission;
     let (h, line) = match outcome {
         Outcome::Complete => ("MISSION COMPLETE", m.title.to_owned()),
-        Outcome::Failed => ("MISSION FAILED", content.as_ref().map_or(m.failed.1.to_owned(), |c| localize(c, m.failed.0, m.failed.1))),
+        // (The scripts' reason when they gave one: friendly fire, out of
+        // flashbangs...)
+        Outcome::Failed => (
+            "MISSION FAILED",
+            match (&campaign.deadquote, content.as_ref()) {
+                (Some(q), Some(c)) => {
+                    let key = q.trim_start_matches(['@', '&']);
+                    localize(c, key, key)
+                }
+                _ => content.as_ref().map_or(m.failed.1.to_owned(), |c| localize(c, m.failed.0, m.failed.1)),
+            },
+        ),
     };
     let secs = (at - campaign.started.unwrap_or(at)).max(0.0) as u32;
     let mut b = format!("{line}\n\nTime  {}:{:02}      Kills  {}", secs / 60, secs % 60, campaign.kills);

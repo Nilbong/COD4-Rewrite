@@ -60,10 +60,14 @@ fn mark_camera(mut commands: Commands, cameras: Query<Entity, (With<MainCamera>,
     }
 }
 
-/// The history the size of the window (the copy needs them equal).
+/// The history the size of the world camera's image (the copy needs them
+/// equal): the window's, or the upscaler's smaller one
+/// (`crate::render_scale`).
 fn size_history(window: Option<Single<&Window, With<bevy::window::PrimaryWindow>>>, mut images: ResMut<Assets<Image>>) {
     let (Some(window), Some(handle)) = (window, HISTORY.get()) else { return };
-    let size = Extent3d { width: window.physical_width().max(1), height: window.physical_height().max(1), depth_or_array_layers: 1 };
+    let full = UVec2::new(window.physical_width(), window.physical_height());
+    let world = crate::render_scale::world_size().unwrap_or(full).max(UVec2::ONE);
+    let size = Extent3d { width: world.x, height: world.y, depth_or_array_layers: 1 };
     if images.get(handle).is_some_and(|i| i.texture_descriptor.size != size) {
         if let Some(mut image) = images.get_mut(handle) {
             image.resize(size);

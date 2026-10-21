@@ -1,0 +1,5 @@
+# mp_crossfire's normal look (lighting pass 2026-10-19, from the user's Crossfire reports): a slightly warmer sun and a little more contrast (the whole sun is live now: no extra sun brightness) and colour, so sun and shade read apart.
+contrast.mp_crossfire = 1.12
+saturation.mp_crossfire = 1.1
+warmth.mp_crossfire = 0.015
+exposure.mp_crossfire = -0.35

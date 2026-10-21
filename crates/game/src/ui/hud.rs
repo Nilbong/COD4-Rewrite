@@ -43,9 +43,6 @@ use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-/// World units from the compass's centre to its edge: half CoD4's
-/// `compassMaxRange` (2500), for a closer view.
-const COMPASS_RANGE: f32 = 1250.0;
 /// `compassPlayerWidth`, `compassFriendlyWidth`.
 const COMPASS_ICON: f32 = 18.75;
 /// `compassSoundPingFadeTime`: how long a shot shows an enemy.
@@ -101,6 +98,9 @@ pub(super) fn build(app: &mut App) {
     if std::env::var_os("COD4RW_HITMARKERTEST").is_some() {
         app.add_systems(Update, hit_marker_test.run_if(in_game));
     }
+    if std::env::var_os("COD4RW_NOTICETEST").is_some() {
+        app.add_systems(Update, notice_test.run_if(in_game));
+    }
     if std::env::var_os("COD4RW_HUDTEST").is_some() {
         app.add_systems(
             Update,
@@ -109,8 +109,90 @@ pub(super) fn build(app: &mut App) {
     }
 }
 
+/// Debug aid: `COD4RW_NOTICETEST=<dir>` shows the match's notices for
+/// screenshots, then exits: a promotion, a kill streak, its key not
+/// available and a weapon to swap for (n1), the player killed (n2), the
+/// scoreboard held up (n3) and the pause menu (n4: Headquarters' or a
+/// mission's where those are running).
+#[allow(clippy::too_many_arguments)]
+fn notice_test(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut hud: ResMut<HudState>,
+    mut fe: Option<ResMut<Frontend>>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    me: Query<Entity, With<LocalPlayer>>,
+    mut step: Local<u8>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+    let t = time.elapsed_secs();
+    let dir = std::path::PathBuf::from(std::env::var("COD4RW_NOTICETEST").unwrap_or_default());
+    let mut shot = |name: &str| {
+        std::fs::create_dir_all(&dir).ok();
+        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(dir.join(format!("{name}.png"))));
+    };
+    match *step {
+        0 if t >= 8.0 => {
+            hud.notify("Promoted!".into(), "Private First Class".into(), String::new(), t);
+            hud.streak_notify = Some((3, Hardpoint::Uav, t - 2.0));
+            hud.unavailable = Some((Hardpoint::Airstrike, t));
+            hud.pickup = Some("WEAPON_M16".into());
+            *step = 1;
+        }
+        1 if t >= 8.8 => {
+            shot("n1");
+            *step = 2;
+        }
+        2 if t >= 9.5 => {
+            hud.pickup = None;
+            if let Ok(e) = me.single() {
+                commands.entity(e).insert(Dead { respawn_at: t + 4.0, killer: Some("Sgt. Newcastle".into()) });
+            }
+            *step = 3;
+        }
+        3 if t >= 10.0 => {
+            shot("n2");
+            *step = 4;
+        }
+        4 if t >= 10.5 => {
+            if let Ok(e) = me.single() {
+                commands.entity(e).remove::<Dead>();
+            }
+            keys.press(KeyCode::Tab);
+            *step = 5;
+        }
+        5 if t >= 11.2 => {
+            shot("n3");
+            keys.release(KeyCode::Tab);
+            *step = 6;
+        }
+        6 if t >= 11.6 => {
+            if let Some(fe) = fe.as_mut() {
+                // (Splitscreen: each player's own, Players 1 and 2.)
+                if crate::splitscreen::active() {
+                    fe.open_for(0, "class", Team::Allies);
+                    fe.open_for(1, "class", Team::Allies);
+                } else {
+                    fe.menu_slot = 0;
+                    fe.open(if crate::hq::active() { super::hq::PAUSE_MENU } else { "class" });
+                }
+            }
+            *step = 7;
+        }
+        7 if t >= 12.4 => {
+            shot("n4");
+            *step = 8;
+        }
+        8 if t >= 13.0 => {
+            exit.write(AppExit::Success);
+        }
+        _ => {}
+    }
+}
+
 /// Debug aid: `COD4RW_HITMARKERTEST=<dir>` fakes a hit 6 s in and a kill
-/// 8 s in, saving frames through each marker's pop and fade, then exits.
+/// (with its "+10") 8 s in, saving frames through each marker's pop and fade, then exits.
 fn hit_marker_test(
     mut commands: Commands,
     time: Res<Time>,
@@ -135,6 +217,8 @@ fn hit_marker_test(
         hud.hit_start = t;
         if kill {
             hud.hit_kill = t;
+            // (And the "+10" the kill is worth.)
+            hud.add_xp(10, t);
         }
     }
     if hud.hit >= start && t - hud.hit >= AT[i] {
@@ -599,10 +683,6 @@ impl Default for HudState {
 }
 
 impl HudState {
-    /// Where the minimap's map is drawn (window pixels), if it is.
-    pub(super) fn minimap_rect(&self) -> Option<(Vec2, Vec2)> {
-        self.compass.as_ref().map(|c| (c.pos, c.size))
-    }
 
     /// A line of plain text among the obituaries.
     /// XP earned: the "+N" by the crosshair, adding up while it shows.
@@ -674,6 +754,10 @@ fn collect(
     let my_team = me.map_or(Team::Allies, |m| m.1);
     // The player's enemies: the other team, or in free-for-all everyone else.
     let enemy = |p: &Pawn| mine.as_ref().map_or(p.team != my_team, |m| hostile(p, m));
+    // Online notices ("Class changed: ...", [`crate::netplay::mixed`]).
+    for text in crate::netplay::mixed::take_notices() {
+        hud.message(text, now);
+    }
     for n in notices.read() {
         match n {
             StreakNotice::Earned { streak, item } => hud.streak_notify = Some((*streak, *item, now)),
@@ -998,8 +1082,9 @@ pub(super) fn paint(
     for h in &mut extra.0 {
         h.compass = None;
     }
-    // Photo mode ([`crate::photo`]): no HUD at all.
-    if crate::photo::active() {
+    // Photo mode ([`crate::photo`]), the fly camera ([`crate::flycam`]) or
+    // a mission's script hiding it: no HUD at all (menus still draw).
+    if crate::photo::active() || crate::flycam::active() || crate::campaign::hud_hidden() {
         hud.ops.clear();
         for h in &mut extra.0 {
             h.ops.clear();
@@ -1008,7 +1093,9 @@ pub(super) fn paint(
     }
     // CoD4 hides the HUD under its menus (`ui_active`).
     // Headquarters has no combat HUD: its stations' names and prompt.
-    if !fe.stack.is_empty() || crate::hq::active() {
+    // (Armed there, at the range or in the killhouse: the match HUD's gun
+    // parts, with the stations' over them.)
+    if !fe.stack.is_empty() || (crate::hq::active() && !crate::hq::armed()) {
         hud.ops.clear();
         if fe.stack.is_empty() {
             let mut p = Painter { fe: &fe, pl: Placement::new(window.width().max(1.0), window.height().max(1.0)), ops: Vec::new() };
@@ -1091,6 +1178,13 @@ pub(super) fn paint(
     }
     let _ = killcam_on;
     fe.game = game;
+    if crate::hq::active() {
+        let mut p = Painter { fe: &fe, pl: Placement::new(window.width().max(1.0), window.height().max(1.0)), ops: Vec::new() };
+        let camera = cameras.iter().find(|c| c.0.0 == 0).map(|c| (c.1, c.2));
+        let input = players.iter().find(|(_, (s, ..), _)| s.0 == 0).map(|(_, (_, i, ..), _)| i);
+        hq_overlay(&mut p, camera, input);
+        all_ops.extend(p.ops);
+    }
     hud.ops = all_ops;
 }
 
@@ -1126,6 +1220,7 @@ fn paint_player(
     hardcore: bool,
     now: f32,
 ) -> Option<CompassView> {
+    use super::next::{font::Cut, theme as t};
     let fe = p.fe;
     let mut compass_view = None;
     let my_team = me.map_or(Team::Allies, |m| m.0.1.team);
@@ -1163,13 +1258,26 @@ fn paint_player(
             }
             low_health(p, health.current, now);
             let uav = radar.is_some_and(|r| r.sweep_for(my_team, e, now).is_some());
-            if let Some(m) = minimap.filter(|_| !hardcore || uav) {
+            // (The campaign has CoD4's single player HUD: no MP minimap,
+            // heading strip, kill streaks; its classic ammo counter.)
+            let sp = crate::campaign::active() || crate::hq::active();
+            if let Some(m) = minimap.filter(|_| (!hardcore || uav) && !sp) {
                 compass_view = compass(p, shared, m, (e, my_team, tf.translation, view.yaw), pawns, objectives, now);
             }
-            if !hardcore {
+            if sp && !crate::campaign::hud_hidden() && !crate::hq::active() {
+                sp_compass(p, minimap.map_or(Vec2::X, |m| m.north), (tf.translation, view.yaw));
+            }
+            if !hardcore && !sp {
                 top_compass(p, shared, minimap.map_or(Vec2::X, |m| m.north), (e, my_team, tf.translation, view.yaw), pawns, now);
             }
-            if !hardcore && modern_hud() {
+            // (A campaign level that took the player's guns: no ammo.)
+            if crate::campaign::unarmed() {
+            } else if sp {
+                ammo(p, weapon, &hud.weapon, now);
+                if let Some(g) = grenades {
+                    offhand(p, weapon, g, loadout.and_then(|l| l.equipment(weapon)));
+                }
+            } else if !hardcore && modern_hud() {
                 let mut held: Vec<(&'static str, u32)> = Vec::new();
                 if let Some(g) = grenades {
                     held.push(("frag_grenade", g.frags));
@@ -1191,8 +1299,21 @@ fn paint_player(
                 if let Some((_, _, Projection::Perspective(proj))) = camera {
                     // (None over the airstrike's laptop: it has its own cursor.)
                     if !mover.sprinting && !hardcore && show(Hud::Crosshair) && !(slot == 0 && crate::killstreaks::hands::laptop_open()) {
-                        let color = if hud.aim_enemy { [1.0, 0.0, 0.0] } else { [1.0; 3] };
+                        // (A mission's friendly under it: green, and their
+                        // name under it, as CoD4 SP's `cg_drawFriendlyNames`.)
+                        let friend = (slot == 0).then(crate::campaign::aimed_friend).flatten();
+                        let color = if hud.aim_enemy {
+                            [1.0, 0.0, 0.0]
+                        } else if friend.is_some() {
+                            [0.2, 1.0, 0.2]
+                        } else {
+                            [1.0; 3]
+                        };
                         crosshair(p, weapon, mover, proj.fov, color);
+                        if let Some(name) = friend {
+                            let k = p.pl.h / 480.0;
+                            p.text(&name, p.pl.w * 0.5, p.pl.h * 0.5 + 28.0 * k, 5, 5, 9.0 * k, 0, [0.6, 1.0, 0.6, 1.0], 0.5, true);
+                        }
                     }
                 }
                 // The hit marker: drawn crisp at any resolution, popping in,
@@ -1226,18 +1347,18 @@ fn paint_player(
             let height = 0.4583 * 48.0;
             if let Some(killer) = &d.killer {
                 let text = loc(fe, "CGAME_YOUWEREKILLED", "Killed by &&1").replace("&&1", killer);
-                p.text(&text, 0.0, 150.0, 2, 2, height, 0, WHITE, 0.5, true);
+                p.notice(&text, 0.0, 150.0, 2, 2, height, Cut::Semi, t::INK, 0.5);
             }
             let left = (d.respawn_at - now).max(0.0).ceil();
             if left.is_finite() {
-                p.text(&format!("Respawning in {left:.0}"), 0.0, 150.0 + height, 2, 2, height * 0.75, 0, WHITE, 0.5, true);
+                p.notice(&format!("Respawning in {left:.0}"), 0.0, 150.0 + height, 2, 2, height * 0.75, Cut::Regular, t::INK_DIM, 0.5);
             } else if !crate::combat::free_for_all() && crate::netplay::authority() {
                 // Out for the round, watching a teammate.
                 let line = match crate::player::watching(slot) {
                     Some(name) => format!("Waiting for next round  -  watching {name} (Fire: next)"),
                     None => "Waiting for next round".to_owned(),
                 };
-                p.text(&line, 0.0, 150.0 + height, 2, 2, height * 0.75, 0, WHITE, 0.5, true);
+                p.notice(&line, 0.0, 150.0 + height, 2, 2, height * 0.75, Cut::Regular, t::INK_DIM, 0.5);
             }
         }
         // The player's part in the objectives, and a round's result.
@@ -1251,21 +1372,22 @@ fn paint_player(
                 .replace("[{+activate}]", &input.use_key())
                 .replace("&&1", &input.use_key());
             let name = fe.assets.localize(&format!("@{key}"));
-            p.text(&format!("{text} {name}"), 0.0, 100.0, 2, 2, 0.4 * 48.0, 0, WHITE, 0.5, true);
+            p.notice(&format!("{text} {name}"), 0.0, 100.0, 2, 2, 0.4 * 48.0, Cut::Semi, t::INK, 0.5);
         }
         // The kill streaks' asks (placing the sentry, opening a crate), and
         // a bar while a crate opens.
         if let Some((text, progress)) = crate::killstreaks::prompt(slot).filter(|_| alive && !killcam_on) {
-            p.text(&text, 0.0, 70.0, 2, 2, 0.4 * 48.0, 0, WHITE, 0.5, true);
+            p.notice(&text, 0.0, 70.0, 2, 2, 0.4 * 48.0, Cut::Semi, t::INK, 0.5);
             if let Some(f) = progress {
                 let (w, h) = (120.0, 6.0);
-                p.outlined_box(vr(-w * 0.5, 80.0, w, h, 2, 2), [0.0, 0.0, 0.0, 0.5], 1.0, [1.0, 1.0, 1.0, 0.8]);
-                p.outlined_box(vr(-w * 0.5, 80.0, w * f.clamp(0.0, 1.0), h, 2, 2), [1.0, 1.0, 1.0, 0.9], 0.0, [0.0; 4]);
+                p.outlined_box(vr(-w * 0.5, 80.0, w, h, 2, 2), t::PANEL, 1.0, t::LINE);
+                p.outlined_box(vr(-w * 0.5, 80.0, w * f.clamp(0.0, 1.0), h, 2, 2), t::ACCENT, 0.0, [0.0; 4]);
             }
         }
     }
     // The campaign: its own HUD ([`crate::campaign`]), no match's.
-    let campaign = crate::campaign::active();
+    // (Nor has Headquarters.)
+    let campaign = crate::campaign::active() || crate::hq::active();
     if show(Hud::KillFeed) && !campaign {
         obituaries(p, shared, now);
     }
@@ -1295,35 +1417,70 @@ fn paint_player(
     }
     if fe.game.scoreboard && !killcam_on && !campaign {
         if crate::tune::get("scoreboard.style", 1.0) > 0.5 {
-            scoreboard_mw3(p, pawns, me.map(|m| m.0.0), my_team, sides);
+            scoreboard_mw3(p, pawns, me.map(|m| m.0.0), my_team, sides, ended.is_some());
         } else {
             scoreboard(p, pawns, me.map(|m| m.0.0), my_team, sides);
         }
     }
-    // The killcam's banner (`_killcam.gsc`).
+    // The killcam's banner (`_killcam.gsc`), in the menus' typeface, white.
+    // The final killcam (the one that can't be skipped) is letterboxed:
+    // near-black bars top and bottom, its words in them.
     if let Some(b) = killcam.and_then(|k| k.banner()).filter(|_| slot == 0) {
-        let height = 0.4583 * 48.0;
-        p.text(b.title, 0.0, 80.0, 2, 1, 36.0, 0, [1.0, 0.85, 0.3, 1.0], 0.5, true);
+        use super::next::{font::Cut, theme as t};
+        // (The new UI's type and ink: H1 for the title, row text under it.)
+        let title_size = crate::tune::get("killcam.title_size", (t::H1.size * HQ_TYPE).round());
+        let text_size = crate::tune::get("killcam.text_size", (t::ROW_TEXT.size * HQ_TYPE).round());
         let line = format!("{}  [{}{}]  {}", b.killer, b.weapon, if b.headshot { " HS" } else { "" }, b.victim);
-        p.text(&line, 0.0, -112.0, 2, 3, height, 0, WHITE, 0.5, true);
         if b.skippable {
+            p.text_hd(b.title, 0.0, 70.0, 2, 1, title_size, Cut::Display, t::INK, 0.5, true);
+            p.image("white", vr(-16.0, 70.0 + title_size * 0.62, 32.0, 1.5, 2, 1), t::ACCENT, 1);
+            p.text_hd(&line, 0.0, -116.0, 2, 3, text_size, Cut::Semi, t::INK, 0.5, true);
             // [Use]: F, or the pad's X / Square (CoD4's console layout).
             let key = me.map_or_else(|| "F".to_owned(), |m| m.1.1.use_key());
             let prompt = loc(fe, "PLATFORM_PRESS_TO_SKIP", "Press [{+activate}] to skip").replace("[{+activate}]", &key);
-            p.text(&prompt, 0.0, -90.0, 2, 3, height * 0.75, 0, WHITE, 0.5, true);
+            p.text_hd(&prompt, 0.0, -96.0, 2, 3, text_size * 0.8, Cut::Regular, t::INK_DIM, 0.5, true);
+        } else {
+            // (`killcam.bars`: each bar's height of the 480-unit screen.)
+            let bar = crate::tune::get("killcam.bars", 54.0).clamp(0.0, 200.0);
+            let shade = [t::SCRIM[0], t::SCRIM[1], t::SCRIM[2], crate::tune::get("killcam.bar_alpha", 0.88).clamp(0.0, 1.0)];
+            p.image("white", vr(0.0, 0.0, 640.0, bar, 4, 4), shade, 1);
+            p.image("white", vr(0.0, 480.0 - bar, 640.0, bar, 4, 4), shade, 1);
+            p.text_hd(b.title, 0.0, bar * 0.5, 2, 1, title_size, Cut::Display, t::INK, 0.5, false);
+            p.text_hd(&line, 0.0, -bar * 0.5, 2, 3, text_size, Cut::Semi, t::INK, 0.5, false);
         }
     }
-    if state.is_some() && !killcam_on && ended.is_some() {
-        let outcome = state.zip(me).and_then(|(s, m)| s.outcome(m.0.1));
-        let (key, fallback) = match outcome {
-            Some(true) => ("MP_VICTORY", "Victory!"),
-            Some(false) => ("MP_DEFEAT", "Defeat!"),
-            None => ("MP_DRAW", "Draw"),
+    // The match's end: a band across the top, "MATCH OVER" and the
+    // outcome in the menus' typeface, coloured as the scoreboard's sides
+    // (won: friendly, lost: enemy, drawn: neutral), sliding in.
+    // (Not while the final killcam is due or playing: it waits for it.)
+    if let (Some(s), false, Some((_, at))) = (state, killcam_on || crate::killcam::busy(), ended) {
+        use super::next::font::Cut;
+        use crate::tune::get;
+        let outcome = me.and_then(|m| s.outcome(m.0.1));
+        // (The scoreboard's side colours, the new UI's by default.)
+        use super::next::theme::{ENEMY, FRIENDLY, REWARD};
+        let side = |name: &str, c: [f32; 4]| [get(&format!("scoreboard.{name}_red"), c[0]), get(&format!("scoreboard.{name}_green"), c[1]), get(&format!("scoreboard.{name}_blue"), c[2])];
+        let (word, rgb) = match outcome {
+            Some(true) => ("VICTORY", side("friendly", FRIENDLY)),
+            Some(false) => ("DEFEAT", side("enemy", ENEMY)),
+            None => ("DRAW", side("ffa", REWARD)),
         };
-        p.text(&loc(fe, key, fallback), 0.0, -40.0, 2, 2, 36.0, 0, WHITE, 0.5, true);
+        // (Fades in once the final killcam is over.)
+        let shown = (now - at.max(crate::killcam::finished_at()) - crate::tune::get("endscreen.delay", 0.0)).max(0.0);
+        let k = 1.0 - (1.0 - (shown / 0.4).min(1.0)).powi(3);
+        let (top, h) = (get("endscreen.y", 22.0), get("endscreen.height", 50.0));
+        // (The view dimmed under it all, so the board reads over any scene.)
+        p.image("white", vr(0.0, 0.0, 640.0, 480.0, 4, 4), [0.0, 0.0, 0.0, get("endscreen.dim", 0.35) * k], 0);
+        p.image("white", vr(0.0, top, 640.0, h, 4, 1), [0.0, 0.0, 0.0, 0.55 * k], 1);
+        p.bar(vr(0.0, top, 640.0, 0.6, 4, 1), [rgb[0], rgb[1], rgb[2], 0.8 * k]);
+        p.bar(vr(0.0, top + h - 0.6, 640.0, 0.6, 4, 1), [rgb[0], rgb[1], rgb[2], 0.35 * k]);
+        let slide = (1.0 - k) * 18.0;
+        p.text_hd("MATCH OVER", -slide, top + h * 0.27, 2, 1, get("endscreen.label_size", 8.0), Cut::Semi, [1.0, 1.0, 1.0, 0.75 * k], 0.5, true);
+        p.text_hd(&loc(fe, &format!("MP_{word}"), word).to_uppercase().trim_end_matches('!').to_owned(), slide, top + h * 0.62, 2, 1, get("endscreen.size", 30.0), Cut::Display, [rgb[0], rgb[1], rgb[2], k], 0.5, true);
     }
-    // XP, notifies and kill streak notices are Player 1's.
-    if slot == 0 {
+    // XP, notifies and kill streak notices are Player 1's (a mission has
+    // none: they're multiplayer's, and they'd sit on its own end text).
+    if slot == 0 && !crate::campaign::active() {
         if !hardcore {
             xp(p, hud, now);
             if !killcam_on && !campaign {
@@ -1340,7 +1497,7 @@ fn paint_player(
             location_map(p, m, (pawn.team, tf.translation, view.yaw), pawns, window.cursor_position());
         }
     }
-    if let Some((streak, m)) = me.and_then(|m| Some((m.2?, m))).filter(|(_, m)| m.0.7.is_none() && !hardcore) {
+    if let Some((streak, m)) = me.and_then(|m| Some((m.2?, m))).filter(|(_, m)| m.0.7.is_none() && !hardcore && !crate::campaign::active() && !crate::hq::active()) {
         killstreak_panel(p, streak, m.1.1.pad_kind);
     }
     compass_view
@@ -1398,9 +1555,12 @@ pub(super) fn update_compass(
 /// A line over a player's menus naming whose they are (splitscreen), top
 /// right of their part of the window (`pl`).
 pub(super) fn menu_banner_ops(fe: &Frontend, pl: &Placement, text: &str) -> Vec<Op> {
+    use super::next::{font::Cut, theme as t};
     let mut p = Painter { fe, pl: *pl, ops: Vec::new() };
-    p.image("white", vr(-112.0, 4.0, 104.0, 22.0, 3, 1), [0.0, 0.0, 0.0, 0.6], 1);
-    p.text(text, -60.0, 21.0, 3, 1, 0.4 * 48.0, 0, [1.0, 0.85, 0.45, 1.0], 0.5, true);
+    // The new UI's panel with an accent bar at its edge, label type.
+    p.image("white", vr(-112.0, 4.0, 104.0, 22.0, 3, 1), t::PANEL, 1);
+    p.image("white", vr(-112.0, 4.0, 2.0, 22.0, 3, 1), t::ACCENT, 1);
+    p.text_hd(text, -58.0, 15.0, 3, 1, t::TAB.size * HQ_TYPE, Cut::Semi, t::INK, 0.5, true);
     p.ops
 }
 
@@ -1514,6 +1674,15 @@ impl Painter<'_> {
         let shadow = if shadow { (self.pl.scale * 0.6).max(1.0) } else { 0.0 };
         self.ops.push(Op::Text { text: text.to_owned(), x: (pos.x - w * align).round(), y: (pos.y + cap * 0.5).round(), font, k, color, shadow });
         w / self.pl.sx(horz)
+    }
+
+    /// A line placed as CoD4's [`Self::text`] would place it (baseline at
+    /// `y`, CoD's `height`), in the menus' typeface ([`Self::text_hd`]):
+    /// the match's notices in the new UI's type. `notice.scale` sizes them.
+    #[allow(clippy::too_many_arguments)]
+    fn notice(&mut self, text: &str, x: f32, y: f32, horz: u8, vert: u8, height: f32, cut: super::next::font::Cut, color: [f32; 4], align: f32) -> f32 {
+        let size = height * crate::tune::get("notice.scale", 0.58);
+        self.text_hd(text, x, y - size * 0.38, horz, vert, size, cut, color, align, true)
     }
 
     /// One line with its baseline at `y`, `height` virtual units tall; `align`
@@ -1945,7 +2114,7 @@ fn top_compass(
     let pos = flat(at);
     let dot = get("compass.enemy_size", 3.5).max(0.5);
     let red = [get("compass.enemy_red", 1.0), get("compass.enemy_green", 1.0), get("compass.enemy_blue", 1.0)];
-    let mut show = |p: &mut Painter, world: Vec3, alpha: f32| {
+    let show = |p: &mut Painter, world: Vec3, alpha: f32| {
         let d = flat(world) - pos;
         if d.length_squared() < 1.0 {
             return;
@@ -2164,9 +2333,37 @@ fn killstreak_panel(p: &mut Painter, streak: &crate::killstreaks::Killstreak, pa
     }
 }
 
+/// CoD4's single player compass (its `compass` menu): a heading tape at the
+/// bottom's middle, ticks over and under its centre, and the objective's
+/// bearing marked on it.
+fn sp_compass(p: &mut Painter, north: Vec2, (at, yaw): (Vec3, f32)) {
+    let north_a = north.y.atan2(north.x);
+    let turns = |v: Vec2| ((north_a - v.y.atan2(v.x)) / TAU).rem_euclid(1.0);
+    let heading = turns(facing(yaw));
+    p.image("white", vr(-62.0, -34.0, 124.0, 13.0, 2, 3), [0.0, 0.0, 0.0, 0.35], 1);
+    ticker_at(p, heading, (-60.0, -30.0, 120.0, 8.0), 1.0, (2, 3));
+    p.bar(vr(-0.5, -34.0, 1.0, 4.0, 2, 3), [1.0, 1.0, 1.0, 0.9]);
+    p.bar(vr(-0.5, -22.0, 1.0, 4.0, 2, 3), [1.0, 1.0, 1.0, 0.9]);
+    // The objective's way, on the tape when within its span.
+    if let Some(o) = crate::campaign::objective_at() {
+        // (CoD's x/y, as `facing` gives the view's.)
+        let me = crate::units::to_cod(at);
+        let rel = (turns(Vec2::new(o[0] - me[0], o[1] - me[1])) - heading + 1.5).rem_euclid(1.0) - 0.5;
+        let x = rel / TICKER_SPAN * 120.0;
+        if x.abs() <= 60.0 {
+            p.image("white", vr(x - 2.0, -31.0, 4.0, 6.0, 2, 3), [1.0, 0.85, 0.3, 1.0], 1);
+        }
+    }
+}
+
 /// `minimapTicker`: the part of the heading tape around `heading` (turns
 /// from north), wrapping round.
 fn ticker(p: &mut Painter, heading: f32, (x, y, w, h): (f32, f32, f32, f32), alpha: f32) {
+    ticker_at(p, heading, (x, y, w, h), alpha, (1, 1));
+}
+
+/// [`ticker`], placed by the given alignment.
+fn ticker_at(p: &mut Painter, heading: f32, (x, y, w, h): (f32, f32, f32, f32), alpha: f32, (ha, va): (u8, u8)) {
     let start = heading - TICKER_SPAN * 0.5;
     let end = start + TICKER_SPAN;
     let mut u = start;
@@ -2174,7 +2371,7 @@ fn ticker(p: &mut Painter, heading: f32, (x, y, w, h): (f32, f32, f32, f32), alp
         let next = (u.floor() + 1.0).min(end);
         let (x0, x1) = (x + (u - start) / TICKER_SPAN * w, x + (next - start) / TICKER_SPAN * w);
         let uv = Rect::new(u - u.floor(), 0.0, next - u.floor(), 1.0);
-        p.image_uv("minimap_tickertape_mp", vr(x0, y, x1 - x0, h, 1, 1), [1.0, 1.0, 1.0, alpha], Some(uv), 0.0, 1);
+        p.image_uv("minimap_tickertape_mp", vr(x0, y, x1 - x0, h, ha, va), [1.0, 1.0, 1.0, alpha], Some(uv), 0.0, 1);
         u = next;
     }
 }
@@ -2392,7 +2589,8 @@ fn offhand(p: &mut Painter, w: &WeaponState, g: &crate::grenades::Grenades, equi
 /// spread reaches, fading as the sights come up; red over an enemy.
 fn crosshair(p: &mut Painter, w: &WeaponState, mover: &Mover, fov: f32, [cr, cg, cb]: [f32; 3]) {
     let r = &w.def.reticle;
-    let alpha = (1.0 - w.ads * 2.0).clamp(0.0, 1.0);
+    // (The laser aim's aim is the laser: [`crate::laser`].)
+    let alpha = (1.0 - w.ads.max(w.laser_aim) * 2.0).clamp(0.0, 1.0);
     let color = [cr, cg, cb, alpha];
     // 3rd Person TDM, the gun in a wall's way ([`crate::cover`]): the
     // reticle's pieces turned into an X, in red.
@@ -2643,6 +2841,7 @@ fn bomb_squad(
 /// Headquarters' stations ([`crate::hq::STATIONS`]): each one's name over it
 /// while it's in view and not far, and "Press F to ..." at the one in reach.
 fn hq_overlay(p: &mut Painter, camera: Option<(&Camera, &GlobalTransform)>, input: Option<&crate::splitscreen::PlayerInput>) {
+    use super::next::{font::Cut, theme as t};
     const SHOWN_WITHIN: f32 = 1000.0;
     if let Some((camera, view)) = camera {
         for s in crate::hq::STATIONS.iter().filter(|_| !crate::hq::revealing()) {
@@ -2652,14 +2851,13 @@ fn hq_overlay(p: &mut Painter, camera: Option<(&Camera, &GlobalTransform)>, inpu
                 continue;
             }
             let Ok(px) = camera.world_to_viewport(view, at) else { continue };
-            let alpha = (1.0 - (far - SHOWN_WITHIN * 0.6) / (SHOWN_WITHIN * 0.4)).clamp(0.0, 1.0) * 0.9;
-            p.text(&crate::hq::label_of(s), px.x, px.y, 5, 5, 0.3 * 48.0 * p.pl.scale, 0, [1.0, 0.85, 0.45, alpha], 0.5, true);
+            let alpha = (1.0 - (far - SHOWN_WITHIN * 0.6) / (SHOWN_WITHIN * 0.4)).clamp(0.0, 1.0) * 0.95;
+            hq_label(p, &crate::hq::label_of(s), px, t::with_alpha(t::INK, alpha));
         }
     }
-    // Opening a drop: what came out, a line each in its rarity's colour,
-    // and the prompt under them.
     // Opening a drop: its cards, dealt over the crate (the Supply Drops
     // menu's), with the prompt under them.
+    hq_base(p, camera);
     let cards = crate::hq::drop_cards();
     if !cards.is_empty() {
         let fe = p.fe;
@@ -2668,16 +2866,85 @@ fn hq_overlay(p: &mut Painter, camera: Option<(&Camera, &GlobalTransform)>, inpu
     if let Some(input) = input {
         let prompt_y = if cards.is_empty() { 100.0 } else { 225.0 };
         if let Some(text) = crate::hq::prompt(input) {
-            p.text(&text, 0.0, prompt_y, 2, 2, 0.4 * 48.0, 0, WHITE, 0.5, true);
+            p.text_hd(&text, 0.0, prompt_y - 4.0, 2, 2, t::BODY.size * HQ_TYPE, Cut::Semi, t::INK, 0.5, true);
         }
         // How to call one in, with the hold filling a bar under it.
         if let Some((text, held)) = crate::hq::call_hint(input) {
-            p.text(&text, 0.0, -34.0, 2, 3, 0.32 * 48.0, 0, [1.0, 0.85, 0.45, 0.9], 0.5, true);
+            p.text_hd(&text, 0.0, -38.0, 2, 3, t::CAPTION.size * HQ_TYPE, Cut::Semi, t::with_alpha(t::INK, 0.9), 0.5, true);
             if held > 0.0 {
-                p.image("white", vr(-60.0, -26.0, 120.0, 3.0, 2, 3), [0.0, 0.0, 0.0, 0.5], 1);
-                p.image("white", vr(-60.0, -26.0, 120.0 * held, 3.0, 2, 3), [1.0, 0.85, 0.45, 0.95], 1);
+                p.image("white", vr(-60.0, -28.0, 120.0, 3.0, 2, 3), t::PANEL, 1);
+                p.image("white", vr(-60.0, -28.0, 120.0 * held, 3.0, 2, 3), t::ACCENT, 1);
             }
         }
+    }
+}
+
+/// The new UI's type sizes (1080-line canvas) in the HUD's 480 lines.
+const HQ_TYPE: f32 = 480.0 / 1080.0;
+
+/// A name over something in Headquarters (pixels): the new UI's label type,
+/// tracked capitals with an accent tick before them.
+fn hq_label(p: &mut Painter, text: &str, px: Vec2, color: [f32; 4]) {
+    use super::next::{font::Cut, theme as t};
+    let size = t::LABEL.size * HQ_TYPE * p.pl.scale * 1.3;
+    let w = p.text_hd(&text.to_uppercase(), px.x, px.y, 5, 5, size, Cut::Semi, color, 0.5, true);
+    let tick = (size * 0.18).max(2.0);
+    p.image("white", vr(px.x - w * 0.5 - tick * 3.0, px.y - size * 0.35, tick, size * 0.7, 5, 5), t::with_alpha(t::ACCENT, color[3]), 1);
+}
+
+/// The F.N.G. base's parts of Headquarters' HUD ([`crate::hq::overlay`]):
+/// the areas' names from afar, the record boards near, a run's clock and
+/// how it went, the range's count.
+fn hq_base(p: &mut Painter, camera: Option<(&Camera, &GlobalTransform)>) {
+    use super::next::{font::Cut, theme as t};
+    let o = crate::hq::overlay();
+    if let Some((camera, view)) = camera {
+        let me = view.translation();
+        for a in crate::hq::AREAS.iter() {
+            let at = crate::units::pos([a.at[0], a.at[1], a.at[2] + 90.0]);
+            let far = me.distance(at) / crate::units::u(1.0);
+            let Ok(px) = camera.world_to_viewport(view, at) else { continue };
+            if far < 250.0 {
+                // At the post: its own name, as a station's.
+                hq_label(p, &format!("Travel  {}", a.name), px, t::with_alpha(t::ACCENT, 0.95));
+                continue;
+            }
+            let alpha = ((far - 250.0) / 300.0).clamp(0.0, 1.0) * 0.8;
+            let size = t::MICRO.size * HQ_TYPE * p.pl.scale * 1.3;
+            p.text_hd(&a.name.to_uppercase(), px.x, px.y, 5, 5, size, Cut::Semi, t::with_alpha(t::INK, alpha), 0.5, true);
+            p.text_hd(&format!("{:.0} M", far * 0.0254), px.x, px.y + size * 1.4, 5, 5, size * 0.85, Cut::Regular, t::with_alpha(t::INK_DIM, alpha), 0.5, true);
+        }
+        for (at, title, lines) in &o.boards {
+            let at = crate::units::pos(*at);
+            let far = me.distance(at) / crate::units::u(1.0);
+            if far > 700.0 {
+                continue;
+            }
+            let Ok(px) = camera.world_to_viewport(view, at) else { continue };
+            let alpha = (1.0 - (far - 450.0) / 250.0).clamp(0.0, 1.0);
+            let scale = p.pl.scale * (300.0 / far.max(150.0)).clamp(0.45, 1.0);
+            let size = t::BODY.size * HQ_TYPE * scale * 1.2;
+            let pitch = size * 1.45;
+            // A panel behind, the title in the reward colour over a line.
+            let (w, h) = (size * 16.0, pitch * (lines.len() as f32 + 1.6));
+            p.image("white", vr(px.x - w * 0.5, px.y - pitch * 0.8, w, h, 5, 5), t::with_alpha(t::PANEL, t::PANEL[3] * alpha), 1);
+            p.image("white", vr(px.x - w * 0.5, px.y - pitch * 0.8, w, (size * 0.12).max(1.0), 5, 5), t::with_alpha(t::REWARD, alpha), 1);
+            p.text_hd(title, px.x, px.y, 5, 5, size * 0.9, Cut::Semi, t::with_alpha(t::REWARD, alpha), 0.5, true);
+            for (i, l) in lines.iter().enumerate() {
+                p.text_hd(l, px.x, px.y + pitch * (i + 1) as f32, 5, 5, size, Cut::Regular, t::with_alpha(t::INK, alpha * 0.95), 0.5, true);
+            }
+        }
+    }
+    if let Some(time) = &o.timer {
+        p.text_hd(time, 0.0, 34.0, 2, 1, t::NUMERAL.size * HQ_TYPE * 0.8, Cut::Display, t::INK, 0.5, true);
+    }
+    if let Some(s) = &o.status {
+        p.text_hd(&s.to_uppercase(), 0.0, 56.0, 2, 1, t::LABEL.size * HQ_TYPE * 1.2, Cut::Semi, t::INK_DIM, 0.5, true);
+    }
+    if let Some(n) = &o.notice {
+        // Records in the reward colour, the rest plain.
+        let c = if n.contains("best") || n.starts_with("Time") || n.starts_with("Obstacle") { t::REWARD } else { t::INK };
+        p.text_hd(n, 0.0, 140.0, 2, 2, t::H2.size * HQ_TYPE, Cut::Semi, c, 0.5, true);
     }
 }
 
@@ -2734,7 +3001,7 @@ fn obituary_line(p: &mut Painter, parts: &[Part], mut x: f32, y: f32, height: f3
     // The menus' typeface (`killfeed.hd 0`: CoD4's font), its capitals
     // centred where CoD4's sit on the baseline.
     let hd = crate::tune::get("killfeed.hd", 1.0) > 0.5;
-    let mut text = |p: &mut Painter, s: &str, x: f32, color: [f32; 4]| {
+    let text = |p: &mut Painter, s: &str, x: f32, color: [f32; 4]| {
         if hd {
             // (`text_hd` measures nothing at alpha 0: a trace of alpha keeps
             // the Modern HUD's measuring pass right.)
@@ -2876,8 +3143,9 @@ fn scoreboard_mw3(
     me: Option<Entity>,
     mine: Team,
     sides: Option<&crate::audio::Sides>,
+    ended: bool,
 ) {
-    use super::next::font::Cut;
+    use super::next::{font::Cut, theme as t};
     use crate::tune::get;
     let width = get("scoreboard.width", 520.0).max(100.0);
     let row = get("scoreboard.row_height", 18.0).max(6.0);
@@ -2888,9 +3156,11 @@ fn scoreboard_mw3(
     let gap = get("scoreboard.team_gap", 30.0);
     let opacity = get("scoreboard.opacity", 1.0).clamp(0.0, 1.0);
     let rgb = |name: &str, d: [f32; 3]| [get(&format!("scoreboard.{name}_red"), d[0]), get(&format!("scoreboard.{name}_green"), d[1]), get(&format!("scoreboard.{name}_blue"), d[2])];
-    let friendly = rgb("friendly", [0.35, 0.9, 0.95]);
-    let enemy = rgb("enemy", [0.95, 0.38, 0.33]);
-    let neutral = rgb("ffa", [0.95, 0.82, 0.4]);
+    // (The new UI's side colours by default.)
+    let token = |c: [f32; 4]| [c[0], c[1], c[2]];
+    let friendly = rgb("friendly", token(t::FRIENDLY));
+    let enemy = rgb("enemy", token(t::ENEMY));
+    let neutral = rgb("ffa", token(t::REWARD));
     let rgba = |c: [f32; 3], a: f32| [c[0], c[1], c[2], a * opacity];
     let left = -width * 0.5;
     // Right edges of the number columns, as shares of the panel's width.
@@ -2905,7 +3175,8 @@ fn scoreboard_mw3(
     let limit: f32 = p.fe.dvar("ui_scorelimit").parse().unwrap_or(0.0);
     let ffa = crate::combat::free_for_all();
     let groups = if ffa { vec![None] } else { vec![Some(mine), Some(mine.other())] };
-    let mut y = get("scoreboard.y", 40.0);
+    // (At the match's end it sits under the outcome's banner.)
+    let mut y = get("scoreboard.y", 40.0) + if ended { get("endscreen.push", 46.0) } else { 0.0 };
     for group in groups {
         let color = match group {
             None => neutral,
@@ -2932,7 +3203,7 @@ fn scoreboard_mw3(
         p.text_hd(&score.to_string(), right, head_y, 2, 1, score_size, Cut::Display, rgba(color, 1.0), 1.0, true);
         let bar_w = width * get("scoreboard.bar_width", 0.3);
         let bar_y = y + score_size * 1.15;
-        p.image("white", vr(right - bar_w, bar_y, bar_w, 3.5, 2, 1), [0.0, 0.0, 0.0, 0.45 * opacity], 1);
+        p.image("white", vr(right - bar_w, bar_y, bar_w, 3.5, 2, 1), [t::PANEL[0], t::PANEL[1], t::PANEL[2], 0.6 * opacity], 1);
         let fill = if limit > 0.0 { (score as f32 / limit).clamp(0.0, 1.0) } else { 1.0 };
         p.image("white", vr(right - bar_w, bar_y, bar_w * fill, 3.5, 2, 1), rgba(color, 1.0), 1);
         y = bar_y + 5.0;
@@ -2950,15 +3221,20 @@ fn scoreboard_mw3(
         // The players.
         for (k, (e, pawn, _, _, dead, bot)) in rows.into_iter().enumerate() {
             let own = Some(e) == me;
+            // The new UI's rows: panel and raised in turn, the player's
+            // own in the accent with a bar at its edge.
             let shade = if own {
-                [0.82, 0.82, 0.82, get("scoreboard.own_alpha", 0.8) * opacity]
+                [t::ACCENT[0], t::ACCENT[1], t::ACCENT[2], get("scoreboard.own_alpha", 0.8) * 0.3 * opacity]
             } else if k % 2 == 0 {
-                [0.0, 0.0, 0.0, get("scoreboard.row_alpha", 0.6) * opacity]
+                [t::ROW[0], t::ROW[1], t::ROW[2], get("scoreboard.row_alpha", 0.6) * opacity]
             } else {
-                [0.07, 0.07, 0.07, get("scoreboard.row_alpha", 0.6) * opacity]
+                [t::RAISED[0], t::RAISED[1], t::RAISED[2], get("scoreboard.row_alpha", 0.6) * opacity]
             };
             p.image("white", vr(left, y, width, row, 2, 1), shade, 1);
-            let ink = if own { [0.12, 0.12, 0.12] } else { [1.0, 1.0, 1.0] };
+            if own {
+                p.image("white", vr(left, y, 2.0, row, 2, 1), [t::ACCENT[0], t::ACCENT[1], t::ACCENT[2], opacity], 1);
+            }
+            let ink = token(t::INK);
             let a = if dead { 0.5 } else { 1.0 };
             let cy = y + row * 0.5;
             let (r, rank_icon) = match bot {
@@ -3140,6 +3416,7 @@ pub(super) fn pick_airstrike(
 /// and 1.75), typed in a letter every 100 ms, shown 4 s and faded over one.
 /// A hardpoint that can't be used now gets its `*_NOT_AVAILABLE` line.
 fn streak_notice(p: &mut Painter, hud: &HudState, now: f32) {
+    use super::next::{font::Cut, theme as t};
     if let Some((streak, item, at)) = hud.streak_notify {
         let t = now - at;
         if t < 5.0 {
@@ -3155,8 +3432,8 @@ fn streak_notice(p: &mut Painter, hud: &HudState, now: f32) {
             };
             let text = loc(p.fe, item.hint(), fallback).replace("{+actionslot 4}", &crate::killstreaks::key_name(item));
             let (title_h, text_h) = (2.5 * 12.0, 1.75 * 12.0);
-            p.text(&typed(&title), 0.0, 30.0 + title_h, 2, 1, title_h, 6, [1.0, 1.0, 1.0, alpha], 0.5, true);
-            p.text(&typed(&text), 0.0, 30.0 + title_h + text_h, 2, 1, text_h, 6, [1.0, 1.0, 1.0, alpha], 0.5, true);
+            p.notice(&typed(&title).to_uppercase(), 0.0, 30.0 + title_h, 2, 1, title_h, Cut::Display, t::with_alpha(t::REWARD, alpha), 0.5);
+            p.notice(&typed(&text), 0.0, 30.0 + title_h + text_h, 2, 1, text_h, Cut::Semi, t::with_alpha(t::INK, alpha), 0.5);
         }
     }
     if let Some((item, at)) = hud.unavailable.filter(|(_, at)| now - at < 3.0) {
@@ -3168,21 +3445,22 @@ fn streak_notice(p: &mut Painter, hud: &HudState, now: f32) {
             Hardpoint::Sentry => ("MP_SENTRY_NOT_AVAILABLE", "Sentry Gun not available."),
         };
         let alpha = (3.0 - (now - at)).min(1.0);
-        p.text(&loc(p.fe, key, fallback), 0.0, -60.0, 2, 2, 0.4583 * 48.0, 0, [1.0, 1.0, 1.0, alpha], 0.5, true);
+        p.notice(&loc(p.fe, key, fallback), 0.0, -60.0, 2, 2, 0.4583 * 48.0, Cut::Semi, t::with_alpha(t::WARN, alpha), 0.5);
     }
 }
 
 /// A notify (`_hud_message.gsc`'s `notifyMessage`): the icon, a big title
 /// and a line under it, for four seconds, fading.
 fn notify(p: &mut Painter, hud: &HudState, now: f32) {
+    use super::next::{font::Cut, theme as t};
     let Some((title, text, icon, at)) = hud.notify.iter().find(|n| n.3 <= now && now - n.3 <= NOTIFY_TIME) else { return };
     let t = now - at;
     let alpha = (t / 0.25).min((NOTIFY_TIME - t) / 0.75).clamp(0.0, 1.0);
     if !icon.is_empty() {
         p.image(icon, vr(-32.0, 70.0, 64.0, 64.0, 2, 1), [1.0, 1.0, 1.0, alpha], 1);
     }
-    p.text(title, 0.0, 160.0, 2, 1, 0.75 * 48.0, 0, [1.0, 0.85, 0.3, alpha], 0.5, true);
-    p.text(text, 0.0, 182.0, 2, 1, 0.4583 * 48.0, 0, [1.0, 1.0, 1.0, alpha], 0.5, true);
+    p.notice(&title.to_uppercase(), 0.0, 160.0, 2, 1, 0.75 * 48.0, Cut::Display, t::with_alpha(t::REWARD, alpha), 0.5);
+    p.notice(text, 0.0, 182.0, 2, 1, 0.4583 * 48.0, Cut::Semi, t::with_alpha(t::INK, alpha), 0.5);
 }
 
 /// How long a notify shows.
@@ -3197,9 +3475,10 @@ fn xp(p: &mut Painter, hud: &HudState, now: f32) {
     }
     let alpha = 0.85 * if t < XP_SHOW { 1.0 } else { 1.0 - (t - XP_SHOW) / XP_FADE };
     let pulse = if t < 0.15 { 1.0 + t / 0.15 } else if t < 0.4 { 2.0 - (t - 0.15) / 0.25 } else { 1.0 };
-    // fontScale 2 (twelve units a unit of scale), centred on y -60.
-    let height = 2.0 * pulse * 12.0;
-    p.text(&format!("+{}", hud.xp.0), 0.0, -60.0 + height * 0.35, 2, 2, height, 0, [1.0, 1.0, 0.5, alpha], 0.5, false);
+    // In the menus' typeface, white, smaller than CoD4's (`xp.size`),
+    // centred on y -60.
+    let height = crate::tune::get("xp.size", 10.0) * (1.0 + (pulse - 1.0) * 0.5);
+    p.text_hd(&format!("+{}", hud.xp.0), 0.0, -60.0, 2, 2, height, super::next::font::Cut::Semi, [1.0, 1.0, 1.0, alpha], 0.5, true);
 }
 
 /// The XP bar along the bottom edge (CoD4's `xpbar`, MW2's): the way from

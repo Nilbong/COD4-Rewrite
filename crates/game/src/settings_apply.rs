@@ -47,6 +47,7 @@ static MOUSE: Value = Value::new(1.0);
 static ADS_MOUSE: Value = Value::new(1.0);
 static INVERT: AtomicBool = AtomicBool::new(false);
 static BLOOM: AtomicBool = AtomicBool::new(true);
+static FILM_FX: AtomicBool = AtomicBool::new(true);
 static MODERN_HUD: AtomicBool = AtomicBool::new(true);
 static FPS_LIMIT: Value = Value::new(0.0);
 static EFFECTS_VOLUME: Value = Value::new(1.0);
@@ -91,9 +92,77 @@ pub fn hud(which: Hud) -> bool {
     HUD[which as usize].load(Ordering::Relaxed)
 }
 
+/// A campaign level script's `cg_fov` (degrees, as f32 bits; 0 for none):
+/// over the player's own while that level runs (the AC-130's zoom).
+pub static SCRIPT_FOV: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static ADS_AFFECTED: AtomicBool = AtomicBool::new(true);
+static AUTO_LEAN: AtomicBool = AtomicBool::new(true);
+/// Weapon Position: 0 far (CoD4's), 1 standard, 2 close.
+static GUN_POSITION: AtomicU32 = AtomicU32::new(0);
+/// Auto lean's sensitivity: 0 low, 1 high.
+static AUTO_LEAN_HIGH: AtomicBool = AtomicBool::new(false);
+
+/// CoD4's own hip field of view, which the weapons' ADS zooms are made for.
+const COD4_FOV: f32 = 65.0;
+
+/// A weapon's aimed field of view (degrees) for its `adsZoomFov`: with ADS
+/// Field of View "Affected" (MW2019's), zoomed by the same amount from the
+/// player's own field of view as from CoD4's 65, so a wide view stays wide;
+/// "Independent", the weapon's own.
+pub fn ads_fov(weapon_ads_fov: f32) -> f32 {
+    if !ADS_AFFECTED.load(Ordering::Relaxed) || weapon_ads_fov <= 0.0 {
+        return weapon_ads_fov;
+    }
+    let half = |d: f32| (d.to_radians() * 0.5).tan();
+    let zoom = half(weapon_ads_fov) / half(COD4_FOV);
+    (2.0 * (half(hip_fov()) * zoom).atan()).to_degrees()
+}
+
+/// Test aid: ADS Field of View affected or not.
+pub fn set_ads_affected(on: bool) {
+    ADS_AFFECTED.store(on, Ordering::Relaxed);
+}
+
+/// The Weapon Position setting's shift of the gun at the hip (CoD inches:
+/// forward, left, up): back towards the eye and in towards the middle,
+/// live tuned `gunpos.<standard|close>_<back|in|up>`.
+pub fn gun_position(now: f32) -> bevy::math::Vec3 {
+    // (Test aid: `COD4RW_GUNPOS=far|standard|close`, or `cycle`: each in
+    // turn, 1.5 s apiece from 5 s, as `COD4RW_SHOT_VIEWS` takes its shots.)
+    let which = match std::env::var("COD4RW_GUNPOS").as_deref() {
+        Ok("cycle") => (((now - 5.0) / 1.5).floor().max(0.0) as u32) % 3,
+        Ok("close") => 2,
+        Ok("standard") => 1,
+        Ok("far") => 0,
+        _ => GUN_POSITION.load(Ordering::Relaxed),
+    };
+    let (name, back, inward, up) = match which {
+        2 => ("close", 4.0, 1.4, 0.8),
+        1 => ("standard", 2.0, 0.7, 0.4),
+        _ => return bevy::math::Vec3::ZERO,
+    };
+    let k = |what: &str, d: f32| crate::tune::get(&format!("gunpos.{name}_{what}"), d);
+    bevy::math::Vec3::new(-k("back", back), k("in", inward), k("up", up))
+}
+
+/// Auto lean set to High (Low: only hugging the edge, after a moment).
+pub fn auto_lean_high() -> bool {
+    AUTO_LEAN_HIGH.load(Ordering::Relaxed)
+}
+
+/// Whether aiming beside a wall's edge leans out past it.
+pub fn auto_lean() -> bool {
+    match std::env::var("COD4RW_AUTOLEAN").as_deref() {
+        Ok("0") => false,
+        Ok(_) => true,
+        Err(_) => AUTO_LEAN.load(Ordering::Relaxed),
+    }
+}
+
 /// The hip field of view (degrees, vertical as CoD4's `cg_fov`).
 pub fn hip_fov() -> f32 {
-    HIP_FOV.get()
+    let script = f32::from_bits(SCRIPT_FOV.load(Ordering::Relaxed));
+    if script > 0.0 && script.is_finite() { script.clamp(10.0, 120.0) } else { HIP_FOV.get() }
 }
 
 /// The mouse's scale on CoD4's base turn (sensitivity 5 is 1), at an aim
@@ -157,6 +226,11 @@ pub fn bloom() -> bool {
     BLOOM.load(Ordering::Relaxed)
 }
 
+/// Film grain, vignette and lens dirt (`r_filmfx`, `crate::vision`).
+pub fn film_fx() -> bool {
+    FILM_FX.load(Ordering::Relaxed)
+}
+
 pub fn overlay() -> u8 {
     OVERLAY.get() as u8
 }
@@ -168,10 +242,15 @@ fn keep_values(settings: Res<Settings>) {
     }
     let s = &*settings;
     HIP_FOV.set(s.num("cg_fov").clamp(50.0, 120.0));
+    ADS_AFFECTED.store(s.text("cg_adsfov") != "independent", Ordering::Relaxed);
+    AUTO_LEAN.store(s.text("cg_autolean") != "0", Ordering::Relaxed);
+    GUN_POSITION.store(match s.text("cg_gunposition") { "close" => 2, "standard" => 1, _ => 0 }, Ordering::Relaxed);
+    AUTO_LEAN_HIGH.store(s.text("cg_autolean") == "1", Ordering::Relaxed);
     MOUSE.set((s.num("sensitivity") / 5.0).clamp(0.02, 10.0));
     ADS_MOUSE.set(s.num("cg_ads_sens").clamp(0.1, 4.0));
     INVERT.store(s.on("m_invert"), Ordering::Relaxed);
     BLOOM.store(s.on("r_bloom"), Ordering::Relaxed);
+    FILM_FX.store(s.on("r_filmfx"), Ordering::Relaxed);
     RICH.store(rich_tonemap(s), Ordering::Relaxed);
     MODERN_HUD.store(s.text("cg_hudstyle") != "classic", Ordering::Relaxed);
     FPS_LIMIT.set(s.num("com_maxfps").max(0.0));
@@ -193,6 +272,7 @@ fn keep_values(settings: Res<Settings>) {
     crate::ragdoll::set_enabled(s.on("ragdoll_enable"));
     crate::first_person::apply(s);
     crate::lightmaps::set_rebaked(s.text("r_lightmaps") == "rebaked");
+    crate::lightmaps::set_live(s.text("r_lightmaps") == "live");
     if let Ok(mut k) = crate::hq::CALL_KEY.lock() {
         *k = s.bindings().key_name(crate::bindings::Action::Frag);
     }
@@ -200,6 +280,7 @@ fn keep_values(settings: Res<Settings>) {
         *k = s.bindings().key_name(crate::bindings::Action::Use);
     }
     crate::clutter::set_enabled(s.on("phys_clutter"));
+    crate::gamepad::playstation::set_enabled(s.on("pad_ps_features"));
     crate::textures::set_anisotropy(match s.text("r_texfilter") {
         "bilinear" => 0,
         "trilinear" => 1,
@@ -279,7 +360,9 @@ fn window(
     if placed_on.as_deref() != Some(chosen.as_str()) {
         let first = placed_on.is_none();
         *placed_on = Some(chosen.clone());
-        if mode == WindowMode::Windowed && !(first && chosen == "current") && monitor != MonitorSelection::Current {
+        // (Not a test window placed with `COD4RW_WINPOS`.)
+        let placed_by_test = std::env::var_os("COD4RW_WINPOS").is_some();
+        if mode == WindowMode::Windowed && !(first && chosen == "current") && monitor != MonitorSelection::Current && !placed_by_test {
             window.position = WindowPosition::Centered(monitor);
         }
     }
@@ -375,8 +458,14 @@ fn camera(
             }
         }
         // (Rich is graded on top: `crate::vision`.)
-        if tonemapping != Some(&Tonemapping::AgX) {
-            c.insert(Tonemapping::AgX);
+        // (Debug A/B: `COD4RW_TONEMAPPER=tony|aces|agx`.)
+        let want = match std::env::var("COD4RW_TONEMAPPER").as_deref() {
+            Ok("tony") => Tonemapping::TonyMcMapface,
+            Ok("aces") => Tonemapping::AcesFitted,
+            _ => Tonemapping::AgX,
+        };
+        if tonemapping != Some(&want) {
+            c.insert(want);
         }
         // A map's own glow (its vision file) takes Bevy's off again
         // (`crate::vision`).
@@ -412,8 +501,11 @@ fn camera(
 fn sun(
     mut commands: Commands,
     settings: Res<Settings>,
-    // (The viewmodels' suns follow the map's: `crate::model_lighting`.)
-    mut suns: Query<(Entity, &mut DirectionalLight), Without<crate::model_lighting::ViewModelSun>>,
+    // (The viewmodels' suns follow the map's: `crate::model_lighting`. Their
+    // fill lights, lightning and the menus' gun preview lights never cast
+    // shadows: given the sun's, the six fills alone added 12 shadow views
+    // for the gun camera, 2048 square each (Shipment, 2026-10-14).)
+    mut suns: Query<(Entity, &mut DirectionalLight, Option<&Name>), (Without<crate::model_lighting::ViewModelSun>, Without<crate::model_lighting::VmFill>)>,
     mut map_size: ResMut<DirectionalLightShadowMap>,
     mut applied: Local<Option<(usize, f32)>>,
 ) {
@@ -427,9 +519,21 @@ fn sun(
         "low" => (true, 1, 30.0, 1024),
         "medium" => (true, 2, 60.0, 1024),
         // Ultra at 2048: 4096 cost ~7 ms on open maps (Bloc) for no visible
-        // difference (perf, 2026-10-08); 3 cascades over 120 m look the same
-        // as 4 (A/B on four maps) and save ~1 ms.
-        "ultra" => (true, 3, 120.0, 2048),
+        // difference (perf, 2026-10-08); 3 cascades over 120 m looked the same
+        // as 4 (A/B on four maps) and saved ~1 ms, and 2 the same as 3
+        // (2026-10-14, Creek and Carentan; GPU -0.7 ms on Creek, -0.3 on
+        // Bloc). Killhouse's reports (2026-10-20: far shadows in blocks,
+        // one 2048 map over 12-120 m): a third cascade fixed them but cost
+        // 1.2-1.3 ms (its shadow view, mostly the render thread), so two
+        // over a shorter reach instead, the far one 10-90 m (a third denser,
+        // free). Live knobs `shadows.ultra_cascades`, `shadows.ultra_distance`
+        // and `shadows.first`.
+        "ultra" => (
+            true,
+            crate::tune::get("shadows.ultra_cascades", 2.0).round().clamp(1.0, 4.0) as usize,
+            crate::tune::get("shadows.ultra_distance", 90.0).clamp(20.0, 300.0),
+            2048,
+        ),
         _ => (true, 2, 80.0, 2048),
     };
     if settings.is_changed() && map_size.size != size {
@@ -438,7 +542,10 @@ fn sun(
     // The cascades anew only when they change (or for a new sun).
     let new_cascades = *applied != Some((cascades, distance));
     let mut any = false;
-    for (e, mut light) in &mut suns {
+    for (e, mut light, name) in &mut suns {
+        if name.is_some_and(|n| matches!(n.as_str(), "lightning" | "gun preview light")) {
+            continue;
+        }
         let added = light.is_added();
         if !(settings.is_changed() || added) {
             continue;
@@ -448,7 +555,7 @@ fn sun(
             light.shadow_maps_enabled = on;
         }
         if new_cascades || added {
-            let config = CascadeShadowConfigBuilder { num_cascades: cascades, maximum_distance: distance, first_cascade_far_bound: 12f32.min(distance), ..default() };
+            let config = CascadeShadowConfigBuilder { num_cascades: cascades, maximum_distance: distance, first_cascade_far_bound: crate::tune::get("shadows.first", if settings.text("r_shadows") == "ultra" { 10.0 } else { 12.0 }).clamp(2.0, distance), ..default() };
             commands.entity(e).insert(config.build());
         }
     }
@@ -510,15 +617,41 @@ fn models(
 }
 
 /// Brightness: the frame's exposure, on every camera that grades colour.
-fn brightness(settings: Res<Settings>, mut grading: Query<&mut ColorGrading>) {
+fn brightness(settings: Res<Settings>, mut grading: Query<&mut ColorGrading>, mut graded: Local<bool>) {
     // (Plus Headquarters' outdoor darkening, `crate::hq`.)
     // (And the showcase's per-map offset, `crate::atmos::climate`.)
     let exposure = settings.num("r_gamma").clamp(0.3, 3.0).log2() + crate::hq::exposure_offset() + crate::atmos::climate::exposure_offset();
+    // (A map look's white balance, `warmth.<map>`: Shipment's golden hour.)
+    let warmth = crate::atmos::climate::look_knob("warmth", |l| l.warmth, 0.0);
+    let tint = crate::atmos::climate::look_knob("tint", |l| l.tint, 0.0);
+    // The Map Look Editor's contrast and saturation (`contrast.<map>`,
+    // `saturation.<map>`): only while set (Bodycam has its own), back to
+    // neutral once unset.
+    let contrast = crate::atmos::climate::look_knob("contrast", |_| -1.0, -1.0);
+    let saturation = crate::atmos::climate::look_knob("saturation", |_| -1.0, -1.0);
+    let set = contrast >= 0.0 || saturation >= 0.0;
     for mut g in &mut grading {
         if (g.global.exposure - exposure).abs() > 1e-4 {
             g.global.exposure = exposure;
         }
+        if (g.global.temperature - warmth).abs() > 1e-4 {
+            g.global.temperature = warmth;
+        }
+        if (g.global.tint - tint).abs() > 1e-4 {
+            g.global.tint = tint;
+        }
+        if set || *graded {
+            let c = if contrast >= 0.0 { contrast.clamp(0.2, 3.0) } else { 1.0 };
+            let s = if saturation >= 0.0 { saturation.clamp(0.0, 3.0) } else { 1.0 };
+            if g.midtones.contrast != c {
+                g.midtones.contrast = c;
+            }
+            if g.global.post_saturation != s {
+                g.global.post_saturation = s;
+            }
+        }
     }
+    *graded = set;
 }
 
 /// The look (`r_tonemap`): Natural, or Rich (`aces`, its old name), which

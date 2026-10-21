@@ -56,7 +56,9 @@ impl Goal {
     fn same(self, other: Goal) -> bool {
         match (self, other) {
             (Goal::Flag(a, _), Goal::Flag(b, _)) | (Goal::Plant(a), Goal::Plant(b)) => a == b,
-            (Goal::Pickup(_), Goal::Pickup(_)) | (Goal::Defuse(_), Goal::Defuse(_)) | (Goal::Hq, Goal::Hq) | (Goal::Crate(_), Goal::Crate(_)) => true,
+            (Goal::Pickup(_), Goal::Pickup(_)) | (Goal::Defuse(_), Goal::Defuse(_)) | (Goal::Hq, Goal::Hq) => true,
+            // (Each crate its own: one given up on isn't every crate.)
+            (Goal::Crate(a), Goal::Crate(b)) => a.distance(b) < u(32.0),
             (Goal::Guard(a), Goal::Guard(b)) => a.distance(b) < u(400.0),
             _ => false,
         }
@@ -97,11 +99,21 @@ pub(super) fn flag_fit(o: &Objectives, team: crate::combat::Team, p: Vec3) -> f3
     0.5 + 1.5 * (-(d / FLAG_NEAR).powi(2)).exp()
 }
 
+/// Next to a crate (horizontally from its middle): there.
+const CRATE_BESIDE: f32 = u(60.0);
+/// Seconds after setting off for a crate to give up on it, and to leave it
+/// be after that.
+const CRATE_GIVE_UP: f32 = 20.0;
+const CRATE_RETRY: f32 = 60.0;
+
 /// What this bot should be doing for the mode's objective, if anything (not
 /// one it couldn't find a way to lately).
-pub(super) fn goal(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx) -> Option<Goal> {
-    let care_package = crate::killstreaks::carepackage::bot_goal(me).map(Goal::Crate);
-    care_package.or_else(|| goal_of(bot, me, feet, tc)).filter(|g| !blocked(bot, *g))
+pub(super) fn goal(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx, now: f32) -> Option<Goal> {
+    // A crate given up on doesn't hide the mode's objective (Domination's
+    // flags), and blocks run out (`decide` also drops the old ones).
+    let live = |g: &Goal| !bot.blocked.iter().any(|b| b.0.same(*g) && b.1 > now);
+    let care_package = crate::killstreaks::carepackage::bot_goal(me).map(Goal::Crate).filter(live);
+    care_package.or_else(|| goal_of(bot, me, feet, tc).filter(live))
 }
 
 fn blocked(bot: &Bot, g: Goal) -> bool {
@@ -260,12 +272,34 @@ fn flag(bot: &Bot, me: Entity, feet: Vec3, tc: &TacCtx, o: &Objectives) -> Optio
 pub(super) fn pursue(bot: &mut Bot, goal: Goal, tc: &TacCtx, nav: Option<&NavGraph>, feet: Vec3, now: f32, rng: &mut impl Rng) {
     // A care package: straight there (no mode's objectives needed).
     if let Goal::Crate(p) = goal {
+        // The crate's middle is inside its box: next to it is there (as
+        // `hardpoints` counts being at it).
+        let beside = (p - feet).with_y(0.0).length() < CRATE_BESIDE;
+        // One it can't get to, or can't get open (enemies about, or someone
+        // else's that takes a while): give up on it for a minute rather
+        // than circle it the rest of the match.
+        let since = match bot.crate_since {
+            Some((at, t)) if at.distance(p) < u(32.0) => t,
+            _ => {
+                bot.crate_since = Some((p, now));
+                now
+            }
+        };
+        if now - since > CRATE_GIVE_UP {
+            bot.blocked.push((goal, now + CRATE_RETRY));
+            bot.crate_since = None;
+            bot.goal = None;
+            bot.set_mode(super::Mode::Hunt, now);
+            return;
+        }
         let changed = bot.mode != super::Mode::Objective || !bot.goal.is_some_and(|g| g.same(goal));
         bot.goal = Some(goal);
-        if changed || (bot.dest.is_none() && feet.distance(p) > u(40.0)) {
+        if changed || (bot.dest.is_none() && !beside) {
             bot.set_mode(super::Mode::Objective, now);
             bot.hold = None;
             bot.go_to(p);
+        } else if beside {
+            bot.dest = None;
         }
         return;
     }

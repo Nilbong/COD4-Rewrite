@@ -47,6 +47,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod graph;
 pub mod join;
 pub mod lagcomp;
+pub mod layout_sync;
+pub mod mixed;
 mod predict;
 mod streaks;
 mod wire;
@@ -62,6 +64,7 @@ impl Plugin for NetplayPlugin {
         use crate::player::InputSet;
         app.init_resource::<graph::NetStats>()
             .init_resource::<world::HostInbox>()
+            .init_resource::<world::ChatEcho>()
             .init_resource::<world::GuestInbox>()
             .add_systems(OnEnter(crate::state::GameState::InGame), begin.in_set(crate::state::Setup::Spawn))
             .add_systems(OnExit(crate::state::GameState::InGame), end)
@@ -73,7 +76,7 @@ impl Plugin for NetplayPlugin {
                     step_remotes.in_set(MovementSet),
                     lagcomp::record.after(MovementSet).before(crate::weapons::WeaponSet),
                     send_world.after(crate::weapons::WeaponSet),
-                    (announce_end, send_kills, send_throws, world::host_news, world::host_requests, world::test_give, streaks::host_blasts, host_pings),
+                    (announce_end, send_kills, send_throws, world::host_news, world::host_requests, world::host_chat, world::test_give, streaks::host_blasts, host_pings),
                     report.run_if(bevy::time::common_conditions::on_timer(std::time::Duration::from_secs(2))),
                     look_at_friend.after(InputSet).before(MovementSet).run_if(|| std::env::var_os("COD4RW_NETLOOK").is_some()),
                 )
@@ -87,12 +90,13 @@ impl Plugin for NetplayPlugin {
                     send_inputs.after(InputSet).before(MovementSet),
                     predict::predict_own.in_set(MovementSet),
                     leave_with_host,
-                    (world::apply, world::guest_news, world::guest_streaks, streaks::mirror).chain().after(receive_guest),
+                    (world::apply, world::guest_news, world::guest_chat, world::guest_streaks, streaks::mirror).chain().after(receive_guest),
                     (pose_puppets, correct_own).after(MovementSet).before(crate::thirdperson::BodyAnimSet),
                     report.run_if(bevy::time::common_conditions::on_timer(std::time::Duration::from_secs(2))),
                 )
                     .run_if(crate::state::in_game.and_then(guesting)),
             )
+            .add_systems(Update, mixed::test_class.before(send_class).run_if(crate::state::in_game.and_then(|n: Option<Res<NetStart>>| n.is_some())))
             .add_systems(Update, (graph::count_hits.after(crate::weapons::WeaponSet), graph::show).run_if(crate::state::in_game.and_then(|n: Option<Res<NetStart>>| n.is_some())));
     }
 }
@@ -176,6 +180,13 @@ pub struct Puppet {
     shots: u8,
     /// Alive at some point: before then it's picking a class, unseen.
     lived: bool,
+}
+
+impl Puppet {
+    /// The weapon spec it's holding.
+    pub fn weapon(&self) -> &str {
+        &self.weapon
+    }
 }
 
 /// Host: one friend's connection.
@@ -301,6 +312,8 @@ fn begin(mut commands: Commands, net: Option<Res<NetStart>>) {
 fn end(mut commands: Commands) {
     GUEST.store(false, Ordering::Relaxed);
     set_pings(Vec::new());
+    // (The host's map editor layout was for that match.)
+    layout_sync::clear();
     join::accept(&mut commands, false);
     commands.remove_resource::<NetStart>();
     commands.remove_resource::<HostState>();
@@ -316,13 +329,21 @@ fn side_of(t: Team) -> u8 {
     (t == Team::Axis) as u8
 }
 
-/// A class from the network, kept to names this game can load.
+/// A class from the network, kept to guns this game can load: one it
+/// can't (a game it hasn't got) is the closest CoD4 gun ([`mixed`]; the
+/// friend's game swaps it first, so this is a fallback).
 fn class_from(c: &Class, content: &crate::content::Content) -> Option<ClassLoadout> {
     let guns: Vec<Gun> = c
         .guns
         .iter()
-        .filter(|(spec, _)| crate::loadout::bot_weapon(content, spec).is_some())
-        .map(|(spec, camo)| Gun { spec: spec.clone(), camo: *camo as usize, name: spec.to_ascii_uppercase(), variant: None })
+        .map(|(spec, camo)| {
+            let here = mixed::loadable(content, spec);
+            if here != *spec {
+                warn!("netplay: a friend's {spec} can't run here: {here} instead");
+            }
+            let camo = if here == *spec { *camo as usize } else { 0 };
+            Gun { name: here.to_ascii_uppercase(), spec: here, camo, variant: None }
+        })
         .collect();
     let known = |s: &String| s.starts_with("specialty_") || s.ends_with("_mp") || s.ends_with("_grenade");
     (!guns.is_empty()).then(|| ClassLoadout {
@@ -1048,7 +1069,7 @@ fn leave_with_host(
     over: Option<Res<crate::tdm::MatchOver>>,
     mut left: Local<bool>,
 ) {
-    let shown = state.and_then(|s| s.ended).is_some_and(|(_, at)| time.elapsed_secs() - at > crate::tdm::POST_MATCH) && !crate::killcam::busy();
+    let shown = state.and_then(|s| s.ended).is_some_and(|(_, at)| time.elapsed_secs() - at.max(crate::killcam::finished_at()) > crate::tdm::POST_MATCH) && !crate::killcam::busy();
     let gone = !matches!(online.status, crate::online::Status::Connected(_));
     if !(shown || gone) {
         *left = false;
@@ -1062,9 +1083,24 @@ fn leave_with_host(
     }
 }
 
-/// Our class, to the host, when it's picked.
-fn send_class(online: Res<Online>, mine: Query<&PawnClass, (With<LocalPlayer>, Changed<PawnClass>)>) {
-    for class in &mine {
+/// Our class, to the host, when it's picked. A gun from a game the host
+/// hasn't got (it couldn't run it) becomes the closest CoD4 gun first, for
+/// us too, and we're told ([`mixed`]).
+fn send_class(online: Res<Online>, net: Res<NetStart>, content: Res<crate::content::Content>, mut mine: Query<&mut PawnClass, (With<LocalPlayer>, Changed<PawnClass>)>) {
+    let host_games = net.members.iter().find(|m| m.peer == HOST).map_or(0, |m| m.profile.games);
+    for mut class in &mut mine {
+        let mut swapped = Vec::new();
+        for gun in &mut class.bypass_change_detection().0.guns {
+            let game = mixed::gun_game(&gun.spec);
+            if host_games & mixed::bit(game) == 0 {
+                let to = mixed::standin(&content, &gun.spec);
+                swapped.push(format!("{} -> {} (the host hasn't got {})", mixed::gun_name(&content, &gun.spec), mixed::gun_name(&content, &to), game.title()));
+                *gun = Gun { name: to.to_ascii_uppercase(), spec: to, camo: 0, variant: None };
+            }
+        }
+        if !swapped.is_empty() {
+            mixed::notify(format!("Class changed: {}", swapped.join(", ")));
+        }
         online.send(HOST, &LobbyMsg::Class(class_to(&class.0)));
     }
 }
@@ -1125,7 +1161,7 @@ fn pose_puppets(
             pawn.deaths = info.deaths as u32;
             if puppet.weapon != info.weapon {
                 puppet.weapon.clone_from(&info.weapon);
-                if let Some(def) = crate::loadout::bot_weapon(&content, &info.weapon) {
+                if let Some(def) = crate::loadout::bot_weapon(&content, &mixed::loadable(&content, &info.weapon)) {
                     weapon.def = def;
                 }
             }
@@ -1189,7 +1225,7 @@ fn pose_puppets(
         let spawn = crate::world::SpawnPoint { pos: Vec3::from_array(p.position), yaw: p.yaw, kind: crate::world::SpawnKind::Tdm };
         let e = spawn_pawn(&mut commands, &assets, &info.name, team_of(info.team), &spawn);
         let mut weapon = WeaponState::default();
-        if let Some(def) = crate::loadout::bot_weapon(&content, &info.weapon) {
+        if let Some(def) = crate::loadout::bot_weapon(&content, &mixed::loadable(&content, &info.weapon)) {
             weapon.def = def;
         }
         let lived = p.life == 0;

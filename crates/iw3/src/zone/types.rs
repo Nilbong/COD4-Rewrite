@@ -382,6 +382,10 @@ pub struct LightDef {
 #[derive(Debug)]
 pub struct PrimaryLight {
     pub kind: u8,
+    /// Whether the engine may give it a shadow map (spots, `sm_spotEnable`).
+    pub can_shadow: bool,
+    /// The spot's falloff exponent across its cone (0: linear).
+    pub exponent: u8,
     pub color: [f32; 3],
     pub dir: [f32; 3],
     pub origin: [f32; 3],

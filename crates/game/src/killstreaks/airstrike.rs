@@ -80,10 +80,6 @@ struct Plane {
 }
 
 impl Airstrikes {
-    /// One is under way (`level.airstrikeInProgress`).
-    pub fn in_progress(&self, now: f32) -> bool {
-        self.strikes.iter().any(|s| now - s.called < IN_PROGRESS)
-    }
 
     /// How dangerous a strike under way makes `at` for spawning
     /// (`getAirstrikeDanger`): from the planes' coming until they're gone,

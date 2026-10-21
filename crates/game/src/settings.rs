@@ -76,13 +76,15 @@ pub const GRAPHICS: &[Setting] = &[
     s("r_monitor", "Monitor", "Which screen the game is on: full screen and borderless fill it, a window moves to it.", Kind::Choice(&[("Current", "current"), ("Primary", "primary"), ("Monitor 1", "0"), ("Monitor 2", "1"), ("Monitor 3", "2"), ("Monitor 4", "3")]), "current"),
     s("r_resolution", "Resolution", "The window's size (full screen: the screen's own unless set).", Kind::Choice(&[("Desktop", "desktop"), ("1280x720", "1280x720"), ("1366x768", "1366x768"), ("1600x900", "1600x900"), ("1920x1080", "1920x1080"), ("2560x1440", "2560x1440"), ("3440x1440", "3440x1440"), ("3840x2160", "3840x2160")]), "desktop"),
     s("r_renderscale", "Render Scale", "The world drawn at this share of the resolution and scaled up (the HUD and gun stay sharp). Lower is faster on a busy graphics card.", Kind::Slider { min: 50.0, max: 100.0, step: 5.0, decimals: 0, suffix: "%" }, "100"),
+    s("r_upscaler", "Upscaler", "Draws the world at a lower resolution and sharpens it back up (FSR 1 style). Raises the frame rate only when your graphics card is the limit; where the processor is, it changes nothing. Quality looks closest to native, Performance is fastest. Overrides Render Scale.", Kind::Choice(&[("Off", "off"), ("Quality", "quality"), ("Balanced", "balanced"), ("Performance", "performance")]), "off"),
     s("r_vsync", "Sync Every Frame", "Wait for the display's refresh (no tearing, a little more latency).", OFF_ON, "1"),
     s("com_maxfps", "Frame Rate Limit", "The most frames a second drawn.", Kind::Choice(&[("30", "30"), ("60", "60"), ("90", "90"), ("120", "120"), ("144", "144"), ("165", "165"), ("240", "240"), ("Unlimited", "0")]), "0"),
     s("cg_fov", "Field of View", "CoD4's is 65; 80 was its widest.", Kind::Slider { min: 65.0, max: 110.0, step: 1.0, decimals: 0, suffix: "" }, "65"),
+    s("cg_adsfov", "ADS Field of View", "Affected: aiming zooms by the gun's own amount from your Field of View, so a wide view stays wide. Independent: every gun aims at its fixed CoD4 zoom.", Kind::Choice(&[("Affected", "affected"), ("Independent", "independent")]), "affected"),
     s("r_gamma", "Brightness", "How bright the picture is.", Kind::Slider { min: 0.5, max: 1.5, step: 0.05, decimals: 2, suffix: "" }, "1"),
     s("r_tonemap", "Tonemapping", "Natural keeps light and shade soft; Rich gives deeper shadows and stronger colour.", Kind::Choice(&[("Natural", "agx"), ("Rich", "aces")]), "agx"),
     s("r_lighting", "Lighting", "Baked is CoD4's lightmaps; ray traced lights the world live (from the next match).", Kind::Choice(&[("Baked", "baked"), ("Ray Traced Low", "rt_low"), ("Ray Traced High", "rt_high")]), "baked"),
-    s("r_lightmaps", "Map Lighting", "Original is CoD4's lightmaps; Rebaked is the map lit again on this PC with modern bounce light, where a bake exists (from the next match).", Kind::Choice(&[("Original", "original"), ("Rebaked", "rebaked")]), "original"),
+    s("r_lightmaps", "Map Lighting", "Original is CoD4's lightmaps; Rebaked is the map lit again with modern bounce light, where a bake exists (shipped with the game or made on this PC); Live (experimental) lights it as it loads, the whole sun live with its bounce (from the next match).", Kind::Choice(&[("Original", "original"), ("Rebaked", "rebaked"), ("Live (experimental)", "live")]), "original"),
     s("r_filmtint", "Film Tint", "Keep each map's colour tint (Killhouse's yellow, for one).", Kind::Choice(&[("Off", "off"), ("On", "on")]), "off"),
     s("cg_drawfps", "Performance Overlay", "Frames a second and frame time in the corner.", Kind::Choice(&[("Off", "0"), ("FPS", "1"), ("FPS and Frame Time", "2")]), "0"),
 ];
@@ -92,8 +94,9 @@ pub const QUALITY: &[Setting] = &[
     s("r_shadows", "Sun Shadows", "How far and how sharp the sun's shadows are.", Kind::Choice(&[("Off", "off"), ("Low", "low"), ("Medium", "medium"), ("High", "high"), ("Ultra", "ultra")]), "high"),
     s("r_propshadows", "Model Shadows", "Static models cast sun shadows too (their own are in the lightmaps already).", OFF_ON, "1"),
     s("r_ssao", "Ambient Occlusion", "Soft shadowing in corners and creases.", OFF_ON, "1"),
-    s("r_aa", "Anti-aliasing", "Smooths jagged edges.", Kind::Choice(&[("Off", "off"), ("FXAA", "fxaa"), ("SMAA", "smaa"), ("SMAA High", "smaa_high")]), "smaa_high"),
+    s("r_aa", "Anti-aliasing", "Smooths jagged edges. TAA also steadies shimmering fences, foliage and distant detail by blending frames, and is the best partner for the Upscaler; it can leave faint trails behind fast effects.", Kind::Choice(&[("Off", "off"), ("FXAA", "fxaa"), ("SMAA", "smaa"), ("SMAA High", "smaa_high"), ("TAA", "taa")]), "smaa_high"),
     s("r_bloom", "Glow", "Bright light glows (maps that have it).", OFF_ON, "1"),
+    s("r_filmfx", "Film Effects", "Film grain, a soft vignette and lens dirt over the picture.", OFF_ON, "1"),
     s("r_volumetric", "Volumetric Lighting", "Sun shafts and light in the air, in each map's own haze.", Kind::Choice(&[("Off", "off"), ("Low", "low"), ("High", "high")]), "off"),
     s("r_sky", "Sky", "Classic is CoD4's skybox; Dynamic draws our own drifting clouds and sun over the map's colours.", Kind::Choice(&[("Classic", "classic"), ("Dynamic", "dynamic")]), "classic"),
     s("r_texfilter", "Texture Filtering", "Sharper textures at a glancing angle (from the next match).", Kind::Choice(&[("Bilinear", "bilinear"), ("Trilinear", "trilinear"), ("Anisotropic 4x", "4"), ("Anisotropic 8x", "8"), ("Anisotropic 16x", "16")]), "16"),
@@ -130,8 +133,11 @@ pub const GAME: &[Setting] = &[
     s("cg_fullbody", "Full Body", "See your own body and legs when you look down.", OFF_ON, "1"),
     s("cg_vmlighting", "Weapon Lighting", "Light your gun and arms by the world around you (shade, sun, rooms), or as CoD4 did.", Kind::Choice(&[("World", "world"), ("Classic", "classic")]), "world"),
     s("cg_weaponsway", "Weapon Sway", "The gun lags a little behind the view as you turn.", OFF_ON, "1"),
+    s("cg_autolean", "Auto Lean", "Aiming right beside a wall's edge or a corner, you lean out just past it on your own. Low: only hugging the edge, after a moment. High: sooner and from a little further off.", Kind::Choice(&[("Off", "0"), ("Low", "low"), ("High", "1")]), "low"),
+    s("cg_gunposition", "Weapon Position", "Where the gun is held at the hip: Far is CoD4's; Standard and Close bring it nearer and larger, as in Modern Warfare. Aiming down the sights is the same in all three.", Kind::Choice(&[("Far", "far"), ("Standard", "standard"), ("Close", "close")]), "far"),
+    s("cg_livehands", "Live Hands", "Your hands work the gun: they grip and regrip, fidget, take the kick and the weight. Off: CoD4's animations alone.", OFF_ON, "1"),
     s("cg_bobstyle", "Weapon Bob", "A fuller bob with footsteps, roll and landings, or CoD4's.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "classic"),
-    s("ui_menustyle", "Menu Style", "The main menu: the new one, or CoD4's own. Shows the next time it opens.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "classic"),
+    s("ui_menustyle", "Menu Style", "The menus: the new ones (main menu, Create a Class, lobby, settings, in-match menus), or CoD4's own. Shows the next time a menu opens.", Kind::Choice(&[("Modern", "modern"), ("Classic", "classic")]), "modern"),
 ];
 
 /// Controls > Look.
@@ -140,9 +146,6 @@ pub const LOOK: &[Setting] = &[
     s("cg_ads_sens", "Aiming Sensitivity", "Sensitivity while aiming down the sights, as a share of the above.", Kind::Slider { min: 0.25, max: 2.0, step: 0.05, decimals: 2, suffix: "x" }, "1"),
     s("m_invert", "Invert Mouse", "Mouse up looks down.", OFF_ON, "0"),
     s("m_raw", "Raw Mouse Input", "The mouse's own counts, with no acceleration (always: the game reads raw motion).", Kind::Choice(&[("On", "1")]), "1"),
-    bind(Action::LeanLeft, "Lean Left"),
-    bind(Action::LeanRight, "Lean Right"),
-    s("cg_lean_mode", "Lean", "Hold the key, or press once to lean and again to stop.", HOLD_TOGGLE, "hold"),
 ];
 
 /// Controls > Move.
@@ -195,6 +198,7 @@ pub const CONTROLLER: &[Setting] = &[
     s("pad_aim_assist", "Aim Assist", "The view slows over enemies and follows them a little.", OFF_ON, "1"),
     s("pad_rumble", "Vibration", "The controller rumbles when you fire and are hit.", OFF_ON, "1"),
     s("pad_layout", "Button Layout", "Default, or Tactical (crouch and melee swapped).", Kind::Choice(&[("Default", "default"), ("Tactical", "tactical")]), "default"),
+    s("pad_ps_features", "PlayStation Controller Features", "DualShock 4 and DualSense pads read directly: their own buttons, rumble and lights. Off reads them like any other pad (try it if your pad keeps disconnecting, or with DS4Windows or Steam Input).", OFF_ON, "1"),
     s("pad_glyphs", "Button Icons", "Which controller's buttons the hints show.", Kind::Choice(&[("Automatic", "auto"), ("Xbox", "xbox"), ("PlayStation", "ps")]), "auto"),
 ];
 
@@ -237,6 +241,11 @@ pub fn is_setting(dvar: &str) -> bool {
 
 /// A setting's default value.
 pub fn default_of(s: &Setting) -> String {
+    // Android's mobile defaults (`crate::android::mobile_default`).
+    #[cfg(target_os = "android")]
+    if let Some(v) = crate::android::mobile_default(s.dvar) {
+        return v;
+    }
     match s.kind {
         Kind::Bind(a) => a.default_value(),
         _ => s.default.to_owned(),
@@ -274,6 +283,10 @@ impl Default for Settings {
         // Debug runs straight into a match can still set these.
         if let Ok(v) = std::env::var("COD4RW_LIGHTING") {
             values.insert("r_lighting", v.to_ascii_lowercase());
+        }
+        // (`COD4RW_SHADOWS=ultra`: a player's shadow setting in a debug run.)
+        if let Ok(v) = std::env::var("COD4RW_SHADOWS") {
+            values.insert("r_shadows", v.to_ascii_lowercase());
         }
         if let Ok(v) = std::env::var("COD4RW_FILMTINT") {
             values.insert("r_filmtint", v);

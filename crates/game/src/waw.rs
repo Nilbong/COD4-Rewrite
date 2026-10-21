@@ -199,10 +199,16 @@ pub fn data() -> Option<&'static Data> {
 /// they are ready when a match starts).
 pub fn preload() {
     std::thread::spawn(|| {
-        if let Some(d) = data() {
-            let _ = d.sound_aliases();
-        }
+        crate::perf::background_thread();
+        preload_blocking();
     });
+}
+
+/// [`preload`]'s work on this thread (`main` runs the games' in turn).
+pub fn preload_blocking() {
+    if let Some(d) = data() {
+        let _ = d.sound_aliases();
+    }
 }
 
 /// WaW's gun sounds, once read ([`Data::sound_aliases`]).
@@ -584,6 +590,8 @@ fn def_from_file(w: &WeaponFile, group: Group) -> WeaponDef {
         first_raise_time: fo("firstRaiseTime", fb.first_raise_time),
         quick_drop_time: fo("quickDropTime", fb.quick_drop_time),
         quick_raise_time: fo("quickRaiseTime", fb.quick_raise_time),
+        empty_drop_time: fo("emptyDropTime", fb.drop_time),
+        empty_raise_time: fo("emptyRaiseTime", fb.raise_time),
         hip_spread_min: [fo("hipSpreadStandMin", 3.0), fo("hipSpreadDuckedMin", 2.5), fo("hipSpreadProneMin", 2.0)],
         hip_spread_max: [fo("hipSpreadMax", 7.0), fo("hipSpreadDuckedMax", 6.0), fo("hipSpreadProneMax", 5.0)],
         hip_spread_fire_add: fo("hipSpreadFireAdd", fb.hip_spread_fire_add),
@@ -788,8 +796,8 @@ pub struct WawPlugin;
 impl Plugin for WawPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MatchContent>()
-            .add_systems(OnEnter(crate::state::GameState::InGame), |mut c: ResMut<MatchContent>| c.start())
             .add_systems(OnEnter(crate::state::GameState::InGame), add_rifle_grenades.in_set(crate::state::Setup::Spawn));
+        app.add_systems(OnEnter(crate::state::GameState::InGame), |mut c: ResMut<MatchContent>| c.start());
     }
 }
 

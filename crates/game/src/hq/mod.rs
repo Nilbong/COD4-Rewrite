@@ -19,8 +19,10 @@ use bevy::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod ambient;
+mod base;
 mod life;
 mod reveal;
+pub use base::{AREAS, armed, movable_brushes, overlay, post};
 pub use reveal::{DEAL, FACE_DOWN, reveal_since, revealing};
 
 pub struct HqPlugin;
@@ -36,7 +38,10 @@ impl Plugin for HqPlugin {
                 app.insert_resource(SpawnAt([x, y, z], yaw));
             }
         }
-        app.add_systems(OnEnter(GameState::InGame), enter.after(crate::world::load_map).in_set(crate::state::Setup::Content))
+        // (Known before the map loads: the doors and targets are built to
+        // move, `crate::world::movable_brush_models`.)
+        app.add_systems(OnEnter(GameState::InGame), (|hq: Option<Res<Headquarters>>| ACTIVE.store(hq.is_some(), Ordering::Relaxed)).before(crate::world::load_map))
+            .add_systems(OnEnter(GameState::InGame), enter.after(crate::world::load_map).in_set(crate::state::Setup::Content))
             .add_systems(OnEnter(GameState::InGame), spawn_figures.in_set(crate::state::Setup::Spawn))
             .add_systems(OnExit(GameState::InGame), leave)
             .add_systems(Update, (third_person, overcast, outdoor_exposure).run_if(|| active()))
@@ -57,6 +62,7 @@ impl Plugin for HqPlugin {
             .run_if(|| active()))
             .add_systems(Update, stations.after(crate::splitscreen::InputGathered).run_if(|| active()));
         reveal::build(app);
+        base::build(app);
         ambient::build(app);
         life::build(app);
     }
@@ -245,10 +251,12 @@ fn outdoor_exposure(time: Res<Time>, spatial: avian3d::prelude::SpatialQuery, ca
 /// Health while Headquarters' frame runs: no damage reaches it.
 const UNHURT: f32 = 1.0e6;
 
-/// Always behind the player.
+/// Behind the player, but in their own eyes where they're armed (the range,
+/// the killhouse).
 fn third_person(mut view: ResMut<crate::wardrobe::ThirdPerson>) {
-    if !view.0[0] {
-        view.0[0] = true;
+    let behind = !armed();
+    if view.0[0] != behind {
+        view.0[0] = behind;
     }
 }
 
@@ -267,7 +275,7 @@ pub struct Station {
 
 /// The hangar's stations: Price's briefing corner and the door. (Supply
 /// drops are called in anywhere: [`reveal`].)
-pub const STATIONS: [Station; 5] = [
+pub const STATIONS: [Station; 7] = [
     Station {
         at: [-508.0, -1025.0, 110.0],
         reach: 110.0,
@@ -303,6 +311,22 @@ pub const STATIONS: [Station; 5] = [
         action: "set up a match",
         script: "\"open\" \"private_match\"",
     },
+    // The rifle range's table, where the level laid out the rifle and the
+    // pistol, and the killhouse's start: pick the class to shoot with.
+    Station {
+        at: [3198.0, -790.0, 70.0],
+        reach: 90.0,
+        label: "Weapon Rack",
+        action: "pick a class to shoot with",
+        script: "\"open\" \"changeclass\"",
+    },
+    Station {
+        at: [560.0, -110.0, 70.0],
+        reach: 70.0,
+        label: "Weapon Rack",
+        action: "pick a class to shoot with",
+        script: "\"open\" \"changeclass\"",
+    },
 ];
 
 /// The station the player stands at ([`STATIONS`]' index), and Use pressed
@@ -311,6 +335,8 @@ static NEAR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::ne
 static USE: AtomicBool = AtomicBool::new(false);
 /// The pad's X last frame (Use is its going down).
 static PAD_USE: AtomicBool = AtomicBool::new(false);
+/// The pad's d-pad across last frame.
+static PAD_DIR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// The station within reach.
 pub fn near() -> Option<&'static Station> {
@@ -327,18 +353,22 @@ pub fn prompt(input: &PlayerInput) -> Option<String> {
     let key = input.use_key();
     match reveal::phase() {
         reveal::Phase::Done => return Some(format!("Press {key} to put it away")),
+        _ if armed() => {}
         reveal::Phase::Waiting if reveal::near_crate() => return Some(format!("Press {key} to open the Supply Drop")),
         reveal::Phase::None | reveal::Phase::Waiting => {}
         _ => return None,
     }
-    near().map(|s| format!("Press {key} to {}", s.action))
+    if let Some(s) = near() {
+        return Some(format!("Press {key} to {}", s.action));
+    }
+    post().map(|a| if armed() { format!("Press {key} to travel to the {}", a.name) } else { format!("Press {key} to travel to the {}  (scroll for another)", a.name) })
 }
 
 /// At the bottom, while there are drops to open and none is out: how to
 /// call one in, and how far into the hold.
 pub fn call_hint(input: &PlayerInput) -> Option<(String, f32)> {
     let n = crate::supply::inventory().unopened;
-    if n == 0 || reveal::phase() != reveal::Phase::None {
+    if n == 0 || reveal::phase() != reveal::Phase::None || armed() {
         return None;
     }
     let key = match input.pad_kind {
@@ -378,6 +408,9 @@ fn stations(player: Query<&Transform, With<crate::player::LocalPlayer>>, fe: Opt
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(i, _)| i);
     NEAR.store(nearest.unwrap_or(usize::MAX), Ordering::Relaxed);
+    if nearest.is_none() && used && !fe.as_ref().is_some_and(|fe| crate::ui::menu_open(Some(&**fe))) {
+        base::use_post();
+    }
     let (Some(i), true, Some(mut fe)) = (nearest, used, fe) else { return };
     if crate::ui::menu_open(Some(&*fe)) {
         return;
@@ -391,6 +424,15 @@ pub fn strip(input: &mut PlayerInput) {
     if !active() {
         return;
     }
+    // The map editor open (F7): its keys are its own.
+    if crate::map_editor::open() {
+        reveal::set_call_held(false);
+        USE.store(false, Ordering::Relaxed);
+        input.keys.reset_all();
+        input.mouse.reset_all();
+        input.scroll = 0.0;
+        return;
+    }
     // Use is for the stations and the drops (F, or a pad's X going down);
     // the Frag key calls drops in.
     let pad_use = input.pad.interact;
@@ -401,7 +443,41 @@ pub fn strip(input: &mut PlayerInput) {
     if input.keys.just_pressed(KeyCode::KeyF) || pad_pressed {
         USE.store(true, Ordering::Relaxed);
     }
-    reveal::set_call_held(input.keys.pressed(KeyCode::KeyG));
+    reveal::set_call_held(input.keys.pressed(KeyCode::KeyG) && !armed());
+    // At a travel post (unarmed, playing: not under a menu), the wheel or
+    // the d-pad picks where to.
+    if !armed() && input.live {
+        let step = if input.scroll > 0.0 { -1 } else if input.scroll < 0.0 { 1 } else { 0 };
+        let pad = input.pad.menu_dir.map_or(0, |d| d.x);
+        let pad_now = pad != 0 && PAD_DIR.swap(pad, Ordering::Relaxed) != pad;
+        if pad == 0 {
+            PAD_DIR.store(0, Ordering::Relaxed);
+        }
+        if step != 0 || pad_now {
+            base::next_destination(if step != 0 { step } else { pad });
+        }
+    }
+    // Armed (the range, the killhouse): the gun's keys go through; Use,
+    // the drops' key and the view toggle stay Headquarters'.
+    if armed() {
+        for key in [KeyCode::KeyG, KeyCode::KeyF, KeyCode::F5, crate::killstreaks::PAD_PICK] {
+            input.keys.reset(key);
+        }
+        // (`COD4RW_HQRUN`'s trigger finger: every other frame, for
+        // semi-automatics.)
+        if base::debug_fire() {
+            // (The test window doesn't have the mouse.)
+            input.live = true;
+            input.mouse.press(MouseButton::Right);
+            static ODD: AtomicBool = AtomicBool::new(false);
+            if !ODD.fetch_xor(true, Ordering::Relaxed) {
+                input.mouse.press(MouseButton::Left);
+            } else {
+                input.mouse.release(MouseButton::Left);
+            }
+        }
+        return;
+    }
     for key in [
         KeyCode::KeyG,
         KeyCode::KeyR,

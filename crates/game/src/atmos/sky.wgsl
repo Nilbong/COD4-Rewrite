@@ -55,6 +55,11 @@ struct SkyParams {
     look: vec4<f32>,
     // The map's night sky: x stars, y zenith darkening, z warm city glow.
     night_look: vec4<f32>,
+    // The Map Look Editor's sky grade: rgb multiplier.
+    grade: vec4<f32>,
+    // 1: clouds in this cube; 0: the sky behind them only (bevy_atmos's
+    // screen-space clouds draw them over it, `sky.rs`).
+    clouds: f32,
 }
 
 @group(0) @binding(0) var<uniform> sky: SkyParams;
@@ -68,7 +73,7 @@ const PI: f32 = 3.14159265;
 const EARTH: f32 = 6360000.0;
 const CLOUD_BASE: f32 = 1500.0;
 const CLOUD_TOP: f32 = 2600.0;
-const STEPS: u32 = 48u;
+const STEPS: u32 = 64u;
 const LIGHT_STEPS: u32 = 4u;
 
 // A cube map texel's direction in the world. The skybox looks the cube
@@ -170,16 +175,25 @@ fn density(p: vec3<f32>, h: f32, cover: f32, detail: bool) -> f32 {
     // Firm edges: cloud bodies against clear gaps.
     // (Softer when overcast: firm edges at high cover left a web of thin
     // bright cracks, the sky showing through.)
-    var d = smoothstep(lo - 0.05, lo + mix(0.18, 0.5, smoothstep(0.55, 0.85, cover)), base);
+    // (A narrow edge band: defined cloud bodies, not a soft haze round
+    // them; the detail erosion below breaks the edge up.)
+    var d = smoothstep(lo - 0.03, lo + mix(0.1, 0.45, smoothstep(0.55, 0.85, cover)), base);
     // Flat bottoms, rounded tops (taller where the cloud is thicker).
     // Overcast: a continuous deck under the masses (the gaps between them
     // read as thin bright cracks, the sky showing through).
     d = max(d, 0.35 * smoothstep(0.85, 0.95, cover) * (1.0 - h));
     d *= smoothstep(0.0, 0.12, h) * smoothstep(1.0, mix(0.35, 0.8, d), h);
     if (detail && d > 0.0) {
-        // Wispy edges.
+        // Detail erosion: small-scale noise eats into the thin edges (the
+        // cores stay solid), billowy (cauliflower) at the tops and wispy
+        // underneath, then a steep ramp so what's left is crisp.
         let wisps = fbm(q * (1.0 / 220.0), 3u);
-        d = saturate(d - wisps * 0.45 * (1.0 - d));
+        // (Nothing finer than ~45 m: smaller noise aliased into grain.)
+        let fine = fbm(q * (1.0 / 90.0), 2u);
+        let billow = mix(fine, 1.0 - fine, saturate(h * 2.5));
+        let erode = wisps * 0.3 + billow * 0.42;
+        d = saturate((d - erode * (1.0 - d * 0.7)) / max(1.0 - erode * 0.5, 0.2));
+        d = min(smoothstep(0.0, 0.22, d) * d * 1.3, 1.0);
     }
     return d;
 }
@@ -410,7 +424,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var color = vec3(0.0);
     var transmittance = 1.0;
     let cover = coverage();
-    if (d.y > 0.0 && cover > 0.0) {
+    if (d.y > 0.0 && cover > 0.0 && sky.clouds > 0.5) {
         let t0 = to_shell(d.y, CLOUD_BASE);
         let t1 = to_shell(d.y, top_height);
         // (Half the steps while a flash redraws the whole sky each frame.)
@@ -549,7 +563,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let ma = acos(clamp(dot(d, moon), -1.0, 1.0));
         let moon_disc = 1.0 - smoothstep(sky.sun_size * 0.8, sky.sun_size, ma);
         let seas = 0.75 + 0.25 * value_noise(d * 900.0);
-        discs += vec3(0.75, 0.8, 0.9) * 24.0 * moon_disc * seas * sky.night * zenith_lum * (1.0 - storm_of());
+        // (Bright against the night: by the zenith's light alone it was too
+        // dim to see. A soft glow round it in the air.)
+        let night_lum = max(zenith_lum, DAY_ZENITH * 0.02);
+        let clear = 1.0 - storm_of();
+        discs += vec3(0.75, 0.8, 0.9) * 600.0 * night_lum * moon_disc * seas * sky.night * clear;
+        let halo = exp(-ma / 0.06) * 0.6 + exp(-ma / 0.25) * 0.15;
+        discs += vec3(0.55, 0.62, 0.8) * 30.0 * night_lum * halo * sky.night * clear * (1.0 - 0.7 * smoothstep(0.6, 0.9, cover));
     }
     // (Overcast: what shows between clouds is more cloud, dimmer than open sky.)
     let behind = mix(1.0, 0.65, smoothstep(0.6, 0.9, cover));
@@ -566,5 +586,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (sky.flash > 0.0) {
         out += vec3(0.85, 0.9, 1.0) * bolt(d) * sky.flash * 30.0 * zenith_lum;
     }
-    textureStore(output, vec2<i32>(id.xy), i32(face), vec4(out, 1.0));
+    textureStore(output, vec2<i32>(id.xy), i32(face), vec4(out * sky.grade.rgb, 1.0));
 }
